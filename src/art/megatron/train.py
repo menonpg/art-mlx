@@ -484,7 +484,6 @@ def run_megatron_sft_job(
                 chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
 
             batch_loss = torch.tensor(0.0, device=device)
-            local_trainable_tokens = 0.0
             for param_group in runtime.optimizer.param_groups:
                 param_group["lr"] = job.learning_rates[batch_idx]
 
@@ -499,7 +498,6 @@ def run_megatron_sft_job(
                 position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
                 shifted_labels = shift_tensor(labels, -100)
                 mask = shifted_labels != -100
-                local_trainable_tokens += float(mask.sum().item())
 
                 per_token_loss: torch.Tensor = runtime.model[0](
                     input_ids=input_ids,
@@ -511,15 +509,10 @@ def run_megatron_sft_job(
                     },
                 )
                 masked_loss = per_token_loss[mask].sum()
-                masked_loss.backward()
+                (masked_loss / float(global_trainable_tokens)).backward()
                 batch_loss += masked_loss.detach()
 
-            num_tokens = torch.tensor(
-                [local_trainable_tokens],
-                device=device,
-                dtype=torch.float32,
-            )
-            finalize_model_grads_extended(runtime.model, num_tokens=num_tokens)
+            finalize_model_grads_extended(runtime.model)
             update_successful, grad_norm, num_zeros_in_grad = runtime.optimizer.step()
             runtime.optimizer.zero_grad()
             del update_successful, num_zeros_in_grad
