@@ -32,7 +32,7 @@ from .jobs import (
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronTrainingJob,
 )
-from .shared import merge_lora_adapter
+from .train import merge_lora_adapter
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
