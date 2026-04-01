@@ -398,7 +398,9 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
             update={
                 "sharded": False,
                 "shard_dim": None,
-                "grad_sync_op": GRAD_SYNC_OP_SUM,  # sum replicated TP contributions
+                # Row-parallel output uses TP collectives whose backward already gives
+                # replicated B the full output gradient on each TP rank.
+                "grad_sync_op": GRAD_SYNC_OP_NONE,
             }
         )
         self.lora = LoRA(
@@ -689,7 +691,9 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
                 "sharded": False,
                 "shard_dim": None,
                 "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
-                "grad_sync_op": GRAD_SYNC_OP_SUM,  # we handle this with extended finalize_grads
+                # Expert row-parallel output follows the same pattern: replicated B
+                # already sees the full gradient from the backward TP collective.
+                "grad_sync_op": GRAD_SYNC_OP_NONE,
             }
         )
         self.lora = LoRA(
