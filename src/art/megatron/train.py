@@ -4,6 +4,14 @@ from art.megatron.runtime_env import configure_megatron_runtime_env
 configure_megatron_runtime_env()
 # isort: on
 
+"""Megatron training runtime and public worker API.
+
+Public cross-repo API consumed by serverless-training:
+- build_training_runtime
+- run_megatron_worker_loop
+- merge_lora_adapter
+"""
+
 import gc
 import importlib
 import json
@@ -57,6 +65,17 @@ load_file = safetensors_torch.load_file
 save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+__all__ = [
+    "DEFAULT_MODEL_IDENTIFIER",
+    "TrainingRuntime",
+    "build_training_runtime",
+    "run_megatron_worker_loop",
+    "run_megatron_rl_job",
+    "run_megatron_sft_job",
+    "finalize_megatron_job",
+    "merge_lora_adapter",
+]
 
 
 class TrainingRuntime(BaseModel):
