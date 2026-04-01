@@ -28,6 +28,7 @@ from .train import (
     configure_moe_routing_replay,
     load_adapter_into_model,
     print0,
+    resolve_global_grad_accumulation_sequences,
     run_training_step,
     select_indexed_inputs,
     select_micro_inputs,
@@ -119,7 +120,9 @@ def run_megatron_rl_job(
         template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
         zero_template = _zero_contribution_inputs(template)
         num_sequences = job.disk_packed_tensors["num_sequences"]
-        global_grad_accumulation_sequences = job.config.grad_accumulation_sequences
+        global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
+            job.config.grad_accumulation_sequences
+        )
         num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
         for step_index in range(num_steps):
             micro_indices = build_micro_sample_indices(

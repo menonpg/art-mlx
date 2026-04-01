@@ -805,7 +805,9 @@ class LocalBackend(Backend):
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        grad_accumulation_sequences = max(1, int(config.grad_accumulation_sequences))
+        grad_accumulation_sequences = max(
+            1, int(config.grad_accumulation_sequences or 1)
+        )
         estimated_gradient_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
         )

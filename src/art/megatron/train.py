@@ -352,35 +352,54 @@ def _zero_contribution_inputs(template: PackedTensors) -> PackedTensors:
     return dummy
 
 
-def resolve_local_grad_accumulation_sequences(
-    global_grad_accumulation_sequences: int,
+def resolve_global_grad_accumulation_sequences(
+    global_grad_accumulation_sequences: int | None,
 ) -> int:
     dp_world_size = ps.get_data_parallel_world_size()
+    if global_grad_accumulation_sequences is None:
+        return dp_world_size
+    return global_grad_accumulation_sequences
+
+
+def resolve_local_grad_accumulation_sequences(
+    global_grad_accumulation_sequences: int | None,
+) -> int:
+    resolved_global_grad_accumulation_sequences = (
+        resolve_global_grad_accumulation_sequences(
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences
+        )
+    )
+    dp_world_size = ps.get_data_parallel_world_size()
     if (
-        global_grad_accumulation_sequences <= 0
-        or global_grad_accumulation_sequences % dp_world_size != 0
+        resolved_global_grad_accumulation_sequences <= 0
+        or resolved_global_grad_accumulation_sequences % dp_world_size != 0
     ):
         raise RuntimeError(
             "Invalid global grad accumulation / DP world size combination: "
-            f"global_grad_accumulation_sequences={global_grad_accumulation_sequences}, "
+            f"global_grad_accumulation_sequences={resolved_global_grad_accumulation_sequences}, "
             f"dp_world_size={dp_world_size}"
         )
-    return global_grad_accumulation_sequences // dp_world_size
+    return resolved_global_grad_accumulation_sequences // dp_world_size
 
 
 def build_micro_sample_indices(
     step_index: int,
     num_sequences: int,
-    global_grad_accumulation_sequences: int,
+    global_grad_accumulation_sequences: int | None,
 ) -> list[int | None]:
     dp_rank = ps.get_data_parallel_rank()
+    resolved_global_grad_accumulation_sequences = (
+        resolve_global_grad_accumulation_sequences(
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences
+        )
+    )
     dp_world_size = ps.get_data_parallel_world_size()
     local_grad_accumulation_sequences = resolve_local_grad_accumulation_sequences(
-        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
     )
-    base_global_sample_index = step_index * global_grad_accumulation_sequences
+    base_global_sample_index = step_index * resolved_global_grad_accumulation_sequences
     global_step_indices: list[int | None] = []
-    for offset in range(global_grad_accumulation_sequences):
+    for offset in range(resolved_global_grad_accumulation_sequences):
         global_sample_index = base_global_sample_index + offset
         global_step_indices.append(
             global_sample_index if global_sample_index < num_sequences else None
@@ -479,10 +498,15 @@ def run_training_step(
         micro_sample_indices = [sample_index]
 
     if moe_routing_replay_controller is not None:
+        resolved_global_grad_accumulation_sequences = (
+            resolve_global_grad_accumulation_sequences(
+                config.grad_accumulation_sequences
+            )
+        )
         moe_routing_replay_controller.set_step(
             step_index=step_index,
             sample_index=micro_sample_indices,
-            global_grad_accumulation_sequences=config.grad_accumulation_sequences,
+            global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
         )
 
     device = next(model_chunks[0].parameters()).device
@@ -532,6 +556,7 @@ def run_training_step(
     if new_logprobs is None or raw_loss_sum is None:
         raise RuntimeError("run_training_step did not produce outputs")
 
+    # num_tokens is reduced in place across ranks by finalize_model_grads().
     finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
