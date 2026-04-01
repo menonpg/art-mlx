@@ -1,10 +1,9 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from .. import dev, types
+from .. import types
 from ..preprocessing.pack import DiskPackedTensors
-from .routing_replay import MoeRoutingReplayBundle
 
 DEFAULT_TRAINING_LOG_PATH = "/tmp/megatron_training_log.jsonl"
 DEFAULT_JOBS_DIR = "/tmp/megatron_training_jobs"
@@ -16,16 +15,10 @@ class MegatronTrainingJob(BaseModel):
     optimizer_state_path: str
     disk_packed_tensors: DiskPackedTensors
     config: types.TrainConfig
-    experimental_config: dev.TrainConfig
+    experimental_config: dict[str, Any]
     moe_routing_replay_path: str | None = None
     moe_routing_replay_strict: bool = True
     log_path: str = DEFAULT_TRAINING_LOG_PATH
-
-
-MegatronTrainingJob.model_rebuild(
-    force=True,
-    _types_namespace={"MoeRoutingReplayBundle": MoeRoutingReplayBundle},
-)
 
 
 class MegatronSFTTrainingJob(BaseModel):

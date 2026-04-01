@@ -9,7 +9,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, cast
 
 from peft.tuners.lora.config import LoraConfig
 import torch
@@ -32,7 +32,7 @@ from .jobs import (
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronTrainingJob,
 )
-from .train import merge_lora_adapter
+from .merge import merge_lora_adapter
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
@@ -283,7 +283,7 @@ class MegatronService:
             optimizer_state_path=self._optimizer_state_path,
             disk_packed_tensors=disk_packed_tensors,
             config=config,
-            experimental_config=_config,
+            experimental_config=cast(dict[str, Any], _config),
             moe_routing_replay_path=_config.get("moe_routing_replay_path"),
             moe_routing_replay_strict=_config.get("moe_routing_replay_strict", True),
             log_path=os.path.join(
