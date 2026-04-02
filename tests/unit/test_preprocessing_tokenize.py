@@ -2,6 +2,7 @@ import sys
 import types
 from typing import cast
 
+from openai.types.chat.chat_completion import Choice
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
@@ -15,6 +16,7 @@ pytest.importorskip("transformers")
 
 
 class _FakeTokenizer:
+    chat_template = ""
     vocab_size = 256
     eos_token = "\x00"
     eos_token_id = 0
@@ -58,6 +60,38 @@ class _FakeTokenizer:
         if isinstance(tokens, str) and len(tokens) == 1:
             return ord(tokens)
         return self.eos_token_id
+
+
+class _Qwen3_5FakeTokenizer(_FakeTokenizer):
+    chat_template = (
+        "{% for args_name, args_value in tool_call.arguments|items %}{% endfor %}"
+    )
+
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=True,
+        return_dict=None,
+        **kwargs,
+    ):
+        del kwargs
+        for message in messages:
+            tool_calls = message.get("tool_calls")
+            if tool_calls is None:
+                continue
+            assert isinstance(tool_calls, list)
+            for tool_call in tool_calls:
+                assert isinstance(tool_call, dict)
+                function = tool_call["function"]
+                assert isinstance(function, dict)
+                assert isinstance(function["arguments"], dict)
+        return super().apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=tokenize,
+            return_dict=return_dict,
+        )
 
 
 def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> None:
@@ -143,3 +177,64 @@ def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(
         [1] * len(expected_ids)
     ]
     assert batch.num_trainable_tokens == len(expected_ids)
+
+
+def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template() -> (
+    None
+):
+    tokenizer = _Qwen3_5FakeTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:65",
+                        "bytes": [65],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    }
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "arguments": '{"city": "San Francisco", "days": 3}',
+                            "name": "lookup_weather",
+                        },
+                        "type": "function",
+                    }
+                ],
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Weather?"},
+            choice,
+        ],
+    )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
+
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=history,
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=trajectory,
+    )
+
+    assert result is not None

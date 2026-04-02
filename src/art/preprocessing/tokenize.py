@@ -2,6 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import takewhile
+import json
 import math
 import random
 from typing import Any, Generator, cast
@@ -29,6 +30,40 @@ def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | N
         else:
             normalized_tools.append({"type": "function", "function": tool})
     return normalized_tools
+
+
+def _normalize_tool_call_arguments_for_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    chat_template = tokenizer.chat_template
+    assert isinstance(chat_template, str)
+    if "tool_call.arguments|items" not in chat_template:
+        return messages
+
+    normalized_messages: list[dict[str, Any]] = []
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            normalized_messages.append(message)
+            continue
+
+        assert isinstance(tool_calls, list)
+        normalized_tool_calls = []
+        for tool_call in tool_calls:
+            assert isinstance(tool_call, dict)
+            function = tool_call["function"]
+            assert isinstance(function, dict)
+            arguments_json = function["arguments"]
+            assert isinstance(arguments_json, str)
+            arguments = json.loads(arguments_json)
+            assert isinstance(arguments, dict)
+            normalized_tool_calls.append(
+                {**tool_call, "function": {**function, "arguments": arguments}}
+            )
+        normalized_messages.append({**message, "tool_calls": normalized_tool_calls})
+
+    return normalized_messages
 
 
 @dataclass
@@ -223,12 +258,15 @@ def tokenize_trajectory(
     if last_assistant_index == -1:
         return None
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
-    messages = get_messages(messages_and_choices)
+    messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
+    # Qwen3.5's chat template uses `tool_call.arguments|items`, so it needs a
+    # mapping here instead of the OpenAI JSON string.
+    messages = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
     tools = _normalize_tools_for_chat_template(history.tools)
     chat = cast(
         str,
         tokenizer.apply_chat_template(
-            cast(list[dict], messages),
+            messages,
             tools=tools,
             continue_final_message=True,
             tokenize=False,
@@ -236,7 +274,7 @@ def tokenize_trajectory(
     )
     original_token_ids = _apply_chat_template_token_ids(
         tokenizer,
-        cast(list[dict[str, Any]], messages),
+        messages,
         tools=tools,
         continue_final_message=True,
     )
