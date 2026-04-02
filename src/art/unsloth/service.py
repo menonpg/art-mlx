@@ -27,13 +27,13 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
-from .shared import (
+from .train import (
     UnslothTrainContext,
     create_unsloth_train_context,
+    gc_and_empty_cuda_cache,
     run_unsloth_rl_training,
     run_unsloth_sft_training,
 )
-from .train import gc_and_empty_cuda_cache
 
 logger = logging.getLogger(__name__)
 
