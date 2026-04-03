@@ -31,3 +31,6 @@ class MegatronSFTTrainingJob(BaseModel):
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     log_path: str = DEFAULT_TRAINING_LOG_PATH
+
+
+MegatronJob = MegatronTrainingJob | MegatronSFTTrainingJob

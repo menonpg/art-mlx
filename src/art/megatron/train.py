@@ -33,11 +33,13 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
+from art.megatron.client import create_megatron_job_paths, write_megatron_job
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
+    MegatronJob,
     MegatronSFTTrainingJob,
     MegatronTrainingJob,
 )
@@ -54,6 +56,7 @@ from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
 )
+from art.megatron.sft_batches import load_sft_batch_from_disk
 from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
@@ -99,9 +102,6 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
-
-
-MegatronJob = MegatronTrainingJob | MegatronSFTTrainingJob
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -473,7 +473,7 @@ def run_megatron_sft_job(
         for batch_idx in range(job.num_batches):
             batch_start_time = time.perf_counter()
             batch_dir = os.path.join(job.sft_data_dir, f"batch_{batch_idx:06d}")
-            batch_metadata, trajectory_tensors = _load_sft_batch_from_disk(batch_dir)
+            batch_metadata, trajectory_tensors = load_sft_batch_from_disk(batch_dir)
             global_trainable_tokens = max(
                 int(batch_metadata["num_trainable_tokens"]),
                 1,
@@ -586,19 +586,6 @@ def _job_cleanup_path(job: MegatronJob) -> str:
     if isinstance(job, MegatronSFTTrainingJob):
         return job.sft_data_dir
     return job.disk_packed_tensors["dir"]
-
-
-def _load_sft_batch_from_disk(
-    batch_dir: str,
-) -> tuple[dict[str, Any], list[dict[str, torch.Tensor]]]:
-    with open(os.path.join(batch_dir, "metadata.json"), encoding="utf-8") as f:
-        metadata = json.load(f)
-
-    trajectory_tensors = []
-    for index in range(metadata["num_trajectory_tensors"]):
-        tensors = load_file(os.path.join(batch_dir, f"trajectory_{index}.safetensors"))
-        trajectory_tensors.append(tensors)
-    return metadata, trajectory_tensors
 
 
 def _load_lora_and_optimizer(
@@ -1018,7 +1005,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
     run_megatron_worker_loop(
         runtime,
-        supports_sft=False,
+        supports_sft=True,
         wait_until_ready=wait_until_ready,
         before_job=lambda: reload_to_gpu(
             runtime.model, runtime.optimizer, runtime.rank, offload_state

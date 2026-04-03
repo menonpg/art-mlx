@@ -1,9 +1,7 @@
 import asyncio
 from dataclasses import dataclass
-import datetime
 from functools import cached_property
 import importlib
-import json
 import os
 from pathlib import Path
 import shlex
@@ -27,12 +25,14 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
+from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
 from .jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
+    MegatronSFTTrainingJob,
     MegatronTrainingJob,
 )
-from .merge import merge_lora_adapter
+from .sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
@@ -210,6 +210,63 @@ class MegatronService:
             cwd=str(project_root),
         )
 
+    def _clear_pending_jobs(self) -> None:
+        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
+        for job_name in os.listdir(DEFAULT_JOBS_DIR):
+            if job_name.endswith(".json"):
+                os.remove(os.path.join(DEFAULT_JOBS_DIR, job_name))
+
+    def _resolve_training_lora_path(self) -> str:
+        lora_path = get_last_checkpoint_dir(self.output_dir)
+        if lora_path is None:
+            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+            self._latest_step = 0
+        self._ensure_identity_lora(lora_path)
+        self._ensure_lora_adapter_config(lora_path)
+        return lora_path
+
+    async def _prepare_for_training(self) -> tuple[AsyncLLM, str]:
+        llm = await self.llm
+        await llm.pause_generation()
+        await llm.reset_prefix_cache()
+        await run_on_workers(llm, do_sleep, level=2)
+        self._is_sleeping = True
+        gc_and_empty_cuda_cache()
+
+        await self._ensure_megatron_running()
+        lora_path = self._resolve_training_lora_path()
+        self._optimizer_state_path = self._get_optimizer_state_path()
+        self._clear_pending_jobs()
+        return llm, lora_path
+
+    async def _publish_training_checkpoint(
+        self,
+        *,
+        llm: AsyncLLM,
+        lora_path: str,
+    ) -> None:
+        next_step = self._latest_step + 1
+        new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
+        os.makedirs(new_checkpoint_dir, exist_ok=True)
+        shutil.copy(
+            f"{lora_path}/adapter_model.safetensors",
+            f"{new_checkpoint_dir}/adapter_model.safetensors",
+        )
+        self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
+
+        wake_lock_path = DEFAULT_VLLM_WAKE_LOCK_PATH
+        try:
+            with open(wake_lock_path, "w") as lock_file:
+                lock_file.write("waking vllm\n")
+            await run_on_workers(llm, do_wake_up)
+            self._is_sleeping = False
+        finally:
+            if os.path.exists(wake_lock_path):
+                os.remove(wake_lock_path)
+
+        await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
+        await llm.resume_generation()
+
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
@@ -248,36 +305,13 @@ class MegatronService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        llm = await self.llm
-        await llm.pause_generation()
-        await llm.reset_prefix_cache()
-        await run_on_workers(llm, do_sleep, level=2)
-        self._is_sleeping = True
-        gc_and_empty_cuda_cache()
-
-        # Start Megatron after vLLM has freed GPU memory.
-        await self._ensure_megatron_running()
-
-        lora_path = get_last_checkpoint_dir(self.output_dir)
-        if lora_path is None:
-            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            self._latest_step = 0
-        self._ensure_identity_lora(lora_path)
-        self._ensure_lora_adapter_config(lora_path)
-
-        self._optimizer_state_path = self._get_optimizer_state_path()
-
-        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
-        for job_name in os.listdir(DEFAULT_JOBS_DIR):
-            if job_name.endswith(".json"):
-                os.remove(os.path.join(DEFAULT_JOBS_DIR, job_name))
+        llm, lora_path = await self._prepare_for_training()
         if _config.get("moe_routing_replay_bundle") is not None:
             raise RuntimeError(
                 "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
                 "MegatronService subprocess jobs must use moe_routing_replay_path."
             )
-        log_dir = "/tmp/megatron_training_logs"
-        os.makedirs(log_dir, exist_ok=True)
+        job_path, log_path = create_megatron_job_paths()
         job = MegatronTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._optimizer_state_path,
@@ -286,68 +320,41 @@ class MegatronService:
             experimental_config=cast(dict[str, Any], _config),
             moe_routing_replay_path=_config.get("moe_routing_replay_path"),
             moe_routing_replay_strict=_config.get("moe_routing_replay_strict", True),
-            log_path=os.path.join(
-                log_dir, f"{datetime.datetime.now().isoformat()}.jsonl"
-            ),
+            log_path=log_path,
         )
-        job_path = os.path.join(
-            DEFAULT_JOBS_DIR,
-            f"{datetime.datetime.now().isoformat()}.json",
-        )
-        with open(job_path, "w") as f:
-            f.write(job.model_dump_json())
+        write_megatron_job(job, job_path=job_path)
 
-        num_lines = 0
-        while True:
-            await asyncio.sleep(0.1)
-            try:
-                with open(job.log_path, "a+") as log_file:
-                    log_file.seek(0)
-                    lines = log_file.readlines()[num_lines:]
-                    for line in lines:
-                        if line := line.strip():
-                            if line == "all done":
-                                merge_lora_adapter(lora_path)
-                                os.remove(job.log_path)
-                                break
-                            num_lines += 1
-                            yield json.loads(line)
-                    else:
-                        continue
-                    break
-            except FileNotFoundError:
-                continue
+        async for result in stream_megatron_job(job, job_path=job_path):
+            yield {key: float(value) for key, value in result.items()}
 
-        next_step = self._latest_step + 1
-        new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
-        os.makedirs(new_checkpoint_dir, exist_ok=True)
-        shutil.copy(
-            f"{lora_path}/adapter_model.safetensors",
-            f"{new_checkpoint_dir}/adapter_model.safetensors",
-        )
-        self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
+        await self._publish_training_checkpoint(llm=llm, lora_path=lora_path)
 
-        wake_lock_path = DEFAULT_VLLM_WAKE_LOCK_PATH
-        try:
-            with open(wake_lock_path, "w") as lock_file:
-                lock_file.write("waking vllm\n")
-            await run_on_workers(llm, do_wake_up)
-            self._is_sleeping = False
-        finally:
-            if os.path.exists(wake_lock_path):
-                os.remove(wake_lock_path)
-
-        await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
-        await llm.resume_generation()
-
-    # SFT not supported for MegatronService
     async def train_sft(
         self,
-        batches: list[Any],
+        batches: list[SFTBatch],
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        raise NotImplementedError("SFT training is not supported for MegatronService")
-        yield {}  # Make this a generator
+        llm, lora_path = await self._prepare_for_training()
+        serialized_batches = materialize_sft_batches(batches)
+        job_path, log_path = create_megatron_job_paths()
+        job = MegatronSFTTrainingJob(
+            lora_path=lora_path,
+            optimizer_state_path=self._optimizer_state_path,
+            sft_data_dir=serialized_batches.sft_data_dir,
+            num_batches=serialized_batches.num_batches,
+            learning_rates=serialized_batches.learning_rates,
+            log_path=log_path,
+        )
+        write_megatron_job(job, job_path=job_path)
+
+        async for result in stream_megatron_job(job, job_path=job_path):
+            yield {
+                "loss/train": float(result["loss"]),
+                "loss/learning_rate": float(result["learning_rate"]),
+                "loss/grad_norm": float(result["grad_norm"]),
+            }
+
+        await self._publish_training_checkpoint(llm=llm, lora_path=lora_path)
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:
