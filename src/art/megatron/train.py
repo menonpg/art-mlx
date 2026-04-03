@@ -511,8 +511,7 @@ def run_megatron_sft_job(
                     },
                 )
                 masked_loss = per_token_loss[mask].sum()
-                loss = masked_loss / global_trainable_tokens
-                loss.backward()
+                masked_loss.backward()
                 batch_loss += masked_loss.detach()
 
             num_tokens = torch.tensor(
