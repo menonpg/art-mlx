@@ -38,6 +38,85 @@ safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
 
 
+def create_identity_lora(base_model: str, lora_path: str, rank: int = 1, lora_alpha: int = 32) -> None:
+    """Create an identity LoRA adapter for a Megatron model.
+
+    For MoE models, this targets fused expert parameters and converts them to
+    per-expert format. The conversion swaps lora_A/lora_B, producing A=zeros and
+    B=Kaiming — which is critical for stable training when alpha/rank is large.
+
+    Args:
+        base_model: HuggingFace model identifier.
+        lora_path: Directory to save the adapter files.
+        rank: LoRA rank (default 1 for Megatron models).
+        lora_alpha: LoRA alpha scaling factor.
+    """
+    from unittest.mock import patch
+
+    from accelerate import init_empty_weights
+    from peft import get_peft_model
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(
+            base_config, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+    model.name_or_path = base_model
+
+    lora_config = LoraConfig(
+        base_model_name_or_path=base_model,
+        r=rank,
+        lora_alpha=lora_alpha,
+        target_modules=[],
+        target_parameters=[
+            name
+            for name, _ in model.named_parameters()
+            if name.endswith(
+                (
+                    "q_proj.weight",
+                    "k_proj.weight",
+                    "v_proj.weight",
+                    "o_proj.weight",
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                )
+            )
+        ],
+        bias="none",
+    )
+
+    meta = torch.device("meta")
+    orig_to = torch.nn.Module.to
+
+    def _skip_meta_to(module: torch.nn.Module, *args: Any, **kwargs: Any) -> torch.nn.Module:
+        device = kwargs.get("device") or (args[0] if args else None)
+        if device == meta or str(device) == "meta":
+            return module
+        return orig_to(module, *args, **kwargs)
+
+    with patch.object(torch.nn.Module, "to", _skip_meta_to):
+        peft_model = get_peft_model(model, lora_config)
+
+    os.makedirs(lora_path, exist_ok=True)
+    peft_model.save_pretrained(lora_path)
+    convert_checkpoint_if_needed(lora_path)
+
+    # Write final adapter_config with per-expert target_modules
+    LoraConfig(
+        base_model_name_or_path=base_model,
+        r=rank,
+        lora_alpha=lora_alpha,
+        target_modules=default_target_modules(base_model),
+        bias="none",
+    ).save_pretrained(lora_path)
+
+    del peft_model, model
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 @dataclass
 class MegatronService:
     model_name: str
@@ -86,60 +165,7 @@ class MegatronService:
         return False
 
     def _create_identity_lora(self, lora_path: str) -> None:
-        from unittest.mock import patch
-
-        from accelerate import init_empty_weights
-        from peft import get_peft_model
-        from transformers import AutoConfig, AutoModelForCausalLM
-
-        base_config = AutoConfig.from_pretrained(
-            self.base_model,
-            trust_remote_code=True,
-        )
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                base_config,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-            )
-        model.name_or_path = self.base_model
-        lora_config = self._default_lora_adapter_config()
-        lora_config.target_modules = []
-        lora_config.target_parameters = [
-            name
-            for name, _ in model.named_parameters()
-            if name.endswith(
-                (
-                    "q_proj.weight",
-                    "k_proj.weight",
-                    "v_proj.weight",
-                    "o_proj.weight",
-                    "mlp.experts.gate_up_proj",
-                    "mlp.experts.down_proj",
-                )
-            )
-        ]
-
-        meta = torch.device("meta")
-        orig_to = torch.nn.Module.to
-
-        def _skip_meta_to(module: torch.nn.Module, *args: Any, **kwargs: Any):
-            device = kwargs.get("device") or (args[0] if args else None)
-            if device == meta or str(device) == "meta":
-                return module
-            return orig_to(module, *args, **kwargs)
-
-        with patch.object(torch.nn.Module, "to", _skip_meta_to):
-            peft_model = get_peft_model(model, lora_config)
-
-        os.makedirs(lora_path, exist_ok=True)
-        peft_model.save_pretrained(lora_path)
-        convert_checkpoint_if_needed(lora_path)
-        self._default_lora_adapter_config().save_pretrained(lora_path)
-        del peft_model, model
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        create_identity_lora(self.base_model, lora_path)
 
     def _ensure_identity_lora(self, lora_path: str) -> None:
         if self._adapter_has_weights(lora_path):
