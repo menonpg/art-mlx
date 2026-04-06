@@ -265,20 +265,18 @@ class UnslothTrainContext:
         optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
         if os.path.exists(optimizer_path):
             optimizer_state = torch.load(optimizer_path, map_location="cpu")
-            optimizer = self.trainer.optimizer
-            if not isinstance(optimizer, Optimizer):
+            if not isinstance(self.trainer.optimizer, Optimizer):
                 raise RuntimeError("Trainer optimizer is not initialized")
-            optimizer.load_state_dict(optimizer_state)
+            self.trainer.optimizer.load_state_dict(optimizer_state)
 
     def save_lora_adapter(self, lora_path: str) -> None:
         self.trainer.save_model(lora_path)
 
     def save_optimizer_state(self, checkpoint_dir: str) -> None:
         optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
-        optimizer = self.trainer.optimizer
-        if not isinstance(optimizer, Optimizer):
+        if not isinstance(self.trainer.optimizer, Optimizer):
             raise RuntimeError("Trainer optimizer is not initialized")
-        torch.save(optimizer.state_dict(), optimizer_path)
+        torch.save(self.trainer.optimizer.state_dict(), optimizer_path)
 
     async def stop_background_training(
         self,

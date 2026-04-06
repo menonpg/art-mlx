@@ -336,7 +336,6 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm, lora_path = await self._prepare_for_training()
-        optimizer_state_path = self._get_optimizer_state_path()
         if _config.get("moe_routing_replay_bundle") is not None:
             raise RuntimeError(
                 "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
@@ -345,7 +344,7 @@ class MegatronService:
         job_path, log_path = create_megatron_job_paths()
         job = MegatronTrainingJob(
             lora_path=lora_path,
-            optimizer_state_path=optimizer_state_path,
+            optimizer_state_path=self._get_optimizer_state_path(),
             disk_packed_tensors=disk_packed_tensors,
             config=config,
             experimental_config=cast(dict[str, Any], _config),
@@ -366,12 +365,11 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm, lora_path = await self._prepare_for_training()
-        optimizer_state_path = self._get_optimizer_state_path()
         serialized_batches = materialize_sft_batches(batches)
         job_path, log_path = create_megatron_job_paths()
         job = MegatronSFTTrainingJob(
             lora_path=lora_path,
-            optimizer_state_path=optimizer_state_path,
+            optimizer_state_path=self._get_optimizer_state_path(),
             sft_data_dir=serialized_batches.sft_data_dir,
             num_batches=serialized_batches.num_batches,
             learning_rates=serialized_batches.learning_rates,
