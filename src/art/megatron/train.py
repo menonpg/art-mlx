@@ -448,6 +448,28 @@ def run_megatron_rl_job(
         torch.cuda.empty_cache()
 
 
+def _flush_param_grads_to_main_grads(model_chunks: list[MegatronModule]) -> None:
+    """Fallback for direct SFT jobs when DDP post-hooks leave grads in param.grad.
+
+    Megatron's distributed optimizer reads gradients from `main_grad`, which is
+    normally populated by DDP backward post-hooks. Some direct ART runtimes can
+    reach finalize/step with gradients still in `param.grad`, so copy them over
+    using the same guard Megatron uses in its hook implementation.
+    """
+    for chunk in model_chunks:
+        for param in chunk.parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            if not hasattr(param, "main_grad"):
+                continue
+            if (
+                not getattr(param, "grad_added_to_main_grad", False)
+                or getattr(param, "zero_out_wgrad", False)
+            ):
+                param.main_grad.add_(param.grad.to(dtype=param.main_grad.dtype))
+            param.grad = None
+
+
 def run_megatron_sft_job(
     runtime: TrainingRuntime,
     job: MegatronSFTTrainingJob,
@@ -514,6 +536,7 @@ def run_megatron_sft_job(
                 masked_loss.backward()
                 batch_loss += masked_loss.detach()
 
+            _flush_param_grads_to_main_grads(runtime.model)
             num_tokens = torch.tensor(
                 [local_trainable_tokens],
                 device=device,
