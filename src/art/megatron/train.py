@@ -143,7 +143,10 @@ def _install_fast_frozen_output_backward() -> None:
         (weight,) = ctx.saved_tensors
         grad_input = _frozen_linear_grad_input(grad_output, weight)
         if ctx.allreduce_dgrad:
-            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+                grad_input,
+                group=ctx.tp_group,
+            )
         return grad_input, None, None, None, None
 
     setattr(_fast_backward, "__art_fast_output_backward__", True)
@@ -462,11 +465,11 @@ def _flush_param_grads_to_main_grads(model_chunks: list[MegatronModule]) -> None
                 continue
             if not hasattr(param, "main_grad"):
                 continue
-            if (
-                not getattr(param, "grad_added_to_main_grad", False)
-                or getattr(param, "zero_out_wgrad", False)
+            main_grad = cast(torch.Tensor, param.main_grad)
+            if not getattr(param, "grad_added_to_main_grad", False) or getattr(
+                param, "zero_out_wgrad", False
             ):
-                param.main_grad.add_(param.grad.to(dtype=param.main_grad.dtype))
+                main_grad.add_(param.grad.to(dtype=main_grad.dtype))
             param.grad = None
 
 
@@ -547,9 +550,9 @@ def run_megatron_sft_job(
             runtime.optimizer.zero_grad()
             del update_successful, num_zeros_in_grad
 
-            torch.distributed.all_reduce(
+            torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
                 batch_loss,
-                op=torch.distributed.ReduceOp.SUM,
+                op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
                 group=ps.get_data_parallel_group(with_context_parallel=True),
             )
             avg_loss = batch_loss / float(global_trainable_tokens)

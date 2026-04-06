@@ -1,11 +1,15 @@
 from dataclasses import dataclass
+import importlib
 import json
 import os
 from typing import TYPE_CHECKING, Any, Iterable
 import uuid
 
-from safetensors.torch import load_file, save_file
 import torch
+
+safetensors_torch = importlib.import_module("safetensors.torch")
+load_file = safetensors_torch.load_file
+save_file = safetensors_torch.save_file
 
 if TYPE_CHECKING:
     from ..preprocessing.tokenize import SFTBatch

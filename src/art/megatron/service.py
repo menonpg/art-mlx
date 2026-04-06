@@ -38,7 +38,9 @@ safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
 
 
-def create_identity_lora(base_model: str, lora_path: str, rank: int = 1, lora_alpha: int = 32) -> None:
+def create_identity_lora(
+    base_model: str, lora_path: str, rank: int = 1, lora_alpha: int = 32
+) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
     For MoE models, this targets fused expert parameters and converts them to
@@ -89,7 +91,9 @@ def create_identity_lora(base_model: str, lora_path: str, rank: int = 1, lora_al
     meta = torch.device("meta")
     orig_to = torch.nn.Module.to
 
-    def _skip_meta_to(module: torch.nn.Module, *args: Any, **kwargs: Any) -> torch.nn.Module:
+    def _skip_meta_to(
+        module: torch.nn.Module, *args: Any, **kwargs: Any
+    ) -> torch.nn.Module:
         device = kwargs.get("device") or (args[0] if args else None)
         if device == meta or str(device) == "meta":
             return module
@@ -332,6 +336,7 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm, lora_path = await self._prepare_for_training()
+        optimizer_state_path = self._get_optimizer_state_path()
         if _config.get("moe_routing_replay_bundle") is not None:
             raise RuntimeError(
                 "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
@@ -340,7 +345,7 @@ class MegatronService:
         job_path, log_path = create_megatron_job_paths()
         job = MegatronTrainingJob(
             lora_path=lora_path,
-            optimizer_state_path=self._optimizer_state_path,
+            optimizer_state_path=optimizer_state_path,
             disk_packed_tensors=disk_packed_tensors,
             config=config,
             experimental_config=cast(dict[str, Any], _config),
@@ -361,11 +366,12 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm, lora_path = await self._prepare_for_training()
+        optimizer_state_path = self._get_optimizer_state_path()
         serialized_batches = materialize_sft_batches(batches)
         job_path, log_path = create_megatron_job_paths()
         job = MegatronSFTTrainingJob(
             lora_path=lora_path,
-            optimizer_state_path=self._optimizer_state_path,
+            optimizer_state_path=optimizer_state_path,
             sft_data_dir=serialized_batches.sft_data_dir,
             num_batches=serialized_batches.num_batches,
             learning_rates=serialized_batches.learning_rates,
