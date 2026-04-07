@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-import importlib
 import json
 from pathlib import Path
 import re
@@ -14,11 +13,8 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.moe_utils import permute, sort_chunks_by_idxs
 from pydantic import BaseModel, ConfigDict, model_validator
+from safetensors.torch import load_file, save_file
 import torch
-
-safetensors_torch = importlib.import_module("safetensors.torch")
-load_file = safetensors_torch.load_file
-save_file = safetensors_torch.save_file
 
 ROUTER_NAME_TOKEN = ".mlp.router"
 ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v1"
