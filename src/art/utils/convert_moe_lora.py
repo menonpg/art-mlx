@@ -12,14 +12,12 @@ vLLM expects per-expert keys:
   ...
 """
 
-import importlib
 import json
 import os
 import re
 
+import safetensors.torch
 import torch
-
-safetensors_torch = importlib.import_module("safetensors.torch")
 
 
 def _has_fused_moe_lora(tensors: dict[str, torch.Tensor]) -> bool:
@@ -154,7 +152,7 @@ def convert_checkpoint_if_needed(checkpoint_dir: str) -> None:
     if not os.path.exists(adapter_path) or not os.path.exists(config_path):
         return
 
-    tensors = safetensors_torch.load_file(adapter_path)
+    tensors = safetensors.torch.load_file(adapter_path)
     if not _has_fused_moe_lora(tensors):
         return
 
@@ -170,7 +168,7 @@ def convert_checkpoint_if_needed(checkpoint_dir: str) -> None:
     )
 
     # Overwrite the adapter with the converted tensors
-    safetensors_torch.save_file(new_tensors, adapter_path)
+    safetensors.torch.save_file(new_tensors, adapter_path)
 
     # Update adapter_config.json target_modules
     adapter_config["target_modules"] = [
