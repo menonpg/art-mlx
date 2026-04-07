@@ -30,6 +30,7 @@ def serialize_sft_batch_to_disk(batch: "SFTBatch", batch_dir: str) -> None:
     metadata = {
         "learning_rate": batch.learning_rate,
         "num_trajectories": batch.num_trajectories,
+        "num_tokens": batch.num_tokens,
         "num_trainable_tokens": batch.num_trainable_tokens,
         "num_trajectory_tensors": len(batch.trajectory_tensors),
     }

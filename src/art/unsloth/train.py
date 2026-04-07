@@ -901,9 +901,7 @@ async def run_unsloth_sft_training(
         optimizer.zero_grad()
 
         batch_time = time.perf_counter() - batch_start_time
-        tokens_per_second = (
-            batch.num_trainable_tokens / batch_time if batch_time > 0 else 0.0
-        )
+        tokens_per_second = batch.num_tokens / batch_time if batch_time > 0 else 0.0
 
         if verbose:
             print(
@@ -916,6 +914,7 @@ async def run_unsloth_sft_training(
             "learning_rate": batch.learning_rate,
             "grad_norm": grad_norm,
             "num_trajectories": float(batch.num_trajectories),
+            "num_tokens": float(batch.num_tokens),
             "num_trainable_tokens": float(batch.num_trainable_tokens),
             "tokens_per_second": tokens_per_second,
         }

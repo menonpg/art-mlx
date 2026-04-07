@@ -876,10 +876,13 @@ class LocalBackend(Backend):
             )
         tokenizer = self._tokenizers[model.base_model]
 
-        # Determine batch_size
-        batch_size = config.batch_size
-        if batch_size == "auto":
-            batch_size = 2  # Default to 2 for SFT
+        from ..utils.sft import resolve_sft_batch_size
+
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size,
+            default_batch_size=self._default_sft_batch_size(),
+        )
+        service_config = config.model_copy(update={"batch_size": batch_size})
 
         # Auto-detect instruction/response parts from model
         from ..utils.model_config import get_instruction_response_parts
@@ -925,7 +928,7 @@ class LocalBackend(Backend):
         total_trajectories = len(trajectory_list)
         batch_count = 0
 
-        async for result in service.train_sft(batches, verbose):
+        async for result in service.train_sft(batches, service_config, verbose):
             pbar.update(1)
             pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
             batch_count += 1
@@ -946,6 +949,9 @@ class LocalBackend(Backend):
 
         if verbose:
             print("_train_sft complete")
+
+    def _default_sft_batch_size(self) -> int:
+        return 2
 
     # ------------------------------------------------------------------
     # Experimental support for S3

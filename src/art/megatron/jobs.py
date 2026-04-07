@@ -28,6 +28,7 @@ class MegatronSFTTrainingJob(BaseModel):
     sft_data_dir: str
     num_batches: int
     learning_rates: list[float]
+    grad_accumulation_sequences: int | None = None
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     log_path: str = DEFAULT_TRAINING_LOG_PATH

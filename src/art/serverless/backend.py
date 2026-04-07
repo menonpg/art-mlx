@@ -398,6 +398,8 @@ class ServerlessBackend(Backend):
 
         import wandb
 
+        from ..utils.sft import resolve_sft_batch_size
+
         assert model.id is not None, "Model ID is required"
 
         # Get the user's default entity from W&B if not set
@@ -497,7 +499,11 @@ class ServerlessBackend(Backend):
 
         sft_config: SFTTrainingConfig = {}
         if config.batch_size != "auto":
-            sft_config["batch_size"] = config.batch_size
+            batch_size = resolve_sft_batch_size(
+                batch_size=config.batch_size,
+                default_batch_size=2,
+            )
+            sft_config["batch_size"] = batch_size
         sft_config["learning_rate"] = config.learning_rate
 
         sft_training_job = await self._client.sft_training_jobs.create(

@@ -360,17 +360,22 @@ class MegatronService:
     async def train_sft(
         self,
         batches: list[SFTBatch],
+        config: types.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         llm, lora_path = await self._prepare_for_training()
         serialized_batches = materialize_sft_batches(batches)
         job_path, log_path = create_megatron_job_paths()
+        grad_accumulation_sequences = (
+            config.batch_size if isinstance(config.batch_size, int) else None
+        )
         job = MegatronSFTTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._get_optimizer_state_path("sft"),
             sft_data_dir=serialized_batches.sft_data_dir,
             num_batches=serialized_batches.num_batches,
             learning_rates=serialized_batches.learning_rates,
+            grad_accumulation_sequences=grad_accumulation_sequences,
             log_path=log_path,
         )
         write_megatron_job(job, job_path=job_path)

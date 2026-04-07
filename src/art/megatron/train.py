@@ -99,7 +99,7 @@ class TrainStepResult(BaseModel):
 
     reduced_loss: torch.Tensor
     probs_corr: float
-    new_logprobs: torch.Tensor
+    new_logprobs: torch.Tensor | None
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
@@ -493,86 +493,73 @@ def run_megatron_sft_job(
         for param_group in runtime.optimizer.param_groups:
             param_group["weight_decay"] = job.weight_decay
 
-        device = next(runtime.model[0].parameters()).device
-        dp_rank = ps.get_data_parallel_rank()
-        dp_world_size = ps.get_data_parallel_world_size()
+        grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
+            job.grad_accumulation_sequences
+        )
 
         for batch_idx in range(job.num_batches):
             batch_start_time = time.perf_counter()
             batch_dir = os.path.join(job.sft_data_dir, f"batch_{batch_idx:06d}")
             batch_metadata, trajectory_tensors = load_sft_batch_from_disk(batch_dir)
+            num_trajectories = int(batch_metadata["num_trajectories"])
+            if not trajectory_tensors:
+                raise RuntimeError(f"SFT batch {batch_idx} is empty")
+            if num_trajectories != len(trajectory_tensors):
+                raise RuntimeError(
+                    "SFT batch metadata does not match trajectory count: "
+                    f"{num_trajectories} != {len(trajectory_tensors)}"
+                )
+
+            global_tokens = max(
+                int(batch_metadata.get("num_tokens", 0)),
+                1,
+            )
+            if "num_tokens" not in batch_metadata:
+                global_tokens = max(
+                    sum(
+                        int(inputs["attention_mask"].sum().item())
+                        for inputs in trajectory_tensors
+                    ),
+                    1,
+                )
             global_trainable_tokens = max(
                 int(batch_metadata["num_trainable_tokens"]),
                 1,
             )
-            local_trajectory_tensors = trajectory_tensors[dp_rank::dp_world_size]
-
-            for chunk in runtime.model:
-                chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
-
-            batch_loss = torch.tensor(0.0, device=device)
-            local_trainable_tokens = 0.0
-            for param_group in runtime.optimizer.param_groups:
-                param_group["lr"] = job.learning_rates[batch_idx]
-
-            for traj_tensors in local_trajectory_tensors:
-                attention_mask_1d = traj_tensors["attention_mask"]
-                actual_len = int(attention_mask_1d.sum().item())
-                input_ids = (
-                    traj_tensors["input_ids"][:actual_len].unsqueeze(0).to(device)
-                )
-                labels = traj_tensors["labels"][:actual_len].unsqueeze(0).to(device)
-                seq_len = input_ids.shape[1]
-                position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-                shifted_labels = shift_tensor(labels, -100)
-                mask = shifted_labels != -100
-                local_trainable_tokens += float(mask.sum().item())
-
-                per_token_loss: torch.Tensor = runtime.model[0](
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    attention_mask=_placeholder_attention_mask(device),
-                    labels=shifted_labels,
-                    extra_block_kwargs={
-                        "attention_bias": _causal_attention_state(seq_len, device),
-                    },
-                )
-                masked_loss = per_token_loss[mask].sum()
-                masked_loss.backward()
-                batch_loss += masked_loss.detach()
-
-            _flush_param_grads_to_main_grads(runtime.model)
-            num_tokens = torch.tensor(
-                [local_trainable_tokens],
-                device=device,
-                dtype=torch.float32,
+            template = _clone_sft_tensors(trajectory_tensors[0])
+            zero_template = _zero_contribution_sft_inputs(template)
+            micro_indices = build_micro_sample_indices(
+                step_index=0,
+                num_sequences=num_trajectories,
+                global_grad_accumulation_sequences=grad_accumulation_sequences,
             )
-            finalize_model_grads_extended(runtime.model, num_tokens=num_tokens)
-            update_successful, grad_norm, num_zeros_in_grad = runtime.optimizer.step()
-            runtime.optimizer.zero_grad()
-            del update_successful, num_zeros_in_grad
-
-            torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-                batch_loss,
-                op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
-                group=ps.get_data_parallel_group(with_context_parallel=True),
+            micro_inputs = select_sft_micro_inputs(
+                trajectory_tensors,
+                micro_indices,
+                zero_template,
             )
-            avg_loss = batch_loss / float(global_trainable_tokens)
+            step_result = run_megatron_sft_step(
+                model_chunks=runtime.model,
+                optimizer=runtime.optimizer,
+                learning_rate=job.learning_rates[batch_idx],
+                inputs=micro_inputs,
+                step_index=batch_idx,
+                sample_index=micro_indices,
+                global_grad_accumulation_sequences=grad_accumulation_sequences,
+                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+            )
             batch_time = time.perf_counter() - batch_start_time
-            tokens_per_second = (
-                global_trainable_tokens / batch_time if batch_time > 0 else 0.0
-            )
+            tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
 
             if runtime.rank == 0:
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
                     log_msg = json.dumps(
                         {
-                            "loss": avg_loss.item(),
+                            "loss": step_result.reduced_loss.item(),
                             "learning_rate": job.learning_rates[batch_idx],
-                            "grad_norm": float(grad_norm),
-                            "num_trajectories": float(
-                                batch_metadata["num_trajectories"]
-                            ),
+                            "grad_norm": float(step_result.grad_norm),
+                            "num_trajectories": float(num_trajectories),
+                            "num_tokens": float(global_tokens),
                             "num_trainable_tokens": float(global_trainable_tokens),
                             "tokens_per_second": tokens_per_second,
                         }
@@ -793,6 +780,22 @@ def _zero_contribution_inputs(template: PackedTensors) -> PackedTensors:
     return dummy
 
 
+@torch.no_grad()
+def _clone_sft_tensors(
+    inputs: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {key: value.clone() for key, value in inputs.items()}
+
+
+@torch.no_grad()
+def _zero_contribution_sft_inputs(
+    template: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    dummy = _clone_sft_tensors(template)
+    dummy["labels"].fill_(-100)
+    return dummy
+
+
 def resolve_global_grad_accumulation_sequences(
     global_grad_accumulation_sequences: int | None,
 ) -> int:
@@ -864,6 +867,19 @@ def select_micro_inputs(
     ]
 
 
+def select_sft_micro_inputs(
+    trajectory_tensors: list[dict[str, torch.Tensor]],
+    sample_indices: list[int | None],
+    zero_template: dict[str, torch.Tensor],
+) -> list[dict[str, torch.Tensor]]:
+    return [
+        _clone_sft_tensors(zero_template)
+        if sample_index is None
+        else _clone_sft_tensors(trajectory_tensors[sample_index])
+        for sample_index in sample_indices
+    ]
+
+
 def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
     for key, value in inputs.items():
         if isinstance(value, torch.Tensor):
@@ -908,6 +924,134 @@ def _local_trainable_token_count_tensor(
 ) -> torch.Tensor:
     local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
     return torch.tensor([local_token_total], device=device, dtype=torch.float32)
+
+
+def _count_sft_trainable_tokens(inputs: dict[str, torch.Tensor]) -> float:
+    attention_mask = inputs["attention_mask"].reshape(-1)
+    actual_len = int(attention_mask.sum().item())
+    labels = inputs["labels"].reshape(-1)[:actual_len].unsqueeze(0)
+    shifted_labels = shift_tensor(labels, -100)
+    return float((shifted_labels != -100).sum().item())
+
+
+def _local_trainable_sft_token_count_tensor(
+    micro_inputs: list[dict[str, torch.Tensor]],
+    device: torch.device,
+) -> torch.Tensor:
+    local_token_total = sum(
+        _count_sft_trainable_tokens(micro) for micro in micro_inputs
+    )
+    return torch.tensor([local_token_total], device=device, dtype=torch.float32)
+
+
+def _prepare_sft_micro_inputs(
+    inputs: dict[str, torch.Tensor],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    attention_mask = inputs["attention_mask"].reshape(-1)
+    actual_len = max(int(attention_mask.sum().item()), 1)
+    input_ids = inputs["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
+    labels = inputs["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
+    position_ids = torch.arange(actual_len, device=device).unsqueeze(0)
+    shifted_labels = shift_tensor(labels, -100)
+    mask = shifted_labels != -100
+    return input_ids, position_ids, shifted_labels, mask, actual_len
+
+
+def run_megatron_sft_step(
+    *,
+    model_chunks: list[MegatronModule],
+    optimizer: Any,
+    learning_rate: float,
+    inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+    step_index: int,
+    sample_index: int | list[int | None],
+    global_grad_accumulation_sequences: int | None,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+) -> TrainStepResult:
+    micro_inputs = inputs if isinstance(inputs, list) else [inputs]
+    if not micro_inputs:
+        raise ValueError("run_megatron_sft_step requires at least one trajectory")
+
+    if isinstance(sample_index, list):
+        if len(sample_index) != len(micro_inputs):
+            raise ValueError(
+                "sample_index list length must match number of micro inputs: "
+                f"{len(sample_index)} != {len(micro_inputs)}"
+            )
+        micro_sample_indices = sample_index
+    else:
+        assert len(micro_inputs) == 1
+        micro_sample_indices = [sample_index]
+
+    if moe_routing_replay_controller is not None:
+        resolved_global_grad_accumulation_sequences = (
+            resolve_global_grad_accumulation_sequences(
+                global_grad_accumulation_sequences
+            )
+        )
+        moe_routing_replay_controller.set_step(
+            step_index=step_index,
+            sample_index=micro_sample_indices,
+            global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
+        )
+
+    device = next(model_chunks[0].parameters()).device
+
+    for chunk in model_chunks:
+        chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
+
+    raw_loss_sum: torch.Tensor | None = None
+    num_tokens = _local_trainable_sft_token_count_tensor(micro_inputs, device=device)
+
+    for micro in micro_inputs:
+        input_ids, position_ids, shifted_labels, mask, seq_len = (
+            _prepare_sft_micro_inputs(micro, device)
+        )
+        per_token_loss: torch.Tensor = model_chunks[0](
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=_placeholder_attention_mask(device),
+            labels=shifted_labels,
+            extra_block_kwargs={
+                "attention_bias": _causal_attention_state(seq_len, device),
+            },
+        )
+        masked_loss = per_token_loss[mask].sum()
+        masked_loss.backward()
+        detached_micro_loss = masked_loss.detach()
+        if raw_loss_sum is None:
+            raw_loss_sum = detached_micro_loss
+        else:
+            raw_loss_sum = raw_loss_sum + detached_micro_loss
+
+    if raw_loss_sum is None:
+        raise RuntimeError("run_megatron_sft_step did not produce outputs")
+
+    _flush_param_grads_to_main_grads(model_chunks)
+    finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
+    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
+        optimizer,
+        learning_rate,
+    )
+    global_num_tokens = max(num_tokens.item(), 1.0)
+    reduced_loss = _reduce_loss(
+        raw_loss_sum / global_num_tokens,
+        op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+        group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+
+    if moe_routing_replay_controller is not None:
+        moe_routing_replay_controller.finalize_step()
+
+    return TrainStepResult(
+        reduced_loss=reduced_loss,
+        probs_corr=1.0,
+        new_logprobs=None,
+        update_successful=update_successful,
+        grad_norm=grad_norm,
+        num_zeros_in_grad=num_zeros_in_grad,
+    )
 
 
 def run_training_step(
