@@ -711,17 +711,12 @@ def _mutation_hook(
 
 def _worker_run(request: WorkerRunRequest) -> None:
     """Executes one full distributed training trace generation worker run."""
-    import importlib
-
+    from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
     import torch
 
     from art import dev, types
     from art.megatron import train as megatron_train
     from art.preprocessing.pack import packed_tensors_from_dir
-
-    safetensors_torch = importlib.import_module("safetensors.torch")
-    load_file = safetensors_torch.load_file
-    save_file = safetensors_torch.save_file
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
