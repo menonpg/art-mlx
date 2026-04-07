@@ -808,19 +808,28 @@ class LocalBackend(Backend):
         grad_accumulation_sequences = max(
             1, int(config.grad_accumulation_sequences or 1)
         )
-        estimated_gradient_steps = math.ceil(
+        fallback_gradient_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
         )
-        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
+        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+        reported_gradient_steps: int | None = None
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
-            num_gradient_steps = int(
-                result.pop(TRAIN_GRADIENT_STEPS_KEY, estimated_gradient_steps)
-            )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+            if raw_num_gradient_steps is not None:
+                num_gradient_steps = int(raw_num_gradient_steps)
+                if reported_gradient_steps is None:
+                    reported_gradient_steps = num_gradient_steps
+                    if pbar.total != num_gradient_steps:
+                        pbar.total = num_gradient_steps
+                        pbar.refresh()
+                else:
+                    assert num_gradient_steps == reported_gradient_steps, (
+                        f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
+                    )
+            else:
+                num_gradient_steps = reported_gradient_steps or fallback_gradient_steps
             yield {
                 **base_metrics,
                 **result,

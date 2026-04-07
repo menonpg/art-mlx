@@ -57,6 +57,7 @@ from art.megatron.routing_replay import (
     MoeRoutingReplayController,
 )
 from art.megatron.sft_batches import load_sft_batch_from_disk
+from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
@@ -425,6 +426,7 @@ def run_megatron_rl_job(
                             "loss": step_result.reduced_loss.item(),
                             "grad_norm": step_result.grad_norm,
                             "probs_corr": step_result.probs_corr,
+                            TRAIN_GRADIENT_STEPS_KEY: num_steps,
                         }
                     )
                     print("Logging", log_msg)

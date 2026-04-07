@@ -7,7 +7,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from typing import Any, AsyncIterator, cast
+from typing import Any, AsyncIterator, Literal, cast
 
 from peft.tuners.lora.config import LoraConfig
 import torch
@@ -131,18 +131,17 @@ class MegatronService:
     _latest_step: int = 0
     _lora_id_counter: int = 1
     _megatron_process: asyncio.subprocess.Process | None = None
-    _optimizer_state_path: str | None = None
 
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
         return self._lora_id_counter
 
-    def _get_optimizer_state_path(self) -> str:
-        if self._optimizer_state_path is not None:
-            return self._optimizer_state_path
-        self._optimizer_state_path = os.path.join(self.output_dir, "optimizer_states")
-        os.makedirs(self._optimizer_state_path, exist_ok=True)
-        return self._optimizer_state_path
+    def _get_optimizer_state_path(self, job_type: Literal["rl", "sft"]) -> str:
+        optimizer_state_path = os.path.join(
+            self.output_dir, f"optimizer_states_{job_type}"
+        )
+        os.makedirs(optimizer_state_path, exist_ok=True)
+        return optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
         # Keep in sync with LoRA settings in megatron/train.py.
@@ -265,7 +264,6 @@ class MegatronService:
 
         await self._ensure_megatron_running()
         lora_path = self._resolve_training_lora_path()
-        self._optimizer_state_path = self._get_optimizer_state_path()
         self._clear_pending_jobs()
         return llm, lora_path
 
@@ -344,7 +342,7 @@ class MegatronService:
         job_path, log_path = create_megatron_job_paths()
         job = MegatronTrainingJob(
             lora_path=lora_path,
-            optimizer_state_path=self._get_optimizer_state_path(),
+            optimizer_state_path=self._get_optimizer_state_path("rl"),
             disk_packed_tensors=disk_packed_tensors,
             config=config,
             experimental_config=cast(dict[str, Any], _config),
@@ -369,7 +367,7 @@ class MegatronService:
         job_path, log_path = create_megatron_job_paths()
         job = MegatronSFTTrainingJob(
             lora_path=lora_path,
-            optimizer_state_path=self._get_optimizer_state_path(),
+            optimizer_state_path=self._get_optimizer_state_path("sft"),
             sft_data_dir=serialized_batches.sft_data_dir,
             num_batches=serialized_batches.num_batches,
             learning_rates=serialized_batches.learning_rates,
