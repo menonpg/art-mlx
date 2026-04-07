@@ -743,6 +743,7 @@ def _load_output_tensor(topology_dir: Path, step: StepTrace):
 def _load_safetensor_map(path: Path) -> dict[str, Any]:
     """Loads one safetensor map from disk."""
     from safetensors.torch import load_file  # ty: ignore[unresolved-import]
+
     return load_file(str(path))
 
 
