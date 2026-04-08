@@ -89,7 +89,7 @@ jobs:
       - name: Install CI dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git zstd
+          apt-get install -y --no-install-recommends ca-certificates curl git zstd libibverbs-dev
           rm -rf /var/lib/apt/lists/*
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "/root/.local/bin" >> "${GITHUB_PATH}"
@@ -130,7 +130,7 @@ jobs:
       - name: Install CI dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git zstd
+          apt-get install -y --no-install-recommends ca-certificates curl git zstd libibverbs-dev
           rm -rf /var/lib/apt/lists/*
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "/root/.local/bin" >> "${GITHUB_PATH}"

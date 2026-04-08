@@ -163,94 +163,6 @@ def _install_fast_frozen_output_backward() -> None:
     LinearWithFrozenWeight.backward = staticmethod(_fast_backward)
 
 
-def _install_intranode_deepep_buffer_patch() -> None:
-    # currently needed because we don't build DeepEP with nvshmem, needed for inter-node comm
-    # when we upgrade to multi-node, we'll build with nvshmem, remove this patch and validate the performance
-    from megatron.core.transformer.moe import fused_a2a
-
-    fused_a2a_module = cast(Any, fused_a2a)
-
-    if getattr(fused_a2a_module.get_buffer, "__art_intranode_deepep_patch__", False):
-        return
-
-    def _safe_rdma_size_hint(config: Any, hidden_bytes: int, group_size: int) -> int:
-        try:
-            return int(config.get_rdma_buffer_size_hint(hidden_bytes, group_size))
-        except RuntimeError as exc:
-            if "NVSHMEM is disable" not in str(exc):
-                raise
-            return 0
-
-    def _patched_get_buffer(
-        group: torch.distributed.ProcessGroup,  # type: ignore[name-defined]
-        hidden_bytes: int,
-    ) -> Any:
-        num_nvl_bytes, num_rdma_bytes = 0, 0
-        for config in (
-            fused_a2a_module.Buffer.get_dispatch_config(group.size()),
-            fused_a2a_module.Buffer.get_combine_config(group.size()),
-        ):
-            num_nvl_bytes = max(
-                int(config.get_nvl_buffer_size_hint(hidden_bytes, group.size())),
-                num_nvl_bytes,
-            )
-            num_rdma_bytes = max(
-                _safe_rdma_size_hint(config, hidden_bytes, group.size()),
-                num_rdma_bytes,
-            )
-
-        buffer = fused_a2a_module._buffer
-        if (
-            buffer is None
-            or buffer.group != group
-            or buffer.num_nvl_bytes < num_nvl_bytes
-            or buffer.num_rdma_bytes < num_rdma_bytes
-        ):
-            buffer = fused_a2a_module.Buffer(group, num_nvl_bytes, num_rdma_bytes)
-            fused_a2a_module._buffer = buffer
-        return buffer
-
-    setattr(_patched_get_buffer, "__art_intranode_deepep_patch__", True)
-    fused_a2a_module.get_buffer = _patched_get_buffer
-
-
-def _install_deepep_metadata_release_patch() -> None:
-    from megatron.core.transformer.moe.token_dispatcher import _DeepepManager
-
-    deepep_manager = cast(Any, _DeepepManager)
-    if getattr(deepep_manager, "__art_metadata_release_patch__", False):
-        return
-
-    original_dispatch = deepep_manager.dispatch
-    original_permute = deepep_manager.get_permuted_hidden_states_by_experts
-    original_restore = deepep_manager.get_restored_hidden_states_by_experts
-
-    def _patched_dispatch(self: Any, *args: Any, **kwargs: Any) -> Any:
-        hidden_states = original_dispatch(self, *args, **kwargs)
-        self.token_indices = None
-        self.token_probs = None
-        return hidden_states
-
-    def _patched_permute(self: Any, *args: Any, **kwargs: Any) -> Any:
-        hidden_states, permuted_probs = original_permute(self, *args, **kwargs)
-        self.dispatched_indices = None
-        self.dispatched_probs = None
-        return hidden_states, permuted_probs
-
-    def _patched_restore(self: Any, *args: Any, **kwargs: Any) -> Any:
-        hidden_states = original_restore(self, *args, **kwargs)
-        self.dispatched_routing_map = None
-        self.reversed_mapping_for_combine = None
-        self.pad_offsets = None
-        self.hidden_shape_before_permute = None
-        return hidden_states
-
-    deepep_manager.dispatch = _patched_dispatch
-    deepep_manager.get_permuted_hidden_states_by_experts = _patched_permute
-    deepep_manager.get_restored_hidden_states_by_experts = _patched_restore
-    setattr(deepep_manager, "__art_metadata_release_patch__", True)
-
-
 def _eager_initialize_optimizer_state(optimizer: Any) -> None:
     chained_optimizers = getattr(optimizer, "chained_optimizers", None)
     if chained_optimizers is not None:
@@ -371,8 +283,6 @@ def build_training_runtime(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     _install_fast_frozen_output_backward()
-    _install_intranode_deepep_buffer_patch()
-    _install_deepep_metadata_release_patch()
     provider = get_provider(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
