@@ -29,6 +29,7 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     moe_routing_replay_path: str | None
     moe_routing_replay_strict: bool
     num_trajectories_learning_rate_multiplier_power: float
+    packed_sequence_length: int | None
     plot_tensors: bool
     ppo: bool
     precalculate_logprobs: bool
