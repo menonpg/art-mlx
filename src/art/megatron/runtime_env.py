@@ -8,7 +8,10 @@ def _set_cache_dir(env_var: str, default_path: str) -> None:
 
 
 def configure_megatron_runtime_env() -> None:
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = os.environ.get(
+        "ART_MEGATRON_CUDA_DEVICE_MAX_CONNECTIONS",
+        os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+    )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
     _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")

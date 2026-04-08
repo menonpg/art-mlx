@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 from typing import Any, AsyncIterator, Literal, cast
 
@@ -27,11 +28,10 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
 from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
 from .jobs import (
-    DEFAULT_JOBS_DIR,
-    DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronSFTTrainingJob,
     MegatronTrainingJob,
 )
+from .lora import LORA_ALPHA, LORA_RANK
 from .sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
@@ -39,7 +39,11 @@ safe_open = safetensors.safe_open
 
 
 def create_identity_lora(
-    base_model: str, lora_path: str, rank: int = 1, lora_alpha: int = 32
+    base_model: str,
+    lora_path: str,
+    rank: int = LORA_RANK,
+    lora_alpha: int = LORA_ALPHA,
+    random_state: int | None = None,
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
@@ -59,6 +63,8 @@ def create_identity_lora(
     from peft import get_peft_model
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    if random_state is not None:
+        torch.manual_seed(random_state)
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
@@ -132,6 +138,30 @@ class MegatronService:
     _lora_id_counter: int = 1
     _megatron_process: asyncio.subprocess.Process | None = None
 
+    def _megatron_random_state(self) -> int | None:
+        for config_key in ("peft_args", "init_args"):
+            random_state = self.config.get(config_key, {}).get("random_state")
+            if random_state is not None:
+                return int(random_state)
+        return None
+
+    def _megatron_runtime_paths(self) -> tuple[str, str, str]:
+        runtime_dir = Path(self.output_dir) / "megatron_runtime"
+        jobs_dir = runtime_dir / "jobs"
+        training_log_dir = runtime_dir / "training_logs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        training_log_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            str(jobs_dir),
+            str(training_log_dir),
+            str(runtime_dir / "vllm_waking.lock"),
+        )
+
+    def _allocate_master_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            return int(sock.getsockname()[1])
+
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
         return self._lora_id_counter
@@ -144,11 +174,10 @@ class MegatronService:
         return optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
-        # Keep in sync with LoRA settings in megatron/train.py.
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=1,
-            lora_alpha=32,
+            r=LORA_RANK,
+            lora_alpha=LORA_ALPHA,
             target_modules=default_target_modules(self.base_model),
             bias="none",
         )
@@ -168,7 +197,11 @@ class MegatronService:
         return False
 
     def _create_identity_lora(self, lora_path: str) -> None:
-        create_identity_lora(self.base_model, lora_path)
+        create_identity_lora(
+            self.base_model,
+            lora_path,
+            random_state=self._megatron_random_state(),
+        )
 
     def _ensure_identity_lora(self, lora_path: str) -> None:
         if self._adapter_has_weights(lora_path):
@@ -224,26 +257,47 @@ class MegatronService:
             setup_script = Path(__file__).parent / "setup.sh"
             setup_cmd = f"bash {setup_script} && "
 
-        subprocess.run(["pkill", "-9", "megatron-service"], check=False)
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
         num_gpus = torch.cuda.device_count()
-        os.environ["MODEL_IDENTIFIER"] = self.base_model
+        jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
+        env = os.environ.copy()
+        env["MODEL_IDENTIFIER"] = self.base_model
+        env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
+        env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
+        master_addr = env.get("MASTER_ADDR", "127.0.0.1")
+        master_port = str(self._allocate_master_port())
+        env["MASTER_ADDR"] = master_addr
+        env["MASTER_PORT"] = master_port
+        random_state = self._megatron_random_state()
+        if random_state is not None:
+            env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
 
         command = (
             f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "
-            f"torchrun --nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
+            f"torchrun --master-addr {shlex.quote(master_addr)} "
+            f"--master-port {shlex.quote(master_port)} "
+            f"--nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
         )
         self._megatron_process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(project_root),
+            env=env,
         )
 
     def _clear_pending_jobs(self) -> None:
-        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
-        for job_name in os.listdir(DEFAULT_JOBS_DIR):
+        jobs_dir, _training_log_dir, _wake_lock_path = self._megatron_runtime_paths()
+        os.makedirs(jobs_dir, exist_ok=True)
+        for job_name in os.listdir(jobs_dir):
             if job_name.endswith(".json"):
-                os.remove(os.path.join(DEFAULT_JOBS_DIR, job_name))
+                os.remove(os.path.join(jobs_dir, job_name))
+
+    def _create_megatron_job_paths(self) -> tuple[str, str]:
+        jobs_dir, training_log_dir, _wake_lock_path = self._megatron_runtime_paths()
+        return create_megatron_job_paths(
+            jobs_dir=jobs_dir,
+            training_log_dir=training_log_dir,
+        )
 
     def _resolve_training_lora_path(self) -> str:
         lora_path = get_last_checkpoint_dir(self.output_dir)
@@ -282,7 +336,7 @@ class MegatronService:
         )
         self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
 
-        wake_lock_path = DEFAULT_VLLM_WAKE_LOCK_PATH
+        _jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         try:
             with open(wake_lock_path, "w") as lock_file:
                 lock_file.write("waking vllm\n")
@@ -339,7 +393,7 @@ class MegatronService:
                 "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
                 "MegatronService subprocess jobs must use moe_routing_replay_path."
             )
-        job_path, log_path = create_megatron_job_paths()
+        job_path, log_path = self._create_megatron_job_paths()
         job = MegatronTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -365,7 +419,7 @@ class MegatronService:
     ) -> AsyncIterator[dict[str, float]]:
         llm, lora_path = await self._prepare_for_training()
         serialized_batches = materialize_sft_batches(batches)
-        job_path, log_path = create_megatron_job_paths()
+        job_path, log_path = self._create_megatron_job_paths()
         grad_accumulation_sequences = (
             config.batch_size if isinstance(config.batch_size, int) else None
         )
