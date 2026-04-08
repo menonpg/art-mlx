@@ -11,11 +11,16 @@ safe_open = safetensors.safe_open
 save_file = safetensors_torch.save_file
 
 
-def merge_lora_adapter(lora_path: str) -> None:
-    base_dir = Path(lora_path)
+def _load_adapter_shards(
+    base_dir: Path,
+) -> tuple[
+    dict[str, torch.Tensor],
+    list[Path],
+    list[Path],
+]:
     shard_filenames = sorted(base_dir.glob("adapter_model-*-of-*.safetensors"))
     if not shard_filenames:
-        return
+        raise FileNotFoundError(f"No adapter shards found in {base_dir}")
 
     shard_files_by_suffix = {
         path.name.removeprefix("adapter_model-").removesuffix(".safetensors"): path
@@ -93,6 +98,30 @@ def merge_lora_adapter(lora_path: str) -> None:
             concat_dim = 1 if "lora_A" in key else 0
             tensor = torch.cat(ordered_shards, dim=concat_dim)
         adapter_model[key] = tensor
+    return adapter_model, shard_filenames, manifest_filenames
+
+
+def load_lora_adapter_state_dict(lora_path: str) -> dict[str, torch.Tensor]:
+    base_dir = Path(lora_path)
+    adapter_model_path = base_dir / "adapter_model.safetensors"
+    if adapter_model_path.exists():
+        with safe_open(adapter_model_path, framework="pt") as file:
+            return {key: file.get_tensor(key) for key in file.keys()}
+
+    adapter_model, _shard_filenames, _manifest_filenames = _load_adapter_shards(
+        base_dir
+    )
+    return adapter_model
+
+
+def merge_lora_adapter(lora_path: str) -> None:
+    base_dir = Path(lora_path)
+    try:
+        adapter_model, shard_filenames, manifest_filenames = _load_adapter_shards(
+            base_dir
+        )
+    except FileNotFoundError:
+        return
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
     save_file(adapter_model, adapter_model_path)

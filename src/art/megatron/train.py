@@ -45,7 +45,7 @@ from art.megatron.jobs import (
     MegatronTrainingJob,
 )
 from art.megatron.lora import apply_lora_adapters
-from art.megatron.merge import merge_lora_adapter
+from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
 from art.megatron.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
@@ -72,7 +72,6 @@ from art.preprocessing.pack import (
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
-load_file = safetensors_torch.load_file
 save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -632,6 +631,7 @@ def run_megatron_sft_job(
         grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
             job.grad_accumulation_sequences
         )
+        checkpoint_interval = job.internal_checkpoint_interval
 
         for batch_idx in range(job.num_batches):
             batch_start_time = time.perf_counter()
@@ -686,6 +686,20 @@ def run_megatron_sft_job(
             )
             batch_time = time.perf_counter() - batch_start_time
             tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
+            completed_batches = batch_idx + 1
+
+            if (
+                checkpoint_interval is not None
+                and completed_batches < job.num_batches
+                and completed_batches % checkpoint_interval == 0
+            ):
+                _save_lora_and_optimizer(
+                    runtime,
+                    adapter_model=adapter_model,
+                    lora_path=job.lora_path,
+                    optimizer_state_path=job.optimizer_state_path,
+                )
+                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
 
             if runtime.rank == 0:
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
@@ -745,11 +759,8 @@ def _load_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
-    adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
-    if not os.path.exists(adapter_model_path):
-        raise FileNotFoundError(f"No adapter model found at {adapter_model_path}")
-    print0(runtime.rank, "Loading adapter model from", adapter_model_path)
-    adapter_model = load_file(adapter_model_path)
+    print0(runtime.rank, "Loading adapter model from", lora_path)
+    adapter_model = load_lora_adapter_state_dict(lora_path)
     load_adapter_into_model(runtime.model, adapter_model)
     runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
     assert runtime.optimizer is not None

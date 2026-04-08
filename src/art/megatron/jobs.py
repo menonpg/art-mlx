@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .. import types
 from ..preprocessing.pack import DiskPackedTensors
@@ -31,6 +31,7 @@ class MegatronSFTTrainingJob(BaseModel):
     grad_accumulation_sequences: int | None = None
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
+    internal_checkpoint_interval: int | None = Field(default=None, ge=1)
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
