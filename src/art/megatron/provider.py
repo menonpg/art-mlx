@@ -98,17 +98,6 @@ def _env_optional_str_list(name: str) -> tuple[bool, list[str] | None]:
     return True, [part for part in parts if part]
 
 
-def _env_optional_moe_router_dtype(
-    name: str,
-) -> tuple[bool, Literal["fp32", "fp64"] | None]:
-    found, value = _env_optional_str(name)
-    if not found or value is None:
-        return found, None
-    if value not in {"fp32", "fp64"}:
-        raise ValueError(f"{name} must be one of 'fp32' or 'fp64', got {value!r}")
-    return True, cast(Literal["fp32", "fp64"], value)
-
-
 def _env_optional_recompute_granularity(
     name: str,
 ) -> tuple[bool, Literal["full", "selective"] | None]:
@@ -176,12 +165,6 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
         provider.moe_deepep_num_sms = deepep_num_sms
     if "ART_MEGATRON_MOE_DEEPEP_NUM_SMS" not in os.environ:
         provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
-
-    moe_router_dtype_found, moe_router_dtype = _env_optional_moe_router_dtype(
-        "ART_MEGATRON_MOE_ROUTER_DTYPE"
-    )
-    if moe_router_dtype_found:
-        provider.moe_router_dtype = moe_router_dtype
 
     moe_apply_probs_on_input = _env_flag("ART_MEGATRON_MOE_APPLY_PROBS_ON_INPUT")
     if moe_apply_probs_on_input is not None:

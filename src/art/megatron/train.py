@@ -876,6 +876,10 @@ def load_adapter_into_model(
             if hasattr(module, "load_lora"):
                 module.load_lora(adapter_model)  # type: ignore[attr-defined]
 
+    if optimizer is None:
+        return
+    optimizer.reload_model_params()
+
 
 def collect_sharded_lora_state(
     model_chunks: ModelChunks,

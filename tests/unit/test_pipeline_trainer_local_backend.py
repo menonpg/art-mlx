@@ -5,12 +5,14 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
+from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir
@@ -303,6 +305,32 @@ async def test_megatron_backend_train_requires_packed_sequence_length(
                 [_make_group([1.0])],
                 save_checkpoint=False,
             )
+
+
+def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
+    class FakeModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loaded_adapter: dict[str, torch.Tensor] | None = None
+
+        def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
+            self.loaded_adapter = adapter_model
+
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.reload_calls = 0
+
+        def reload_model_params(self) -> None:
+            self.reload_calls += 1
+
+    module = FakeModule()
+    optimizer = FakeOptimizer()
+    adapter_model = {"weight": torch.tensor([1.0])}
+
+    load_adapter_into_model([module], adapter_model, optimizer)
+
+    assert module.loaded_adapter is adapter_model
+    assert optimizer.reload_calls == 1
 
 
 @pytest.mark.asyncio
