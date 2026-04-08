@@ -108,7 +108,9 @@ def load_lora_adapter_state_dict(lora_path: str) -> dict[str, torch.Tensor]:
         with safe_open(adapter_model_path, framework="pt") as file:
             return {key: file.get_tensor(key) for key in file.keys()}
 
-    adapter_model, _shard_filenames, _manifest_filenames = _load_adapter_shards(base_dir)
+    adapter_model, _shard_filenames, _manifest_filenames = _load_adapter_shards(
+        base_dir
+    )
     return adapter_model
 
 
