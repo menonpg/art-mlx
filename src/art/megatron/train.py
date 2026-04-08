@@ -479,7 +479,6 @@ def run_megatron_sft_job(
     job: MegatronSFTTrainingJob,
 ) -> None:
     adapter_model = None
-    final_checkpoint_already_saved = False
 
     try:
         configure_moe_routing_replay(runtime)
@@ -553,9 +552,10 @@ def run_megatron_sft_job(
             tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
             completed_batches = batch_idx + 1
 
-            if checkpoint_interval is not None and (
-                completed_batches % checkpoint_interval == 0
-                or completed_batches == job.num_batches
+            if (
+                checkpoint_interval is not None
+                and completed_batches < job.num_batches
+                and completed_batches % checkpoint_interval == 0
             ):
                 _save_lora_and_optimizer(
                     runtime,
@@ -564,7 +564,6 @@ def run_megatron_sft_job(
                     optimizer_state_path=job.optimizer_state_path,
                 )
                 torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-                final_checkpoint_already_saved = completed_batches == job.num_batches
 
             if runtime.rank == 0:
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
@@ -582,13 +581,12 @@ def run_megatron_sft_job(
                     print("Logging SFT", log_msg)
                     log_file.write(log_msg + "\n")
 
-        if not final_checkpoint_already_saved:
-            _save_lora_and_optimizer(
-                runtime,
-                adapter_model=adapter_model,
-                lora_path=job.lora_path,
-                optimizer_state_path=job.optimizer_state_path,
-            )
+        _save_lora_and_optimizer(
+            runtime,
+            adapter_model=adapter_model,
+            lora_path=job.lora_path,
+            optimizer_state_path=job.optimizer_state_path,
+        )
     finally:
         if adapter_model is not None:
             del adapter_model
