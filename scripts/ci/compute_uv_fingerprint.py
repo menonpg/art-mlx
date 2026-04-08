@@ -43,6 +43,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Python major.minor string used in CI (for example: 3.11)",
     )
     parser.add_argument(
+        "--torch-cuda-arch-list",
+        default="9.0",
+        help="TORCH_CUDA_ARCH_LIST value used for native CUDA extension builds.",
+    )
+    parser.add_argument(
         "--length",
         type=int,
         default=16,
@@ -78,7 +83,7 @@ def main() -> int:
             "uv_lock_sha256": _sha256_file(args.uv_lock),
         },
         "ci_context": {
-            "fingerprint_schema_version": 8,
+            "fingerprint_schema_version": 9,
             "cache_kind": "full_uv_cache",
             "cache_scope": "prek_all_extras_group_dev",
             "cache_target": "uv_cache",
@@ -92,6 +97,7 @@ def main() -> int:
         {
             "base_image": args.base_image,
             "python_mm": args.python_mm,
+            "torch_cuda_arch_list": args.torch_cuda_arch_list,
             "ci_apex_parallel_build": args.ci_apex_parallel_build,
             "ci_apex_nvcc_threads": args.ci_apex_nvcc_threads,
         }

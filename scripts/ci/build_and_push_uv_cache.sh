@@ -13,6 +13,7 @@ AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-8}"
 UV_BUILD_SLOTS="${UV_BUILD_SLOTS:-2}"
 CI_APEX_PARALLEL_BUILD="${CI_APEX_PARALLEL_BUILD:-8}"
 CI_APEX_NVCC_THREADS="${CI_APEX_NVCC_THREADS:-1}"
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
 UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
@@ -158,7 +159,8 @@ compute_fingerprint() {
     --pyproject "${REPO_ROOT}/pyproject.toml" \
     --uv-lock "${REPO_ROOT}/uv.lock" \
     --base-image "${BASE_IMAGE}" \
-    --python-mm "${PYTHON_MM}"
+    --python-mm "${PYTHON_MM}" \
+    --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}"
 }
 
 resolve_build_jobs() {
@@ -270,7 +272,7 @@ build_cache_archive() {
   export CMAKE_BUILD_PARALLEL_LEVEL="${compile_jobs}"
   export MAX_JOBS="${compile_jobs}"
   export NINJAFLAGS="-j${compile_jobs}"
-  export TORCH_CUDA_ARCH_LIST=8.0
+  export TORCH_CUDA_ARCH_LIST
 
   local cudnn_path="${TMP_DIR}/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/cudnn"
   export CUDNN_PATH="${cudnn_path}"
@@ -281,7 +283,7 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
+  log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
   uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
 
