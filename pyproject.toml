@@ -19,6 +19,7 @@ dependencies = [
 plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
 
 backend = [
+    "art-vllm-runtime",
     "peft>=0.14.0",
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
@@ -42,6 +43,7 @@ backend = [
     "vllm @ https://github.com/vivekkalyan/vllm/releases/download/v0.17.0-art1/vllm-0.17.0%2Bart1-cp38-abi3-manylinux_2_31_x86_64.whl ; sys_platform == 'linux'",
 ]
 megatron = [
+    "art-vllm-runtime",
     "torch>=2.8.0",
     "quack-kernels==0.2.5",
     "apex",
@@ -222,6 +224,7 @@ allowed-unresolved-imports = [
 
 [dependency-groups]
 dev = [
+    "art-vllm-runtime",
     "black>=25.1.0",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
@@ -239,6 +242,7 @@ dev = [
 ]
 
 [tool.uv.sources]
+art-vllm-runtime = { path = "vllm_runtime" }
 panza = { git = "https://github.com/corbt/panza.git" }
 apex = { git = "https://github.com/NVIDIA/apex.git", branch = "25.09" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "75f2c5ad4afb702b57b4781a00f5291a66bcf183" }

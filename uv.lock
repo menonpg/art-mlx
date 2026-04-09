@@ -384,6 +384,21 @@ wheels = [
 ]
 
 [[package]]
+name = "art-vllm-runtime"
+version = "0.1.0"
+source = { directory = "vllm_runtime" }
+dependencies = [
+    { name = "transformers" },
+    { name = "vllm", marker = "sys_platform == 'linux'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "transformers", specifier = "==5.2.0" },
+    { name = "vllm", marker = "sys_platform == 'linux'", url = "https://github.com/vivekkalyan/vllm/releases/download/v0.17.0-art1/vllm-0.17.0%2Bart1-cp38-abi3-manylinux_2_31_x86_64.whl" },
+]
+
+[[package]]
 name = "asgiref"
 version = "3.11.1"
 source = { registry = "https://pypi.org/simple" }
@@ -5497,6 +5512,7 @@ dependencies = [
 [package.optional-dependencies]
 backend = [
     { name = "accelerate" },
+    { name = "art-vllm-runtime" },
     { name = "awscli" },
     { name = "bitsandbytes" },
     { name = "duckdb" },
@@ -5525,6 +5541,7 @@ langgraph = [
 ]
 megatron = [
     { name = "apex" },
+    { name = "art-vllm-runtime" },
     { name = "deep-ep", marker = "sys_platform == 'linux'" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
@@ -5557,6 +5574,7 @@ tinker = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "art-vllm-runtime" },
     { name = "black" },
     { name = "duckdb" },
     { name = "hatch" },
@@ -5577,6 +5595,8 @@ dev = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'backend'", specifier = "==1.7.0" },
     { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?branch=25.09" },
+    { name = "art-vllm-runtime", marker = "extra == 'backend'", directory = "vllm_runtime" },
+    { name = "art-vllm-runtime", marker = "extra == 'megatron'", directory = "vllm_runtime" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
     { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
@@ -5637,6 +5657,7 @@ provides-extras = ["plotting", "backend", "megatron", "langgraph", "tinker"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "art-vllm-runtime", directory = "vllm_runtime" },
     { name = "black", specifier = ">=25.1.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "hatch", specifier = ">=1.14.1" },

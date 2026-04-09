@@ -8,7 +8,6 @@ import logging
 import os
 import socket
 import subprocess
-import sys
 from typing import Any, AsyncIterator, Literal, cast
 
 import torch
@@ -27,6 +26,10 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
+from ..vllm.runtime_project import (
+    build_dedicated_vllm_server_cmd,
+    get_vllm_runtime_project_root,
+)
 from .train import (
     UnslothTrainContext,
     create_unsloth_train_context,
@@ -187,20 +190,17 @@ class UnslothService:
         for key in ("model", "served_model_name", "enable_sleep_mode"):
             engine_args.pop(key, None)
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "art.vllm.dedicated_server",
-            f"--model={self.base_model}",
-            f"--port={port}",
-            f"--host={self._vllm_host}",
-            f"--cuda-visible-devices={cuda_devices}",
-            f"--lora-path={lora_path}",
-            f"--served-model-name={self.model_name}@{self._latest_step}",
-            f"--rollout-weights-mode={self.rollout_weights_mode}",
-            f"--engine-args-json={json.dumps(engine_args)}",
-            f"--server-args-json={json.dumps(server_args)}",
-        ]
+        cmd = build_dedicated_vllm_server_cmd(
+            base_model=self.base_model,
+            port=port,
+            host=self._vllm_host,
+            cuda_visible_devices=cuda_devices,
+            lora_path=lora_path,
+            served_model_name=f"{self.model_name}@{self._latest_step}",
+            rollout_weights_mode=self.rollout_weights_mode,
+            engine_args=engine_args,
+            server_args=server_args,
+        )
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -209,7 +209,11 @@ class UnslothService:
         )
 
         self._vllm_process = subprocess.Popen(
-            cmd, stdout=self._vllm_log_file, stderr=subprocess.STDOUT, bufsize=1
+            cmd,
+            cwd=str(get_vllm_runtime_project_root()),
+            stdout=self._vllm_log_file,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
         )
         self._vllm_port = port
 

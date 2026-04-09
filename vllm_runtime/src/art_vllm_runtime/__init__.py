@@ -1,5 +1,3 @@
-"""Compatibility wrapper around the ART-owned vLLM runtime patch package."""
-
 from art_vllm_runtime.patches import (
     apply_vllm_runtime_patches,
     patch_listen_for_disconnect,
