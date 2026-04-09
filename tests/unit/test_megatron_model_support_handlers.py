@@ -35,8 +35,8 @@ def test_default_dense_handler_collects_dense_layer_families() -> None:
     provider = type("Provider", (), {"num_moe_experts": 0})()
 
     assert DEFAULT_DENSE_HANDLER.collect_layer_families(provider) == [
-        LayerFamilyInstance(key="standard_attention"),
-        LayerFamilyInstance(key="dense_mlp"),
+        LayerFamilyInstance(key="standard_attention", layer_index=0),
+        LayerFamilyInstance(key="dense_mlp", layer_index=0),
     ]
 
 
@@ -51,16 +51,18 @@ def test_default_dense_handler_collects_moe_layer_families() -> None:
     )()
 
     assert DEFAULT_DENSE_HANDLER.collect_layer_families(provider) == [
-        LayerFamilyInstance(key="standard_attention"),
-        LayerFamilyInstance(key="grouped_moe_mlp"),
-        LayerFamilyInstance(key="shared_experts_mlp"),
+        LayerFamilyInstance(key="standard_attention", layer_index=0),
+        LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
+        LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
     ]
 
 
 def test_qwen_handler_collects_expected_layer_families() -> None:
-    assert QWEN3_5_MOE_HANDLER.collect_layer_families(object()) == [
-        LayerFamilyInstance(key="standard_attention"),
-        LayerFamilyInstance(key="gated_delta_net_attention"),
-        LayerFamilyInstance(key="grouped_moe_mlp"),
-        LayerFamilyInstance(key="shared_experts_mlp"),
+    provider = type("Provider", (), {"linear_attention_freq": 4, "num_layers": 8})()
+
+    assert QWEN3_5_MOE_HANDLER.collect_layer_families(provider) == [
+        LayerFamilyInstance(key="standard_attention", layer_index=3),
+        LayerFamilyInstance(key="gated_delta_net_attention", layer_index=0),
+        LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
+        LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
     ]

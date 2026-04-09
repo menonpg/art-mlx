@@ -10,12 +10,24 @@ class Qwen35MoeHandler(DefaultDenseHandler):
     key = "qwen3_5_moe"
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
-        del provider
+        linear_attention_pattern = _linear_attention_pattern(provider)
+        gated_delta_net_layer_index = (
+            linear_attention_pattern.index(1) if 1 in linear_attention_pattern else 0
+        )
+        standard_attention_layer_index = (
+            linear_attention_pattern.index(0) if 0 in linear_attention_pattern else 0
+        )
         return [
-            LayerFamilyInstance(key="standard_attention"),
-            LayerFamilyInstance(key="gated_delta_net_attention"),
-            LayerFamilyInstance(key="grouped_moe_mlp"),
-            LayerFamilyInstance(key="shared_experts_mlp"),
+            LayerFamilyInstance(
+                key="standard_attention",
+                layer_index=standard_attention_layer_index,
+            ),
+            LayerFamilyInstance(
+                key="gated_delta_net_attention",
+                layer_index=gated_delta_net_layer_index,
+            ),
+            LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
+            LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
         ]
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
@@ -299,3 +311,18 @@ def _optional_gated_delta_net_type() -> type[Any] | None:
     except ImportError:
         return None
     return GatedDeltaNet
+
+
+def _linear_attention_pattern(provider: Any) -> list[int]:
+    try:
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_linear_attention_pattern,
+        )
+    except ImportError:
+        frequency = int(getattr(provider, "linear_attention_freq", 1) or 1)
+        layer_count = int(getattr(provider, "num_layers", 1) or 1)
+        return [
+            0 if frequency > 0 and (layer_index + 1) % frequency == 0 else 1
+            for layer_index in range(layer_count)
+        ]
+    return list(get_linear_attention_pattern(provider))
