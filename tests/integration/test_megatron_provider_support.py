@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -18,6 +19,7 @@ class _FakeProvider:
     def __init__(self) -> None:
         self.transformer_layer_spec = self._base_layer_spec
         self.finalized = False
+        self.overlap_moe_expert_parallel_comm = False
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
@@ -99,7 +101,7 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
 
-    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=7)
+    layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=7)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
@@ -139,7 +141,7 @@ def test_get_provider_preserves_hybrid_layer_specs(
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
 
     resolved = provider_module.get_provider("unused-qwen")
-    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
+    layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
 
     assert hasattr(layer_spec, "layer_specs")
     gdn_layer, attention_layer = layer_spec.layer_specs

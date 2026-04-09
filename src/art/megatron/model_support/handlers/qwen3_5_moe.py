@@ -1,5 +1,5 @@
 from types import MethodType
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from art.megatron.model_support.handlers.default_dense import DefaultDenseHandler
 from art.megatron.provider_common import patch_layer_spec_tree
@@ -72,6 +72,91 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             provider.transformer_layer_spec = _qwen35_layer_spec
             provider.provide = MethodType(_provide_qwen35_with_flex_attention, provider)
 
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            _is_language_transformer_layer_name,
+            wrap_dense_mlp,
+            wrap_gated_delta_net_attention,
+            wrap_grouped_moe_experts,
+            wrap_shared_experts_mlp,
+            wrap_standard_self_attention,
+        )
+
+        target_set = set(target_modules)
+        gated_delta_net_type = _optional_gated_delta_net_type()
+        for chunk in model_chunks:
+            for module_name, module in chunk.named_modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                if not _is_language_transformer_layer_name(module_name):
+                    continue
+                adapter_model_prefix = _adapter_model_prefix(module)
+                if isinstance(module.self_attention, SelfAttention):
+                    wrap_standard_self_attention(
+                        module.self_attention,
+                        adapter_model_prefix=adapter_model_prefix,
+                        provider=provider,
+                        target_modules=target_set,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                elif gated_delta_net_type is not None and isinstance(
+                    module.self_attention, gated_delta_net_type
+                ):
+                    wrap_gated_delta_net_attention(
+                        module.self_attention,
+                        adapter_model_prefix=adapter_model_prefix,
+                        provider=provider,
+                        target_modules=target_set,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                else:
+                    raise TypeError(
+                        "Unsupported self_attention module type for Megatron LoRA: "
+                        f"{type(module.self_attention)}"
+                    )
+                experts = getattr(module.mlp, "experts", None)
+                if experts is not None:
+                    wrap_grouped_moe_experts(
+                        experts,
+                        adapter_model_prefix=adapter_model_prefix,
+                        target_modules=target_set,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                else:
+                    wrap_dense_mlp(
+                        module.mlp,
+                        adapter_model_prefix=adapter_model_prefix,
+                        provider=provider,
+                        target_modules=target_set,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                shared_experts = getattr(module.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    wrap_shared_experts_mlp(
+                        shared_experts,
+                        adapter_model_prefix=adapter_model_prefix,
+                        provider=provider,
+                        target_modules=target_set,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+
 
 QWEN3_5_MOE_HANDLER = Qwen35MoeHandler()
 
@@ -104,14 +189,7 @@ def _optional_qwen35_provider_type() -> type[Any] | None:
     return Qwen35VLMoEModelProvider
 
 
-def _require_qwen35_provider_symbols() -> tuple[
-    type[Any],
-    type[Any],
-    type[Any],
-    Callable[[object, type[Any]], None],
-    Callable[..., Any],
-    Callable[..., Any],
-]:
+def _require_qwen35_provider_symbols() -> tuple[Any, ...]:
     from megatron.bridge.models.gpt_provider import mtp_block_spec
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import (
         Qwen3VLSelfAttention,
@@ -133,3 +211,11 @@ def _require_qwen35_provider_symbols() -> tuple[
         get_transformer_block_with_experimental_attention_variant_spec,
         mtp_block_spec,
     )
+
+
+def _optional_gated_delta_net_type() -> type[Any] | None:
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return None
+    return GatedDeltaNet

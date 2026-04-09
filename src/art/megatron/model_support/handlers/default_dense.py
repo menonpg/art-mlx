@@ -21,7 +21,34 @@ class DefaultDenseHandler:
         rank: int,
         alpha: int,
     ) -> None:
-        return None
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            wrap_grouped_moe_experts,
+            wrap_standard_self_attention,
+        )
+
+        target_set = set(target_modules)
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                wrap_standard_self_attention(
+                    module.self_attention,
+                    adapter_model_prefix=_adapter_model_prefix(module),
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                wrap_grouped_moe_experts(
+                    module.mlp.experts,
+                    adapter_model_prefix=_adapter_model_prefix(module),
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
 
     def build_adapter_weights(self, model_chunks: Sequence[Any]) -> dict[str, Any]:
         return {}

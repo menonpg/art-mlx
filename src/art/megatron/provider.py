@@ -1,7 +1,7 @@
 from functools import partial
 import os
 from pathlib import Path
-from typing import Callable, Literal, cast
+from typing import Any, Callable, Literal, cast
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -250,6 +250,8 @@ def get_provider_bundle(
             )
         )
     provider = bridge.to_megatron_provider()
+    setattr(provider, "_art_model_support_handler", handler)
+    setattr(provider, "_art_model_support_spec", spec)
     handler.patch_provider(provider, bridge)
     base_layer_spec = provider.transformer_layer_spec
 
@@ -260,7 +262,7 @@ def get_provider_bundle(
         patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
         return layer_spec
 
-    provider.transformer_layer_spec = _flex_attention_layer_spec
+    provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
     provider.attention_backend = AttnBackend.auto
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
