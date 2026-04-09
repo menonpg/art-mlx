@@ -2,6 +2,7 @@ from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
 )
+from art.megatron.model_support.spec import LayerFamilyInstance
 
 
 def test_default_dense_handler_returns_standard_attention_kwargs() -> None:
@@ -28,3 +29,38 @@ def test_qwen_handler_unwraps_model_wrappers() -> None:
         wrapper,
         attention_bias="bias",
     ) == {"extra_block_kwargs": {"extra_block_kwargs": {"attention_bias": "bias"}}}
+
+
+def test_default_dense_handler_collects_dense_layer_families() -> None:
+    provider = type("Provider", (), {"num_moe_experts": 0})()
+
+    assert DEFAULT_DENSE_HANDLER.collect_layer_families(provider) == [
+        LayerFamilyInstance(key="standard_attention"),
+        LayerFamilyInstance(key="dense_mlp"),
+    ]
+
+
+def test_default_dense_handler_collects_moe_layer_families() -> None:
+    provider = type(
+        "Provider",
+        (),
+        {
+            "num_moe_experts": 8,
+            "moe_shared_expert_intermediate_size": 4096,
+        },
+    )()
+
+    assert DEFAULT_DENSE_HANDLER.collect_layer_families(provider) == [
+        LayerFamilyInstance(key="standard_attention"),
+        LayerFamilyInstance(key="grouped_moe_mlp"),
+        LayerFamilyInstance(key="shared_experts_mlp"),
+    ]
+
+
+def test_qwen_handler_collects_expected_layer_families() -> None:
+    assert QWEN3_5_MOE_HANDLER.collect_layer_families(object()) == [
+        LayerFamilyInstance(key="standard_attention"),
+        LayerFamilyInstance(key="gated_delta_net_attention"),
+        LayerFamilyInstance(key="grouped_moe_mlp"),
+        LayerFamilyInstance(key="shared_experts_mlp"),
+    ]

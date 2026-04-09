@@ -10,7 +10,17 @@ class DefaultDenseHandler:
         return None
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
-        return []
+        layer_families = [LayerFamilyInstance(key="standard_attention")]
+        if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+            layer_families.append(LayerFamilyInstance(key="grouped_moe_mlp"))
+            if (
+                int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0)
+                > 0
+            ):
+                layer_families.append(LayerFamilyInstance(key="shared_experts_mlp"))
+            return layer_families
+        layer_families.append(LayerFamilyInstance(key="dense_mlp"))
+        return layer_families
 
     def apply_lora_adapters(
         self,

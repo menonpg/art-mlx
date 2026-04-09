@@ -15,6 +15,34 @@ class DependencyFloor(BaseModel):
 class LayerFamilyInstance(BaseModel):
     key: str
     count: int = 1
+    layer_index: int | None = None
+    module_path: str | None = None
+    module_type: str | None = None
+
+
+class ArchitectureReport(BaseModel):
+    base_model: str
+    model_key: str
+    handler_key: str
+    bridge_type: str | None = None
+    provider_type: str | None = None
+    layer_families: list[LayerFamilyInstance] = Field(default_factory=list)
+    recommended_min_layers: int = 1
+    unresolved_risks: list[str] = Field(default_factory=list)
+
+
+class ValidationStageResult(BaseModel):
+    name: str
+    passed: bool = False
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    artifact_dir: str | None = None
+
+
+class ValidationReport(BaseModel):
+    base_model: str
+    model_key: str
+    dependency_versions: dict[str, str] = Field(default_factory=dict)
+    stages: list[ValidationStageResult] = Field(default_factory=list)
 
 
 class ModelSupportSpec(BaseModel):

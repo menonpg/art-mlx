@@ -1,3 +1,7 @@
+from art.megatron.model_support.discovery import (
+    inspect_architecture,
+    summarize_layer_families,
+)
 from art.megatron.model_support.registry import (
     DEFAULT_DENSE_SPEC,
     QWEN3_5_MOE_MODELS,
@@ -11,29 +15,51 @@ from art.megatron.model_support.registry import (
     model_requires_merged_rollout,
 )
 from art.megatron.model_support.spec import (
+    ArchitectureReport,
     DependencyFloor,
     LayerFamilyInstance,
     ModelSupportHandler,
     ModelSupportSpec,
     NativeVllmLoraStatus,
     RolloutWeightsMode,
+    ValidationReport,
+    ValidationStageResult,
+)
+from art.megatron.model_support.workflow import (
+    MANDATORY_VALIDATION_STAGES,
+    NATIVE_VLLM_LORA_STAGE,
+    build_validation_report,
+    build_validation_stage_names,
+    detect_dependency_versions,
+    initialize_validation_report,
 )
 
 __all__ = [
+    "ArchitectureReport",
     "DEFAULT_DENSE_SPEC",
     "DependencyFloor",
     "LayerFamilyInstance",
+    "MANDATORY_VALIDATION_STAGES",
     "ModelSupportHandler",
     "ModelSupportSpec",
     "NativeVllmLoraStatus",
+    "NATIVE_VLLM_LORA_STAGE",
     "QWEN3_5_MOE_MODELS",
     "QWEN3_5_MOE_SPEC",
     "RolloutWeightsMode",
+    "ValidationReport",
+    "ValidationStageResult",
+    "build_validation_report",
+    "build_validation_stage_names",
     "default_target_modules_for_model",
+    "detect_dependency_versions",
     "get_model_support_handler",
     "get_model_support_handler_for_spec",
     "get_model_support_spec",
+    "initialize_validation_report",
+    "inspect_architecture",
     "is_model_support_registered",
     "list_model_support_specs",
     "model_requires_merged_rollout",
+    "summarize_layer_families",
 ]

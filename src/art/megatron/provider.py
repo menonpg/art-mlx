@@ -18,12 +18,12 @@ from megatron.core.transformer.enums import AttnBackend
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
-from art.megatron.model_support import (
-    get_model_support_handler,
-    get_model_support_spec,
-)
 from art.megatron.model_support.handlers.qwen3_5_moe import (
     supported_qwen_moe_bridge_types,
+)
+from art.megatron.model_support.registry import (
+    get_model_support_handler,
+    get_model_support_spec,
 )
 from art.megatron.provider_common import (
     ProviderBundle,

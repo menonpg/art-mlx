@@ -2,11 +2,21 @@ from types import MethodType
 from typing import Any, Callable, Sequence
 
 from art.megatron.model_support.handlers.default_dense import DefaultDenseHandler
+from art.megatron.model_support.spec import LayerFamilyInstance
 from art.megatron.provider_common import patch_layer_spec_tree
 
 
 class Qwen35MoeHandler(DefaultDenseHandler):
     key = "qwen3_5_moe"
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        del provider
+        return [
+            LayerFamilyInstance(key="standard_attention"),
+            LayerFamilyInstance(key="gated_delta_net_attention"),
+            LayerFamilyInstance(key="grouped_moe_mlp"),
+            LayerFamilyInstance(key="shared_experts_mlp"),
+        ]
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
         del bridge
