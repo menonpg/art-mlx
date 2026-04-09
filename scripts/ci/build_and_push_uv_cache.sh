@@ -16,7 +16,7 @@ CI_APEX_NVCC_THREADS="${CI_APEX_NVCC_THREADS:-1}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
-UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
+UPLOAD_TIMEOUT_MINUTES="${UPLOAD_TIMEOUT_MINUTES:-30}"
 SKIP_BUILD=0
 SKIP_PRUNE=0
 ARCHIVE_PATH=""
@@ -342,7 +342,7 @@ upload_cache_assets() {
   if ((PART_SIZE_MB > 1900)); then
     fail "--part-size-mb must be <= 1900 to stay within GitHub release asset limits."
   fi
-  [[ "${UPLOAD_JOBS}" =~ ^[1-9][0-9]*$ ]] || fail "UPLOAD_JOBS must be a positive integer."
+  [[ "${UPLOAD_TIMEOUT_MINUTES}" =~ ^[1-9][0-9]*$ ]] || fail "UPLOAD_TIMEOUT_MINUTES must be a positive integer."
 
   delete_assets_for_fingerprint "${repo}" "${fingerprint}"
 
@@ -362,21 +362,16 @@ upload_cache_assets() {
     fail "No cache parts produced from archive ${archive_path}."
   fi
 
-  local upload_jobs="${UPLOAD_JOBS}"
-  if ((upload_jobs > part_count)); then
-    upload_jobs="${part_count}"
-  fi
-
-  log "Uploading ${part_count} cache parts with ${upload_jobs} parallel upload jobs."
-  printf '%s\0' "${parts[@]}" | xargs -0 -n 1 -P "${upload_jobs}" sh -c '
-    chunk="$1"
-    part_asset="${chunk##*/}"
-    printf "[ci-cache] Uploading cache part %s\n" "${part_asset}"
-    gh release upload "'"${UV_CACHE_RELEASE_TAG}"'" \
-      --repo "'"${repo}"'" \
-      "${chunk}" \
-      --clobber
-  ' sh
+  log "Uploading ${part_count} cache parts serially with a ${UPLOAD_TIMEOUT_MINUTES} minute timeout per part."
+  for chunk in "${parts[@]}"; do
+    local part_asset="${chunk##*/}"
+    log "Uploading cache part ${part_asset}."
+    timeout "${UPLOAD_TIMEOUT_MINUTES}m" \
+      gh release upload "${UV_CACHE_RELEASE_TAG}" \
+        --repo "${repo}" \
+        "${chunk}" \
+        --clobber
+  done
 
   rm -rf "${parts_dir}"
   printf '%s\n' "${part_count}"
