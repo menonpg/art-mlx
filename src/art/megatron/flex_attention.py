@@ -34,6 +34,14 @@ class FlexAttentionWrapper(torch.nn.Module):
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     }
+    # Skip Inductor's flex_decoding specialization: it has triggered both
+    # shared-memory OOMs (triton_flex_decoding) and symbolic-shape assertion
+    # failures (create_flex_decoding_kernel). The regular flex_attention
+    # kernel autotunes against the actual hardware smem budget, so this
+    # stays GPU-agnostic.
+    _kernel_options = {
+        "FORCE_USE_FLEX_ATTENTION": True,
+    }
     _compiled_flex_attention: ClassVar = torch.compile(
         flex_attention,
         options=_compile_options,
@@ -59,6 +67,7 @@ class FlexAttentionWrapper(torch.nn.Module):
                 block_mask=block_mask,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                kernel_options=FlexAttentionWrapper._kernel_options,
             ),
         )
 
