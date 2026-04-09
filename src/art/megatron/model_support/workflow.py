@@ -2,7 +2,12 @@ import importlib.metadata
 
 from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.model_support.registry import get_model_support_spec
-from art.megatron.model_support.spec import ValidationReport, ValidationStageResult
+from art.megatron.model_support.spec import (
+    ArchitectureReport,
+    MinimalLayerCoverageReport,
+    ValidationReport,
+    ValidationStageResult,
+)
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -78,3 +83,26 @@ def build_validation_report(
             "unresolved_risks": list(architecture.unresolved_risks),
         }
     return report
+
+
+def assess_minimal_layer_coverage(
+    *,
+    base_model: str,
+    num_layers: int,
+    architecture: ArchitectureReport | None = None,
+) -> MinimalLayerCoverageReport:
+    architecture_report = architecture or inspect_architecture(base_model)
+    missing_layer_families = [
+        family.key
+        for family in architecture_report.layer_families
+        if family.layer_index is not None and family.layer_index >= num_layers
+    ]
+    return MinimalLayerCoverageReport(
+        base_model=base_model,
+        model_key=architecture_report.model_key,
+        requested_num_layers=num_layers,
+        recommended_min_layers=architecture_report.recommended_min_layers,
+        covered=not missing_layer_families and not architecture_report.unresolved_risks,
+        missing_layer_families=missing_layer_families,
+        unresolved_risks=list(architecture_report.unresolved_risks),
+    )

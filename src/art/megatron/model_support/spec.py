@@ -31,6 +31,16 @@ class ArchitectureReport(BaseModel):
     unresolved_risks: list[str] = Field(default_factory=list)
 
 
+class MinimalLayerCoverageReport(BaseModel):
+    base_model: str
+    model_key: str
+    requested_num_layers: int
+    recommended_min_layers: int
+    covered: bool
+    missing_layer_families: list[str] = Field(default_factory=list)
+    unresolved_risks: list[str] = Field(default_factory=list)
+
+
 class ValidationStageResult(BaseModel):
     name: str
     passed: bool = False
