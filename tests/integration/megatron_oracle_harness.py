@@ -233,6 +233,7 @@ class MetricThresholdRule(BaseModel):
     """Callable row pass rule that AND-checks configured metric upper bounds."""
 
     limits: dict[str, float] = Field(default_factory=dict)
+    minimums: dict[str, float] = Field(default_factory=dict)
 
     def failure_reasons(self, summary: MetricSummary) -> list[str]:
         """Builds readable failure reasons for this threshold rule."""
@@ -244,6 +245,13 @@ class MetricThresholdRule(BaseModel):
                 continue
             if float(value) > float(limit):
                 reasons.append(f"{key}={float(value):.6g}>{float(limit):.6g}")
+        for key, minimum in sorted(self.minimums.items()):
+            value = summary.get(key)
+            if not isinstance(value, (int, float)):
+                reasons.append(f"{key}=missing")
+                continue
+            if float(value) <= float(minimum):
+                reasons.append(f"{key}={float(value):.6g}<={float(minimum):.6g}")
         return reasons
 
     def __call__(self, summary: MetricSummary) -> bool:
@@ -404,6 +412,7 @@ class DiffAccumulator:
         self.diff_sq_sum = 0.0
         self.ref_sq_sum = 0.0
         self.ref_abs_sum = 0.0
+        self.candidate_abs_sum = 0.0
         self.router_topk_total = 0
         self.router_topk_mismatch = 0
         self.router_top1_total = 0
@@ -421,6 +430,7 @@ class DiffAccumulator:
         self.diff_sq_sum += float((cand - ref).square().sum().item())
         self.ref_sq_sum += float(ref.square().sum().item())
         self.ref_abs_sum += float(ref.abs().sum().item())
+        self.candidate_abs_sum += float(cand.abs().sum().item())
 
     @staticmethod
     def layer_averaged_summary(reference_stack, candidate_stack) -> dict[str, float]:  # type: ignore[no-untyped-def]
@@ -435,6 +445,7 @@ class DiffAccumulator:
                 "mean_abs_diff",
                 "relative_l2",
                 "typical_abs_scale",
+                "candidate_abs_scale",
                 "mean_abs_pct",
             ]
         }
@@ -477,12 +488,14 @@ class DiffAccumulator:
                 "mean_abs_diff": 0.0,
                 "relative_l2": 0.0,
                 "typical_abs_scale": 0.0,
+                "candidate_abs_scale": 0.0,
                 "mean_abs_pct": 0.0,
                 "topk_mismatch_fraction": topk_fraction,
                 "top1_mismatch_fraction": top1_fraction,
             }
         mean_abs = self.abs_sum / self.numel
         typical_abs = self.ref_abs_sum / self.numel
+        candidate_abs = self.candidate_abs_sum / self.numel
         mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
         return {
             "numel": _finite_metric(float(self.numel), default=0.0),
@@ -491,6 +504,7 @@ class DiffAccumulator:
                 (self.diff_sq_sum**0.5) / max(self.ref_sq_sum**0.5, 1e-12)
             ),
             "typical_abs_scale": _finite_metric(typical_abs, default=0.0),
+            "candidate_abs_scale": _finite_metric(candidate_abs, default=0.0),
             "mean_abs_pct": _finite_metric(mean_abs_pct),
             "topk_mismatch_fraction": _finite_metric(topk_fraction, default=1.0),
             "top1_mismatch_fraction": _finite_metric(top1_fraction, default=1.0),
@@ -1058,6 +1072,7 @@ class VariantRunner:
             "mean_abs_diff": NON_FINITE_METRIC_VALUE,
             "relative_l2": NON_FINITE_METRIC_VALUE,
             "typical_abs_scale": 0.0,
+            "candidate_abs_scale": 0.0,
             "mean_abs_pct": NON_FINITE_METRIC_VALUE,
             "topk_mismatch_fraction": 1.0,
             "top1_mismatch_fraction": 1.0,
@@ -1490,10 +1505,18 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # note the metrics get averaged across layers to reduce noise
     # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
+    non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
     fwd_out_loss = MetricThresholdRule(
         limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0}
     )
-    grads_deltas = MetricThresholdRule(limits={"mean_abs_pct": 3.0})
+    fwd_out = MetricThresholdRule(
+        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
+        minimums=non_zero_scales,
+    )
+    grads_deltas = MetricThresholdRule(
+        limits={"mean_abs_pct": 3.0},
+        minimums=non_zero_scales,
+    )
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay
             limits={
@@ -1502,7 +1525,7 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
             }
         )
     )
-    return {key: fwd_out_loss for key in ["forward", "outputs", "losses"]} | {
+    return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
         "grads": grads_deltas,
         "deltas": grads_deltas,
         "router_topk_ids": router_topk_rule,
