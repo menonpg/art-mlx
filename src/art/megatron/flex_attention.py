@@ -1,6 +1,7 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
 import math
+import os
 from typing import Any, ClassVar, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -34,10 +35,23 @@ class FlexAttentionWrapper(torch.nn.Module):
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     }
-    _compiled_flex_attention: ClassVar = torch.compile(
-        flex_attention,
-        options=_compile_options,
-    )
+    _compiled_flex_attention: ClassVar[Any | None] = None
+
+    @classmethod
+    def _compiled_enabled(cls) -> bool:
+        value = os.environ.get("ART_MEGATRON_DISABLE_COMPILED_FLEX_ATTENTION", "")
+        return value.strip().lower() not in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _resolve_impl(cls) -> Any:
+        if not cls._compiled_enabled():
+            return flex_attention
+        if cls._compiled_flex_attention is None:
+            cls._compiled_flex_attention = torch.compile(
+                flex_attention,
+                options=cls._compile_options,
+            )
+        return cls._compiled_flex_attention
 
     def forward(
         self,
@@ -52,7 +66,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         # q, k, v are [B, H, S, D] tensors expected by torch.flex_attention.
         return cast(
             Tensor,
-            FlexAttentionWrapper._compiled_flex_attention(
+            self._resolve_impl()(
                 q,
                 k,
                 v,
@@ -63,7 +77,17 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-_compiled_create_block_mask = torch.compile(create_block_mask)
+_compiled_create_block_mask: Any | None = None
+
+
+def _resolve_create_block_mask() -> Any:
+    global _compiled_create_block_mask
+    value = os.environ.get("ART_MEGATRON_DISABLE_COMPILED_FLEX_ATTENTION", "")
+    if value.strip().lower() in {"1", "true", "yes", "on"}:
+        return create_block_mask
+    if _compiled_create_block_mask is None:
+        _compiled_create_block_mask = torch.compile(create_block_mask)
+    return _compiled_create_block_mask
 
 
 def create_shared_prefix_attention_state(
@@ -93,7 +117,7 @@ def create_shared_prefix_attention_state(
         parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
 
-    block_mask = _compiled_create_block_mask(
+    block_mask = _resolve_create_block_mask()(
         _shared_prefix_mask,
         group_ids.shape[0],
         None,

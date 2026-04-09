@@ -141,12 +141,53 @@ def test_get_provider_preserves_hybrid_layer_specs(
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
 
     resolved = provider_module.get_provider("unused-qwen")
-    layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=0)
+    layer_spec = cast(Any, resolved).transformer_layer_spec(resolved, vp_stage=0)
 
     assert hasattr(layer_spec, "layer_specs")
-    gdn_layer, attention_layer = layer_spec.layer_specs
+    gdn_layer, attention_layer = cast(Any, layer_spec).layer_specs
     assert not hasattr(gdn_layer.submodules.self_attention.submodules, "core_attention")
     assert (
         attention_layer.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
+    )
+
+
+def test_get_provider_bundle_single_gpu_parity_uses_clean_runtime_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    fake_bridge = _FakeBridge(
+        model_bridge=object.__new__(Qwen3MoEBridge),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+
+    bundle = provider_module.get_provider_bundle(
+        "unused-model",
+        runtime_profile="single_gpu_parity",
+    )
+    resolved = bundle.provider
+
+    assert resolved.tensor_model_parallel_size == 1
+    assert resolved.context_parallel_size == 1
+    assert resolved.pipeline_model_parallel_size == 1
+    assert resolved.expert_model_parallel_size == 1
+    assert resolved.expert_tensor_parallel_size == 1
+    assert resolved.sequence_parallel is False
+    assert resolved.recompute_granularity is None
+    assert resolved.recompute_method is None
+    assert resolved.recompute_num_layers is None
+    assert resolved.overlap_moe_expert_parallel_comm is False
+    assert resolved.moe_token_dispatcher_type == "alltoall"
+    assert resolved.moe_shared_expert_overlap is False
+
+    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
+    assert (
+        layer_spec.submodules.self_attention.submodules.core_attention
+        is not FlexDotProductAttention
     )

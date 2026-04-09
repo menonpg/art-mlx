@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 from typing import Any, cast
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.transformer.utils import get_default_causal_mask
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
@@ -32,6 +35,20 @@ from .megatron_oracle_worker import (
     _set_deterministic_seed,
 )
 from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tensors
+
+HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
+HF_PARITY_DISABLE_COMPILED_FLEX_ENV = "ART_MEGATRON_DISABLE_COMPILED_FLEX_ATTENTION"
+
+
+def _debug(message: str) -> None:
+    if os.environ.get(HF_PARITY_DEBUG_ENV, "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    print(f"[hf_parity] {message}", flush=True)
 
 
 def _load_hf_model(
@@ -91,6 +108,35 @@ def _tensor_map_deltas(
     }
 
 
+def _bridge_compatible_hf_key(key: str, expected_keys: set[str]) -> str:
+    if key in expected_keys:
+        return key
+    if key.startswith("model."):
+        prefixed = f"model.language_model.{key.removeprefix('model.')}"
+        if prefixed in expected_keys:
+            return prefixed
+    if key.startswith("model.language_model."):
+        stripped = f"model.{key.removeprefix('model.language_model.')}"
+        if stripped in expected_keys:
+            return stripped
+    return key
+
+
+def _normalize_hf_tensor_map_for_bridge(
+    hf_map: dict[str, torch.Tensor],
+    expected_keys: set[str],
+) -> dict[str, torch.Tensor]:
+    normalized: dict[str, torch.Tensor] = {}
+    for key, value in hf_map.items():
+        normalized_key = _bridge_compatible_hf_key(key, expected_keys)
+        if normalized_key in normalized:
+            raise RuntimeError(
+                f"Duplicate normalized HF key '{normalized_key}' from '{key}'"
+            )
+        normalized[normalized_key] = value
+    return normalized
+
+
 def _run_hf_sft_step(
     *,
     base_model: str,
@@ -101,7 +147,9 @@ def _run_hf_sft_step(
 ) -> tuple[
     torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
 ]:
+    _debug("loading HF model")
     model = _load_hf_model(base_model=base_model, num_layers=num_layers, device=device)
+    _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
     optimizer = torch.optim.Adam(
         [param for param in model.parameters() if param.requires_grad],
@@ -158,27 +206,36 @@ def _run_hf_sft_step(
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _debug("finished HF step")
     return output_vector, scalar_loss, grads, deltas
 
 
 def _build_megatron_runtime(
     request: HfParityRunRequest,
 ) -> megatron_train.TrainingRuntime:
+    os.environ.setdefault(HF_PARITY_DISABLE_COMPILED_FLEX_ENV, "1")
+    _debug("building Megatron provider bundle")
     provider_bundle = get_provider_bundle(
         request.case_config.base_model,
         torch_dtype=torch.float32,
+        runtime_profile="single_gpu_parity",
     )
+    _debug("Megatron provider bundle built")
     provider = provider_bundle.provider
     _configure_provider(provider, ORACLE_TOPOLOGY, request.case_config)
+    _debug("Megatron provider configured for oracle topology")
     model = cast(
         list[Any],
         provider.provide_distributed_model(
-            wrap_with_ddp=False,
+            ddp_config=DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                average_in_collective=False,
+            ),
             data_parallel_random_init=False,
-            pre_wrap_hook=[],
             mixed_precision_wrapper=None,
         ),
     )
+    _debug("Megatron model instantiated")
     megatron_train._install_gpt_preprocess_hook(model)
     return megatron_train.TrainingRuntime(
         provider_bundle=provider_bundle,
@@ -211,6 +268,19 @@ def _megatron_task_tensor(
     if mode == "param":
         return param.detach()
     raise ValueError(f"Unsupported task-tensor mode: {mode}")
+
+
+def _task_has_nonzero_grad(task: Any) -> bool:
+    grad = _megatron_task_tensor(task, mode="grad")
+    return bool(torch.count_nonzero(grad).item() > 0)
+
+
+def _mapping_supports_derivative_parity(mapping: Any) -> bool:
+    from megatron.bridge.models.conversion.param_mapping import (
+        RMSNorm2ZeroCenteredRMSNormMapping,
+    )
+
+    return not isinstance(mapping, RMSNorm2ZeroCenteredRMSNormMapping)
 
 
 def _convert_megatron_tasks_to_hf(
@@ -272,6 +342,10 @@ def _run_megatron_sft_step(
 ]:
     runtime = _build_megatron_runtime(request)
     assert runtime.optimizer is not None
+    uses_standard_attention_path = (
+        getattr(runtime.provider, "_art_runtime_profile", None) == "single_gpu_parity"
+    )
+    _debug("initializing Megatron optimizer state")
     megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
     tasks = [
         task
@@ -281,6 +355,7 @@ def _run_megatron_sft_step(
         )
         if isinstance(task.param_weight, torch.nn.Parameter)
     ]
+    _debug(f"built {len(tasks)} Megatron conversion tasks")
     for chunk in runtime.model:
         if hasattr(chunk, "zero_grad_buffer"):
             chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
@@ -293,21 +368,32 @@ def _run_megatron_sft_step(
         input_ids, position_ids, shifted_labels, mask, seq_len = (
             megatron_train._prepare_sft_micro_inputs(micro, device)
         )
+        attention_mask = megatron_train._placeholder_attention_mask(device)
+        if uses_standard_attention_path:
+            attention_mask = get_default_causal_mask(seq_len).view(
+                1, 1, seq_len, seq_len
+            )
+            forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
+                runtime.model[0]
+            )
+        else:
+            forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
+                runtime.model[0],
+                attention_bias=megatron_train._causal_attention_state(seq_len, device),
+            )
         per_token_loss = runtime.model[0](
             input_ids=input_ids,
             position_ids=position_ids,
-            attention_mask=megatron_train._placeholder_attention_mask(device),
+            attention_mask=attention_mask,
             labels=shifted_labels,
-            **runtime.model_support_handler.get_forward_kwargs(
-                runtime.model[0],
-                attention_bias=megatron_train._causal_attention_state(seq_len, device),
-            ),
+            **forward_kwargs,
         )
         masked_losses = per_token_loss[mask]
         trainable_losses.append(masked_losses.detach().cpu())
         loss_sum = loss_sum + masked_losses.sum()
         token_count += int(mask.sum().item())
         masked_losses.sum().backward()
+    _debug("finished Megatron forward/backward")
     num_tokens = megatron_train._local_trainable_sft_token_count_tensor(
         micro_inputs,
         device=device,
@@ -317,25 +403,39 @@ def _run_megatron_sft_step(
         megatron_train.as_megatron_api_chunks(runtime.model),
         num_tokens=num_tokens,
     )
+    _debug("finalized Megatron grads")
+    signal_tasks = [task for task in tasks if _task_has_nonzero_grad(task)]
+    _debug(f"retained {len(signal_tasks)} non-zero-grad conversion tasks")
+    derivative_tasks = [
+        task
+        for task in signal_tasks
+        if _mapping_supports_derivative_parity(task.mapping)
+    ]
+    _debug(f"retained {len(derivative_tasks)} derivative-safe conversion tasks")
     grads = _convert_megatron_tasks_to_hf(
         runtime,
         mode="grad",
-        tasks=tasks,
+        tasks=derivative_tasks,
     )
+    _debug("exported Megatron grads")
     params_before = _convert_megatron_tasks_to_hf(
         runtime,
         mode="param",
-        tasks=tasks,
+        tasks=derivative_tasks,
     )
+    _debug("exported Megatron params before step")
     megatron_train._optimizer_step(runtime.optimizer, request.case_config.learning_rate)
+    _debug("completed Megatron optimizer step")
     params_after = _convert_megatron_tasks_to_hf(
         runtime,
         mode="param",
-        tasks=tasks,
+        tasks=derivative_tasks,
     )
+    _debug("exported Megatron params after step")
     deltas = _tensor_map_deltas(params_before, params_after)
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
+    _debug("finished Megatron step")
     return output_vector, scalar_loss, grads, deltas
 
 
@@ -344,9 +444,22 @@ def _filter_hf_maps(
     hf_deltas: dict[str, torch.Tensor],
     expected_keys: set[str],
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    normalized_hf_grads = _normalize_hf_tensor_map_for_bridge(hf_grads, expected_keys)
+    normalized_hf_deltas = _normalize_hf_tensor_map_for_bridge(
+        hf_deltas,
+        expected_keys,
+    )
     return (
-        {key: hf_grads[key] for key in sorted(expected_keys) if key in hf_grads},
-        {key: hf_deltas[key] for key in sorted(expected_keys) if key in hf_deltas},
+        {
+            key: normalized_hf_grads[key]
+            for key in sorted(expected_keys)
+            if key in normalized_hf_grads
+        },
+        {
+            key: normalized_hf_deltas[key]
+            for key in sorted(expected_keys)
+            if key in normalized_hf_deltas
+        },
     )
 
 
@@ -376,6 +489,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
     device = torch.device("cuda", 0)
     try:
         optimizer_config = _build_optimizer_config(request.case_config)
+        _debug("starting HF parity worker")
         hf_outputs, hf_loss, hf_grads, hf_deltas = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
@@ -390,6 +504,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
                 device=device,
             )
         )
+        _debug("finished HF and Megatron steps, building report")
         expected_keys = set(megatron_grads.keys()) | set(megatron_deltas.keys())
         filtered_hf_grads, filtered_hf_deltas = _filter_hf_maps(
             hf_grads,
@@ -419,6 +534,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             Path(request.output_dir) / HF_PARITY_REPORT_FILENAME,
             report.model_dump(mode="json"),
         )
+        _debug("wrote HF parity report")
     finally:
         if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
             torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]

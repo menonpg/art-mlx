@@ -139,6 +139,49 @@ def _tp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
     )
 
 
+def _apply_art_training_runtime_defaults(provider: GPTModelProvider) -> None:
+    provider.recompute_granularity = "full"
+    provider.recompute_method = "uniform"
+    provider.recompute_num_layers = 1
+    provider.moe_shared_expert_overlap = True
+    _apply_default_parallel_topology(provider)
+    _apply_runtime_env_overrides(provider)
+    if _tp_ep_parallel_domain_size(provider) > 1:
+        # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
+        # compute, so these are very beneficial
+        apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+    provider.sequence_parallel = provider.tensor_model_parallel_size > 1
+
+
+def _apply_single_gpu_parity_runtime_defaults(provider: GPTModelProvider) -> None:
+    provider.tensor_model_parallel_size = 1
+    provider.context_parallel_size = 1
+    provider.pipeline_model_parallel_size = 1
+    provider.expert_model_parallel_size = 1
+    provider.expert_tensor_parallel_size = 1
+    provider.sequence_parallel = False
+    provider.recompute_granularity = None
+    provider.recompute_method = None
+    provider.recompute_num_layers = None
+    provider.overlap_moe_expert_parallel_comm = False
+    provider.moe_token_dispatcher_type = "alltoall"
+    provider.moe_shared_expert_overlap = False
+
+
+def _apply_runtime_profile_defaults(
+    provider: GPTModelProvider,
+    *,
+    runtime_profile: Literal["art_training", "single_gpu_parity"],
+) -> None:
+    if runtime_profile == "art_training":
+        _apply_art_training_runtime_defaults(provider)
+        return
+    if runtime_profile == "single_gpu_parity":
+        _apply_single_gpu_parity_runtime_defaults(provider)
+        return
+    raise ValueError(f"Unsupported runtime profile: {runtime_profile}")
+
+
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     overlap = _env_flag("ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM")
     if overlap is not None:
@@ -229,6 +272,7 @@ def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    runtime_profile: Literal["art_training", "single_gpu_parity"] = "art_training",
 ) -> ProviderBundle:
     spec = get_model_support_spec(model)
     handler = get_model_support_handler(model)
@@ -252,6 +296,7 @@ def get_provider_bundle(
     provider = bridge.to_megatron_provider()
     setattr(provider, "_art_model_support_handler", handler)
     setattr(provider, "_art_model_support_spec", spec)
+    setattr(provider, "_art_runtime_profile", runtime_profile)
     handler.patch_provider(provider, bridge)
     base_layer_spec = provider.transformer_layer_spec
 
@@ -262,18 +307,10 @@ def get_provider_bundle(
         patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
         return layer_spec
 
-    provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
+    if runtime_profile == "art_training":
+        provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
     provider.attention_backend = AttnBackend.auto
-    provider.recompute_granularity = "full"
-    provider.recompute_method = "uniform"
-    provider.recompute_num_layers = 1
-    provider.moe_shared_expert_overlap = True
-    _apply_default_parallel_topology(provider)
-    _apply_runtime_env_overrides(provider)
-    if _tp_ep_parallel_domain_size(provider) > 1:
-        # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
-        # compute, so these are very beneficial
-        apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+    _apply_runtime_profile_defaults(provider, runtime_profile=runtime_profile)
     provider.moe_permute_fusion = True
     provider.moe_router_dtype = "fp32"
     # params are disabled anyways, but should know about this if we switch to full FT
@@ -281,7 +318,6 @@ def get_provider_bundle(
     provider.moe_aux_loss_coeff = 0.0
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
-    provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     handler.patch_provider(provider, bridge)
     provider.finalize()
     return ProviderBundle(

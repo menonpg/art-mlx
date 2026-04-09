@@ -151,11 +151,47 @@ def build_parity_sample_indices(
     ]
 
 
+def _iter_hf_layer_config_views(config: Any) -> list[tuple[str, Any]]:
+    views: list[tuple[str, Any]] = [("", config)]
+    base_config_key = getattr(config, "base_config_key", None)
+    candidate_names = [
+        name
+        for name in [
+            base_config_key if isinstance(base_config_key, str) else None,
+            "text_config",
+            "language_config",
+            "llm_config",
+            "decoder_config",
+        ]
+        if isinstance(name, str)
+    ]
+    seen_ids = {id(config)}
+    for name in candidate_names:
+        nested = getattr(config, name, None)
+        if nested is None or id(nested) in seen_ids:
+            continue
+        seen_ids.add(id(nested))
+        views.append((f"{name}.", nested))
+    return views
+
+
 def set_hf_config_num_layers(config: Any, num_layers: int) -> str:
-    for field in ("num_hidden_layers", "num_layers", "n_layer"):
-        if hasattr(config, field):
-            setattr(config, field, num_layers)
-            return field
+    for prefix, config_view in _iter_hf_layer_config_views(config):
+        for field in ("num_hidden_layers", "num_layers", "n_layer"):
+            if not hasattr(config_view, field):
+                continue
+            setattr(config_view, field, num_layers)
+            layer_types = getattr(config_view, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                setattr(config_view, "layer_types", list(layer_types[:num_layers]))
+            mlp_only_layers = getattr(config_view, "mlp_only_layers", None)
+            if isinstance(mlp_only_layers, (list, tuple)):
+                setattr(
+                    config_view,
+                    "mlp_only_layers",
+                    [layer for layer in mlp_only_layers if int(layer) < num_layers],
+                )
+            return f"{prefix}{field}"
     raise ValueError(
         f"Could not find a supported layer-count field on HF config type {type(config)}"
     )
