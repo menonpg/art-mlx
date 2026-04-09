@@ -219,6 +219,14 @@ class Qwen35MoeHandler(DefaultDenseHandler):
                     )
         return adapter_weights_by_base
 
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        if type(unwrapped).__name__ == "Qwen3VLModel":
+            return {"extra_block_kwargs": {"extra_block_kwargs": kwargs}}
+        return {"extra_block_kwargs": kwargs}
+
 
 QWEN3_5_MOE_HANDLER = Qwen35MoeHandler()
 

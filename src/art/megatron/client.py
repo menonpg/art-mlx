@@ -4,7 +4,7 @@ import json
 import os
 from typing import Any, AsyncIterator
 
-from .jobs import DEFAULT_JOBS_DIR, MegatronJob
+from .jobs import DEFAULT_JOBS_DIR, MegatronJob, MegatronSyncJob, dump_megatron_job
 from .merge import merge_lora_adapter
 
 DEFAULT_TRAINING_LOG_DIR = "/tmp/megatron_training_logs"
@@ -27,7 +27,7 @@ def create_megatron_job_paths(
 def write_megatron_job(job: MegatronJob, *, job_path: str) -> None:
     os.makedirs(os.path.dirname(job_path), exist_ok=True)
     with open(job_path, "w", encoding="utf-8") as handle:
-        handle.write(job.model_dump_json())
+        handle.write(dump_megatron_job(job))
 
 
 async def stream_megatron_job(
@@ -51,7 +51,8 @@ async def stream_megatron_job(
                 if not (line := line.strip()):
                     continue
                 if line == "all done":
-                    merge_lora_adapter(job.lora_path)
+                    if not isinstance(job, MegatronSyncJob):
+                        merge_lora_adapter(job.lora_path)
                     return
                 num_lines += 1
                 yield json.loads(line)

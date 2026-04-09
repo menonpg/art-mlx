@@ -1,6 +1,6 @@
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from .. import types
 from ..preprocessing.pack import DiskPackedTensors
@@ -10,7 +10,20 @@ DEFAULT_JOBS_DIR = "/tmp/megatron_training_jobs"
 DEFAULT_VLLM_WAKE_LOCK_PATH = "/tmp/megatron_vllm_waking"
 
 
-class MegatronTrainingJob(BaseModel):
+class MergedWeightTransferInitInfo(BaseModel):
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+
+
+class MergedWeightTransferSpec(BaseModel):
+    init_info: MergedWeightTransferInitInfo
+    vllm_base_url: str
+    served_model_name: str
+
+
+class _MegatronTrainingJobBase(BaseModel):
     lora_path: str
     optimizer_state_path: str
     disk_packed_tensors: DiskPackedTensors
@@ -21,8 +34,24 @@ class MegatronTrainingJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
+class MegatronTrainingJob(_MegatronTrainingJobBase):
+    kind: Literal["train_lora"] = "train_lora"
+
+
+class MegatronMergedTrainingJob(_MegatronTrainingJobBase):
+    kind: Literal["train_merged"] = "train_merged"
+    merged_weight_transfer: MergedWeightTransferSpec
+
+
+class MegatronSyncJob(BaseModel):
+    kind: Literal["sync"] = "sync"
+    lora_path: str
+    merged_weight_transfer: MergedWeightTransferSpec
+    log_path: str = DEFAULT_TRAINING_LOG_PATH
+
+
 class MegatronSFTTrainingJob(BaseModel):
-    job_type: Literal["sft"] = "sft"
+    kind: Literal["sft"] = "sft"
     lora_path: str
     optimizer_state_path: str
     sft_data_dir: str
@@ -35,4 +64,20 @@ class MegatronSFTTrainingJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
-MegatronJob = MegatronTrainingJob | MegatronSFTTrainingJob
+MegatronJob: TypeAlias = Annotated[
+    MegatronTrainingJob
+    | MegatronMergedTrainingJob
+    | MegatronSyncJob
+    | MegatronSFTTrainingJob,
+    Field(discriminator="kind"),
+]
+
+_MEGATRON_JOB_ADAPTER = TypeAdapter(MegatronJob)
+
+
+def dump_megatron_job(job: MegatronJob) -> str:
+    return _MEGATRON_JOB_ADAPTER.dump_json(job).decode()
+
+
+def load_megatron_job(raw: str | bytes) -> MegatronJob:
+    return _MEGATRON_JOB_ADAPTER.validate_json(raw)

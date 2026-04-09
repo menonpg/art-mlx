@@ -12,6 +12,7 @@ Public cross-repo API consumed by serverless-training:
 - merge_lora_adapter
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import importlib
 import json
@@ -41,8 +42,13 @@ from art.megatron.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronJob,
+    MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
+    MegatronSyncJob,
     MegatronTrainingJob,
+    MergedWeightTransferInitInfo,
+    MergedWeightTransferSpec,
+    load_megatron_job,
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
@@ -56,6 +62,10 @@ from art.megatron.offload import (
     OffloadState,
     offload_to_cpu,
     reload_to_gpu,
+)
+from art.megatron.param_name_canonicalization import (
+    canonical_art_param_name,
+    is_art_adapter_param_name,
 )
 from art.megatron.provider import get_provider_bundle
 from art.megatron.provider_common import ProviderBundle
@@ -100,6 +110,8 @@ class TrainingRuntime(BaseModel):
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
+    merged_weight_transfer_group: Any | None = None
+    merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
 
     @field_validator("model")
     @classmethod
@@ -129,6 +141,16 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
+
+
+class MergedWeightExport(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    bridge: Any
+    model: ModelChunks
+    model_config_value: Any
+    conversion_tasks: list[Any]
+    adapter_weights_by_base: dict[str, list[Any]]
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -418,7 +440,7 @@ def run_megatron_worker_loop(
 
 def run_megatron_rl_job(
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob,
 ) -> None:
     packed_tensors = None
     adapter_model = None
@@ -463,6 +485,7 @@ def run_megatron_rl_job(
             )
             step_result = run_training_step(
                 model_chunks=runtime.model,
+                model_support_handler=runtime.model_support_handler,
                 optimizer=runtime.optimizer,
                 learning_rate=job.config.learning_rate,
                 inputs=micro_inputs,
@@ -602,6 +625,7 @@ def run_megatron_sft_job(
             )
             step_result = run_megatron_sft_step(
                 model_chunks=runtime.model,
+                model_support_handler=runtime.model_support_handler,
                 optimizer=runtime.optimizer,
                 learning_rate=job.learning_rates[batch_idx],
                 inputs=micro_inputs,
@@ -658,22 +682,36 @@ def run_megatron_sft_job(
 
 def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
     with open(job_path, "rb") as handle:
-        job_data = json.loads(handle.read())
-    if job_data.get("job_type") == "sft":
-        if not supports_sft:
-            raise NotImplementedError("SFT jobs are not supported in this worker loop")
-        return MegatronSFTTrainingJob.model_validate(job_data)
-    return MegatronTrainingJob.model_validate(job_data)
+        job = load_megatron_job(handle.read())
+    if isinstance(job, MegatronSFTTrainingJob) and not supports_sft:
+        raise NotImplementedError("SFT jobs are not supported in this worker loop")
+    return job
 
 
 def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
+    if isinstance(job, MegatronSyncJob):
+        maybe_load_adapter_into_model(runtime.model, job.lora_path, rank=runtime.rank)
+        _sync_merged_weights_to_vllm(
+            runtime,
+            job.merged_weight_transfer,
+            pause_generation=False,
+        )
+        return
     if isinstance(job, MegatronSFTTrainingJob):
         run_megatron_sft_job(runtime, job)
         return
     run_megatron_rl_job(runtime, job)
+    if isinstance(job, MegatronMergedTrainingJob):
+        _sync_merged_weights_to_vllm(
+            runtime,
+            job.merged_weight_transfer,
+            pause_generation=True,
+        )
 
 
-def _job_cleanup_path(job: MegatronJob) -> str:
+def _job_cleanup_path(job: MegatronJob) -> str | None:
+    if isinstance(job, MegatronSyncJob):
+        return None
     if isinstance(job, MegatronSFTTrainingJob):
         return job.sft_data_dir
     return job.disk_packed_tensors["dir"]
@@ -685,9 +723,11 @@ def _load_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
-    print0(runtime.rank, "Loading adapter model from", lora_path)
-    adapter_model = load_lora_adapter_state_dict(lora_path)
-    load_adapter_into_model(runtime.model, adapter_model)
+    adapter_model = maybe_load_adapter_into_model(
+        runtime.model,
+        lora_path,
+        rank=runtime.rank,
+    )
     runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
     assert runtime.optimizer is not None
 
@@ -706,6 +746,22 @@ def _load_lora_and_optimizer(
             "- resetting optimizer for new run",
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
+    return adapter_model
+
+
+def maybe_load_adapter_into_model(
+    model_chunks: ModelChunks,
+    lora_path: str,
+    *,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
+    if not os.path.exists(adapter_model_path):
+        print0(rank, "No adapter model found at", adapter_model_path)
+        return {}
+    print0(rank, "Loading adapter model from", lora_path)
+    adapter_model = load_lora_adapter_state_dict(lora_path)
+    load_adapter_into_model(model_chunks, adapter_model)
     return adapter_model
 
 
@@ -750,7 +806,7 @@ def finalize_megatron_job(
     *,
     job_path: str | None,
     log_path: str,
-    cleanup_path: str,
+    cleanup_path: str | None,
 ) -> None:
     torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
     if runtime.rank != 0:
@@ -758,7 +814,7 @@ def finalize_megatron_job(
 
     if job_path is not None and os.path.exists(job_path):
         os.remove(job_path)
-    if os.path.exists(cleanup_path):
+    if cleanup_path is not None and os.path.exists(cleanup_path):
         shutil.rmtree(cleanup_path)
     with open(log_path, "a+", encoding="utf-8") as log_file:
         log_file.write("all done\n")
@@ -1056,6 +1112,7 @@ def _prepare_sft_micro_inputs(
 def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
+    model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
@@ -1108,9 +1165,10 @@ def run_megatron_sft_step(
             position_ids=position_ids,
             attention_mask=_placeholder_attention_mask(device),
             labels=shifted_labels,
-            extra_block_kwargs={
-                "attention_bias": _causal_attention_state(seq_len, device),
-            },
+            **model_support_handler.get_forward_kwargs(
+                model_chunks[0],
+                attention_bias=_causal_attention_state(seq_len, device),
+            ),
         )
         masked_loss = per_token_loss[mask].sum()
         masked_loss.backward()
@@ -1154,6 +1212,7 @@ def run_megatron_sft_step(
 def run_training_step(
     *,
     model_chunks: ModelChunks,
+    model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],
@@ -1215,7 +1274,10 @@ def run_training_step(
             position_ids=micro["input_pos"],
             attention_mask=attention_mask,
             labels=shift_tensor(micro["tokens"], 0),
-            extra_block_kwargs={"attention_bias": attention_state},
+            **model_support_handler.get_forward_kwargs(
+                model_chunks[0],
+                attention_bias=attention_state,
+            ),
         )
 
         loss_info = loss_fn(
@@ -1273,6 +1335,231 @@ def run_training_step(
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
     )
+
+
+def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
+    if getattr(mapping, "allow_hf_name_mismatch", False):
+        return True
+    hf_param = mapping.hf_param
+    if isinstance(hf_param, str):
+        return hf_param in hf_keys
+    if isinstance(hf_param, dict):
+        return all(param in hf_keys for param in hf_param.values())
+    return False
+
+
+def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
+    from itertools import chain
+
+    from megatron.bridge.models.conversion.model_bridge import (
+        WeightConversionTask,
+        _megatron_local_name_to_global,
+    )
+    from megatron.bridge.models.conversion.utils import (
+        get_module_and_param_from_name,
+        persistent_buffers,
+    )
+
+    bridge = runtime.bridge
+    mapping_registry = bridge._model_bridge.mapping_registry()
+    hf_source = bridge.hf_pretrained.state.source
+    hf_keys = set(hf_source.get_all_keys())
+    megatron_models = as_megatron_api_chunks(runtime.model)
+    model_config = cast(Any, runtime.model[0].config)
+    tasks: list[Any] = []
+    for vp_stage, model in enumerate(runtime.model):
+        for local_name, _ in chain(model.named_parameters(), persistent_buffers(model)):
+            if "_extra_state" in local_name or is_art_adapter_param_name(local_name):
+                continue
+            global_name = _megatron_local_name_to_global(
+                megatron_models,
+                model_config,
+                canonical_art_param_name(local_name),
+                vp_stage,
+            )
+            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
+            if mapping is None or not _mapping_hf_weights_exist(mapping, hf_keys):
+                continue
+            module_and_param = cast(
+                tuple[Any, torch.Tensor],
+                get_module_and_param_from_name(
+                    megatron_models,
+                    local_name,
+                    vp_stage,
+                ),
+            )
+            local_module, local_weights = module_and_param
+            if local_module is not None and not hasattr(local_module, "config"):
+                setattr(local_module, "config", model_config)
+            tasks.append(
+                WeightConversionTask(
+                    pp_rank=0,
+                    vp_stage=vp_stage,
+                    param_name=local_name,
+                    global_param_name=global_name,
+                    megatron_module=local_module,
+                    param_weight=local_weights,
+                    mapping=mapping,
+                )
+            )
+    return tasks
+
+
+def _build_merged_weight_export(runtime: TrainingRuntime) -> MergedWeightExport:
+    return MergedWeightExport(
+        bridge=runtime.bridge,
+        model=runtime.model,
+        model_config_value=runtime.model[0].config,
+        conversion_tasks=_build_art_conversion_tasks(runtime),
+        adapter_weights_by_base=runtime.model_support_handler.build_adapter_weights_by_base(
+            runtime.model
+        ),
+    )
+
+
+def _iter_merged_vllm_weights(weight_export: MergedWeightExport) -> Any:
+    bridge = weight_export.bridge
+    model_bridge = bridge._model_bridge
+    hf_state_dict = bridge.hf_pretrained.state
+    grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
+    for task in weight_export.conversion_tasks:
+        converted_weights_dict = task.mapping.megatron_to_hf(
+            task.param_weight,
+            task.megatron_module,
+        )
+        adapter_weights = weight_export.adapter_weights_by_base.get(
+            task.global_param_name
+        )
+        if adapter_weights is not None:
+            converted_weights_dict = model_bridge._merge_lora_adapter_weights(
+                weight_export.model,
+                converted_weights_dict,
+                adapter_weights,
+            )
+        if getattr(task.mapping, "is_grouped_export", False):
+            merged_result = model_bridge._accumulate_grouped_export(
+                task,
+                converted_weights_dict,
+                weight_export.model_config_value,
+                grouped_buffers,
+                hf_state_dict,
+            )
+            if merged_result is None:
+                continue
+            converted_weights_dict = merged_result
+        else:
+            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
+                task,
+                converted_weights_dict,
+                hf_state_dict,
+            )
+        for hf_name, tensor in converted_weights_dict.items():
+            yield hf_name, tensor
+
+
+def _ensure_merged_weight_transfer_group(
+    runtime: TrainingRuntime,
+    spec: MergedWeightTransferSpec,
+) -> None:
+    assert runtime.rank == 0
+    assert runtime.world_size == 1
+    if runtime.merged_weight_transfer_init_info == spec.init_info:
+        assert runtime.merged_weight_transfer_group is not None
+        return
+
+    import httpx
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    def _remote_init() -> None:
+        response = httpx.post(
+            f"{spec.vllm_base_url}/init_weight_transfer_engine",
+            json={"init_info": spec.init_info.model_dump()},
+            timeout=300.0,
+        )
+        response.raise_for_status()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        remote_future = executor.submit(_remote_init)
+        time.sleep(1.0)
+        runtime.merged_weight_transfer_group = NCCLWeightTransferEngine.trainer_init(
+            {
+                "master_address": spec.init_info.master_address,
+                "master_port": spec.init_info.master_port,
+                "world_size": spec.init_info.world_size,
+            }
+        )
+        remote_future.result()
+    runtime.merged_weight_transfer_init_info = spec.init_info
+
+
+def _sync_merged_weights_to_vllm(
+    runtime: TrainingRuntime,
+    spec: MergedWeightTransferSpec,
+    *,
+    pause_generation: bool,
+) -> None:
+    assert runtime.rank == 0
+    assert runtime.world_size == 1
+
+    import httpx
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    _ensure_merged_weight_transfer_group(runtime, spec)
+    weight_export = _build_merged_weight_export(runtime)
+
+    def _send_weights() -> None:
+        NCCLWeightTransferEngine.trainer_send_weights(
+            _iter_merged_vllm_weights(weight_export),
+            {"group": runtime.merged_weight_transfer_group},
+        )
+
+    with httpx.Client() as client:
+        if pause_generation:
+            response = client.post(
+                f"{spec.vllm_base_url}/pause",
+                params={"mode": "wait"},
+                timeout=300.0,
+            )
+            response.raise_for_status()
+        try:
+            torch.cuda.synchronize()
+            names: list[str] = []
+            dtype_names: list[str] = []
+            shapes: list[list[int]] = []
+            for name, tensor in _iter_merged_vllm_weights(weight_export):
+                names.append(name)
+                dtype_names.append(str(tensor.dtype).removeprefix("torch."))
+                shapes.append(list(tensor.shape))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                send_future = executor.submit(_send_weights)
+                response = client.post(
+                    f"{spec.vllm_base_url}/update_weights",
+                    json={
+                        "update_info": {
+                            "names": names,
+                            "dtype_names": dtype_names,
+                            "shapes": shapes,
+                            "is_checkpoint_format": True,
+                        }
+                    },
+                    timeout=600.0,
+                )
+                response.raise_for_status()
+                send_future.result()
+            response = client.post(
+                f"{spec.vllm_base_url}/art/set_served_model_name",
+                json={"name": spec.served_model_name},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            torch.cuda.synchronize()
+        finally:
+            if pause_generation:
+                response = client.post(
+                    f"{spec.vllm_base_url}/resume",
+                    timeout=30.0,
+                )
+                response.raise_for_status()
 
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:

@@ -98,7 +98,8 @@ class DefaultDenseHandler:
         return adapter_weights_by_base
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
-        return kwargs
+        del model
+        return {"extra_block_kwargs": kwargs}
 
 
 DEFAULT_DENSE_HANDLER = DefaultDenseHandler()
