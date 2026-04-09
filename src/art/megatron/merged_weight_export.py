@@ -1,9 +1,15 @@
+from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
+import time
 from typing import Any, Iterator, cast
 
 from pydantic import BaseModel, ConfigDict
 import torch
 
+from art.megatron.jobs import (
+    MergedWeightTransferInitInfo,
+    MergedWeightTransferSpec,
+)
 from art.megatron.model_chunks import ModelChunks, as_megatron_api_chunks
 from art.megatron.param_name_canonicalization import (
     canonical_art_param_name,
@@ -149,9 +155,141 @@ def iter_merged_vllm_weights(
         yield from converted_weights_dict.items()
 
 
+def ensure_merged_weight_transfer_group(
+    *,
+    rank: int,
+    world_size: int,
+    merged_weight_transfer_group: Any | None,
+    merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None,
+    spec: MergedWeightTransferSpec,
+) -> tuple[Any, MergedWeightTransferInitInfo]:
+    assert rank == 0
+    assert world_size == 1
+    if merged_weight_transfer_init_info == spec.init_info:
+        assert merged_weight_transfer_group is not None
+        assert merged_weight_transfer_init_info is not None
+        return merged_weight_transfer_group, merged_weight_transfer_init_info
+
+    import httpx
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    def _remote_init() -> None:
+        response = httpx.post(
+            f"{spec.vllm_base_url}/init_weight_transfer_engine",
+            json={"init_info": spec.init_info.model_dump()},
+            timeout=300.0,
+        )
+        response.raise_for_status()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        remote_future = executor.submit(_remote_init)
+        time.sleep(1.0)
+        merged_weight_transfer_group = NCCLWeightTransferEngine.trainer_init(
+            {
+                "master_address": spec.init_info.master_address,
+                "master_port": spec.init_info.master_port,
+                "world_size": spec.init_info.world_size,
+            }
+        )
+        remote_future.result()
+    return merged_weight_transfer_group, spec.init_info
+
+
+def sync_merged_weights_to_vllm(
+    *,
+    bridge: Any,
+    model: ModelChunks,
+    model_support_handler: Any,
+    rank: int,
+    world_size: int,
+    merged_weight_transfer_group: Any | None,
+    merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None,
+    spec: MergedWeightTransferSpec,
+    pause_generation: bool,
+) -> tuple[Any, MergedWeightTransferInitInfo]:
+    assert rank == 0
+    assert world_size == 1
+
+    import httpx
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    (
+        merged_weight_transfer_group,
+        merged_weight_transfer_init_info,
+    ) = ensure_merged_weight_transfer_group(
+        rank=rank,
+        world_size=world_size,
+        merged_weight_transfer_group=merged_weight_transfer_group,
+        merged_weight_transfer_init_info=merged_weight_transfer_init_info,
+        spec=spec,
+    )
+    weight_export = build_merged_weight_export(
+        bridge=bridge,
+        model=model,
+        model_support_handler=model_support_handler,
+    )
+
+    def _send_weights() -> None:
+        NCCLWeightTransferEngine.trainer_send_weights(
+            iter_merged_vllm_weights(weight_export),
+            {"group": merged_weight_transfer_group},
+        )
+
+    with httpx.Client() as client:
+        if pause_generation:
+            response = client.post(
+                f"{spec.vllm_base_url}/pause",
+                params={"mode": "wait"},
+                timeout=300.0,
+            )
+            response.raise_for_status()
+        try:
+            torch.cuda.synchronize()
+            names: list[str] = []
+            dtype_names: list[str] = []
+            shapes: list[list[int]] = []
+            for name, tensor in iter_merged_vllm_weights(weight_export):
+                names.append(name)
+                dtype_names.append(str(tensor.dtype).removeprefix("torch."))
+                shapes.append(list(tensor.shape))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                send_future = executor.submit(_send_weights)
+                response = client.post(
+                    f"{spec.vllm_base_url}/update_weights",
+                    json={
+                        "update_info": {
+                            "names": names,
+                            "dtype_names": dtype_names,
+                            "shapes": shapes,
+                            "is_checkpoint_format": True,
+                        }
+                    },
+                    timeout=600.0,
+                )
+                response.raise_for_status()
+                send_future.result()
+            response = client.post(
+                f"{spec.vllm_base_url}/art/set_served_model_name",
+                json={"name": spec.served_model_name},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            torch.cuda.synchronize()
+        finally:
+            if pause_generation:
+                response = client.post(
+                    f"{spec.vllm_base_url}/resume",
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+    return merged_weight_transfer_group, merged_weight_transfer_init_info
+
+
 __all__ = [
     "MergedWeightExport",
     "build_art_conversion_tasks",
     "build_merged_weight_export",
+    "ensure_merged_weight_transfer_group",
     "iter_merged_vllm_weights",
+    "sync_merged_weights_to_vllm",
 ]

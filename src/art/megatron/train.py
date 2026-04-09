@@ -12,7 +12,6 @@ Public cross-repo API consumed by serverless-training:
 - merge_lora_adapter
 """
 
-from concurrent.futures import ThreadPoolExecutor
 import gc
 import importlib
 import json
@@ -53,8 +52,7 @@ from art.megatron.jobs import (
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
 from art.megatron.merged_weight_export import (
-    build_merged_weight_export,
-    iter_merged_vllm_weights,
+    sync_merged_weights_to_vllm,
 )
 from art.megatron.model_chunks import (
     ModelChunks,
@@ -1327,113 +1325,26 @@ def run_training_step(
     )
 
 
-def _ensure_merged_weight_transfer_group(
-    runtime: TrainingRuntime,
-    spec: MergedWeightTransferSpec,
-) -> None:
-    assert runtime.rank == 0
-    assert runtime.world_size == 1
-    if runtime.merged_weight_transfer_init_info == spec.init_info:
-        assert runtime.merged_weight_transfer_group is not None
-        return
-
-    import httpx
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-    def _remote_init() -> None:
-        response = httpx.post(
-            f"{spec.vllm_base_url}/init_weight_transfer_engine",
-            json={"init_info": spec.init_info.model_dump()},
-            timeout=300.0,
-        )
-        response.raise_for_status()
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        remote_future = executor.submit(_remote_init)
-        time.sleep(1.0)
-        runtime.merged_weight_transfer_group = NCCLWeightTransferEngine.trainer_init(
-            {
-                "master_address": spec.init_info.master_address,
-                "master_port": spec.init_info.master_port,
-                "world_size": spec.init_info.world_size,
-            }
-        )
-        remote_future.result()
-    runtime.merged_weight_transfer_init_info = spec.init_info
-
-
 def _sync_merged_weights_to_vllm(
     runtime: TrainingRuntime,
     spec: MergedWeightTransferSpec,
     *,
     pause_generation: bool,
 ) -> None:
-    assert runtime.rank == 0
-    assert runtime.world_size == 1
-
-    import httpx
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-    _ensure_merged_weight_transfer_group(runtime, spec)
-    weight_export = build_merged_weight_export(
+    (
+        runtime.merged_weight_transfer_group,
+        runtime.merged_weight_transfer_init_info,
+    ) = sync_merged_weights_to_vllm(
         bridge=runtime.bridge,
         model=runtime.model,
         model_support_handler=runtime.model_support_handler,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        merged_weight_transfer_group=runtime.merged_weight_transfer_group,
+        merged_weight_transfer_init_info=runtime.merged_weight_transfer_init_info,
+        spec=spec,
+        pause_generation=pause_generation,
     )
-
-    def _send_weights() -> None:
-        NCCLWeightTransferEngine.trainer_send_weights(
-            iter_merged_vllm_weights(weight_export),
-            {"group": runtime.merged_weight_transfer_group},
-        )
-
-    with httpx.Client() as client:
-        if pause_generation:
-            response = client.post(
-                f"{spec.vllm_base_url}/pause",
-                params={"mode": "wait"},
-                timeout=300.0,
-            )
-            response.raise_for_status()
-        try:
-            torch.cuda.synchronize()
-            names: list[str] = []
-            dtype_names: list[str] = []
-            shapes: list[list[int]] = []
-            for name, tensor in iter_merged_vllm_weights(weight_export):
-                names.append(name)
-                dtype_names.append(str(tensor.dtype).removeprefix("torch."))
-                shapes.append(list(tensor.shape))
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                send_future = executor.submit(_send_weights)
-                response = client.post(
-                    f"{spec.vllm_base_url}/update_weights",
-                    json={
-                        "update_info": {
-                            "names": names,
-                            "dtype_names": dtype_names,
-                            "shapes": shapes,
-                            "is_checkpoint_format": True,
-                        }
-                    },
-                    timeout=600.0,
-                )
-                response.raise_for_status()
-                send_future.result()
-            response = client.post(
-                f"{spec.vllm_base_url}/art/set_served_model_name",
-                json={"name": spec.served_model_name},
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            torch.cuda.synchronize()
-        finally:
-            if pause_generation:
-                response = client.post(
-                    f"{spec.vllm_base_url}/resume",
-                    timeout=30.0,
-                )
-                response.raise_for_status()
 
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:

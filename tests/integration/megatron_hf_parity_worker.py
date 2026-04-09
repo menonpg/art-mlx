@@ -7,8 +7,8 @@ from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 
-from art.loss import shift_tensor
 from art.megatron import train as megatron_train
 from art.megatron.merged_weight_export import build_art_conversion_tasks
 from art.megatron.provider import get_provider_bundle
@@ -66,21 +66,60 @@ def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
     return grads
 
 
+def _collect_hf_params(model: Any) -> dict[str, torch.Tensor]:
+    return {
+        name: param.detach().cpu().to(dtype=torch.float32).clone()
+        for name, param in model.named_parameters()
+    }
+
+
+def _tensor_map_deltas(
+    before: dict[str, torch.Tensor],
+    after: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    before_keys = set(before.keys())
+    after_keys = set(after.keys())
+    if before_keys != after_keys:
+        missing = sorted(before_keys - after_keys)
+        extra = sorted(after_keys - before_keys)
+        raise KeyError(
+            f"Tensor-map keys changed across optimizer step: missing={missing[:3]} extra={extra[:3]}"
+        )
+    return {
+        key: (after[key] - before[key]).detach().cpu().to(dtype=torch.float32)
+        for key in sorted(before_keys)
+    }
+
+
 def _run_hf_sft_step(
     *,
     base_model: str,
     num_layers: int,
     micro_inputs: list[dict[str, torch.Tensor]],
-    learning_rate: float,
+    optimizer_config: Any,
     device: torch.device,
 ) -> tuple[
     torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
 ]:
     model = _load_hf_model(base_model=base_model, num_layers=num_layers, device=device)
     model.zero_grad(set_to_none=True)
+    optimizer = torch.optim.Adam(
+        [param for param in model.parameters() if param.requires_grad],
+        lr=float(optimizer_config.lr),
+        betas=(float(optimizer_config.adam_beta1), float(optimizer_config.adam_beta2)),
+        eps=float(optimizer_config.adam_eps),
+        weight_decay=float(optimizer_config.weight_decay),
+    )
     loss_sum = torch.tensor(0.0, device=device)
     token_count = 0
     trainable_losses: list[torch.Tensor] = []
+    total_token_count = max(
+        sum(
+            int(megatron_train._count_sft_trainable_tokens(micro))
+            for micro in micro_inputs
+        ),
+        1,
+    )
     for micro in micro_inputs:
         attention_mask = micro["attention_mask"].reshape(-1)
         actual_len = max(int(attention_mask.sum().item()), 1)
@@ -92,7 +131,7 @@ def _run_hf_sft_step(
             attention_mask=hf_attention_mask,
             use_cache=False,
         ).logits
-        shifted_labels = shift_tensor(labels, -100)
+        shifted_labels = megatron_train.shift_tensor(labels, -100)
         per_token_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             shifted_labels.reshape(-1),
@@ -104,14 +143,18 @@ def _run_hf_sft_step(
         trainable_losses.append(masked_losses.detach().cpu())
         loss_sum = loss_sum + masked_losses.sum()
         token_count += int(mask.sum().item())
-        masked_losses.sum().backward()
+        (masked_losses.sum() / total_token_count).backward()
     grads = _collect_hf_grads(model)
-    deltas = {
-        key: (-learning_rate * value).detach().cpu().to(dtype=torch.float32)
-        for key, value in grads.items()
-    }
+    params_before = _collect_hf_params(model)
+    clip_grad = float(optimizer_config.clip_grad)
+    if clip_grad > 0:
+        clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+    optimizer.step()
+    params_after = _collect_hf_params(model)
+    deltas = _tensor_map_deltas(params_before, params_after)
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
+    del optimizer
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -141,7 +184,9 @@ def _build_megatron_runtime(
         provider_bundle=provider_bundle,
         provider=provider,
         model=model,
-        optimizer=None,
+        optimizer=megatron_train._build_optimizer(
+            model, _build_optimizer_config(request.case_config)
+        ),
         optimizer_config=_build_optimizer_config(request.case_config),
         rank=torch.distributed.get_rank(),  # ty: ignore[possibly-missing-attribute]
         world_size=torch.distributed.get_world_size(),  # ty: ignore[possibly-missing-attribute]
@@ -163,34 +208,32 @@ def _megatron_task_tensor(
         if hasattr(grad, "_local_tensor"):
             grad = cast(torch.Tensor, grad._local_tensor)
         return cast(torch.Tensor, grad)
-    if mode == "delta":
-        grad = _megatron_task_tensor(task, mode="grad")
-        return (-1.0 * grad).to(dtype=torch.float32)
-    return param.detach()
+    if mode == "param":
+        return param.detach()
+    raise ValueError(f"Unsupported task-tensor mode: {mode}")
 
 
 def _convert_megatron_tasks_to_hf(
     runtime: megatron_train.TrainingRuntime,
     *,
     mode: str,
-    learning_rate: float,
+    tasks: list[Any] | None = None,
 ) -> dict[str, torch.Tensor]:
-    tasks = [
-        task
-        for task in build_art_conversion_tasks(
-            bridge=runtime.bridge,
-            model=runtime.model,
-        )
-        if isinstance(task.param_weight, torch.nn.Parameter)
-    ]
+    if tasks is None:
+        tasks = [
+            task
+            for task in build_art_conversion_tasks(
+                bridge=runtime.bridge,
+                model=runtime.model,
+            )
+            if isinstance(task.param_weight, torch.nn.Parameter)
+        ]
     model_bridge = runtime.bridge._model_bridge
     hf_state_dict = runtime.bridge.hf_pretrained.state
     grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
     converted: dict[str, torch.Tensor] = {}
     for task in tasks:
-        tensor = _megatron_task_tensor(task, mode="grad" if mode == "delta" else mode)
-        if mode == "delta":
-            tensor = tensor * (-learning_rate)
+        tensor = _megatron_task_tensor(task, mode=mode)
         converted_weights_dict = task.mapping.megatron_to_hf(
             tensor,
             task.megatron_module,
@@ -228,6 +271,16 @@ def _run_megatron_sft_step(
     torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
 ]:
     runtime = _build_megatron_runtime(request)
+    assert runtime.optimizer is not None
+    megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
+    tasks = [
+        task
+        for task in build_art_conversion_tasks(
+            bridge=runtime.bridge,
+            model=runtime.model,
+        )
+        if isinstance(task.param_weight, torch.nn.Parameter)
+    ]
     for chunk in runtime.model:
         if hasattr(chunk, "zero_grad_buffer"):
             chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
@@ -255,16 +308,32 @@ def _run_megatron_sft_step(
         loss_sum = loss_sum + masked_losses.sum()
         token_count += int(mask.sum().item())
         masked_losses.sum().backward()
+    num_tokens = megatron_train._local_trainable_sft_token_count_tensor(
+        micro_inputs,
+        device=device,
+    )
+    megatron_train._flush_param_grads_to_main_grads(runtime.model)
+    megatron_train.finalize_model_grads_extended(
+        megatron_train.as_megatron_api_chunks(runtime.model),
+        num_tokens=num_tokens,
+    )
     grads = _convert_megatron_tasks_to_hf(
         runtime,
         mode="grad",
-        learning_rate=request.case_config.learning_rate,
+        tasks=tasks,
     )
-    deltas = _convert_megatron_tasks_to_hf(
+    params_before = _convert_megatron_tasks_to_hf(
         runtime,
-        mode="delta",
-        learning_rate=request.case_config.learning_rate,
+        mode="param",
+        tasks=tasks,
     )
+    megatron_train._optimizer_step(runtime.optimizer, request.case_config.learning_rate)
+    params_after = _convert_megatron_tasks_to_hf(
+        runtime,
+        mode="param",
+        tasks=tasks,
+    )
+    deltas = _tensor_map_deltas(params_before, params_after)
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
     return output_vector, scalar_loss, grads, deltas
@@ -306,11 +375,12 @@ def _worker_run(request: HfParityRunRequest) -> None:
     )
     device = torch.device("cuda", 0)
     try:
+        optimizer_config = _build_optimizer_config(request.case_config)
         hf_outputs, hf_loss, hf_grads, hf_deltas = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
             micro_inputs=micro_inputs,
-            learning_rate=request.case_config.learning_rate,
+            optimizer_config=optimizer_config,
             device=device,
         )
         megatron_outputs, megatron_loss, megatron_grads, megatron_deltas = (
