@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from art.loss import shift_tensor
 from art.megatron import train as megatron_train
+from art.megatron.merged_weight_export import build_art_conversion_tasks
 from art.megatron.provider import get_provider_bundle
 from art.preprocessing.pack import packed_tensors_from_dir
 
@@ -30,6 +31,7 @@ from .megatron_oracle_worker import (
     _configure_provider,
     _set_deterministic_seed,
 )
+from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 
 def _load_hf_model(
@@ -175,7 +177,10 @@ def _convert_megatron_tasks_to_hf(
 ) -> dict[str, torch.Tensor]:
     tasks = [
         task
-        for task in megatron_train._build_art_conversion_tasks(runtime)
+        for task in build_art_conversion_tasks(
+            bridge=runtime.bridge,
+            model=runtime.model,
+        )
         if isinstance(task.param_weight, torch.nn.Parameter)
     ]
     model_bridge = runtime.bridge._model_bridge
@@ -286,8 +291,8 @@ def _worker_run(request: HfParityRunRequest) -> None:
     packed_tensors = packed_tensors_from_dir(
         **request.packed_tensors.model_dump(exclude_none=True)
     )
-    trajectory_tensors = (
-        megatron_train.build_sft_trajectory_tensors_from_packed_tensors(packed_tensors)
+    trajectory_tensors = build_sft_trajectory_tensors_from_packed_tensors(
+        packed_tensors
     )
     zero_template = megatron_train._zero_contribution_sft_inputs(trajectory_tensors[0])
     sample_indices = build_parity_sample_indices(

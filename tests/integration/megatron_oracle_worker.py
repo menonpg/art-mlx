@@ -35,6 +35,7 @@ from .megatron_oracle_harness import (
     _require_not_none,
     _write_json,
 )
+from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 
 def run_worker_subprocess(
@@ -819,10 +820,8 @@ def _worker_run(request: WorkerRunRequest) -> None:
         template = megatron_train.select_indexed_inputs(packed_tensors, 0)
         rl_zero_template = megatron_train._zero_contribution_inputs(template)
     else:
-        sft_trajectory_tensors = (
-            megatron_train.build_sft_trajectory_tensors_from_packed_tensors(
-                packed_tensors
-            )
+        sft_trajectory_tensors = build_sft_trajectory_tensors_from_packed_tensors(
+            packed_tensors
         )
         sft_zero_template = megatron_train._zero_contribution_sft_inputs(
             sft_trajectory_tensors[0]

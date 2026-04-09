@@ -52,6 +52,10 @@ from art.megatron.jobs import (
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.merged_weight_export import (
+    build_merged_weight_export,
+    iter_merged_vllm_weights,
+)
 from art.megatron.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
@@ -62,10 +66,6 @@ from art.megatron.offload import (
     OffloadState,
     offload_to_cpu,
     reload_to_gpu,
-)
-from art.megatron.param_name_canonicalization import (
-    canonical_art_param_name,
-    is_art_adapter_param_name,
 )
 from art.megatron.provider import get_provider_bundle
 from art.megatron.provider_common import ProviderBundle
@@ -141,16 +141,6 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
-
-
-class MergedWeightExport(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    bridge: Any
-    model: ModelChunks
-    model_config_value: Any
-    conversion_tasks: list[Any]
-    adapter_weights_by_base: dict[str, list[Any]]
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -939,24 +929,6 @@ def _clone_sft_tensors(
 
 
 @torch.no_grad()
-def build_sft_trajectory_tensors_from_packed_tensors(
-    packed_tensors: PackedTensors,
-) -> list[dict[str, torch.Tensor]]:
-    tokens = packed_tensors["tokens"]
-    assistant_mask = packed_tensors["assistant_mask"]
-    labels = torch.where(assistant_mask, tokens, torch.full_like(tokens, -100))
-    attention_mask = torch.ones_like(tokens, dtype=torch.long)
-    return [
-        {
-            "input_ids": tokens[index].detach().clone(),
-            "attention_mask": attention_mask[index].detach().clone(),
-            "labels": labels[index].detach().clone(),
-        }
-        for index in range(int(tokens.shape[0]))
-    ]
-
-
-@torch.no_grad()
 def _zero_contribution_sft_inputs(
     template: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -1355,126 +1327,6 @@ def run_training_step(
     )
 
 
-def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
-    if getattr(mapping, "allow_hf_name_mismatch", False):
-        return True
-    hf_param = mapping.hf_param
-    if isinstance(hf_param, str):
-        return hf_param in hf_keys
-    if isinstance(hf_param, dict):
-        return all(param in hf_keys for param in hf_param.values())
-    return False
-
-
-def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
-    from itertools import chain
-
-    from megatron.bridge.models.conversion.model_bridge import (
-        WeightConversionTask,
-        _megatron_local_name_to_global,
-    )
-    from megatron.bridge.models.conversion.utils import (
-        get_module_and_param_from_name,
-        persistent_buffers,
-    )
-
-    bridge = runtime.bridge
-    mapping_registry = bridge._model_bridge.mapping_registry()
-    hf_source = bridge.hf_pretrained.state.source
-    hf_keys = set(hf_source.get_all_keys())
-    megatron_models = as_megatron_api_chunks(runtime.model)
-    model_config = cast(Any, runtime.model[0].config)
-    tasks: list[Any] = []
-    for vp_stage, model in enumerate(runtime.model):
-        for local_name, _ in chain(model.named_parameters(), persistent_buffers(model)):
-            if "_extra_state" in local_name or is_art_adapter_param_name(local_name):
-                continue
-            global_name = _megatron_local_name_to_global(
-                megatron_models,
-                model_config,
-                canonical_art_param_name(local_name),
-                vp_stage,
-            )
-            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-            if mapping is None or not _mapping_hf_weights_exist(mapping, hf_keys):
-                continue
-            module_and_param = cast(
-                tuple[Any, torch.Tensor],
-                get_module_and_param_from_name(
-                    megatron_models,
-                    local_name,
-                    vp_stage,
-                ),
-            )
-            local_module, local_weights = module_and_param
-            if local_module is not None and not hasattr(local_module, "config"):
-                setattr(local_module, "config", model_config)
-            tasks.append(
-                WeightConversionTask(
-                    pp_rank=0,
-                    vp_stage=vp_stage,
-                    param_name=local_name,
-                    global_param_name=global_name,
-                    megatron_module=local_module,
-                    param_weight=local_weights,
-                    mapping=mapping,
-                )
-            )
-    return tasks
-
-
-def _build_merged_weight_export(runtime: TrainingRuntime) -> MergedWeightExport:
-    return MergedWeightExport(
-        bridge=runtime.bridge,
-        model=runtime.model,
-        model_config_value=runtime.model[0].config,
-        conversion_tasks=_build_art_conversion_tasks(runtime),
-        adapter_weights_by_base=runtime.model_support_handler.build_adapter_weights_by_base(
-            runtime.model
-        ),
-    )
-
-
-def _iter_merged_vllm_weights(weight_export: MergedWeightExport) -> Any:
-    bridge = weight_export.bridge
-    model_bridge = bridge._model_bridge
-    hf_state_dict = bridge.hf_pretrained.state
-    grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
-    for task in weight_export.conversion_tasks:
-        converted_weights_dict = task.mapping.megatron_to_hf(
-            task.param_weight,
-            task.megatron_module,
-        )
-        adapter_weights = weight_export.adapter_weights_by_base.get(
-            task.global_param_name
-        )
-        if adapter_weights is not None:
-            converted_weights_dict = model_bridge._merge_lora_adapter_weights(
-                weight_export.model,
-                converted_weights_dict,
-                adapter_weights,
-            )
-        if getattr(task.mapping, "is_grouped_export", False):
-            merged_result = model_bridge._accumulate_grouped_export(
-                task,
-                converted_weights_dict,
-                weight_export.model_config_value,
-                grouped_buffers,
-                hf_state_dict,
-            )
-            if merged_result is None:
-                continue
-            converted_weights_dict = merged_result
-        else:
-            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
-                task,
-                converted_weights_dict,
-                hf_state_dict,
-            )
-        for hf_name, tensor in converted_weights_dict.items():
-            yield hf_name, tensor
-
-
 def _ensure_merged_weight_transfer_group(
     runtime: TrainingRuntime,
     spec: MergedWeightTransferSpec,
@@ -1523,11 +1375,15 @@ def _sync_merged_weights_to_vllm(
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
     _ensure_merged_weight_transfer_group(runtime, spec)
-    weight_export = _build_merged_weight_export(runtime)
+    weight_export = build_merged_weight_export(
+        bridge=runtime.bridge,
+        model=runtime.model,
+        model_support_handler=runtime.model_support_handler,
+    )
 
     def _send_weights() -> None:
         NCCLWeightTransferEngine.trainer_send_weights(
-            _iter_merged_vllm_weights(weight_export),
+            iter_merged_vllm_weights(weight_export),
             {"group": runtime.merged_weight_transfer_group},
         )
 
@@ -1544,7 +1400,7 @@ def _sync_merged_weights_to_vllm(
             names: list[str] = []
             dtype_names: list[str] = []
             shapes: list[list[int]] = []
-            for name, tensor in _iter_merged_vllm_weights(weight_export):
+            for name, tensor in iter_merged_vllm_weights(weight_export):
                 names.append(name)
                 dtype_names.append(str(tensor.dtype).removeprefix("torch."))
                 shapes.append(list(tensor.shape))
