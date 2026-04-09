@@ -1,9 +1,11 @@
 import torch
 
 from .megatron_oracle_harness import (
+    ORACLE_TOPOLOGY,
     DiffAccumulator,
     MetricThresholdRule,
     _default_phase_pass_fns,
+    _suite_variants,
 )
 
 
@@ -46,3 +48,11 @@ def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas()
     assert not phase_pass["grads"](zero_signal_summary)
     assert not phase_pass["deltas"](zero_signal_summary)
     assert phase_pass["losses"](zero_signal_summary)
+
+
+def test_suite_variants_skip_duplicate_oracle_replay_variant() -> None:
+    variants = _suite_variants("rl")
+
+    assert variants
+    assert all(variant.topology != ORACLE_TOPOLOGY for variant in variants)
+    assert all("oracle_replay" not in variant.name for variant in variants)

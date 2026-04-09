@@ -21,7 +21,6 @@ from .megatron_forward_trace import ForwardTraceCapture
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_correctness")
 ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
-ORACLE_REPLAY_TOPOLOGY_SUFFIX = "oracle_replay"
 
 REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 EXTENDED_TOPOLOGIES_ENV = "ART_ENABLE_EXTENDED_TOPOLOGIES"
@@ -984,7 +983,7 @@ class VariantRunner:
         return topology_dir
 
     def ensure_oracle(self) -> Path:
-        """Ensures oracle capture and canonical replay artifacts exist exactly once per session."""
+        """Ensures routing capture and the canonical replay-backed oracle exist once."""
         regenerate = regenerate_requested()
         if self._oracle_initialized and (not regenerate or self._oracle_regenerated):
             return self.oracle_dir
@@ -1535,20 +1534,7 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
 def _suite_variants(objective: OracleObjective) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
-    variants = [
-        VariantSpec(
-            name=f"{objective}_oracle_replay_parity",
-            objective=objective,
-            topology=ORACLE_TOPOLOGY,
-            output_slug=oracle_output_slug(
-                objective,
-                ORACLE_TOPOLOGY,
-                ORACLE_REPLAY_TOPOLOGY_SUFFIX,
-            ),
-            pass_fn_by_phase=phase_pass,
-            force_regenerate=regenerate_requested(),
-        )
-    ]
+    variants: list[VariantSpec] = []
     for topology in TOPOLOGIES[1:] + (
         EXTENDED_TOPOLOGIES if extended_topologies_enabled() else []
     ):
@@ -1567,7 +1553,7 @@ def run_suite(
     *,
     case_config: OracleCaseConfig,
 ) -> list[VariantReport]:
-    """Runs replay parity and topology variants with fail-fast assertions."""
+    """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
     for objective in selected_oracle_objectives():
         runner = VariantRunner(objective=objective, case_config=case_config)
