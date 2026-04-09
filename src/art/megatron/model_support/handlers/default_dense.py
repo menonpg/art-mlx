@@ -50,8 +50,52 @@ class DefaultDenseHandler:
                     alpha=alpha,
                 )
 
-    def build_adapter_weights(self, model_chunks: Sequence[Any]) -> dict[str, Any]:
-        return {}
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.adapter_export import (
+            add_dense_mlp_adapter_weights,
+            add_grouped_moe_adapter_weights,
+            add_shared_experts_adapter_weights,
+            add_standard_self_attention_adapter_weights,
+            layer_base_prefix,
+        )
+
+        adapter_weights_by_base: dict[str, list[Any]] = {}
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                layer_prefix = layer_base_prefix(module)
+                add_standard_self_attention_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    self_attention=module.self_attention,
+                )
+                experts = getattr(module.mlp, "experts", None)
+                if experts is not None:
+                    add_grouped_moe_adapter_weights(
+                        adapter_weights_by_base,
+                        layer_prefix=layer_prefix,
+                        experts=experts,
+                    )
+                else:
+                    add_dense_mlp_adapter_weights(
+                        adapter_weights_by_base,
+                        layer_prefix=layer_prefix,
+                        mlp=module.mlp,
+                    )
+                shared_experts = getattr(module.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    add_shared_experts_adapter_weights(
+                        adapter_weights_by_base,
+                        layer_prefix=layer_prefix,
+                        shared_experts=shared_experts,
+                    )
+        return adapter_weights_by_base
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
         return kwargs

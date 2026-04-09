@@ -17,7 +17,6 @@ from art.megatron.model_support.spec import (
     ModelSupportSpec,
     NativeVllmLoraStatus,
     RolloutWeightsMode,
-    ValidationManifest,
 )
 
 __all__ = [
@@ -30,7 +29,6 @@ __all__ = [
     "QWEN3_5_MOE_MODELS",
     "QWEN3_5_MOE_SPEC",
     "RolloutWeightsMode",
-    "ValidationManifest",
     "default_target_modules_for_model",
     "get_model_support_handler",
     "get_model_support_handler_for_spec",

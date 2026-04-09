@@ -241,3 +241,67 @@ def test_apply_lora_adapters_accepts_layernorm_column_fc1_dense_path() -> None:
 
         assert isinstance(target_layer.mlp.linear_fc1, SharedExpertsLinearFC1LoRA)
         assert isinstance(target_layer.mlp.linear_fc2, SharedExpertsLinearFC2LoRA)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="No CUDA available in this environment",
+)
+def test_qwen35_handler_builds_canonical_adapter_weights_by_base() -> None:
+    with _single_rank_model_parallel():
+        provider = _make_qwen35_provider()
+        model = provider.provide_language_model(pre_process=True, post_process=True)
+        apply_lora_adapters([model], provider)
+
+        adapter_weights_by_base = QWEN3_5_MOE_HANDLER.build_adapter_weights_by_base(
+            [model]
+        )
+
+        qkv_key = next(
+            key
+            for key in adapter_weights_by_base
+            if key.endswith(".self_attention.linear_qkv.weight")
+        )
+        qkv_weights = adapter_weights_by_base[qkv_key]
+        assert len(qkv_weights) == 3
+        assert {weight.adapter_key for weight in qkv_weights} == {
+            "adapter_q",
+            "adapter_k",
+            "adapter_v",
+        }
+
+        gdn_key = next(
+            key
+            for key in adapter_weights_by_base
+            if key.endswith(".self_attention.in_proj.weight")
+        )
+        gdn_weights = adapter_weights_by_base[gdn_key]
+        assert len(gdn_weights) == 1
+        assert gdn_weights[0].adapter_key is None
+
+        shared_fc1_key = next(
+            key
+            for key in adapter_weights_by_base
+            if key.endswith(".mlp.shared_experts.linear_fc1.weight")
+        )
+        shared_fc1_weights = adapter_weights_by_base[shared_fc1_key]
+        assert len(shared_fc1_weights) == 2
+        assert {weight.adapter_key for weight in shared_fc1_weights} == {
+            "adapter_gate",
+            "adapter_up",
+        }
+
+        grouped_fc1_keys = [
+            key
+            for key in adapter_weights_by_base
+            if ".mlp.experts.linear_fc1.weight" in key
+        ]
+        grouped_fc2_keys = [
+            key
+            for key in adapter_weights_by_base
+            if ".mlp.experts.linear_fc2.weight" in key
+        ]
+        assert grouped_fc1_keys
+        assert grouped_fc2_keys
+        assert all(len(adapter_weights_by_base[key]) == 1 for key in grouped_fc1_keys)
+        assert all(len(adapter_weights_by_base[key]) == 1 for key in grouped_fc2_keys)

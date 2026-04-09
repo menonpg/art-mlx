@@ -12,16 +12,6 @@ class DependencyFloor(BaseModel):
     megatron_bridge: str | None = None
 
 
-class ValidationManifest(BaseModel):
-    require_hf_parity: bool = True
-    require_oracle_correctness: bool = True
-    require_non_zero_forwards: bool = True
-    require_non_zero_grads: bool = True
-    require_non_zero_deltas: bool = True
-    require_chat_template_validation: bool = True
-    require_yes_no_trainability: bool = True
-
-
 class LayerFamilyInstance(BaseModel):
     key: str
     count: int = 1
@@ -35,7 +25,6 @@ class ModelSupportSpec(BaseModel):
     default_rollout_weights_mode: RolloutWeightsMode = "lora"
     native_vllm_lora_status: NativeVllmLoraStatus = "disabled"
     dependency_floor: DependencyFloor = Field(default_factory=DependencyFloor)
-    validation: ValidationManifest = Field(default_factory=ValidationManifest)
 
 
 class ModelSupportHandler(Protocol):
@@ -55,6 +44,9 @@ class ModelSupportHandler(Protocol):
         alpha: int,
     ) -> None: ...
 
-    def build_adapter_weights(self, model_chunks: Sequence[Any]) -> dict[str, Any]: ...
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]: ...
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]: ...
