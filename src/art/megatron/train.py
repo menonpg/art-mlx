@@ -57,7 +57,8 @@ from art.megatron.offload import (
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import get_provider
+from art.megatron.provider import get_provider_bundle
+from art.megatron.provider_common import ProviderBundle
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
@@ -91,6 +92,7 @@ __all__ = [
 class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    provider_bundle: ProviderBundle
     provider: Any
     model: ModelChunks
     optimizer: Any | None
@@ -104,6 +106,18 @@ class TrainingRuntime(BaseModel):
     def _validate_model(cls, value: ModelChunks) -> ModelChunks:
         validate_model_chunks(value)
         return value
+
+    @property
+    def bridge(self) -> Any:
+        return self.provider_bundle.bridge
+
+    @property
+    def model_support_handler(self) -> Any:
+        return self.provider_bundle.handler
+
+    @property
+    def model_support_spec(self) -> Any:
+        return self.provider_bundle.spec
 
 
 class TrainStepResult(BaseModel):
@@ -283,11 +297,12 @@ def build_training_runtime(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     _install_fast_frozen_output_backward()
-    provider = get_provider(
+    provider_bundle = get_provider_bundle(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
     )
+    provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
     provider.register_pre_wrap_hook(freeze_model)
@@ -341,6 +356,7 @@ def build_training_runtime(
         print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
 
     runtime = TrainingRuntime(
+        provider_bundle=provider_bundle,
         provider=provider,
         model=model,
         optimizer=optimizer,

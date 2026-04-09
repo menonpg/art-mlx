@@ -1,11 +1,7 @@
 """Validation functions for model configuration."""
 
+from ..megatron.model_support import QWEN3_5_MOE_MODELS
 from .model import InternalModelConfig, RolloutWeightsMode
-
-QWEN3_5_MOE_MODELS = {
-    "Qwen/Qwen3.5-35B-A3B",
-    "Qwen/Qwen3.5-397B-A17B",
-}
 
 
 def is_dedicated_mode(config: InternalModelConfig) -> bool:

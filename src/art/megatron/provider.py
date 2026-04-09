@@ -21,6 +21,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
+from art.megatron.model_support import (
+    get_model_support_handler,
+    get_model_support_spec,
+)
+from art.megatron.provider_common import ProviderBundle
 
 
 def _resolve_layer_spec(
@@ -231,11 +236,13 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
             provider.recompute_granularity = None
 
 
-def get_provider(
+def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
-) -> GPTModelProvider:
+) -> ProviderBundle:
+    spec = get_model_support_spec(model)
+    handler = get_model_support_handler(model)
     bridge = AutoBridge.from_hf_pretrained(
         model,
         dtype=torch_dtype,
@@ -286,5 +293,19 @@ def get_provider(
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
+    handler.patch_provider(provider, bridge)
     provider.finalize()
-    return provider
+    return ProviderBundle(
+        provider=provider,
+        bridge=bridge,
+        handler=handler,
+        spec=spec,
+    )
+
+
+def get_provider(
+    model: str,
+    *,
+    torch_dtype: torch.dtype = torch.bfloat16,
+) -> GPTModelProvider:
+    return get_provider_bundle(model, torch_dtype=torch_dtype).provider

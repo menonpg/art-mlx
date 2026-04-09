@@ -1,31 +1,11 @@
+from ..megatron.model_support import default_target_modules_for_model
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
-from .validate import QWEN3_5_MOE_MODELS, is_dedicated_mode
+from .validate import is_dedicated_mode
 
 
 def default_target_modules(base_model: str) -> list[str]:
-    if base_model in QWEN3_5_MOE_MODELS:
-        return [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "in_proj_qkv",
-            "in_proj_z",
-            "out_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
-    return [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
+    return default_target_modules_for_model(base_model)
 
 
 def get_model_config(
