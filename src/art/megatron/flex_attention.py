@@ -29,9 +29,8 @@ class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
     # Torchtitan inductor options for compiling flex attention.
-    _compile_options = {
+    _compile_options: dict[str, Any] = {
         "max_autotune": True,
-        "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     }
     # Skip Inductor's flex_decoding specialization: it has triggered both
@@ -72,14 +71,11 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-_compiled_create_block_mask = torch.compile(create_block_mask)
-
-
 def create_shared_prefix_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> SharedPrefixAttentionState:
-    """Build a compiled block mask for ART shared-prefix packing.
+    """Build a block mask for ART shared-prefix packing.
 
     Initialized on the device of the group_ids tensor.
 
@@ -102,7 +98,15 @@ def create_shared_prefix_attention_state(
         parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
 
-    block_mask = _compiled_create_block_mask(
+    # NOTE: build the BlockMask eagerly, NOT through torch.compile.
+    # `_shared_prefix_mask` is a fresh closure on every call that captures
+    # different `group_ids` / `parent_ids` tensors from the enclosing scope.
+    # torch.compile's cache can reuse a compiled BlockMask built against stale
+    # closure captures, producing a mask whose block structure mismatches the
+    # forward — the compiled flex_attention backward then computes gradients
+    # over the wrong regions and produces astronomical-but-finite grads on a
+    # subset of micro-batches. Keep this call eager.
+    block_mask = create_block_mask(
         _shared_prefix_mask,
         group_ids.shape[0],
         None,
