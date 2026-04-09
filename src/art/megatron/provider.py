@@ -1,6 +1,4 @@
-import copy
 from functools import partial
-import inspect
 import os
 from pathlib import Path
 from typing import Callable, Literal, cast
@@ -17,7 +15,6 @@ from megatron.bridge.training.flex_dispatcher_backend import (
     apply_flex_dispatcher_backend,
 )
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.spec_utils import ModuleSpec
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
@@ -25,22 +22,14 @@ from art.megatron.model_support import (
     get_model_support_handler,
     get_model_support_spec,
 )
-from art.megatron.provider_common import ProviderBundle
-
-
-def _resolve_layer_spec(
-    base_layer_spec: ModuleSpec | Callable[[GPTModelProvider], ModuleSpec],
-    config: GPTModelProvider,
-    vp_stage: int | None = None,
-) -> ModuleSpec:
-    if isinstance(base_layer_spec, ModuleSpec):
-        return copy.deepcopy(base_layer_spec)
-    kwargs = (
-        {"vp_stage": vp_stage}
-        if vp_stage in inspect.signature(base_layer_spec).parameters
-        else {}
-    )
-    return base_layer_spec(config, **kwargs)
+from art.megatron.model_support.handlers.qwen3_5_moe import (
+    supported_qwen_moe_bridge_types,
+)
+from art.megatron.provider_common import (
+    ProviderBundle,
+    patch_layer_spec_tree,
+    resolve_layer_spec,
+)
 
 
 class _CastingStateSource(StateSource):
@@ -248,8 +237,8 @@ def get_provider_bundle(
         dtype=torch_dtype,
         trust_remote_code=True,
     )
-    assert isinstance(bridge._model_bridge, Qwen3MoEBridge), (
-        "Only Qwen3 MoE models are supported"
+    assert isinstance(bridge._model_bridge, supported_qwen_moe_bridge_types()), (
+        "Only Qwen3 and Qwen3.5 MoE models are supported"
     )
     if torch_dtype != torch.bfloat16:
         model_name_or_path = bridge.hf_pretrained.model_name_or_path
@@ -261,16 +250,14 @@ def get_provider_bundle(
             )
         )
     provider = bridge.to_megatron_provider()
+    handler.patch_provider(provider, bridge)
     base_layer_spec = provider.transformer_layer_spec
 
     def _flex_attention_layer_spec(
         config: GPTModelProvider, vp_stage: int | None = None
-    ) -> ModuleSpec:
-        layer_spec = _resolve_layer_spec(base_layer_spec, config, vp_stage)
-        # Keep Megatron's standard layer stack and replace only core attention.
-        layer_spec.submodules.self_attention.submodules.core_attention = (  # ty: ignore[unresolved-attribute]
-            FlexDotProductAttention
-        )
+    ) -> object:
+        layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
+        patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
         return layer_spec
 
     provider.transformer_layer_spec = _flex_attention_layer_spec
