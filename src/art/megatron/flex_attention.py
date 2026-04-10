@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
     BlockMask,
+    FlexKernelOptions,
     create_block_mask,
     flex_attention,
 )
@@ -38,7 +39,7 @@ class FlexAttentionWrapper(torch.nn.Module):
     # failures (create_flex_decoding_kernel). The regular flex_attention
     # kernel autotunes against the actual hardware smem budget, so this
     # stays GPU-agnostic.
-    _kernel_options = {
+    _kernel_options: FlexKernelOptions = {
         "FORCE_USE_FLEX_ATTENTION": True,
     }
     _compiled_flex_attention: ClassVar = torch.compile(
