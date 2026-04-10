@@ -37,7 +37,6 @@ from .megatron_oracle_worker import (
 from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
-HF_PARITY_DISABLE_COMPILED_FLEX_ENV = "ART_MEGATRON_DISABLE_COMPILED_FLEX_ATTENTION"
 
 
 def _debug(message: str) -> None:
@@ -213,7 +212,6 @@ def _run_hf_sft_step(
 def _build_megatron_runtime(
     request: HfParityRunRequest,
 ) -> megatron_train.TrainingRuntime:
-    os.environ.setdefault(HF_PARITY_DISABLE_COMPILED_FLEX_ENV, "1")
     _debug("building Megatron provider bundle")
     provider_bundle = get_provider_bundle(
         request.case_config.base_model,
