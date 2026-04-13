@@ -1434,6 +1434,15 @@ class LocalBackend(Backend):
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)
 
+        # Also overwrite the initial empty checkpoint at step 0 so vLLM
+        # loads the forked weights on startup (it uses @0 by default)
+        step0_dir = get_step_checkpoint_dir(dest_model_dir, 0)
+        if os.path.exists(step0_dir) and step0_dir != dest_checkpoint_dir:
+            if verbose:
+                print(f"Overwriting initial checkpoint at {step0_dir} with forked weights")
+            shutil.rmtree(step0_dir)
+            shutil.copytree(dest_checkpoint_dir, step0_dir)
+
         if verbose:
             print(
                 f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"
