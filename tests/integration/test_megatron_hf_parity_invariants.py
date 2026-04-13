@@ -21,6 +21,7 @@ from .megatron_hf_parity_worker import (
     _filter_language_only_tensor_map,
     _is_language_hf_param_name,
     _mapping_supports_derivative_parity,
+    _normalize_hf_grads_for_bridge,
     _normalize_hf_tensor_map_for_bridge,
 )
 from .megatron_oracle_harness import DiskPackedTensorsSpec, OracleCaseConfig
@@ -220,6 +221,25 @@ def test_language_hf_param_filter_keeps_text_and_drops_visual() -> None:
         filtered["model.layers.0.self_attn.q_proj.weight"],
         torch.ones(1),
     )
+
+
+def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
+    normalized = _normalize_hf_grads_for_bridge(
+        {
+            "model.layers.0.input_layernorm.weight": torch.ones(1),
+            "lm_head.weight": torch.ones(1),
+            "model.visual.blocks.0.attn.qkv.weight": torch.ones(1),
+        },
+        expected_grad_keys={
+            "model.language_model.layers.0.input_layernorm.weight",
+            "lm_head.weight",
+        },
+    )
+
+    assert set(normalized) == {
+        "model.language_model.layers.0.input_layernorm.weight",
+        "lm_head.weight",
+    }
 
 
 def test_build_megatron_runtime_uses_single_gpu_parity_provider_bundle(

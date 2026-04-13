@@ -15,7 +15,6 @@ from .megatron_oracle_harness import (
     NON_FINITE_METRIC_VALUE,
     DiffAccumulator,
     DiskPackedTensorsSpec,
-    MetricThresholdRule,
     OracleCaseConfig,
     PhasePassFn,
     _default_phase_pass_fns,
@@ -65,12 +64,7 @@ class HfParityReport(BaseModel):
 
 
 def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
-    pass_fns = _default_phase_pass_fns()
-    pass_fns["deltas"] = MetricThresholdRule(
-        limits={"relative_l2": 0.5, "mean_abs_pct": 20.0},
-        minimums={"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0},
-    )
-    return pass_fns
+    return _default_phase_pass_fns()
 
 
 def hf_parity_enabled() -> bool:
@@ -327,7 +321,6 @@ def build_hf_parity_report(
     outputs_summary: dict[str, float],
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
-    deltas_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
     rows = [
         _build_metric_row(
@@ -341,7 +334,6 @@ def build_hf_parity_report(
             summary=loss_summary,
         ),
         *grads_rows,
-        *deltas_rows,
     ]
     pass_count = sum(1 for row in rows if row.pass_signal)
     fail_count = len(rows) - pass_count

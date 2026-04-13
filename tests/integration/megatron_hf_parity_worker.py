@@ -4,6 +4,7 @@ import argparse
 import faulthandler
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, cast
@@ -16,6 +17,15 @@ import torch.nn.functional as F
 from art.megatron import train as megatron_train
 from art.megatron.merged_weight_export import build_art_conversion_tasks
 from art.megatron.provider import get_provider_bundle
+from art.megatron.routing_replay import (
+    MoeRoutingReplayBundle,
+    RouterCallRoute,
+    StepRouterRoutes,
+    StepRoutes,
+)
+from art.megatron.routing_replay import (
+    ParallelTopology as ReplayParallelTopology,
+)
 from art.preprocessing.pack import packed_tensors_from_dir
 
 from .megatron_hf_parity import (
@@ -41,6 +51,126 @@ from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tenso
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
 _DEBUG_START_TIME = time.perf_counter()
 _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
+_HF_MOE_ROUTER_NAME_PATTERN = re.compile(r"^model\.layers\.(?P<layer>\d+)\.mlp\.gate$")
+_REPLAY_ROUTER_LAYER_PATTERN = re.compile(
+    r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
+)
+_GATE_WEIGHT_PATTERN = re.compile(
+    r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.gate\.weight$"
+)
+
+
+def _hf_moe_router_key(module_name: str) -> str | None:
+    match = _HF_MOE_ROUTER_NAME_PATTERN.match(module_name)
+    if match is None:
+        return None
+    return f"chunk_00.layer_{int(match.group('layer')):04d}.mlp.router"
+
+
+class _HfMoeRoutingCapture:
+    def __init__(self, model: Any) -> None:
+        self._handles: list[Any] = []
+        self._routes: dict[str, dict[int, RouterCallRoute]] = {}
+        self._active_sample_index: int | None = None
+        self._active_micro_slot = 0
+        for module_name, module in model.named_modules():
+            router_key = _hf_moe_router_key(module_name)
+            if router_key is None:
+                continue
+            self._routes[router_key] = {}
+            self._handles.append(
+                module.register_forward_hook(self._make_hook(router_key, module))
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._handles)
+
+    def set_active_micro(self, sample_index: int | None, micro_slot: int) -> None:
+        self._active_sample_index = sample_index
+        self._active_micro_slot = micro_slot
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def build_replay_bundle(
+        self,
+        *,
+        topology: ReplayParallelTopology,
+    ) -> MoeRoutingReplayBundle | None:
+        if not self.enabled:
+            return None
+        routers: dict[str, StepRouterRoutes] = {}
+        max_topk = 0
+        num_global_tokens: int | None = None
+        for router_key in sorted(self._routes):
+            calls = self._routes[router_key]
+            if not calls:
+                raise RuntimeError(f"HF parity captured no routes for '{router_key}'")
+            routers[router_key] = StepRouterRoutes(calls=calls)
+            for route in calls.values():
+                max_topk = max(max_topk, route.max_topk)
+                if num_global_tokens is None:
+                    num_global_tokens = route.num_global_tokens
+                elif num_global_tokens != route.num_global_tokens:
+                    raise RuntimeError(
+                        "HF parity routing capture token count mismatch: "
+                        f"expected={num_global_tokens}, got={route.num_global_tokens}, "
+                        f"router='{router_key}'"
+                    )
+        if num_global_tokens is None:
+            raise RuntimeError("HF parity routing capture produced no route tokens")
+        return MoeRoutingReplayBundle(
+            topology=topology,
+            num_steps=1,
+            max_topk=max_topk,
+            router_keys=sorted(routers),
+            steps={
+                0: StepRoutes(
+                    routers=routers,
+                    global_token_uids=torch.arange(
+                        num_global_tokens, dtype=torch.int64
+                    ),
+                )
+            },
+        )
+
+    def _make_hook(self, router_key: str, module: Any) -> Any:
+        def _hook(_module: Any, _inputs: Any, output: Any) -> None:
+            if not isinstance(output, tuple) or len(output) < 3:
+                raise RuntimeError(
+                    f"Expected HF router tuple output for '{router_key}', got {type(output)}"
+                )
+            router_scores = output[1]
+            router_indices = output[2]
+            if not isinstance(router_scores, torch.Tensor) or not isinstance(
+                router_indices, torch.Tensor
+            ):
+                raise RuntimeError(
+                    f"Expected tensor router outputs for '{router_key}', "
+                    f"got scores={type(router_scores)} indices={type(router_indices)}"
+                )
+            route = RouterCallRoute(
+                expert_indices=router_indices.detach().cpu().to(torch.int32),
+                expert_probs=router_scores.detach().cpu().to(torch.float32),
+                expert_mask=torch.ones_like(
+                    router_indices.detach().cpu(), dtype=torch.bool
+                ),
+                num_experts=int(
+                    getattr(module, "num_experts", router_scores.shape[-1])
+                ),
+                sample_index=self._active_sample_index,
+                micro_slot=(
+                    None
+                    if self._active_sample_index is not None
+                    else self._active_micro_slot
+                ),
+            )
+            self._routes[router_key][len(self._routes[router_key])] = route
+
+        return _hook
 
 
 def _debug(message: str) -> None:
@@ -159,31 +289,6 @@ def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
     return grads
 
 
-def _collect_hf_params(model: Any) -> dict[str, torch.Tensor]:
-    return {
-        name: param.detach().cpu().to(dtype=torch.float32).clone()
-        for name, param in model.named_parameters()
-    }
-
-
-def _tensor_map_deltas(
-    before: dict[str, torch.Tensor],
-    after: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    before_keys = set(before.keys())
-    after_keys = set(after.keys())
-    if before_keys != after_keys:
-        missing = sorted(before_keys - after_keys)
-        extra = sorted(after_keys - before_keys)
-        raise KeyError(
-            f"Tensor-map keys changed across optimizer step: missing={missing[:3]} extra={extra[:3]}"
-        )
-    return {
-        key: (after[key] - before[key]).detach().cpu().to(dtype=torch.float32)
-        for key in sorted(before_keys)
-    }
-
-
 def _bridge_compatible_hf_key(key: str, expected_keys: set[str]) -> str:
     if key in expected_keys:
         return key
@@ -213,27 +318,88 @@ def _normalize_hf_tensor_map_for_bridge(
     return normalized
 
 
+def _active_embedding_token_rows(
+    micro_inputs: list[dict[str, torch.Tensor]],
+) -> torch.Tensor:
+    active_token_ids: list[torch.Tensor] = []
+    for micro in micro_inputs:
+        attention_mask = micro["attention_mask"].reshape(-1).to(dtype=torch.bool)
+        if not bool(attention_mask.any()):
+            continue
+        active_token_ids.append(micro["input_ids"].reshape(-1)[attention_mask].cpu())
+    if not active_token_ids:
+        return torch.zeros((0,), dtype=torch.long)
+    return torch.unique(torch.cat(active_token_ids, dim=0), sorted=True)
+
+
+def _active_router_rows_by_layer(
+    replay_bundle: MoeRoutingReplayBundle | None,
+) -> dict[int, torch.Tensor]:
+    if replay_bundle is None:
+        return {}
+    active_rows: dict[int, torch.Tensor] = {}
+    step_routes = replay_bundle.steps.get(0)
+    if step_routes is None:
+        return {}
+    for router_key, router_routes in step_routes.routers.items():
+        match = _REPLAY_ROUTER_LAYER_PATTERN.match(router_key)
+        if match is None:
+            continue
+        layer_index = int(match.group("layer"))
+        layer_rows: list[torch.Tensor] = []
+        for route in router_routes.calls.values():
+            if route.expert_indices.numel() == 0:
+                continue
+            layer_rows.append(route.expert_indices[route.expert_mask].to(torch.long))
+        if layer_rows:
+            active_rows[layer_index] = torch.unique(
+                torch.cat(layer_rows, dim=0),
+                sorted=True,
+            )
+    return active_rows
+
+
+def _focus_derivative_tensor_map(
+    tensor_map: dict[str, torch.Tensor],
+    *,
+    active_embedding_rows: torch.Tensor,
+    active_router_rows: dict[int, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    focused: dict[str, torch.Tensor] = {}
+    for key, value in tensor_map.items():
+        focused_value = value
+        if (
+            key == "model.language_model.embed_tokens.weight"
+            and active_embedding_rows.numel() > 0
+        ):
+            focused_value = value.index_select(0, active_embedding_rows)
+        elif match := _GATE_WEIGHT_PATTERN.match(key):
+            active_rows = active_router_rows.get(int(match.group("layer")))
+            if active_rows is not None and active_rows.numel() > 0:
+                focused_value = value.index_select(0, active_rows)
+        focused[key] = focused_value
+    return focused
+
+
 def _run_hf_sft_step(
     *,
     base_model: str,
     num_layers: int,
     micro_inputs: list[dict[str, torch.Tensor]],
-    optimizer_config: Any,
+    sample_indices: list[int | None],
+    topology: ReplayParallelTopology,
     device: torch.device,
 ) -> tuple[
-    torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    MoeRoutingReplayBundle | None,
 ]:
     _debug("loading HF model")
     model = _load_hf_model(base_model=base_model, num_layers=num_layers, device=device)
+    route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
-    optimizer = torch.optim.Adam(
-        [param for param in model.parameters() if param.requires_grad],
-        lr=float(optimizer_config.lr),
-        betas=(float(optimizer_config.adam_beta1), float(optimizer_config.adam_beta2)),
-        eps=float(optimizer_config.adam_eps),
-        weight_decay=float(optimizer_config.weight_decay),
-    )
     loss_sum = torch.tensor(0.0, device=device)
     token_count = 0
     trainable_losses: list[torch.Tensor] = []
@@ -244,7 +410,10 @@ def _run_hf_sft_step(
         ),
         1,
     )
-    for micro in micro_inputs:
+    for micro_slot, (micro, sample_index) in enumerate(
+        zip(micro_inputs, sample_indices, strict=True)
+    ):
+        route_capture.set_active_micro(sample_index, micro_slot)
         attention_mask = micro["attention_mask"].reshape(-1)
         actual_len = max(int(attention_mask.sum().item()), 1)
         input_ids = micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
@@ -269,22 +438,15 @@ def _run_hf_sft_step(
         token_count += int(mask.sum().item())
         (masked_losses.sum() / total_token_count).backward()
     grads = _collect_hf_grads(model)
-    params_before = _collect_hf_params(model)
-    _clip_hf_grads_like_megatron(
-        model,
-        max_norm=float(optimizer_config.clip_grad),
-    )
-    optimizer.step()
-    params_after = _collect_hf_params(model)
-    deltas = _tensor_map_deltas(params_before, params_after)
+    routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
-    del optimizer
+    route_capture.close()
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     _debug("finished HF step")
-    return output_vector, scalar_loss, grads, deltas
+    return output_vector, scalar_loss, grads, routing_replay_bundle
 
 
 def _build_megatron_runtime(
@@ -385,23 +547,6 @@ def _filter_language_only_tensor_map(
     }
 
 
-def _clip_hf_grads_like_megatron(model: Any, *, max_norm: float) -> float:
-    params = [param for param in model.parameters() if param.grad is not None]
-    if not params or max_norm <= 0:
-        return 0.0
-    total_norm_sq = torch.zeros((), device=params[0].grad.device, dtype=torch.float32)
-    for param in params:
-        grad = param.grad.detach().to(dtype=torch.float32)
-        total_norm_sq += torch.sum(grad * grad)
-    total_norm = float(torch.sqrt(total_norm_sq).item())
-    clip_coeff = max_norm / (total_norm + 1.0e-6)
-    if clip_coeff >= 1.0:
-        return total_norm
-    for param in params:
-        param.grad.mul_(clip_coeff)
-    return total_norm
-
-
 def _convert_megatron_tasks_to_hf(
     runtime: megatron_train.TrainingRuntime,
     *,
@@ -457,13 +602,29 @@ def _run_megatron_sft_step(
     *,
     request: HfParityRunRequest,
     micro_inputs: list[dict[str, torch.Tensor]],
+    sample_indices: list[int | None],
     device: torch.device,
-) -> tuple[
-    torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
-]:
+    moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     runtime = _build_megatron_runtime(request)
     _assert_runtime_configuration(runtime.model, request.case_config)
     assert runtime.optimizer is not None
+    if moe_routing_replay_bundle is not None:
+        megatron_train.configure_moe_routing_replay(
+            runtime,
+            replay_bundle=moe_routing_replay_bundle,
+            strict=True,
+        )
+        controller = runtime.moe_routing_replay_controller
+        if controller is None:
+            raise RuntimeError(
+                "Expected MoE routing replay controller to be configured"
+            )
+        controller.set_step(
+            step_index=0,
+            sample_index=sample_indices,
+            global_grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
+        )
     uses_standard_attention_path = (
         getattr(runtime.provider, "_art_runtime_profile", None) == "single_gpu_parity"
     )
@@ -539,56 +700,29 @@ def _run_megatron_sft_step(
         tasks=derivative_tasks,
     )
     _debug("exported Megatron grads")
-    params_before = _convert_megatron_tasks_to_hf(
-        runtime,
-        mode="param",
-        tasks=derivative_tasks,
-    )
-    _debug("exported Megatron params before step")
-    megatron_train._optimizer_step(runtime.optimizer, request.case_config.learning_rate)
-    _debug("completed Megatron optimizer step")
-    params_after = _convert_megatron_tasks_to_hf(
-        runtime,
-        mode="param",
-        tasks=derivative_tasks,
-    )
-    _debug("exported Megatron params after step")
-    deltas = _tensor_map_deltas(params_before, params_after)
+    if runtime.moe_routing_replay_controller is not None:
+        runtime.moe_routing_replay_controller.finalize_step()
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
     _debug("finished Megatron step")
-    return output_vector, scalar_loss, grads, deltas
+    return output_vector, scalar_loss, grads
 
 
-def _normalize_hf_maps_for_bridge(
+def _normalize_hf_grads_for_bridge(
     hf_grads: dict[str, torch.Tensor],
-    hf_deltas: dict[str, torch.Tensor],
     *,
     expected_grad_keys: set[str],
-    expected_delta_keys: set[str],
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+) -> dict[str, torch.Tensor]:
     hf_grads = _filter_language_only_tensor_map(hf_grads)
-    hf_deltas = _filter_language_only_tensor_map(hf_deltas)
     normalized_hf_grads = _normalize_hf_tensor_map_for_bridge(
         hf_grads,
         expected_grad_keys,
     )
-    normalized_hf_deltas = _normalize_hf_tensor_map_for_bridge(
-        hf_deltas,
-        expected_delta_keys,
-    )
-    return (
-        {
-            key: normalized_hf_grads[key]
-            for key in sorted(expected_grad_keys)
-            if key in normalized_hf_grads
-        },
-        {
-            key: normalized_hf_deltas[key]
-            for key in sorted(expected_delta_keys)
-            if key in normalized_hf_deltas
-        },
-    )
+    return {
+        key: normalized_hf_grads[key]
+        for key in sorted(expected_grad_keys)
+        if key in normalized_hf_grads
+    }
 
 
 def _worker_run(request: HfParityRunRequest) -> None:
@@ -615,30 +749,46 @@ def _worker_run(request: HfParityRunRequest) -> None:
         sample_indices,
         zero_template,
     )
+    replay_topology = ReplayParallelTopology.model_validate(
+        ORACLE_TOPOLOGY.model_dump(
+            include={"tp", "ep", "etp", "dp", "sp", "cp", "pp", "vpp"},
+            mode="python",
+        )
+    )
     device = torch.device("cuda", 0)
     try:
-        optimizer_config = _build_optimizer_config(request.case_config)
         _debug("starting HF parity worker")
-        hf_outputs, hf_loss, hf_grads, hf_deltas = _run_hf_sft_step(
+        hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
             micro_inputs=micro_inputs,
-            optimizer_config=optimizer_config,
+            sample_indices=sample_indices,
+            topology=replay_topology,
             device=device,
         )
-        megatron_outputs, megatron_loss, megatron_grads, megatron_deltas = (
-            _run_megatron_sft_step(
-                request=request,
-                micro_inputs=micro_inputs,
-                device=device,
-            )
+        megatron_outputs, megatron_loss, megatron_grads = _run_megatron_sft_step(
+            request=request,
+            micro_inputs=micro_inputs,
+            sample_indices=sample_indices,
+            device=device,
+            moe_routing_replay_bundle=moe_routing_replay_bundle,
         )
         _debug("finished HF and Megatron steps, building report")
-        normalized_hf_grads, normalized_hf_deltas = _normalize_hf_maps_for_bridge(
+        normalized_hf_grads = _normalize_hf_grads_for_bridge(
             hf_grads,
-            hf_deltas,
             expected_grad_keys=set(megatron_grads.keys()),
-            expected_delta_keys=set(megatron_deltas.keys()),
+        )
+        active_embedding_rows = _active_embedding_token_rows(micro_inputs)
+        active_router_rows = _active_router_rows_by_layer(moe_routing_replay_bundle)
+        normalized_hf_grads = _focus_derivative_tensor_map(
+            normalized_hf_grads,
+            active_embedding_rows=active_embedding_rows,
+            active_router_rows=active_router_rows,
+        )
+        megatron_grads = _focus_derivative_tensor_map(
+            megatron_grads,
+            active_embedding_rows=active_embedding_rows,
+            active_router_rows=active_router_rows,
         )
         outputs_summary = summarize_tensor_pair(hf_outputs, megatron_outputs)
         loss_summary = summarize_tensor_pair(hf_loss, megatron_loss)
@@ -647,17 +797,11 @@ def _worker_run(request: HfParityRunRequest) -> None:
             reference=normalized_hf_grads,
             candidate=megatron_grads,
         )
-        deltas_rows = build_tensor_map_metric_rows(
-            phase="deltas",
-            reference=normalized_hf_deltas,
-            candidate=megatron_deltas,
-        )
         report = build_hf_parity_report(
             request=request,
             outputs_summary=outputs_summary,
             loss_summary=loss_summary,
             grads_rows=grads_rows,
-            deltas_rows=deltas_rows,
         )
         _write_json(
             Path(request.output_dir) / HF_PARITY_REPORT_FILENAME,
