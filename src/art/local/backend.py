@@ -1434,16 +1434,18 @@ class LocalBackend(Backend):
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)
 
-        # Also overwrite the initial empty checkpoint at step 0 so vLLM
-        # loads the forked weights on startup (it uses @0 by default)
-        step0_dir = get_step_checkpoint_dir(dest_model_dir, 0)
-        if os.path.exists(step0_dir) and step0_dir != dest_checkpoint_dir:
+        # Invalidate the UnslothService _state cache so the trainer
+        # re-initializes with the forked checkpoint instead of the base model.
+        # _state is a cached_property that reads get_last_checkpoint_dir() on
+        # first access; if it was accessed before the fork, it cached the base
+        # model and will never pick up the forked weights.
+        service = await self._get_service(model)
+        if hasattr(service, "_state") and "_state" in service.__dict__:
+            del service.__dict__["_state"]
             if verbose:
                 print(
-                    f"Overwriting initial checkpoint at {step0_dir} with forked weights"
+                    "Invalidated UnslothService _state cache to pick up forked checkpoint"
                 )
-            shutil.rmtree(step0_dir)
-            shutil.copytree(dest_checkpoint_dir, step0_dir)
 
         if verbose:
             print(
