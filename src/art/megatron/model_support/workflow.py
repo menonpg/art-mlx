@@ -112,6 +112,100 @@ def run_hf_parity_stage(
     )
 
 
+def run_lora_coverage_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    lora_coverage = _import_integration_module("integration.megatron_lora_coverage")
+    oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    case_config = oracle_harness.OracleCaseConfig(
+        base_model=base_model,
+        precision="fp32",
+        num_layers=max(1, architecture.recommended_min_layers),
+        num_steps=1,
+    )
+    report = lora_coverage.run_lora_coverage(case_config)
+    return ValidationStageResult(
+        name="lora_coverage",
+        passed=not report.missing_wrapped_target_modules
+        and not report.missing_exported_target_modules,
+        metrics=report.model_dump(mode="json"),
+    )
+
+
+def run_correctness_sensitivity_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    case_config = oracle_harness.OracleCaseConfig(
+        base_model=base_model,
+        precision="fp32",
+        num_layers=max(1, architecture.recommended_min_layers),
+        num_steps=1,
+    )
+    suite_topologies = list(oracle_harness.TOPOLOGIES)
+    if oracle_harness.extended_topologies_enabled():
+        suite_topologies.extend(oracle_harness.EXTENDED_TOPOLOGIES)
+    suite_world_size = max(topology.world_size() for topology in suite_topologies)
+    objectives = list(oracle_harness.selected_oracle_objectives())
+    mutations: list[str] = []
+    for objective in objectives:
+        for mutation in oracle_harness.supported_sensitivity_mutations_for_objective(
+            objective
+        ):
+            if mutation not in mutations:
+                mutations.append(mutation)
+    sensitivity_world_size = oracle_harness.sensitivity_required_world_size(mutations)
+    available_gpu_count = oracle_harness.available_gpu_count()
+    required_gpu_count = max(suite_world_size, sensitivity_world_size)
+    if available_gpu_count < required_gpu_count:
+        raise RuntimeError(
+            "Need "
+            f"{required_gpu_count} GPUs for correctness/sensitivity, found {available_gpu_count}"
+        )
+    suite_reports = oracle_harness.run_suite(case_config=case_config)
+    sensitivity_reports = oracle_harness.run_sensitivity_suite(
+        case_config=case_config,
+        mutations=mutations,
+    )
+    case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
+    return ValidationStageResult(
+        name="correctness_sensitivity",
+        passed=True,
+        metrics={
+            "requested_num_layers": case_config.num_layers,
+            "objectives": objectives,
+            "sensitivity_mutations": mutations,
+            "required_gpu_count": required_gpu_count,
+            "correctness_variant_count": len(suite_reports),
+            "correctness_variants": [
+                {
+                    "variant": report.variant,
+                    "topology": report.topology,
+                    "signal": report.signal,
+                    "fail_count": report.fail_count,
+                }
+                for report in suite_reports
+            ],
+            "sensitivity_variant_count": len(sensitivity_reports),
+            "sensitivity_variants": [
+                {
+                    "variant": report.variant,
+                    "topology": report.topology,
+                    "signal": report.signal,
+                    "expected_signal": report.expected_signal,
+                    "fail_count": report.fail_count,
+                }
+                for report in sensitivity_reports
+            ],
+        },
+        artifact_dir=case_artifacts.case_dir,
+    )
+
+
 def build_validation_report(
     *,
     base_model: str,
@@ -122,28 +216,35 @@ def build_validation_report(
         include_native_vllm_lora=include_native_vllm_lora,
     )
     architecture = inspect_architecture(base_model)
-    hf_parity_stage: ValidationStageResult | None = None
-    try:
-        hf_parity_stage = run_hf_parity_stage(
-            base_model=base_model,
-            architecture=architecture,
-        )
-    except Exception as exc:
-        hf_parity_stage = ValidationStageResult(
-            name="hf_parity",
-            passed=False,
-            metrics=_stage_error_metrics(exc),
-        )
+    stage_runners = {
+        "hf_parity": run_hf_parity_stage,
+        "lora_coverage": run_lora_coverage_stage,
+        "correctness_sensitivity": run_correctness_sensitivity_stage,
+    }
+    stage_results: dict[str, ValidationStageResult] = {}
+    for stage_name, stage_runner in stage_runners.items():
+        try:
+            stage_results[stage_name] = stage_runner(
+                base_model=base_model,
+                architecture=architecture,
+            )
+        except Exception as exc:
+            stage_results[stage_name] = ValidationStageResult(
+                name=stage_name,
+                passed=False,
+                metrics=_stage_error_metrics(exc),
+            )
     for stage in report.stages:
         if stage.name == "dependency_resolution":
             stage.passed = True
             stage.metrics = dict(report.dependency_versions)
             continue
         if stage.name != "architecture_discovery":
-            if stage.name == "hf_parity":
-                stage.passed = hf_parity_stage.passed
-                stage.metrics = dict(hf_parity_stage.metrics)
-                stage.artifact_dir = hf_parity_stage.artifact_dir
+            stage_result = stage_results.get(stage.name)
+            if stage_result is not None:
+                stage.passed = stage_result.passed
+                stage.metrics = dict(stage_result.metrics)
+                stage.artifact_dir = stage_result.artifact_dir
             continue
         stage.passed = not architecture.unresolved_risks
         stage.metrics = {
