@@ -15,12 +15,13 @@ from .megatron_oracle_harness import (
     NON_FINITE_METRIC_VALUE,
     DiffAccumulator,
     DiskPackedTensorsSpec,
+    MetricThresholdRule,
     OracleCaseConfig,
+    PhasePassFn,
     _default_phase_pass_fns,
     _read_json,
     _write_json,
     ensure_case_artifacts,
-    regenerate_requested,
 )
 
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
@@ -63,6 +64,15 @@ class HfParityReport(BaseModel):
     metrics: list[HfParityMetricRow] = Field(default_factory=list)
 
 
+def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
+    pass_fns = _default_phase_pass_fns()
+    pass_fns["deltas"] = MetricThresholdRule(
+        limits={"relative_l2": 0.5, "mean_abs_pct": 20.0},
+        minimums={"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0},
+    )
+    return pass_fns
+
+
 def hf_parity_enabled() -> bool:
     value = os.environ.get(HF_PARITY_ENABLE_ENV)
     if value is None:
@@ -98,7 +108,7 @@ def _build_metric_row(
         candidate_abs_scale=summary["candidate_abs_scale"],
         mean_abs_pct=summary["mean_abs_pct"],
     )
-    pass_fn = _default_phase_pass_fns().get(phase)
+    pass_fn = _hf_parity_phase_pass_fns().get(phase)
     if pass_fn is None:
         row.pass_signal = structural_failure is None
         if structural_failure is not None:
@@ -122,22 +132,45 @@ def summarize_tensor_pair(reference: Any, candidate: Any) -> dict[str, float]:
     return accumulator.as_summary()
 
 
-def summarize_tensor_maps(
+def build_tensor_map_metric_rows(
+    *,
+    phase: str,
     reference: dict[str, Any],
     candidate: dict[str, Any],
-) -> tuple[dict[str, float], str | None]:
+) -> list[HfParityMetricRow]:
     reference_keys = set(reference.keys())
     candidate_keys = set(candidate.keys())
     if reference_keys != candidate_keys:
         missing = sorted(reference_keys - candidate_keys)
         extra = sorted(candidate_keys - reference_keys)
-        return _inf_summary(), f"missing={missing[:5]} extra={extra[:5]}"
-    accumulator = DiffAccumulator()
+        return [
+            _build_metric_row(
+                phase=phase,
+                param="__tensor_set__",
+                summary=_inf_summary(),
+                structural_failure=f"missing={missing[:5]} extra={extra[:5]}",
+            )
+        ]
+    rows: list[HfParityMetricRow] = []
     for key in sorted(reference_keys):
         if tuple(reference[key].shape) != tuple(candidate[key].shape):
-            return _inf_summary(), f"shape mismatch for '{key}'"
-        accumulator.update(reference[key], candidate[key])
-    return accumulator.as_summary(), None
+            rows.append(
+                _build_metric_row(
+                    phase=phase,
+                    param=key,
+                    summary=_inf_summary(),
+                    structural_failure=f"shape mismatch for '{key}'",
+                )
+            )
+            continue
+        rows.append(
+            _build_metric_row(
+                phase=phase,
+                param=key,
+                summary=summarize_tensor_pair(reference[key], candidate[key]),
+            )
+        )
+    return rows
 
 
 def build_parity_sample_indices(
@@ -272,12 +305,9 @@ def run_hf_parity(
     case_artifacts = ensure_case_artifacts(case_config)
     output_dir = Path(case_artifacts.case_dir) / HF_PARITY_OUTPUT_DIRNAME
     report_path = output_dir / HF_PARITY_REPORT_FILENAME
-    if report_path.exists() and not regenerate_requested():
-        report = HfParityReport.model_validate(_read_json(report_path))
-        assert_hf_parity_pass(report, report_path=report_path)
-        return report
-
     output_dir.mkdir(parents=True, exist_ok=True)
+    if report_path.exists():
+        report_path.unlink()
     request = HfParityRunRequest(
         case_id=case_artifacts.case_id,
         case_config=case_config,
@@ -296,10 +326,8 @@ def build_hf_parity_report(
     request: HfParityRunRequest,
     outputs_summary: dict[str, float],
     loss_summary: dict[str, float],
-    grads_summary: dict[str, float],
-    deltas_summary: dict[str, float],
-    grads_structural_failure: str | None = None,
-    deltas_structural_failure: str | None = None,
+    grads_rows: list[HfParityMetricRow],
+    deltas_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
     rows = [
         _build_metric_row(
@@ -312,18 +340,8 @@ def build_hf_parity_report(
             param="loss",
             summary=loss_summary,
         ),
-        _build_metric_row(
-            phase="grads",
-            param="__all__",
-            summary=grads_summary,
-            structural_failure=grads_structural_failure,
-        ),
-        _build_metric_row(
-            phase="deltas",
-            param="__all__",
-            summary=deltas_summary,
-            structural_failure=deltas_structural_failure,
-        ),
+        *grads_rows,
+        *deltas_rows,
     ]
     pass_count = sum(1 for row in rows if row.pass_signal)
     fail_count = len(rows) - pass_count
@@ -350,10 +368,10 @@ __all__ = [
     "assert_hf_parity_pass",
     "build_hf_parity_report",
     "build_parity_sample_indices",
+    "build_tensor_map_metric_rows",
     "hf_parity_enabled",
     "run_hf_parity",
     "set_hf_config_num_layers",
-    "summarize_tensor_maps",
     "summarize_tensor_pair",
     "zero_hf_dropout_config",
 ]

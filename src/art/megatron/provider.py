@@ -1,7 +1,6 @@
-from functools import partial
 import os
 from pathlib import Path
-from typing import Any, Callable, Literal, cast
+from typing import Any, Literal, cast
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -10,7 +9,6 @@ from megatron.bridge.models.hf_pretrained.state import (
     StateDict,
     StateSource,
 )
-from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
 from megatron.bridge.training.flex_dispatcher_backend import (
     apply_flex_dispatcher_backend,
 )
@@ -30,6 +28,8 @@ from art.megatron.provider_common import (
     patch_layer_spec_tree,
     resolve_layer_spec,
 )
+
+RuntimeProfile = Literal["art_training", "single_gpu_parity"]
 
 
 class _CastingStateSource(StateSource):
@@ -139,21 +139,27 @@ def _tp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
     )
 
 
-def _apply_art_training_runtime_defaults(provider: GPTModelProvider) -> None:
+def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> None:
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
     provider.moe_shared_expert_overlap = True
     _apply_default_parallel_topology(provider)
     _apply_runtime_env_overrides(provider)
-    if _tp_ep_parallel_domain_size(provider) > 1:
-        # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
-        # compute, so these are very beneficial
-        apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
 
 
-def _apply_single_gpu_parity_runtime_defaults(provider: GPTModelProvider) -> None:
+def _apply_art_training_runtime_finalize_defaults(provider: GPTModelProvider) -> None:
+    if _tp_ep_parallel_domain_size(provider) <= 1:
+        return
+    # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
+    # compute, so these are very beneficial
+    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+
+
+def _apply_single_gpu_parity_runtime_prepare_defaults(
+    provider: GPTModelProvider,
+) -> None:
     provider.tensor_model_parallel_size = 1
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
@@ -168,16 +174,29 @@ def _apply_single_gpu_parity_runtime_defaults(provider: GPTModelProvider) -> Non
     provider.moe_shared_expert_overlap = False
 
 
-def _apply_runtime_profile_defaults(
+def _apply_runtime_profile_prepare_defaults(
     provider: GPTModelProvider,
     *,
-    runtime_profile: Literal["art_training", "single_gpu_parity"],
+    runtime_profile: RuntimeProfile,
 ) -> None:
     if runtime_profile == "art_training":
-        _apply_art_training_runtime_defaults(provider)
+        _apply_art_training_runtime_prepare_defaults(provider)
         return
     if runtime_profile == "single_gpu_parity":
-        _apply_single_gpu_parity_runtime_defaults(provider)
+        _apply_single_gpu_parity_runtime_prepare_defaults(provider)
+        return
+    raise ValueError(f"Unsupported runtime profile: {runtime_profile}")
+
+
+def _apply_runtime_profile_finalize_defaults(
+    provider: GPTModelProvider,
+    *,
+    runtime_profile: RuntimeProfile,
+) -> None:
+    if runtime_profile == "art_training":
+        _apply_art_training_runtime_finalize_defaults(provider)
+        return
+    if runtime_profile == "single_gpu_parity":
         return
     raise ValueError(f"Unsupported runtime profile: {runtime_profile}")
 
@@ -268,11 +287,24 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
             provider.recompute_granularity = None
 
 
-def get_provider_bundle(
+def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
+    base_layer_spec = provider.transformer_layer_spec
+
+    def _flex_attention_layer_spec(
+        config: GPTModelProvider, vp_stage: int | None = None
+    ) -> object:
+        layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
+        patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
+        return layer_spec
+
+    provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
+
+
+def _build_provider_bundle(
     model: str,
     *,
-    torch_dtype: torch.dtype = torch.bfloat16,
-    runtime_profile: Literal["art_training", "single_gpu_parity"] = "art_training",
+    torch_dtype: torch.dtype,
+    runtime_profile: RuntimeProfile,
 ) -> ProviderBundle:
     spec = get_model_support_spec(model)
     handler = get_model_support_handler(model)
@@ -284,7 +316,7 @@ def get_provider_bundle(
     assert isinstance(bridge._model_bridge, supported_qwen_moe_bridge_types()), (
         "Only Qwen3 and Qwen3.5 MoE models are supported"
     )
-    if torch_dtype != torch.bfloat16:
+    if torch_dtype != torch.bfloat16 and runtime_profile != "single_gpu_parity":
         model_name_or_path = bridge.hf_pretrained.model_name_or_path
         assert model_name_or_path is not None
         bridge.hf_pretrained._state_dict_accessor = StateDict(
@@ -293,24 +325,30 @@ def get_provider_bundle(
                 dtype=torch_dtype,
             )
         )
-    provider = bridge.to_megatron_provider()
-    setattr(provider, "_art_model_support_handler", handler)
-    setattr(provider, "_art_model_support_spec", spec)
+    return ProviderBundle(
+        provider=bridge.to_megatron_provider(),
+        bridge=bridge,
+        handler=handler,
+        spec=spec,
+    )
+
+
+def prepare_provider_bundle(
+    model: str,
+    *,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    runtime_profile: RuntimeProfile = "art_training",
+) -> ProviderBundle:
+    bundle = _build_provider_bundle(
+        model,
+        torch_dtype=torch_dtype,
+        runtime_profile=runtime_profile,
+    )
+    provider = bundle.provider
+    setattr(provider, "_art_model_support_handler", bundle.handler)
+    setattr(provider, "_art_model_support_spec", bundle.spec)
     setattr(provider, "_art_runtime_profile", runtime_profile)
-    handler.patch_provider(provider, bridge)
-    base_layer_spec = provider.transformer_layer_spec
-
-    def _flex_attention_layer_spec(
-        config: GPTModelProvider, vp_stage: int | None = None
-    ) -> object:
-        layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
-        patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
-        return layer_spec
-
-    if runtime_profile == "art_training":
-        provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
     provider.attention_backend = AttnBackend.auto
-    _apply_runtime_profile_defaults(provider, runtime_profile=runtime_profile)
     provider.moe_permute_fusion = True
     provider.moe_router_dtype = "fp32"
     # params are disabled anyways, but should know about this if we switch to full FT
@@ -318,13 +356,42 @@ def get_provider_bundle(
     provider.moe_aux_loss_coeff = 0.0
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
-    handler.patch_provider(provider, bridge)
+    _apply_runtime_profile_prepare_defaults(
+        provider,
+        runtime_profile=runtime_profile,
+    )
+    if runtime_profile == "art_training":
+        _install_art_training_flex_attention(provider)
+    bundle.handler.patch_provider(provider, bundle.bridge)
+    return bundle
+
+
+def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
+    provider = cast(GPTModelProvider, provider_bundle.provider)
+    runtime_profile = cast(
+        RuntimeProfile,
+        getattr(provider, "_art_runtime_profile", "art_training"),
+    )
+    _apply_runtime_profile_finalize_defaults(
+        provider,
+        runtime_profile=runtime_profile,
+    )
     provider.finalize()
-    return ProviderBundle(
-        provider=provider,
-        bridge=bridge,
-        handler=handler,
-        spec=spec,
+    return provider_bundle
+
+
+def get_provider_bundle(
+    model: str,
+    *,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    runtime_profile: RuntimeProfile = "art_training",
+) -> ProviderBundle:
+    return finalize_provider_bundle(
+        prepare_provider_bundle(
+            model,
+            torch_dtype=torch_dtype,
+            runtime_profile=runtime_profile,
+        )
     )
 
 

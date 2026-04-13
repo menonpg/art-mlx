@@ -65,7 +65,7 @@ from art.megatron.offload import (
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import get_provider_bundle
+from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
 from art.megatron.provider_common import ProviderBundle
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
@@ -307,7 +307,7 @@ def build_training_runtime(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     _install_fast_frozen_output_backward()
-    provider_bundle = get_provider_bundle(
+    provider_bundle = prepare_provider_bundle(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
@@ -315,6 +315,7 @@ def build_training_runtime(
     provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
+    finalize_provider_bundle(provider_bundle)
     provider.register_pre_wrap_hook(freeze_model)
     provider.register_pre_wrap_hook(
         lambda chunks: apply_lora_adapters(chunks, provider)

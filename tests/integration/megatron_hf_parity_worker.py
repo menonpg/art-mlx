@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, cast
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.transformer.utils import get_default_causal_mask
 import torch
 import torch.nn.functional as F
-from torch.nn.utils import clip_grad_norm_
 
 from art.megatron import train as megatron_train
 from art.megatron.merged_weight_export import build_art_conversion_tasks
@@ -22,13 +23,14 @@ from .megatron_hf_parity import (
     HfParityRunRequest,
     build_hf_parity_report,
     build_parity_sample_indices,
+    build_tensor_map_metric_rows,
     set_hf_config_num_layers,
-    summarize_tensor_maps,
     summarize_tensor_pair,
     zero_hf_dropout_config,
 )
 from .megatron_oracle_harness import ORACLE_TOPOLOGY, _read_json, _write_json
 from .megatron_oracle_worker import (
+    _assert_runtime_configuration,
     _build_optimizer_config,
     _configure_cuda_precision,
     _configure_provider,
@@ -37,6 +39,8 @@ from .megatron_oracle_worker import (
 from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
+_DEBUG_START_TIME = time.perf_counter()
+_VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
 
 
 def _debug(message: str) -> None:
@@ -47,7 +51,80 @@ def _debug(message: str) -> None:
         "on",
     }:
         return
-    print(f"[hf_parity] {message}", flush=True)
+    elapsed = time.perf_counter() - _DEBUG_START_TIME
+    print(f"[hf_parity +{elapsed:8.2f}s] {message}", flush=True)
+
+
+def _enable_debug_traceback_dump() -> None:
+    if os.environ.get(HF_PARITY_DEBUG_ENV, "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(60, repeat=True)
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get(HF_PARITY_DEBUG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _install_bridge_timing_debug(provider_bundle: Any) -> None:
+    if not _debug_enabled():
+        return
+    provider = provider_bundle.provider
+    pre_wrap_hooks = list(getattr(provider, "_pre_wrap_hooks", []))
+    _debug(
+        "registered pre-wrap hooks: "
+        + ", ".join(
+            getattr(hook, "__qualname__", repr(hook)) for hook in pre_wrap_hooks
+        )
+    )
+    timed_hooks = []
+    for index, hook in enumerate(pre_wrap_hooks):
+        label = f"pre_wrap_hook[{index}]"
+
+        def _timed_hook(
+            model: list[Any], _hook: Any = hook, _label: str = label
+        ) -> list[Any]:
+            start = time.perf_counter()
+            _debug(f"{_label}: start")
+            try:
+                return _hook(model)
+            finally:
+                _debug(f"{_label}: done in {time.perf_counter() - start:.2f}s")
+
+        timed_hooks.append(_timed_hook)
+    if pre_wrap_hooks:
+        provider._pre_wrap_hooks = timed_hooks
+
+    model_bridge = getattr(provider_bundle.bridge, "_model_bridge", None)
+    if model_bridge is None:
+        return
+    if getattr(model_bridge, "_art_hf_parity_timing_wrapped", False):
+        return
+    original = model_bridge.load_weights_hf_to_megatron
+
+    def _timed_load_weights(*args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        _debug("bridge.load_weights_hf_to_megatron: start")
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _debug(
+                "bridge.load_weights_hf_to_megatron: done in "
+                f"{time.perf_counter() - start:.2f}s"
+            )
+
+    model_bridge.load_weights_hf_to_megatron = _timed_load_weights
+    model_bridge._art_hf_parity_timing_wrapped = True
 
 
 def _load_hf_model(
@@ -193,9 +270,10 @@ def _run_hf_sft_step(
         (masked_losses.sum() / total_token_count).backward()
     grads = _collect_hf_grads(model)
     params_before = _collect_hf_params(model)
-    clip_grad = float(optimizer_config.clip_grad)
-    if clip_grad > 0:
-        clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+    _clip_hf_grads_like_megatron(
+        model,
+        max_norm=float(optimizer_config.clip_grad),
+    )
     optimizer.step()
     params_after = _collect_hf_params(model)
     deltas = _tensor_map_deltas(params_before, params_after)
@@ -219,6 +297,7 @@ def _build_megatron_runtime(
         runtime_profile="single_gpu_parity",
     )
     _debug("Megatron provider bundle built")
+    _install_bridge_timing_debug(provider_bundle)
     provider = provider_bundle.provider
     _configure_provider(provider, ORACLE_TOPOLOGY, request.case_config)
     _debug("Megatron provider configured for oracle topology")
@@ -268,17 +347,59 @@ def _megatron_task_tensor(
     raise ValueError(f"Unsupported task-tensor mode: {mode}")
 
 
-def _task_has_nonzero_grad(task: Any) -> bool:
-    grad = _megatron_task_tensor(task, mode="grad")
-    return bool(torch.count_nonzero(grad).item() > 0)
-
-
 def _mapping_supports_derivative_parity(mapping: Any) -> bool:
     from megatron.bridge.models.conversion.param_mapping import (
         RMSNorm2ZeroCenteredRMSNormMapping,
     )
 
     return not isinstance(mapping, RMSNorm2ZeroCenteredRMSNormMapping)
+
+
+def _is_language_hf_param_name(name: str) -> bool:
+    return not name.startswith(_VISUAL_HF_PREFIXES)
+
+
+def _language_hf_param_names(mapping: Any) -> list[str]:
+    hf_param = mapping.hf_param
+    if isinstance(hf_param, str):
+        return [hf_param]
+    if isinstance(hf_param, dict):
+        return [value for value in hf_param.values() if isinstance(value, str)]
+    return []
+
+
+def _mapping_targets_language_only(mapping: Any) -> bool:
+    names = _language_hf_param_names(mapping)
+    if not names:
+        return True
+    return all(_is_language_hf_param_name(name) for name in names)
+
+
+def _filter_language_only_tensor_map(
+    tensor_map: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in tensor_map.items()
+        if _is_language_hf_param_name(key)
+    }
+
+
+def _clip_hf_grads_like_megatron(model: Any, *, max_norm: float) -> float:
+    params = [param for param in model.parameters() if param.grad is not None]
+    if not params or max_norm <= 0:
+        return 0.0
+    total_norm_sq = torch.zeros((), device=params[0].grad.device, dtype=torch.float32)
+    for param in params:
+        grad = param.grad.detach().to(dtype=torch.float32)
+        total_norm_sq += torch.sum(grad * grad)
+    total_norm = float(torch.sqrt(total_norm_sq).item())
+    clip_coeff = max_norm / (total_norm + 1.0e-6)
+    if clip_coeff >= 1.0:
+        return total_norm
+    for param in params:
+        param.grad.mul_(clip_coeff)
+    return total_norm
 
 
 def _convert_megatron_tasks_to_hf(
@@ -324,6 +445,8 @@ def _convert_megatron_tasks_to_hf(
                 hf_state_dict,
             )
         for hf_name, value in converted_weights_dict.items():
+            if not _is_language_hf_param_name(hf_name):
+                continue
             if hf_name in converted:
                 raise RuntimeError(f"Duplicate converted HF key '{hf_name}' in {mode}")
             converted[hf_name] = value.detach().cpu().to(dtype=torch.float32)
@@ -339,6 +462,7 @@ def _run_megatron_sft_step(
     torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]
 ]:
     runtime = _build_megatron_runtime(request)
+    _assert_runtime_configuration(runtime.model, request.case_config)
     assert runtime.optimizer is not None
     uses_standard_attention_path = (
         getattr(runtime.provider, "_art_runtime_profile", None) == "single_gpu_parity"
@@ -402,12 +526,11 @@ def _run_megatron_sft_step(
         num_tokens=num_tokens,
     )
     _debug("finalized Megatron grads")
-    signal_tasks = [task for task in tasks if _task_has_nonzero_grad(task)]
-    _debug(f"retained {len(signal_tasks)} non-zero-grad conversion tasks")
     derivative_tasks = [
         task
-        for task in signal_tasks
+        for task in tasks
         if _mapping_supports_derivative_parity(task.mapping)
+        and _mapping_targets_language_only(task.mapping)
     ]
     _debug(f"retained {len(derivative_tasks)} derivative-safe conversion tasks")
     grads = _convert_megatron_tasks_to_hf(
@@ -437,25 +560,32 @@ def _run_megatron_sft_step(
     return output_vector, scalar_loss, grads, deltas
 
 
-def _filter_hf_maps(
+def _normalize_hf_maps_for_bridge(
     hf_grads: dict[str, torch.Tensor],
     hf_deltas: dict[str, torch.Tensor],
-    expected_keys: set[str],
+    *,
+    expected_grad_keys: set[str],
+    expected_delta_keys: set[str],
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    normalized_hf_grads = _normalize_hf_tensor_map_for_bridge(hf_grads, expected_keys)
+    hf_grads = _filter_language_only_tensor_map(hf_grads)
+    hf_deltas = _filter_language_only_tensor_map(hf_deltas)
+    normalized_hf_grads = _normalize_hf_tensor_map_for_bridge(
+        hf_grads,
+        expected_grad_keys,
+    )
     normalized_hf_deltas = _normalize_hf_tensor_map_for_bridge(
         hf_deltas,
-        expected_keys,
+        expected_delta_keys,
     )
     return (
         {
             key: normalized_hf_grads[key]
-            for key in sorted(expected_keys)
+            for key in sorted(expected_grad_keys)
             if key in normalized_hf_grads
         },
         {
             key: normalized_hf_deltas[key]
-            for key in sorted(expected_keys)
+            for key in sorted(expected_delta_keys)
             if key in normalized_hf_deltas
         },
     )
@@ -467,6 +597,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
     torch.cuda.set_device(0)
     _set_deterministic_seed(request.case_config.seed)
     _configure_cuda_precision(request.case_config)
+    _enable_debug_traceback_dump()
 
     packed_tensors = packed_tensors_from_dir(
         **request.packed_tensors.model_dump(exclude_none=True)
@@ -503,30 +634,30 @@ def _worker_run(request: HfParityRunRequest) -> None:
             )
         )
         _debug("finished HF and Megatron steps, building report")
-        expected_keys = set(megatron_grads.keys()) | set(megatron_deltas.keys())
-        filtered_hf_grads, filtered_hf_deltas = _filter_hf_maps(
+        normalized_hf_grads, normalized_hf_deltas = _normalize_hf_maps_for_bridge(
             hf_grads,
             hf_deltas,
-            expected_keys,
+            expected_grad_keys=set(megatron_grads.keys()),
+            expected_delta_keys=set(megatron_deltas.keys()),
         )
         outputs_summary = summarize_tensor_pair(hf_outputs, megatron_outputs)
         loss_summary = summarize_tensor_pair(hf_loss, megatron_loss)
-        grads_summary, grads_failure = summarize_tensor_maps(
-            filtered_hf_grads,
-            megatron_grads,
+        grads_rows = build_tensor_map_metric_rows(
+            phase="grads",
+            reference=normalized_hf_grads,
+            candidate=megatron_grads,
         )
-        deltas_summary, deltas_failure = summarize_tensor_maps(
-            filtered_hf_deltas,
-            megatron_deltas,
+        deltas_rows = build_tensor_map_metric_rows(
+            phase="deltas",
+            reference=normalized_hf_deltas,
+            candidate=megatron_deltas,
         )
         report = build_hf_parity_report(
             request=request,
             outputs_summary=outputs_summary,
             loss_summary=loss_summary,
-            grads_summary=grads_summary,
-            deltas_summary=deltas_summary,
-            grads_structural_failure=grads_failure,
-            deltas_structural_failure=deltas_failure,
+            grads_rows=grads_rows,
+            deltas_rows=deltas_rows,
         )
         _write_json(
             Path(request.output_dir) / HF_PARITY_REPORT_FILENAME,
