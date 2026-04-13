@@ -588,6 +588,11 @@ class UnslothService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         """Train in dedicated mode — no sleep/wake, vLLM keeps running on separate GPU."""
+        # Load forked adapter weights on first training call if needed.
+        forked_dir = getattr(self, "_forked_checkpoint_dir", None)
+        if forked_dir is not None:
+            del self._forked_checkpoint_dir
+            await self._state.load_lora_adapter(forked_dir)
         async for result in run_unsloth_rl_training(
             self._state,
             disk_packed_tensors=disk_packed_tensors,
@@ -629,6 +634,11 @@ class UnslothService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         """Train in shared mode — sleep/wake cycle with in-process vLLM."""
+        # Load forked adapter weights on first training call if needed.
+        forked_dir = getattr(self, "_forked_checkpoint_dir", None)
+        if forked_dir is not None:
+            del self._forked_checkpoint_dir
+            await self._state.load_lora_adapter(forked_dir)
         llm = await self.llm
 
         # Pause generation to prevent new requests during training
