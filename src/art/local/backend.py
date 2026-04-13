@@ -1439,7 +1439,9 @@ class LocalBackend(Backend):
         step0_dir = get_step_checkpoint_dir(dest_model_dir, 0)
         if os.path.exists(step0_dir) and step0_dir != dest_checkpoint_dir:
             if verbose:
-                print(f"Overwriting initial checkpoint at {step0_dir} with forked weights")
+                print(
+                    f"Overwriting initial checkpoint at {step0_dir} with forked weights"
+                )
             shutil.rmtree(step0_dir)
             shutil.copytree(dest_checkpoint_dir, step0_dir)
 
