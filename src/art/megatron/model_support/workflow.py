@@ -206,6 +206,30 @@ def run_correctness_sensitivity_stage(
     )
 
 
+def run_merged_vllm_serving_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    merged_vllm_serving = _import_integration_module(
+        "integration.megatron_merged_vllm_serving"
+    )
+    oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    case_config = oracle_harness.OracleCaseConfig(
+        base_model=base_model,
+        precision="fp32",
+        num_layers=max(1, architecture.recommended_min_layers),
+        num_steps=1,
+    )
+    report = merged_vllm_serving.run_merged_vllm_serving(case_config)
+    return ValidationStageResult(
+        name="merged_vllm_serving",
+        passed=bool(report.model_ids),
+        metrics=report.model_dump(mode="json"),
+        artifact_dir=report.output_dir,
+    )
+
+
 def build_validation_report(
     *,
     base_model: str,
@@ -219,6 +243,7 @@ def build_validation_report(
     stage_runners = {
         "hf_parity": run_hf_parity_stage,
         "lora_coverage": run_lora_coverage_stage,
+        "merged_vllm_serving": run_merged_vllm_serving_stage,
         "correctness_sensitivity": run_correctness_sensitivity_stage,
     }
     stage_results: dict[str, ValidationStageResult] = {}

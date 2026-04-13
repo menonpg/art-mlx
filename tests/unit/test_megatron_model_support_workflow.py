@@ -13,6 +13,7 @@ from art.megatron.model_support.workflow import (
     build_validation_stage_names,
     run_correctness_sensitivity_stage,
     run_lora_coverage_stage,
+    run_merged_vllm_serving_stage,
 )
 
 
@@ -67,6 +68,15 @@ def test_build_validation_report_populates_architecture_stage(
             artifact_dir="/tmp/correctness",
         ),
     )
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow.run_merged_vllm_serving_stage",
+        lambda *, base_model, architecture: ValidationStageResult(
+            name="merged_vllm_serving",
+            passed=True,
+            metrics={"served_model_name": "validation@0"},
+            artifact_dir="/tmp/merged-serving",
+        ),
+    )
 
     report = build_validation_report(base_model="Qwen/Qwen3.5-35B-A3B")
 
@@ -115,6 +125,12 @@ def test_build_validation_report_populates_architecture_stage(
         "sensitivity_variant_count": 9,
     }
     assert correctness_stage.artifact_dir == "/tmp/correctness"
+    merged_stage = next(
+        stage for stage in report.stages if stage.name == "merged_vllm_serving"
+    )
+    assert merged_stage.passed is True
+    assert merged_stage.metrics == {"served_model_name": "validation@0"}
+    assert merged_stage.artifact_dir == "/tmp/merged-serving"
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:
@@ -145,6 +161,14 @@ def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None
         "art.megatron.model_support.workflow.run_lora_coverage_stage",
         lambda *, base_model, architecture: ValidationStageResult(
             name="lora_coverage",
+            passed=True,
+            metrics={},
+        ),
+    )
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow.run_merged_vllm_serving_stage",
+        lambda *, base_model, architecture: ValidationStageResult(
+            name="merged_vllm_serving",
             passed=True,
             metrics={},
         ),
@@ -208,6 +232,14 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
         "art.megatron.model_support.workflow.run_correctness_sensitivity_stage",
         lambda *, base_model, architecture: ValidationStageResult(
             name="correctness_sensitivity",
+            passed=True,
+            metrics={},
+        ),
+    )
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow.run_merged_vllm_serving_stage",
+        lambda *, base_model, architecture: ValidationStageResult(
+            name="merged_vllm_serving",
             passed=True,
             metrics={},
         ),
@@ -386,3 +418,50 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.metrics["correctness_variant_count"] == 1
     assert stage.metrics["sensitivity_variant_count"] == 1
     assert stage.artifact_dir == "/tmp/oracle"
+
+
+def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None:
+    architecture = ArchitectureReport(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        model_key="qwen3_5_moe",
+        handler_key="qwen3_5_moe",
+        recommended_min_layers=4,
+    )
+    oracle_module = SimpleNamespace(
+        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    merged_module = SimpleNamespace(
+        run_merged_vllm_serving=lambda case_config: SimpleNamespace(
+            output_dir="/tmp/merged-serving",
+            model_ids=["validation@0"],
+            model_dump=lambda mode="json": {
+                "base_model": "Qwen/Qwen3.5-35B-A3B",
+                "served_model_name": "validation@0",
+            },
+        )
+    )
+
+    def _import_integration_module(name: str):
+        if name == "integration.megatron_oracle_harness":
+            return oracle_module
+        if name == "integration.megatron_merged_vllm_serving":
+            return merged_module
+        raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        _import_integration_module,
+    )
+
+    stage = run_merged_vllm_serving_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=architecture,
+    )
+
+    assert stage.name == "merged_vllm_serving"
+    assert stage.passed is True
+    assert stage.metrics == {
+        "base_model": "Qwen/Qwen3.5-35B-A3B",
+        "served_model_name": "validation@0",
+    }
+    assert stage.artifact_dir == "/tmp/merged-serving"
