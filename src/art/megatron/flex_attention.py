@@ -72,6 +72,11 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
+# Sequence-length churn can break the Inductor backend here. Keep this
+# on aot_eager instead.
+_compiled_create_block_mask = torch.compile(create_block_mask, backend="aot_eager")
+
+
 def create_shared_prefix_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
@@ -99,15 +104,7 @@ def create_shared_prefix_attention_state(
         parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
 
-    # NOTE: build the BlockMask eagerly, NOT through torch.compile.
-    # `_shared_prefix_mask` is a fresh closure on every call that captures
-    # different `group_ids` / `parent_ids` tensors from the enclosing scope.
-    # torch.compile's cache can reuse a compiled BlockMask built against stale
-    # closure captures, producing a mask whose block structure mismatches the
-    # forward — the compiled flex_attention backward then computes gradients
-    # over the wrong regions and produces astronomical-but-finite grads on a
-    # subset of micro-batches. Keep this call eager.
-    block_mask = create_block_mask(
+    block_mask = _compiled_create_block_mask(
         _shared_prefix_mask,
         group_ids.shape[0],
         None,
