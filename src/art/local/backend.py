@@ -1439,7 +1439,7 @@ class LocalBackend(Backend):
         # _state is a cached_property that reads get_last_checkpoint_dir() on
         # first access; if it was accessed before the fork, it cached the base
         # model and will never pick up the forked weights.
-        service = await self._get_service(model)
+        service = await self._get_service(cast(TrainableModel, model))
         if hasattr(service, "_state") and "_state" in service.__dict__:
             del service.__dict__["_state"]
             if verbose:
