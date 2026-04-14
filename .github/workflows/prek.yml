@@ -18,7 +18,7 @@ env:
   CI_UV_BUILD_SLOTS: "2"
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "copy"
-  TORCH_CUDA_ARCH_LIST: "8.0"
+  TORCH_CUDA_ARCH_LIST: "9.0"
 
 jobs:
   cache-status:
@@ -38,6 +38,7 @@ jobs:
             --uv-lock uv.lock \
             --base-image "${CI_BASE_IMAGE}" \
             --python-mm "${CI_PYTHON_MM}" \
+            --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
             --ci-apex-parallel-build "${CI_APEX_PARALLEL_BUILD}" \
             --ci-apex-nvcc-threads "${CI_APEX_NVCC_THREADS}")"
           echo "fingerprint=${fp}" >> "${GITHUB_OUTPUT}"
@@ -89,7 +90,7 @@ jobs:
       - name: Install CI dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git zstd
+          apt-get install -y --no-install-recommends ca-certificates curl git zstd libibverbs-dev
           rm -rf /var/lib/apt/lists/*
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "/root/.local/bin" >> "${GITHUB_PATH}"
@@ -130,7 +131,7 @@ jobs:
       - name: Install CI dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git zstd
+          apt-get install -y --no-install-recommends ca-certificates curl git zstd libibverbs-dev
           rm -rf /var/lib/apt/lists/*
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "/root/.local/bin" >> "${GITHUB_PATH}"

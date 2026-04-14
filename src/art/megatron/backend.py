@@ -14,6 +14,8 @@ class MegatronBackend(LocalBackend):
         path: str | None = None,
     ) -> None:
         super().__init__(in_process=in_process, path=path)
+        self._requires_explicit_packed_sequence_length = True
+        self._packed_sequence_length_requires_chunk_alignment = False
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config

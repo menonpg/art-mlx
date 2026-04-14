@@ -17,7 +17,7 @@ import importlib
 import json
 import math
 import os
-from pathlib import Path
+import random
 import shutil
 import time
 from typing import Any, Callable, cast
@@ -27,13 +27,14 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
-from pydantic import BaseModel, ConfigDict
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from pydantic import BaseModel, ConfigDict, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
-from art.megatron.client import create_megatron_job_paths, write_megatron_job
+from art.megatron.compile_workarounds import install_torch_compile_workarounds
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.jobs import (
@@ -45,13 +46,18 @@ from art.megatron.jobs import (
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.model_chunks import (
+    ModelChunks,
+    as_megatron_api_chunks,
+    unwrap_megatron_chunk,
+    validate_model_chunks,
+)
 from art.megatron.offload import (
     OffloadState,
-    clear_optimizer_state,
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import get_provider
+from art.megatron.provider import _env_flag, get_provider
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
@@ -69,6 +75,7 @@ safe_open = safetensors.safe_open
 save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+_optimizer_stats_printed = False
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -86,11 +93,18 @@ class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     provider: Any
-    model: list[MegatronModule]
-    optimizer: Any
+    model: ModelChunks
+    optimizer: Any | None
+    optimizer_config: OptimizerConfig
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: ModelChunks) -> ModelChunks:
+        validate_model_chunks(value)
+        return value
 
 
 class TrainStepResult(BaseModel):
@@ -98,7 +112,7 @@ class TrainStepResult(BaseModel):
 
     reduced_loss: torch.Tensor
     probs_corr: float
-    new_logprobs: torch.Tensor | None
+    new_logprobs: list[torch.Tensor] | None = None
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
@@ -122,10 +136,7 @@ def _frozen_linear_grad_input(
 ) -> torch.Tensor:
     if grad_output.dim() <= 2 or weight.dim() != 2:
         return grad_output.matmul(weight)
-    try:
-        grad_output_2d = grad_output.view(-1, int(grad_output.shape[-1]))
-    except RuntimeError:
-        grad_output_2d = grad_output.reshape(-1, int(grad_output.shape[-1]))
+    grad_output_2d = grad_output.reshape(-1, int(grad_output.shape[-1]))
     grad_input_2d = grad_output_2d.matmul(weight)
     return grad_input_2d.reshape(*grad_output.shape[:-1], int(weight.shape[-1]))
 
@@ -153,9 +164,26 @@ def _install_fast_frozen_output_backward() -> None:
     LinearWithFrozenWeight.backward = staticmethod(_fast_backward)
 
 
-def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
+def _eager_initialize_optimizer_state(optimizer: Any) -> None:
+    chained_optimizers = getattr(optimizer, "chained_optimizers", None)
+    if chained_optimizers is not None:
+        for child_optimizer in chained_optimizers:
+            _eager_initialize_optimizer_state(child_optimizer)
+        return
+    init_state_fn = getattr(optimizer, "init_state_fn", None)
+    inner_optimizer = getattr(optimizer, "optimizer", None)
+    if callable(init_state_fn) and inner_optimizer is not None:
+        init_state_fn(inner_optimizer, getattr(optimizer, "config", None))
+
+
+def _compile_enabled() -> bool:
+    disabled = _env_flag("ART_DISABLE_MEGATRON_COMPILE")
+    return disabled is not True
+
+
+def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
     for chunk in model_chunks:
-        module: Any = chunk
+        module: Any = unwrap_megatron_chunk(chunk)
         while not isinstance(module, GPTModel) and hasattr(module, "module"):
             module = module.module
         if not isinstance(module, GPTModel):
@@ -192,6 +220,42 @@ def _default_optimizer_config() -> OptimizerConfig:
         weight_decay=0.1,
         adam_eps=1e-13,
     )
+
+
+def _maybe_print_optimizer_stats(
+    optimizer: Any,
+    model: ModelChunks,
+) -> None:
+    global _optimizer_stats_printed
+    if _optimizer_stats_printed:
+        return
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
+            _optimizer_stats_printed = True
+            return
+    num_params = sum(
+        p.numel()
+        for group in optimizer.param_groups
+        if not group["is_decoupled_lr"]
+        for p in group["params"]
+    )
+    print(f"Number of parameters in optimizer: {num_params:,}")
+    total_params = sum(p.numel() for module in model for p in module.parameters())
+    percent = (num_params / total_params) * 100 if total_params > 0 else 0
+    print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
+    _optimizer_stats_printed = True
+
+
+def _build_optimizer(
+    model: ModelChunks,
+    optimizer_config: OptimizerConfig,
+) -> Any:
+    optimizer = get_megatron_optimizer(
+        config=optimizer_config,
+        model_chunks=as_megatron_api_chunks(model),
+    )
+    _maybe_print_optimizer_stats(optimizer, model)
+    return optimizer
 
 
 def configure_moe_routing_replay(
@@ -237,8 +301,14 @@ def build_training_runtime(
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
     moe_routing_replay_strict: bool = True,
     print_env: bool = True,
-    print_optimizer_stats: bool = True,
+    build_optimizer: bool = True,
 ) -> TrainingRuntime:
+    if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
+        seed = int(random_state)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     _install_fast_frozen_output_backward()
     provider = get_provider(
         model_identifier
@@ -253,7 +323,7 @@ def build_training_runtime(
     )
 
     model = cast(
-        list[MegatronModule],
+        ModelChunks,
         provider.provide_distributed_model(
             ddp_config=DistributedDataParallelConfig(
                 # memory and comm for this should be small anyways cause lora
@@ -277,28 +347,26 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     _install_gpt_preprocess_hook(model)
+    if _compile_enabled():
+        install_torch_compile_workarounds()
+        for chunk in model:
+            _compile_transformer_layers(chunk)
 
-    optimizer = get_megatron_optimizer(
-        config=optimizer_config or _default_optimizer_config(),
-        model_chunks=model,
-    )
-
-    if rank == 0 and print_optimizer_stats:
-        num_params = sum(
-            p.numel()
-            for group in optimizer.param_groups
-            if not group["is_decoupled_lr"]
-            for p in group["params"]
+    optimizer_config = optimizer_config or _default_optimizer_config()
+    optimizer = (
+        _build_optimizer(
+            model,
+            optimizer_config,
         )
-        print(f"Number of parameters in optimizer: {num_params:,}")
-        total_params = sum(p.numel() for module in model for p in module.parameters())
-        percent = (num_params / total_params) * 100 if total_params > 0 else 0
-        print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
+        if build_optimizer
+        else None
+    )
 
     runtime = TrainingRuntime(
         provider=provider,
         model=model,
         optimizer=optimizer,
+        optimizer_config=optimizer_config,
         rank=rank,
         world_size=world_size,
     )
@@ -319,13 +387,12 @@ def run_megatron_worker_loop(
     before_job: Callable[[], None] | None = None,
     after_job: Callable[[], None] | None = None,
 ) -> None:
+    jobs_dir = os.environ.get("ART_MEGATRON_JOBS_DIR", DEFAULT_JOBS_DIR)
     while True:
         torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
+        os.makedirs(jobs_dir, exist_ok=True)
         job_names = sorted(
-            job_name
-            for job_name in os.listdir(DEFAULT_JOBS_DIR)
-            if job_name.endswith(".json")
+            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
         )
         if not job_names:
             time.sleep(1)
@@ -336,7 +403,7 @@ def run_megatron_worker_loop(
         if before_job is not None:
             before_job()
 
-        job_path = os.path.join(DEFAULT_JOBS_DIR, job_names[0])
+        job_path = os.path.join(jobs_dir, job_names[0])
         job = _load_megatron_job(job_path, supports_sft=supports_sft)
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
@@ -452,7 +519,7 @@ def run_megatron_rl_job(
         torch.cuda.empty_cache()
 
 
-def _flush_param_grads_to_main_grads(model_chunks: list[MegatronModule]) -> None:
+def _flush_param_grads_to_main_grads(model_chunks: ModelChunks) -> None:
     """Fallback for direct SFT jobs when DDP post-hooks leave grads in param.grad.
 
     Megatron's distributed optimizer reads gradients from `main_grad`, which is
@@ -488,6 +555,7 @@ def run_megatron_sft_job(
             optimizer_state_path=job.optimizer_state_path,
         )
 
+        assert runtime.optimizer is not None
         runtime.optimizer.config.clip_grad = job.max_grad_norm
         for param_group in runtime.optimizer.param_groups:
             param_group["weight_decay"] = job.weight_decay
@@ -625,7 +693,12 @@ def _load_lora_and_optimizer(
 ) -> dict[str, torch.Tensor]:
     print0(runtime.rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_adapter_state_dict(lora_path)
-    load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
+    load_adapter_into_model(runtime.model, adapter_model)
+    runtime.optimizer = _build_optimizer(
+        runtime.model,
+        runtime.optimizer_config,
+    )
+    assert runtime.optimizer is not None
 
     optimizer_shard_path = os.path.join(
         optimizer_state_path,
@@ -641,8 +714,7 @@ def _load_lora_and_optimizer(
             optimizer_shard_path,
             "- resetting optimizer for new run",
         )
-        clear_optimizer_state(runtime.optimizer)
-        runtime.optimizer.reload_model_params()
+        _eager_initialize_optimizer_state(runtime.optimizer)
     return adapter_model
 
 
@@ -653,6 +725,7 @@ def _save_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> None:
+    assert runtime.optimizer is not None
     sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
         runtime.model,
         adapter_model,
@@ -713,14 +786,34 @@ def _causal_attention_state(seq_len: int, device: torch.device) -> Any:
     )
 
 
-def iter_modules(model_chunks: list[MegatronModule]) -> Any:
+def _set_child_module(
+    parent: torch.nn.Module,
+    name: str,
+    child: torch.nn.Module,
+) -> None:
+    if isinstance(parent, torch.nn.ModuleList | torch.nn.Sequential):
+        parent[int(name)] = child
+        return
+    setattr(parent, name, child)
+
+
+def _compile_transformer_layers(module: torch.nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        if isinstance(child, TransformerLayer):
+            compiled_child = cast(torch.nn.Module, torch.compile(child))
+            _set_child_module(parent=module, name=name, child=compiled_child)
+            continue
+        _compile_transformer_layers(child)
+
+
+def iter_modules(model_chunks: ModelChunks) -> Any:
     for chunk in model_chunks:
         for module in chunk.modules():
             yield module
 
 
 def load_adapter_into_model(
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
 ) -> None:
@@ -735,7 +828,7 @@ def load_adapter_into_model(
 
 
 def collect_sharded_lora_state(
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
 ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]]]:
     sharded_state_dict: dict[str, torch.Tensor] = {}
@@ -749,7 +842,7 @@ def collect_sharded_lora_state(
                 target_dtype = (
                     adapter_model[key].dtype if key in adapter_model else value.dtype
                 )
-                sharded_state_dict[key] = value.to(target_dtype)
+                sharded_state_dict[key] = value.to(target_dtype).contiguous()
         if hasattr(module, "sharded_lora_manifest"):
             module_sharded_lora_manifest: dict[str, dict[str, Any]] = (
                 module.sharded_lora_manifest()  # type: ignore[attr-defined]
@@ -971,7 +1064,7 @@ def _prepare_sft_micro_inputs(
 
 def run_megatron_sft_step(
     *,
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     optimizer: Any,
     learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
@@ -1040,7 +1133,9 @@ def run_megatron_sft_step(
         raise RuntimeError("run_megatron_sft_step did not produce outputs")
 
     _flush_param_grads_to_main_grads(model_chunks)
-    finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
+    finalize_model_grads_extended(
+        as_megatron_api_chunks(model_chunks), num_tokens=num_tokens
+    )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
@@ -1067,7 +1162,7 @@ def run_megatron_sft_step(
 
 def run_training_step(
     *,
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     optimizer: Any,
     learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],
@@ -1112,9 +1207,9 @@ def run_training_step(
 
     micro_count = len(micro_inputs)
     raw_loss_sum: torch.Tensor | None = None
-    num_tokens = _local_trainable_token_count_tensor(micro_inputs, device=device)
+    token_count = _local_trainable_token_count_tensor(micro_inputs, device=device)
     probs_corr_sum = 0.0
-    new_logprobs: torch.Tensor | None = None
+    new_logprobs_list: list[torch.Tensor] = []
 
     for micro in micro_inputs:
         _move_inputs_to_device(micro, device)
@@ -1148,17 +1243,28 @@ def run_training_step(
             raw_loss_sum = detached_micro_loss
         else:
             raw_loss_sum = raw_loss_sum + detached_micro_loss
+        del loss_info
+        del micro_loss
+        del attention_mask
+        del attention_state
+        new_logprobs_list.append(
+            new_logprobs.detach().to(device="cpu", non_blocking=True)
+        )
+        del new_logprobs
 
-    if new_logprobs is None or raw_loss_sum is None:
+    if raw_loss_sum is None:
         raise RuntimeError("run_training_step did not produce outputs")
 
-    # num_tokens is reduced in place across ranks by finalize_model_grads().
-    finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
+    torch.cuda.empty_cache()
+    finalize_model_grads_extended(
+        as_megatron_api_chunks(model_chunks),
+        num_tokens=token_count,
+    )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
     )
-    global_num_tokens = max(num_tokens.item(), 1.0)
+    global_num_tokens = max(token_count.item(), 1.0)
     reduced_loss = _reduce_loss(
         raw_loss_sum / global_num_tokens,
         op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
@@ -1171,7 +1277,7 @@ def run_training_step(
     return TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=probs_corr_sum / micro_count,
-        new_logprobs=new_logprobs,
+        new_logprobs=new_logprobs_list,
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
@@ -1180,28 +1286,37 @@ def run_training_step(
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_state = OffloadState()
-    offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+    wake_lock_path = os.environ.get(
+        "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
+    )
 
     def wait_until_ready() -> None:
-        while os.path.exists(DEFAULT_VLLM_WAKE_LOCK_PATH):
+        while os.path.exists(wake_lock_path):
             time.sleep(0.2)
 
+    def before_job() -> None:
+        reload_to_gpu(runtime.model, runtime.rank, offload_state)
+
+    def after_job() -> None:
+        runtime.optimizer = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        offload_to_cpu(runtime.model, runtime.rank, offload_state)
+
+    after_job()
     run_megatron_worker_loop(
         runtime,
         supports_sft=True,
         wait_until_ready=wait_until_ready,
-        before_job=lambda: reload_to_gpu(
-            runtime.model, runtime.optimizer, runtime.rank, offload_state
-        ),
-        after_job=lambda: offload_to_cpu(
-            runtime.model, runtime.optimizer, runtime.rank, offload_state
-        ),
+        before_job=before_job,
+        after_job=after_job,
     )
 
 
 def main() -> None:
     runtime = build_training_runtime(
-        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER)
+        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        build_optimizer=False,
     )
     _run_service_loop(runtime)
 

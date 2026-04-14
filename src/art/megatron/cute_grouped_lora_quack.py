@@ -564,6 +564,9 @@ class _QuackGroupedLoraDualFn(torch.autograd.Function):
         )
 
 
+# Dynamo tracing through CuTe's DLPack interop fails on FakeTensor, so keep the
+# QuACK grouped kernels eager while the surrounding layer stays compiled.
+@torch.compiler.disable
 def quack_grouped_lora(
     x: torch.Tensor,
     a_t: torch.Tensor,
@@ -586,6 +589,7 @@ def quack_grouped_lora(
     return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale)
 
 
+@torch.compiler.disable
 def quack_grouped_lora_dual(
     x: torch.Tensor,
     gate_a_t: torch.Tensor,

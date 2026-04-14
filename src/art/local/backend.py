@@ -108,6 +108,8 @@ class LocalBackend(Backend):
         self._services: dict[str, ModelService] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
+        self._requires_explicit_packed_sequence_length = False
+        self._packed_sequence_length_requires_chunk_alignment = True
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -325,6 +327,8 @@ class LocalBackend(Backend):
         allow_training_without_logprobs: bool,
         scale_rewards: bool,
         plot_tensors: bool,
+        packed_sequence_length: int | None,
+        logprob_calculation_chunk_size: int,
     ) -> PackedTensors | None:
         if model.base_model not in self._tokenizers:
             self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
@@ -349,20 +353,66 @@ class LocalBackend(Backend):
         )
         if not tokenized_results:
             return None
-        max_tokens = max(len(result.token_ids) for result in tokenized_results)
-        # Round up max_tokens to the nearest multiple of 2048
-        sequence_length = math.ceil(max_tokens / 2048) * 2048
-        # Cap sequence length at the model's max sequence length
-        sequence_length = min(
-            sequence_length,
+        model_max_sequence_length = (
             (model._internal_config or dev.InternalModelConfig())
             .get("init_args", {})
-            .get("max_seq_length", 32_768),
+            .get("max_seq_length", 32_768)
         )
+        if packed_sequence_length is None:
+            assert not self._requires_explicit_packed_sequence_length, (
+                f"{type(self).__name__} requires packed_sequence_length to be set."
+            )
+            max_tokens = max(len(result.token_ids) for result in tokenized_results)
+            sequence_length = min(
+                math.ceil(max_tokens / 2048) * 2048,
+                model_max_sequence_length,
+            )
+        else:
+            sequence_length = packed_sequence_length
+
+        if sequence_length > model_max_sequence_length:
+            raise ValueError(
+                f"packed_sequence_length ({sequence_length}) exceeds model max_seq_length "
+                f"({model_max_sequence_length})"
+            )
+        if (
+            packed_sequence_length is not None
+            and self._packed_sequence_length_requires_chunk_alignment
+            and sequence_length % logprob_calculation_chunk_size != 0
+        ):
+            raise ValueError(
+                f"packed_sequence_length ({sequence_length}) must be divisible by "
+                f"logprob_calculation_chunk_size ({logprob_calculation_chunk_size})"
+            )
+
+        too_long_results = [
+            result
+            for result in tokenized_results
+            if len(result.token_ids) > sequence_length
+        ]
+        if too_long_results:
+            warnings.warn(
+                "Dropping "
+                f"{len(too_long_results)} tokenized results from "
+                f"{len({id(result.trajectory) for result in too_long_results})} "
+                f"trajectories longer than packed_sequence_length={sequence_length} "
+                f"(max seen {max(len(result.token_ids) for result in too_long_results)}). "
+                "This affects training, but your model may still learn.",
+                stacklevel=2,
+            )
+            tokenized_results = [
+                result
+                for result in tokenized_results
+                if len(result.token_ids) <= sequence_length
+            ]
+            if not tokenized_results:
+                return None
+
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,
+            truncate_long_results=False,
             advantage_balance=advantage_balance,
         )
         if (
@@ -560,6 +610,7 @@ class LocalBackend(Backend):
         truncated_importance_sampling: float | None = None,
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
+        packed_sequence_length: int | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -616,6 +667,9 @@ class LocalBackend(Backend):
                 by reward standard deviation. Defaults to False.
             logprob_calculation_chunk_size: Chunk size for logprob calculation.
                 Defaults to 1024.
+            packed_sequence_length: Packed sequence length to use for training.
+                When unset, Unsloth keeps the current max-length-rounded-to-2048
+                behavior. Required for Megatron.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -644,6 +698,13 @@ class LocalBackend(Backend):
             raise ValueError("LocalBackend requires normalize_advantages=True.")
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
+        if (
+            self._requires_explicit_packed_sequence_length
+            and packed_sequence_length is None
+        ):
+            raise ValueError(
+                f"{type(self).__name__}.train requires packed_sequence_length to be set."
+            )
 
         resolved_kl_ref_adapter_path = kl_ref_adapter_path
         if (
@@ -672,6 +733,7 @@ class LocalBackend(Backend):
             truncated_importance_sampling=truncated_importance_sampling,
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
+            packed_sequence_length=packed_sequence_length,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )
@@ -741,6 +803,10 @@ class LocalBackend(Backend):
             ),
             scale_rewards=dev_config.get("scale_rewards", True),
             plot_tensors=dev_config.get("plot_tensors", False),
+            packed_sequence_length=dev_config.get("packed_sequence_length"),
+            logprob_calculation_chunk_size=dev_config.get(
+                "logprob_calculation_chunk_size", 1024
+            ),
         )
         if packed_tensors is None:
             print(

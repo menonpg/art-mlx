@@ -155,6 +155,7 @@ def tokenize_trajectory_groups(
     allow_training_without_logprobs: bool,
     scale_rewards: bool,
     shuffle_group_trajectories: bool = True,
+    drop_zero_advantage_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
@@ -172,8 +173,7 @@ def tokenize_trajectory_groups(
             advantage = trajectory.reward - reward_mean
             if scale_rewards:
                 advantage /= reward_std + 1e-6
-            # Skip trajectories with no advantage
-            if advantage == 0:
+            if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             trajectory_results: list[TokenizedResult] = []
             for history in [

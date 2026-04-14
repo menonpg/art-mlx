@@ -5,11 +5,16 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import torch
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
+from art.megatron import MegatronBackend
+from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer.trainer import PipelineTrainer
+from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir
 
 
@@ -89,6 +94,33 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_pipeline_trainer_forwards_packed_sequence_length_when_set(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-packed-sequence-length",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        packed_sequence_length=4096,
+    )
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    await trainer._training_stage()
+
+    assert backend.train.await_args.kwargs["packed_sequence_length"] == 4096
+
+
+@pytest.mark.asyncio
 async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
     tmp_path: Path,
 ) -> None:
@@ -157,12 +189,148 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
             model,
             [_make_group([1.0])],
             loss_fn="ppo",
+            packed_sequence_length=2048,
             save_checkpoint=False,
         )
 
     assert result.step == 1
     assert seen["config"].learning_rate == 5e-6
     assert seen["dev_config"]["ppo"] is True
+    assert seen["dev_config"]["packed_sequence_length"] == 2048
+
+
+def _make_tokenized_result(
+    trajectory: Trajectory,
+    token_ids: list[int],
+) -> TokenizedResult:
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        SimpleNamespace(eos_token_id=0, decode=lambda token_id: str(token_id)),
+    )
+    return TokenizedResult(
+        advantage=1.0,
+        chat="",
+        token_ids=token_ids,
+        input_pos=list(range(len(token_ids))),
+        assistant_mask=[0] * (len(token_ids) - 1) + [1],
+        logprobs=[float("nan")] * (len(token_ids) - 1) + [-0.1],
+        pixel_values=None,
+        image_grid_thw=None,
+        trajectory=trajectory,
+        choice_offsets=[],
+        extra_logprobs={},
+        _tokenizer=tokenizer,
+        weight=1.0,
+        prompt_id=123,
+        prompt_length=1,
+    )
+
+
+def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    model = TrainableModel(
+        name="local-backend-packed-sequence-length",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    short_trajectory = Trajectory(
+        reward=1.0,
+        initial_policy_version=0,
+        messages_and_choices=[
+            {"role": "user", "content": "short"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+    long_trajectory = Trajectory(
+        reward=1.0,
+        initial_policy_version=0,
+        messages_and_choices=[
+            {"role": "user", "content": "long"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+    short_result = _make_tokenized_result(short_trajectory, [1, 2, 3, 4])
+    long_result = _make_tokenized_result(long_trajectory, list(range(10)))
+
+    with (
+        patch(
+            "art.local.backend.AutoTokenizer.from_pretrained",
+            return_value=short_result._tokenizer,
+        ),
+        patch(
+            "art.local.backend.AutoImageProcessor.from_pretrained", return_value=None
+        ),
+        patch(
+            "art.local.backend.tokenize_trajectory_groups",
+            return_value=iter([short_result, long_result]),
+        ),
+        pytest.warns(UserWarning, match="Dropping 1 tokenized results"),
+    ):
+        packed_tensors = backend._get_packed_tensors(
+            model,
+            [_make_group([0.0, 1.0])],
+            advantage_balance=0.0,
+            allow_training_without_logprobs=False,
+            scale_rewards=True,
+            plot_tensors=False,
+            packed_sequence_length=4,
+            logprob_calculation_chunk_size=2,
+        )
+
+    assert packed_tensors is not None
+    assert packed_tensors["tokens"].shape == (1, 4)
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_train_requires_packed_sequence_length(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="megatron-backend-packed-sequence-length",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MegatronBackend(path=str(tmp_path))
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        with pytest.raises(
+            ValueError, match="MegatronBackend\\.train requires packed_sequence_length"
+        ):
+            await backend.train(
+                model,
+                [_make_group([1.0])],
+                save_checkpoint=False,
+            )
+
+
+def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
+    class FakeModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loaded_adapter: dict[str, torch.Tensor] | None = None
+
+        def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
+            self.loaded_adapter = adapter_model
+
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.reload_calls = 0
+
+        def reload_model_params(self) -> None:
+            self.reload_calls += 1
+
+    module = FakeModule()
+    optimizer = FakeOptimizer()
+    adapter_model = {"weight": torch.tensor([1.0])}
+
+    load_adapter_into_model([module], adapter_model, optimizer)
+
+    assert module.loaded_adapter is adapter_model
+    assert optimizer.reload_calls == 1
 
 
 @pytest.mark.asyncio

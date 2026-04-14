@@ -26,7 +26,7 @@ from openai.types.chat.chat_completion_tool_union_param import (
 )
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
-from pydantic import BaseModel, Field, SkipValidation
+from pydantic import BaseModel, Field, SkipValidation, TypeAdapter
 import tinker
 from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
@@ -49,6 +49,7 @@ class ModelUpsert(BaseModel):
 
 
 WireMessagesAndChoices = list[Choice | Message]
+_MESSAGE_ADAPTER = TypeAdapter(ChatCompletionMessageParam)
 
 
 class MessagesAndChoicesWithLogprobsArgs(BaseModel):
@@ -61,6 +62,14 @@ class MessagesAndChoicesWithLogprobsArgs(BaseModel):
 class MessagesAndChoicesWithLogprobs(BaseModel):
     messages_and_choices: WireMessagesAndChoices
     usages: list[CompletionUsage]
+
+
+def _normalize_message_or_choice(
+    message_or_choice: Choice | Message,
+) -> Choice | Message:
+    if isinstance(message_or_choice, Choice):
+        return message_or_choice
+    return cast(Message, _MESSAGE_ADAPTER.validate_python(message_or_choice))
 
 
 def _normalize_qwen3_5_messages(
@@ -264,7 +273,10 @@ class OpenAICompatibleTinkerServer:
                 ]
             )
             return MessagesAndChoicesWithLogprobs(
-                messages_and_choices=args.messages_and_choices,
+                messages_and_choices=[
+                    _normalize_message_or_choice(item)
+                    for item in args.messages_and_choices
+                ],
                 usages=usages,
             )
 

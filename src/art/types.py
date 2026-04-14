@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
-from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion import Choice as Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 import pydantic

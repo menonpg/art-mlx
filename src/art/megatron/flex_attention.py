@@ -1,7 +1,8 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
+from collections.abc import Callable
 import math
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, TypeAlias, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -26,11 +27,14 @@ class SharedPrefixAttentionState(BaseModel):
     block_mask: BlockMask
 
 
+CompileOptions: TypeAlias = dict[str, str | int | bool | Callable[..., Any]]
+
+
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
     # Torchtitan inductor options for compiling flex attention.
-    _compile_options: dict[str, Any] = {
+    _compile_options: ClassVar[CompileOptions] = {
         "max_autotune": True,
         "triton.cudagraphs": False,
     }
@@ -39,7 +43,7 @@ class FlexAttentionWrapper(torch.nn.Module):
     # failures (create_flex_decoding_kernel). The regular flex_attention
     # kernel autotunes against the actual hardware smem budget, so this
     # stays GPU-agnostic.
-    _kernel_options: FlexKernelOptions = {
+    _kernel_options: ClassVar[FlexKernelOptions] = {
         "FORCE_USE_FLEX_ATTENTION": True,
     }
     _compiled_flex_attention: ClassVar = torch.compile(

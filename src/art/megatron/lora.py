@@ -22,6 +22,9 @@ import torch
 
 from .cute_grouped_lora_quack import quack_grouped_lora, quack_grouped_lora_dual
 
+LORA_RANK = 1
+LORA_ALPHA = 32
+
 ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
 GradSyncOp = Literal["none", "sum", "avg"]
@@ -743,8 +746,8 @@ def apply_lora_adapters(
                 module.self_attention.linear_proj = SelfAttentionLinearProjLoRA(
                     adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
                     linear_proj=self_attention_linear_proj,
-                    rank=1,
-                    alpha=32,
+                    rank=LORA_RANK,
+                    alpha=LORA_ALPHA,
                     provider=provider,
                 )
                 self_attention_linear_qkv = _unwrap_attr(
@@ -755,8 +758,8 @@ def apply_lora_adapters(
                 module.self_attention.linear_qkv = SelfAttentionLinearQKVLoRA(
                     adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
                     linear_qkv=self_attention_linear_qkv,
-                    rank=1,
-                    alpha=32,
+                    rank=LORA_RANK,
+                    alpha=LORA_ALPHA,
                     provider=provider,
                 )
                 assert isinstance(module.mlp.experts, TEGroupedMLP)
@@ -768,8 +771,8 @@ def apply_lora_adapters(
                 module.mlp.experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
                     adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
                     linear_fc1=mlp_experts_linear_fc1,
-                    rank=1,
-                    alpha=32,
+                    rank=LORA_RANK,
+                    alpha=LORA_ALPHA,
                     num_local_experts=module.mlp.experts.num_local_experts,
                 )
                 mlp_experts_linear_fc2 = _unwrap_attr(
@@ -780,8 +783,8 @@ def apply_lora_adapters(
                 module.mlp.experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
                     adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
                     linear_fc2=mlp_experts_linear_fc2,
-                    rank=1,
-                    alpha=32,
+                    rank=LORA_RANK,
+                    alpha=LORA_ALPHA,
                     num_local_experts=module.mlp.experts.num_local_experts,
                 )
     return list(model)

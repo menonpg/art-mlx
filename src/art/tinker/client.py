@@ -12,17 +12,23 @@ from openai._types import Body, Headers, NotGiven, Query, not_given
 from openai.resources.models import AsyncModels
 from openai.types import Model
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from openai.types.completion_usage import CompletionUsage
+from pydantic import TypeAdapter
 
 from art.types import Message, MessageOrChoice, MessagesAndChoices, Tools
 
 ParsedMessageOrChoice = Choice | Message
 ParsedMessagesAndChoices = list[ParsedMessageOrChoice]
+_MESSAGE_ADAPTER = TypeAdapter(ChatCompletionMessageParam)
 
 
 def _message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, Any]:
     if isinstance(message_or_choice, dict):
-        return cast(dict[str, Any], message_or_choice)
+        validated = _MESSAGE_ADAPTER.validate_python(message_or_choice)
+        return cast(
+            dict[str, Any], _MESSAGE_ADAPTER.dump_python(validated, mode="json")
+        )
     if isinstance(message_or_choice, BaseModel):
         return cast(dict[str, Any], message_or_choice.to_dict())
     to_dict = getattr(message_or_choice, "to_dict", None)

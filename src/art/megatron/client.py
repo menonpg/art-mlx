@@ -10,13 +10,17 @@ from .merge import merge_lora_adapter
 DEFAULT_TRAINING_LOG_DIR = "/tmp/megatron_training_logs"
 
 
-def create_megatron_job_paths() -> tuple[str, str]:
+def create_megatron_job_paths(
+    *,
+    jobs_dir: str = DEFAULT_JOBS_DIR,
+    training_log_dir: str = DEFAULT_TRAINING_LOG_DIR,
+) -> tuple[str, str]:
     timestamp = datetime.datetime.now().isoformat()
-    os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
-    os.makedirs(DEFAULT_TRAINING_LOG_DIR, exist_ok=True)
+    os.makedirs(jobs_dir, exist_ok=True)
+    os.makedirs(training_log_dir, exist_ok=True)
     return (
-        os.path.join(DEFAULT_JOBS_DIR, f"{timestamp}.json"),
-        os.path.join(DEFAULT_TRAINING_LOG_DIR, f"{timestamp}.jsonl"),
+        os.path.join(jobs_dir, f"{timestamp}.json"),
+        os.path.join(training_log_dir, f"{timestamp}.jsonl"),
     )
 
 

@@ -33,6 +33,7 @@ def build_rl_train_configs(
     truncated_importance_sampling: float | None = None,
     scale_learning_rate_by_reward_std_dev: bool | None = None,
     logprob_calculation_chunk_size: int | None = None,
+    packed_sequence_length: int | None = None,
     num_trajectories_learning_rate_multiplier_power: float | None = None,
     kl_ref_adapter_path: str | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
@@ -62,6 +63,8 @@ def build_rl_train_configs(
         )
     if logprob_calculation_chunk_size is not None:
         dev_config["logprob_calculation_chunk_size"] = logprob_calculation_chunk_size
+    if packed_sequence_length is not None:
+        dev_config["packed_sequence_length"] = packed_sequence_length
     if num_trajectories_learning_rate_multiplier_power is not None:
         dev_config["num_trajectories_learning_rate_multiplier_power"] = (
             num_trajectories_learning_rate_multiplier_power
