@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+import signal
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -116,3 +117,69 @@ async def test_dedicated_train_uses_merged_job_and_updates_latest_step(
     assert results == []
     assert seen_job["job"].kind == "train_merged"
     assert service._latest_step == 1
+
+
+def test_stop_megatron_process_kills_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [0],
+            "inference_gpu_ids": [1],
+            "rollout_weights_mode": "merged",
+        },
+        output_dir=str(tmp_path),
+    )
+
+    class _Process:
+        pid = 4321
+        returncode = None
+
+    seen: dict[str, int] = {}
+    monkeypatch.setattr("art.megatron.service.os.getpgid", lambda pid: pid + 1)
+    monkeypatch.setattr(
+        "art.megatron.service.os.killpg",
+        lambda pgid, sig: seen.update({"pgid": pgid, "sig": int(sig)}),
+    )
+    service._megatron_process = cast(Any, _Process())
+
+    service._stop_megatron_process()
+
+    assert seen == {"pgid": 4322, "sig": int(signal.SIGTERM)}
+    assert service._megatron_process is None
+
+
+def test_stop_megatron_process_ignores_missing_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [0],
+            "inference_gpu_ids": [1],
+            "rollout_weights_mode": "merged",
+        },
+        output_dir=str(tmp_path),
+    )
+
+    class _Process:
+        pid = 4321
+        returncode = None
+
+    monkeypatch.setattr("art.megatron.service.os.getpgid", lambda pid: pid)
+
+    def _raise_process_lookup(pgid: int, sig: int) -> None:
+        del pgid, sig
+        raise ProcessLookupError
+
+    monkeypatch.setattr("art.megatron.service.os.killpg", _raise_process_lookup)
+    service._megatron_process = cast(Any, _Process())
+
+    service._stop_megatron_process()
+
+    assert service._megatron_process is None

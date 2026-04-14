@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 from typing import Any, AsyncIterator, Literal, cast
@@ -509,6 +510,7 @@ class MegatronService:
             command,
             cwd=str(project_root),
             env=env,
+            start_new_session=True,
         )
 
     def _clear_pending_jobs(self) -> None:
@@ -756,7 +758,13 @@ class MegatronService:
         if self._megatron_process is None:
             return
         if self._megatron_process.returncode is None:
-            self._megatron_process.terminate()
+            try:
+                os.killpg(
+                    os.getpgid(self._megatron_process.pid),
+                    signal.SIGTERM,
+                )
+            except ProcessLookupError:
+                pass
         self._megatron_process = None
 
     def close(self) -> None:

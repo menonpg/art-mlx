@@ -1,7 +1,9 @@
 import importlib
 import importlib.metadata
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 from typing import Any
 
 from art.megatron.model_support.discovery import inspect_architecture
@@ -27,6 +29,14 @@ MANDATORY_VALIDATION_STAGES = (
     "yes_no_trainability",
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
+SUBPROCESS_VALIDATION_STAGES = frozenset(
+    {
+        "hf_parity",
+        "lora_coverage",
+        "merged_vllm_serving",
+        "correctness_sensitivity",
+    }
+)
 
 
 def build_validation_stage_names(
@@ -77,6 +87,73 @@ def _import_integration_module(module_name: str) -> Any:
     if tests_dir not in sys.path:
         sys.path.insert(0, tests_dir)
     return importlib.import_module(module_name)
+
+
+def _subprocess_log_tail(log_path: Path, *, max_lines: int = 40) -> str:
+    if not log_path.exists():
+        return ""
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+def _run_stage_in_subprocess(
+    *,
+    stage_name: str,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    with tempfile.TemporaryDirectory(prefix=f"model_support_{stage_name}_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        architecture_json = tmp_path / "architecture.json"
+        output_json = tmp_path / "stage_result.json"
+        log_path = tmp_path / "stage.log"
+        architecture_json.write_text(
+            architecture.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "art.megatron.model_support.workflow_stage_worker",
+            "--stage",
+            stage_name,
+            "--base-model",
+            base_model,
+            "--architecture-json",
+            str(architecture_json),
+            "--output-json",
+            str(output_json),
+        ]
+        with log_path.open("w", encoding="utf-8") as log_file:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(REPO_ROOT),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        if completed.returncode != 0:
+            tail = _subprocess_log_tail(log_path)
+            error = (
+                f"subprocess exited with code {completed.returncode}"
+                if not tail
+                else tail
+            )
+            return ValidationStageResult(
+                name=stage_name,
+                passed=False,
+                metrics={"error": error},
+            )
+        if not output_json.exists():
+            return ValidationStageResult(
+                name=stage_name,
+                passed=False,
+                metrics={"error": "stage worker did not write output_json"},
+            )
+        return ValidationStageResult.model_validate_json(
+            output_json.read_text(encoding="utf-8")
+        )
 
 
 def run_hf_parity_stage(
@@ -248,6 +325,13 @@ def build_validation_report(
     }
     stage_results: dict[str, ValidationStageResult] = {}
     for stage_name, stage_runner in stage_runners.items():
+        if stage_name in SUBPROCESS_VALIDATION_STAGES:
+            stage_results[stage_name] = _run_stage_in_subprocess(
+                stage_name=stage_name,
+                base_model=base_model,
+                architecture=architecture,
+            )
+            continue
         try:
             stage_results[stage_name] = stage_runner(
                 base_model=base_model,

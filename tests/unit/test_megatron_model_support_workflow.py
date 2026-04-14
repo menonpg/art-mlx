@@ -43,39 +43,35 @@ def test_build_validation_report_populates_architecture_stage(
         lambda: {"transformers": "5.2.0"},
     )
     monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_hf_parity_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="hf_parity",
-            passed=True,
-            metrics={"signal": "pass", "requested_num_layers": 1},
-            artifact_dir="/tmp/hf_parity",
-        ),
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_lora_coverage_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="lora_coverage",
-            passed=True,
-            metrics={"wrapped_adapter_prefix_count": 12},
-        ),
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_correctness_sensitivity_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="correctness_sensitivity",
-            passed=True,
-            metrics={"correctness_variant_count": 4, "sensitivity_variant_count": 9},
-            artifact_dir="/tmp/correctness",
-        ),
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_merged_vllm_serving_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="merged_vllm_serving",
-            passed=True,
-            metrics={"served_model_name": "validation@0"},
-            artifact_dir="/tmp/merged-serving",
-        ),
+        "art.megatron.model_support.workflow._run_stage_in_subprocess",
+        lambda *, stage_name, base_model, architecture: {
+            "hf_parity": ValidationStageResult(
+                name="hf_parity",
+                passed=True,
+                metrics={"signal": "pass", "requested_num_layers": 1},
+                artifact_dir="/tmp/hf_parity",
+            ),
+            "lora_coverage": ValidationStageResult(
+                name="lora_coverage",
+                passed=True,
+                metrics={"wrapped_adapter_prefix_count": 12},
+            ),
+            "merged_vllm_serving": ValidationStageResult(
+                name="merged_vllm_serving",
+                passed=True,
+                metrics={"served_model_name": "validation@0"},
+                artifact_dir="/tmp/merged-serving",
+            ),
+            "correctness_sensitivity": ValidationStageResult(
+                name="correctness_sensitivity",
+                passed=True,
+                metrics={
+                    "correctness_variant_count": 4,
+                    "sensitivity_variant_count": 9,
+                },
+                artifact_dir="/tmp/correctness",
+            ),
+        }[stage_name],
     )
 
     report = build_validation_report(base_model="Qwen/Qwen3.5-35B-A3B")
@@ -149,36 +145,20 @@ def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None
         lambda: {},
     )
 
-    def _fail_hf_parity(*, base_model: str, architecture: ArchitectureReport) -> None:
-        del base_model, architecture
-        raise AssertionError("parity failed")
-
     monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_hf_parity_stage",
-        _fail_hf_parity,
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_lora_coverage_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="lora_coverage",
-            passed=True,
-            metrics={},
-        ),
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_merged_vllm_serving_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="merged_vllm_serving",
-            passed=True,
-            metrics={},
-        ),
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_correctness_sensitivity_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="correctness_sensitivity",
-            passed=True,
-            metrics={},
+        "art.megatron.model_support.workflow._run_stage_in_subprocess",
+        lambda *, stage_name, base_model, architecture: (
+            ValidationStageResult(
+                name="hf_parity",
+                passed=False,
+                metrics={"error": "AssertionError: parity failed"},
+            )
+            if stage_name == "hf_parity"
+            else ValidationStageResult(
+                name=stage_name,
+                passed=True,
+                metrics={},
+            )
         ),
     )
 
@@ -208,40 +188,19 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
         lambda: {},
     )
     monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_hf_parity_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="hf_parity",
-            passed=True,
-            metrics={},
-        ),
-    )
-
-    def _fail_lora_coverage(
-        *,
-        base_model: str,
-        architecture: ArchitectureReport,
-    ) -> None:
-        del base_model, architecture
-        raise RuntimeError("missing wrapped targets")
-
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_lora_coverage_stage",
-        _fail_lora_coverage,
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_correctness_sensitivity_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="correctness_sensitivity",
-            passed=True,
-            metrics={},
-        ),
-    )
-    monkeypatch.setattr(
-        "art.megatron.model_support.workflow.run_merged_vllm_serving_stage",
-        lambda *, base_model, architecture: ValidationStageResult(
-            name="merged_vllm_serving",
-            passed=True,
-            metrics={},
+        "art.megatron.model_support.workflow._run_stage_in_subprocess",
+        lambda *, stage_name, base_model, architecture: (
+            ValidationStageResult(
+                name="lora_coverage",
+                passed=False,
+                metrics={"error": "RuntimeError: missing wrapped targets"},
+            )
+            if stage_name == "lora_coverage"
+            else ValidationStageResult(
+                name=stage_name,
+                passed=True,
+                metrics={},
+            )
         ),
     )
 
