@@ -111,6 +111,7 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
+    _forked_checkpoint_dir: str | None = None
     _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
     # Dedicated mode subprocess state
     _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]

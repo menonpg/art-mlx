@@ -1451,7 +1451,7 @@ class LocalBackend(Backend):
                 print(
                     "Invalidated UnslothService _state cache to pick up forked checkpoint"
                 )
-        service._forked_checkpoint_dir = dest_checkpoint_dir
+        service._forked_checkpoint_dir = dest_checkpoint_dir  # type: ignore[union-attr]
 
         if verbose:
             print(
