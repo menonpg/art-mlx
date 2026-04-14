@@ -1453,6 +1453,23 @@ class LocalBackend(Backend):
                 )
         service._forked_checkpoint_dir = dest_checkpoint_dir
 
+        try:
+            service = await self._get_service(model)
+        except Exception:
+            service = None
+        if service is not None:
+            load_adapter = getattr(service, "load_adapter_from_checkpoint", None)
+            if callable(load_adapter):
+                try:
+                    await load_adapter(dest_checkpoint_dir)
+                    if verbose:
+                        print(
+                            f"Loaded forked adapter from {dest_checkpoint_dir} into training service"
+                        )
+                except Exception as exc:
+                    if verbose:
+                        print(f"Warning: failed to load forked adapter: {exc}")
+
         if verbose:
             print(
                 f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"

@@ -819,6 +819,10 @@ class UnslothService:
         if verbose:
             print("SFT training finished")
 
+    async def load_adapter_from_checkpoint(self, checkpoint_dir: str) -> None:
+        """Load LoRA weights from a checkpoint into the active PEFT model."""
+        await self._state.load_lora_adapter(checkpoint_dir)
+
     @cached_property
     def _state(self) -> UnslothTrainContext:
         init_args = dict(self.config.get("init_args", {}))
