@@ -11,9 +11,11 @@ from art.megatron.model_support.workflow import (
     assess_minimal_layer_coverage,
     build_validation_report,
     build_validation_stage_names,
+    run_chat_template_rollout_stage,
     run_correctness_sensitivity_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
+    run_yes_no_trainability_stage,
 )
 
 
@@ -71,6 +73,24 @@ def test_build_validation_report_populates_architecture_stage(
                 },
                 artifact_dir="/tmp/correctness",
             ),
+            "chat_template_rollout": ValidationStageResult(
+                name="chat_template_rollout",
+                passed=True,
+                metrics={
+                    "assistant_token_count": 8,
+                    "packed_num_sequences": 1,
+                },
+                artifact_dir="/tmp/chat-template",
+            ),
+            "yes_no_trainability": ValidationStageResult(
+                name="yes_no_trainability",
+                passed=True,
+                metrics={
+                    "latest_step": 3,
+                    "final_eval_reward": 0.97,
+                },
+                artifact_dir="/tmp/trainability",
+            ),
         }[stage_name],
     )
 
@@ -127,6 +147,24 @@ def test_build_validation_report_populates_architecture_stage(
     assert merged_stage.passed is True
     assert merged_stage.metrics == {"served_model_name": "validation@0"}
     assert merged_stage.artifact_dir == "/tmp/merged-serving"
+    chat_template_stage = next(
+        stage for stage in report.stages if stage.name == "chat_template_rollout"
+    )
+    assert chat_template_stage.passed is True
+    assert chat_template_stage.metrics == {
+        "assistant_token_count": 8,
+        "packed_num_sequences": 1,
+    }
+    assert chat_template_stage.artifact_dir == "/tmp/chat-template"
+    trainability_stage = next(
+        stage for stage in report.stages if stage.name == "yes_no_trainability"
+    )
+    assert trainability_stage.passed is True
+    assert trainability_stage.metrics == {
+        "latest_step": 3,
+        "final_eval_reward": 0.97,
+    }
+    assert trainability_stage.artifact_dir == "/tmp/trainability"
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:
@@ -244,6 +282,74 @@ def test_assess_minimal_layer_coverage_reports_missing_families(
     assert coverage.recommended_min_layers == 4
     assert coverage.missing_layer_families == ["standard_attention"]
     assert coverage.unresolved_risks == []
+
+
+def test_run_chat_template_rollout_stage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(
+            run_chat_template_rollout=lambda *, base_model: SimpleNamespace(
+                assistant_token_count=12,
+                packed_num_sequences=2,
+                requires_mapping_tool_arguments=True,
+                normalized_mapping_tool_arguments=True,
+                output_dir="/tmp/chat-template",
+                model_dump=lambda mode="json": {
+                    "assistant_token_count": 12,
+                    "packed_num_sequences": 2,
+                    "requires_mapping_tool_arguments": True,
+                    "normalized_mapping_tool_arguments": True,
+                },
+            )
+        ),
+    )
+
+    result = run_chat_template_rollout_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+        ),
+    )
+
+    assert result.passed is True
+    assert result.artifact_dir == "/tmp/chat-template"
+
+
+def test_run_yes_no_trainability_stage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(
+            run_yes_no_trainability=lambda *, base_model: SimpleNamespace(
+                latest_step=2,
+                initial_eval_reward=0.4,
+                final_eval_reward=0.95,
+                reward_threshold=0.95,
+                saturated_step=2,
+                output_dir="/tmp/trainability",
+                model_dump=lambda mode="json": {
+                    "latest_step": 2,
+                    "initial_eval_reward": 0.4,
+                    "final_eval_reward": 0.95,
+                    "reward_threshold": 0.95,
+                    "saturated_step": 2,
+                },
+            )
+        ),
+    )
+
+    result = run_yes_no_trainability_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+        ),
+    )
+
+    assert result.passed is True
+    assert result.artifact_dir == "/tmp/trainability"
 
 
 def test_assess_minimal_layer_coverage_passes_when_prefix_covers_all_families(

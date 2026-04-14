@@ -18,6 +18,20 @@ from art.megatron.lora import (
 )
 
 
+def _ensure_bridge_qwen35_adapter_name_map() -> None:
+    from megatron.bridge.models.conversion import peft_bridge
+
+    extra_entries = {
+        ".in_proj_qkv.weight": "adapter_qkv",
+        ".in_proj_z.weight": "adapter_z",
+        ".in_proj_b.weight": "adapter_b",
+        ".in_proj_a.weight": "adapter_a",
+    }
+    for suffix, adapter_key in extra_entries.items():
+        peft_bridge.ADAPTER_NAME_MAP.setdefault(suffix, adapter_key)
+        peft_bridge.ADAPTER_KEY_TO_SUFFIX.setdefault(adapter_key, suffix)
+
+
 def layer_base_prefix(module: TransformerLayer) -> str:
     return f"language_model.decoder.layers.{module.layer_number - 1}"
 
@@ -129,6 +143,24 @@ def _fused_gdn_adapter_weight(
     )
 
 
+def _zero_adapter_weight(
+    *,
+    base_prefix: str,
+    adapter_key: str,
+    input_dim: int,
+    output_dim: int,
+    like: torch.Tensor,
+) -> AdapterWeight:
+    return _adapter_weight(
+        base_prefix=base_prefix,
+        adapter_key=adapter_key,
+        alpha=1,
+        dim=1,
+        linear_in=like.new_zeros((1, input_dim)),
+        linear_out=like.new_zeros((output_dim, 1)),
+    )
+
+
 def _fused_pair_adapter_weight(
     base_prefix: str,
     first_lora: LoRA,
@@ -210,6 +242,8 @@ def add_gated_delta_net_adapter_weights(
     layer_prefix: str,
     self_attention: Any,
 ) -> None:
+    _ensure_bridge_qwen35_adapter_name_map()
+
     out_proj = getattr(self_attention, "out_proj", None)
     if isinstance(out_proj, SelfAttentionLinearProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.out_proj"
@@ -221,7 +255,30 @@ def add_gated_delta_net_adapter_weights(
     if isinstance(in_proj, GatedDeltaNetInProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.in_proj"
         adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _fused_gdn_adapter_weight(base_prefix, in_proj)
+            _simple_adapter_weight(
+                base_prefix,
+                in_proj.qkv_lora,
+                adapter_key="adapter_qkv",
+            ),
+            _simple_adapter_weight(
+                base_prefix,
+                in_proj.z_lora,
+                adapter_key="adapter_z",
+            ),
+            _zero_adapter_weight(
+                base_prefix=base_prefix,
+                adapter_key="adapter_b",
+                input_dim=int(in_proj.qkv_lora.A_T.shape[-1]),
+                output_dim=int(in_proj.num_value_heads_per_partition),
+                like=in_proj.qkv_lora.B_T,
+            ),
+            _zero_adapter_weight(
+                base_prefix=base_prefix,
+                adapter_key="adapter_a",
+                input_dim=int(in_proj.qkv_lora.A_T.shape[-1]),
+                output_dim=int(in_proj.num_value_heads_per_partition),
+                like=in_proj.qkv_lora.B_T,
+            ),
         ]
 
 

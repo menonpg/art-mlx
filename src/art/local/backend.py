@@ -486,20 +486,23 @@ class LocalBackend(Backend):
         def done_callback(_: asyncio.Task[None]) -> None:
             close_proxy(self._services.pop(model.name))
 
-        asyncio.create_task(
-            self._monitor_openai_server(model, base_url, api_key)
-        ).add_done_callback(done_callback)
+        if os.environ.get("ART_DISABLE_SERVER_MONITOR", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            asyncio.create_task(
+                self._monitor_openai_server(model, base_url, api_key)
+            ).add_done_callback(done_callback)
 
         return base_url, api_key
 
     async def _monitor_openai_server(
         self, model: AnyTrainableModel, base_url: str, api_key: str
     ) -> None:
+        del api_key
         model_name = model.name
-        openai_client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-        )
         consecutive_failures = 0
         max_consecutive_failures = 3
         async with aiohttp.ClientSession() as session:
@@ -525,18 +528,21 @@ class LocalBackend(Backend):
                             running_requests = int(float(line.split()[1]))
                         elif line.startswith("vllm:num_requests_waiting"):
                             pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, send a health check
+                    # If there are no running or pending requests, send a cheap API probe.
                     if running_requests == 0 and pending_requests == 0:
                         try:
-                            # Send a health check with a short timeout
-                            await openai_client.completions.create(
-                                model=self._model_inference_name(model),
-                                prompt="Hi",
-                                max_tokens=1,
-                                timeout=float(
-                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
+                            async with session.get(
+                                f"{base_url}/models",
+                                timeout=aiohttp.ClientTimeout(
+                                    total=float(
+                                        os.environ.get(
+                                            "ART_SERVER_MONITOR_TIMEOUT", 5.0
+                                        )
+                                    )
                                 ),
-                            )
+                            ) as response:
+                                response.raise_for_status()
+                                await response.text()
                         except Exception as e:
                             # If the server is sleeping, a failed health check is okay
                             if await self._services[

@@ -5,11 +5,32 @@ from typing import Any, Sequence
 
 import torch
 
+_SYNC_DEALLOC_FAKE_REGISTERED = False
+
 
 @dataclass
 class OffloadState:
     pinned_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     is_offloaded: bool = False
+
+
+def _maybe_register_sync_dealloc_fake() -> None:
+    global _SYNC_DEALLOC_FAKE_REGISTERED
+    if _SYNC_DEALLOC_FAKE_REGISTERED:
+        return
+    streams_ops = getattr(torch.ops, "streams", None)
+    if streams_ops is None or not hasattr(streams_ops, "sync_dealloc"):
+        return
+    try:
+
+        @torch.library.register_fake("streams::sync_dealloc")
+        def _sync_dealloc_fake(*args, **kwargs):
+            del args, kwargs
+            return None
+    except RuntimeError as exc:
+        if "already has a fake impl registered" not in str(exc):
+            raise
+    _SYNC_DEALLOC_FAKE_REGISTERED = True
 
 
 def _iter_megatron_param_buffers(model: Sequence[torch.nn.Module]) -> Iterator[Any]:
@@ -36,6 +57,7 @@ def offload_to_cpu(
 
     for param_buffer in _iter_megatron_param_buffers(model):
         param_buffer.offload_to_cpu(move_params=True, move_grads=True)
+    _maybe_register_sync_dealloc_fake()
 
     # Megatron remaps trainable params into contiguous DDP buffers. Offload those via the
     # native buffer APIs above, and only manually offload frozen params here.
@@ -84,6 +106,7 @@ def reload_to_gpu(
 
     for param_buffer in _iter_megatron_param_buffers(model):
         param_buffer.reload_from_cpu(move_params=True, move_grads=True)
+    _maybe_register_sync_dealloc_fake()
 
     # Reload frozen params that were manually offloaded.
     for chunk in model:

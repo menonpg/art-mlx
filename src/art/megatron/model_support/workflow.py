@@ -35,6 +35,8 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "lora_coverage",
         "merged_vllm_serving",
         "correctness_sensitivity",
+        "chat_template_rollout",
+        "yes_no_trainability",
     }
 )
 
@@ -307,6 +309,55 @@ def run_merged_vllm_serving_stage(
     )
 
 
+def run_chat_template_rollout_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    del architecture
+    chat_template_rollout = _import_integration_module(
+        "integration.megatron_chat_template_rollout"
+    )
+    report = chat_template_rollout.run_chat_template_rollout(base_model=base_model)
+    return ValidationStageResult(
+        name="chat_template_rollout",
+        passed=report.assistant_token_count > 0
+        and report.packed_num_sequences > 0
+        and (
+            not report.requires_mapping_tool_arguments
+            or report.normalized_mapping_tool_arguments
+        ),
+        metrics=report.model_dump(mode="json"),
+        artifact_dir=report.output_dir,
+    )
+
+
+def run_yes_no_trainability_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    del architecture
+    yes_no_trainability = _import_integration_module(
+        "integration.megatron_yes_no_trainability"
+    )
+    report = yes_no_trainability.run_yes_no_trainability(base_model=base_model)
+    passed = (
+        report.saturated_step is not None
+        and report.saturated_step > 0
+        and report.initial_eval_reward < report.reward_threshold
+        and report.final_eval_reward is not None
+        and report.final_eval_reward >= report.reward_threshold
+        and report.final_eval_reward > report.initial_eval_reward
+    )
+    return ValidationStageResult(
+        name="yes_no_trainability",
+        passed=passed,
+        metrics=report.model_dump(mode="json"),
+        artifact_dir=report.output_dir,
+    )
+
+
 def build_validation_report(
     *,
     base_model: str,
@@ -322,6 +373,8 @@ def build_validation_report(
         "lora_coverage": run_lora_coverage_stage,
         "merged_vllm_serving": run_merged_vllm_serving_stage,
         "correctness_sensitivity": run_correctness_sensitivity_stage,
+        "chat_template_rollout": run_chat_template_rollout_stage,
+        "yes_no_trainability": run_yes_no_trainability_stage,
     }
     stage_results: dict[str, ValidationStageResult] = {}
     for stage_name, stage_runner in stage_runners.items():

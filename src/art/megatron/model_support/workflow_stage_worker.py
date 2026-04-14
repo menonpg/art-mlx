@@ -3,10 +3,12 @@ from pathlib import Path
 
 from art.megatron.model_support.spec import ArchitectureReport
 from art.megatron.model_support.workflow import (
+    run_chat_template_rollout_stage,
     run_correctness_sensitivity_stage,
     run_hf_parity_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
+    run_yes_no_trainability_stage,
 )
 
 _STAGE_RUNNERS = {
@@ -14,6 +16,8 @@ _STAGE_RUNNERS = {
     "lora_coverage": run_lora_coverage_stage,
     "merged_vllm_serving": run_merged_vllm_serving_stage,
     "correctness_sensitivity": run_correctness_sensitivity_stage,
+    "chat_template_rollout": run_chat_template_rollout_stage,
+    "yes_no_trainability": run_yes_no_trainability_stage,
 }
 
 

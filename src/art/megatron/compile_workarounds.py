@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch._dynamo.variables.streams  # noqa: F401
 
 _INSTALLED = False
 
@@ -20,11 +21,29 @@ def install_torch_compile_workarounds() -> None:
     from megatron.core.transformer.moe import moe_utils, token_dispatcher
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
+    from art.megatron.lora import MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
+
+    try:
+
+        @torch.library.register_fake("streams::sync_dealloc")
+        def _sync_dealloc_fake(
+            wait_event_index: int,
+            src_stream_index: int,
+            to_dealloc: torch.Tensor,
+        ) -> None:
+            del wait_event_index, src_stream_index, to_dealloc
+            return None
+    except RuntimeError as exc:
+        if "already has a fake impl registered" not in str(exc):
+            raise
+
     moe_utils.maybe_move_tensor_to_cpu = _disable(moe_utils.maybe_move_tensor_to_cpu)
     token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = _disable(
         token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
     )
     MoELayer.preprocess = _disable(MoELayer.preprocess)
+    MLPExpertsLinearFC1LoRA.forward = _disable(MLPExpertsLinearFC1LoRA.forward)
+    MLPExpertsLinearFC2LoRA.forward = _disable(MLPExpertsLinearFC2LoRA.forward)
     deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
     if deepep_manager is not None:
         deepep_manager.dispatch = _disable(deepep_manager.dispatch)

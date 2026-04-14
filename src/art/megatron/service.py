@@ -489,9 +489,14 @@ class MegatronService:
         else:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
+        runtime_dir = str(Path(jobs_dir).parent)
         env["MODEL_IDENTIFIER"] = self.base_model
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
+        env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(runtime_dir, "torchinductor")
+        env["TRITON_CACHE_DIR"] = os.path.join(runtime_dir, "triton")
+        os.makedirs(env["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
+        os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
         master_addr = env.get("MASTER_ADDR", "127.0.0.1")
         master_port = str(self._allocate_master_port())
         env["MASTER_ADDR"] = master_addr

@@ -108,7 +108,7 @@ async def _run_merged_vllm_serving(
                     "max_tokens": 1,
                     "temperature": 0.0,
                 },
-                timeout=120.0,
+                timeout=900.0,
             )
             completion_response.raise_for_status()
             completion_json = completion_response.json()

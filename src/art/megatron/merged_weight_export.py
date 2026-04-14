@@ -130,11 +130,35 @@ def iter_merged_vllm_weights(
             task.global_param_name
         )
         if adapter_weights is not None:
-            converted_weights_dict = model_bridge._merge_lora_adapter_weights(
-                weight_export.model,
-                converted_weights_dict,
-                adapter_weights,
-            )
+            try:
+                converted_weights_dict = model_bridge._merge_lora_adapter_weights(
+                    weight_export.model,
+                    converted_weights_dict,
+                    adapter_weights,
+                )
+            except Exception as exc:
+                converted_shapes = {
+                    key: tuple(value.shape)
+                    for key, value in converted_weights_dict.items()
+                }
+                adapter_summaries = [
+                    {
+                        "base_prefix": adapter_weight.global_base_prefix,
+                        "adapter_key": adapter_weight.adapter_key,
+                        "linear_in": tuple(
+                            adapter_weight.linear_in_weight.weight.shape
+                        ),
+                        "linear_out": tuple(
+                            adapter_weight.linear_out_weight.weight.shape
+                        ),
+                    }
+                    for adapter_weight in adapter_weights
+                ]
+                raise RuntimeError(
+                    "Failed merged LoRA export for "
+                    f"{task.global_param_name}: converted={converted_shapes} "
+                    f"adapter_weights={adapter_summaries}"
+                ) from exc
         if getattr(task.mapping, "is_grouped_export", False):
             merged_result = model_bridge._accumulate_grouped_export(
                 task,
