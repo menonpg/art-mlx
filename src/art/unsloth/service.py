@@ -27,6 +27,7 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
+from . import dtype_patch  # noqa: F401  # ensure dtype harmonisation patch runs
 from .train import (
     UnslothTrainContext,
     create_unsloth_train_context,
@@ -112,6 +113,7 @@ class UnslothService:
     _is_sleeping: bool = False
     _latest_step: int = 0
     _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
+    _forked_checkpoint_dir: str | None = None
     # Dedicated mode subprocess state
     _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
     _vllm_log_file: Any = field(default=None, repr=False)

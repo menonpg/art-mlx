@@ -1444,19 +1444,18 @@ class LocalBackend(Backend):
         #    is necessary because from_pretrained may set up the LoRA
         #    architecture without loading the actual trained weights
         #    (especially across precision mismatches).
-        service = await self._get_service(cast(TrainableModel, model))
-        if hasattr(service, "_state") and "_state" in service.__dict__:
-            del service.__dict__["_state"]
-            if verbose:
-                print(
-                    "Invalidated UnslothService _state cache to pick up forked checkpoint"
-                )
-        service._forked_checkpoint_dir = dest_checkpoint_dir
-
         try:
-            service = await self._get_service(model)
+            service = await self._get_service(cast(TrainableModel, model))
         except Exception:
             service = None
+        if service is not None and hasattr(service, "__dict__"):
+            if hasattr(service, "_state") and "_state" in service.__dict__:
+                del service.__dict__["_state"]
+                if verbose:
+                    print(
+                        "Invalidated UnslothService _state cache to pick up forked checkpoint"
+                    )
+            setattr(service, "_forked_checkpoint_dir", dest_checkpoint_dir)
         if service is not None:
             load_adapter = getattr(service, "load_adapter_from_checkpoint", None)
             if callable(load_adapter):
