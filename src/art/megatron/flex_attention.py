@@ -36,6 +36,7 @@ class FlexAttentionWrapper(torch.nn.Module):
     # Torchtitan inductor options for compiling flex attention.
     _compile_options: ClassVar[CompileOptions] = {
         "max_autotune": True,
+        "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     }
     # Skip Inductor's flex_decoding specialization: it has triggered both
