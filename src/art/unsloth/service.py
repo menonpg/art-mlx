@@ -592,7 +592,7 @@ class UnslothService:
         # Load forked adapter weights on first training call if needed.
         forked_dir = getattr(self, "_forked_checkpoint_dir", None)
         if forked_dir is not None:
-            del self._forked_checkpoint_dir
+            self._forked_checkpoint_dir = None
             await self._state.load_lora_adapter(forked_dir)
         async for result in run_unsloth_rl_training(
             self._state,
@@ -638,7 +638,7 @@ class UnslothService:
         # Load forked adapter weights on first training call if needed.
         forked_dir = getattr(self, "_forked_checkpoint_dir", None)
         if forked_dir is not None:
-            del self._forked_checkpoint_dir
+            self._forked_checkpoint_dir = None
             await self._state.load_lora_adapter(forked_dir)
         llm = await self.llm
 

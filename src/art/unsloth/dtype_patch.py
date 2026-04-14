@@ -86,14 +86,14 @@ def ensure_dtype_patch(log: logging.Logger | None = None) -> bool:
                 W_full = W.dequantize()
             else:
                 W_full = W.contiguous()
-            out = torch_matmul(X, W_full.t(), out=out)
+            out = torch_matmul(X, W_full.t(), out=out)  # type: ignore[call-arg]
         elif getattr(W, "dtype", None) == getattr(torch, "float8_e4m3fn", None):
             if fp8_linear is None:
                 raise RuntimeError("FP8 weights detected but fp8_linear unavailable.")
             out = fp8_linear(X, W, W_quant)
         else:
-            W_full = fast_dequantize(W, W_quant, use_global_buffer=True)
-            out = torch_matmul(X, W_full.t(), out=out)
+            W_full = fast_dequantize(W, W_quant, use_global_buffer=True)  # type: ignore[call-arg]
+            out = torch_matmul(X, W_full.t(), out=out)  # type: ignore[call-arg]
 
         if A is not None:
             td = _target_dtype(out, dtype)
@@ -113,7 +113,7 @@ def ensure_dtype_patch(log: logging.Logger | None = None) -> bool:
             return patched_matmul_lora(X, W, W_quant, lora_A, lora_B, lora_S)
 
         if W_quant is None:
-            out = torch_matmul(X, W.t(), out=out)
+            out = torch_matmul(X, W.t(), out=out)  # type: ignore[call-arg]
         elif getattr(W, "dtype", None) == getattr(torch, "float8_e4m3fn", None):
             if fp8_linear is None:
                 raise RuntimeError("FP8 weights detected but fp8_linear unavailable.")
@@ -121,8 +121,8 @@ def ensure_dtype_patch(log: logging.Logger | None = None) -> bool:
         elif fast_gemv is not None and bsz == 1 and q_len == 1:
             out = fast_gemv(X, W, W_quant, out=out)
         else:
-            W_full = fast_dequantize(W.t(), W_quant, use_global_buffer=True)
-            out = torch_matmul(X, W_full, out=out)
+            W_full = fast_dequantize(W.t(), W_quant, use_global_buffer=True)  # type: ignore[call-arg]
+            out = torch_matmul(X, W_full, out=out)  # type: ignore[call-arg]
 
         if lora_A is not None:
             td = _target_dtype(out, X.dtype)
@@ -166,3 +166,7 @@ def ensure_dtype_patch(log: logging.Logger | None = None) -> bool:
     if log:
         log.debug("Applied Unsloth LoRA dtype harmonisation patch.")
     return True
+
+
+# Apply eagerly so import side-effects protect downstream callers.
+ensure_dtype_patch(logging.getLogger(__name__))
