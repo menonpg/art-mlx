@@ -257,7 +257,7 @@ def test_build_megatron_runtime_uses_single_gpu_parity_provider_bundle(
     fake_bundle = SimpleNamespace(
         provider=fake_provider,
         bridge="bridge",
-        handler="handler",
+        handler=SimpleNamespace(install_preprocess_patch=lambda model: None),
         spec="spec",
     )
 
@@ -279,10 +279,6 @@ def test_build_megatron_runtime_uses_single_gpu_parity_provider_bundle(
                 },
             )
         ),
-    )
-    monkeypatch.setattr(
-        "integration.megatron_hf_parity_worker.megatron_train._install_gpt_preprocess_hook",
-        lambda model: None,
     )
     monkeypatch.setattr(
         "integration.megatron_hf_parity_worker.megatron_train._build_optimizer",

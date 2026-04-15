@@ -9,6 +9,10 @@ class DefaultDenseHandler:
     def patch_provider(self, provider: Any, bridge: Any) -> None:
         return None
 
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         layer_families = [LayerFamilyInstance(key="standard_attention", layer_index=0)]
         if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:

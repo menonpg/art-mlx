@@ -9,6 +9,9 @@ from art.megatron.provider_common import patch_layer_spec_tree
 class Qwen35MoeHandler(DefaultDenseHandler):
     key = "qwen3_5_moe"
 
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         linear_attention_pattern = _linear_attention_pattern(provider)
         gated_delta_net_layer_index = (

@@ -475,7 +475,7 @@ def _build_megatron_runtime(
         ),
     )
     _debug("Megatron model instantiated")
-    megatron_train._install_gpt_preprocess_hook(model)
+    provider_bundle.handler.install_preprocess_patch(model)
     return megatron_train.TrainingRuntime(
         provider_bundle=provider_bundle,
         provider=provider,

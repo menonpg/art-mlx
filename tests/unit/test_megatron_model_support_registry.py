@@ -55,6 +55,19 @@ def test_qwen3_5_registry_exports():
     assert get_model_support_handler("Qwen/Qwen3.5-35B-A3B").key == "qwen3_5_moe"
 
 
+def test_qwen3_moe_model_support_spec():
+    spec = get_model_support_spec("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    assert spec.key == "qwen3_moe"
+    assert spec.handler_key == "qwen3_moe"
+    assert get_model_support_handler("Qwen/Qwen3-30B-A3B-Instruct-2507").key == (
+        "qwen3_moe"
+    )
+
+
 def test_model_support_specs_list_is_stable():
     specs = list_model_support_specs()
-    assert [spec.key for spec in specs] == ["default_dense", "qwen3_5_moe"]
+    assert [spec.key for spec in specs] == [
+        "default_dense",
+        "qwen3_moe",
+        "qwen3_5_moe",
+    ]

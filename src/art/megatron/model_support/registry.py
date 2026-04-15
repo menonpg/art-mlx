@@ -1,6 +1,7 @@
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
+    QWEN3_MOE_HANDLER,
 )
 from art.megatron.model_support.spec import (
     DependencyFloor,
@@ -37,6 +38,12 @@ DEFAULT_DENSE_SPEC = ModelSupportSpec(
     default_target_modules=_DENSE_TARGET_MODULES,
 )
 
+QWEN3_MOE_SPEC = ModelSupportSpec(
+    key="qwen3_moe",
+    handler_key=QWEN3_MOE_HANDLER.key,
+    default_target_modules=_DENSE_TARGET_MODULES,
+)
+
 QWEN3_5_MOE_SPEC = ModelSupportSpec(
     key="qwen3_5_moe",
     handler_key=QWEN3_5_MOE_HANDLER.key,
@@ -54,6 +61,7 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
 
 _SPECS_BY_KEY = {
     DEFAULT_DENSE_SPEC.key: DEFAULT_DENSE_SPEC,
+    QWEN3_MOE_SPEC.key: QWEN3_MOE_SPEC,
     QWEN3_5_MOE_SPEC.key: QWEN3_5_MOE_SPEC,
 }
 _SPECS_BY_MODEL = {
@@ -61,6 +69,7 @@ _SPECS_BY_MODEL = {
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
     DEFAULT_DENSE_HANDLER.key: DEFAULT_DENSE_HANDLER,
+    QWEN3_MOE_HANDLER.key: QWEN3_MOE_HANDLER,
     QWEN3_5_MOE_HANDLER.key: QWEN3_5_MOE_HANDLER,
 }
 
@@ -68,6 +77,8 @@ QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)
 
 
 def get_model_support_spec(base_model: str) -> ModelSupportSpec:
+    if _is_qwen3_moe_model(base_model):
+        return QWEN3_MOE_SPEC
     return _SPECS_BY_MODEL.get(base_model, DEFAULT_DENSE_SPEC)
 
 
@@ -95,3 +106,12 @@ def is_model_support_registered(base_model: str) -> bool:
 
 def list_model_support_specs() -> list[ModelSupportSpec]:
     return list(_SPECS_BY_KEY.values())
+
+
+def _is_qwen3_moe_model(base_model: str) -> bool:
+    return (
+        base_model.startswith("Qwen/Qwen3-")
+        and "Qwen3.5" not in base_model
+        and "-VL-" not in base_model
+        and ("-A3B" in base_model or "-A22B" in base_model)
+    )

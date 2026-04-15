@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 import torch
 from torch.distributed import destroy_process_group, init_process_group, is_initialized
 
-from art.megatron import train as megatron_train
 from art.megatron.provider import get_provider_bundle
 
 from .megatron_oracle_harness import (
@@ -206,7 +205,7 @@ def run_packed_position_ids(
         )
         gpt_module = _locate_gpt_module(model_chunks)
         original_preprocess = gpt_module._preprocess
-        megatron_train._install_gpt_preprocess_hook(model_chunks)
+        provider_bundle.handler.install_preprocess_patch(model_chunks)
         hooked_preprocess = gpt_module._preprocess
 
         for scenario_name, packed_config in scenarios:
@@ -215,17 +214,22 @@ def run_packed_position_ids(
             input_ids = cast(torch.Tensor, packed_tensors["tokens"]).cuda()
             group_ids = cast(torch.Tensor, packed_tensors["group_ids"])
             parent_ids = cast(torch.Tensor, packed_tensors["parent_ids"])
-            original_output = original_preprocess(
-                input_ids=input_ids,
-                position_ids=position_ids,
-            )
-            hooked_output = hooked_preprocess(
-                input_ids=input_ids,
-                position_ids=position_ids,
-            )
-            original_rotary = cast(torch.Tensor, original_output[1])
-            hooked_rotary = cast(torch.Tensor, hooked_output[1])
-            expected = _expected_hooked_rotary(original_rotary, position_ids)
+            matched = True
+            for row_index in range(int(position_ids.shape[0])):
+                row_position_ids = position_ids[row_index : row_index + 1]
+                row_input_ids = input_ids[row_index : row_index + 1]
+                original_output = original_preprocess(
+                    input_ids=row_input_ids,
+                    position_ids=row_position_ids,
+                )
+                hooked_output = hooked_preprocess(
+                    input_ids=row_input_ids,
+                    position_ids=row_position_ids,
+                )
+                original_rotary = cast(torch.Tensor, original_output[1])
+                hooked_rotary = cast(torch.Tensor, hooked_output[1])
+                expected = _expected_hooked_rotary(original_rotary, row_position_ids)
+                matched = matched and torch.equal(hooked_rotary, expected)
             report.scenarios.append(
                 PackedPositionIdScenario(
                     name=scenario_name,
@@ -233,7 +237,7 @@ def run_packed_position_ids(
                     sequence_length=int(position_ids.shape[1]),
                     checked_token_count=int((group_ids != -1).sum().item()),
                     prompt_family_count=_prompt_family_count(group_ids, parent_ids),
-                    matched=torch.equal(hooked_rotary, expected),
+                    matched=matched,
                 )
             )
         del model_chunks, provider_bundle

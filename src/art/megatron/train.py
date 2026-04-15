@@ -224,11 +224,9 @@ def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
                 decoder_input.requires_grad_(True)
             position_ids = kwargs["position_ids"]
             table = preproc_output[1]  # [S, B, 1, D]  # type: ignore[index]
-            if table is None:
-                return tuple(preproc_output)
             if not isinstance(table, torch.Tensor):
                 raise TypeError(
-                    "Expected rotary positional embedding tensor or None, got "
+                    "Expected rotary positional embedding tensor, got "
                     f"{type(table).__name__}"
                 )
             if table.ndim != 4:
@@ -238,12 +236,6 @@ def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
                 )
             embedding_dim = table.size(-1)
             batch_size, sequence_length = position_ids.shape
-            if (
-                table.size(0) == sequence_length
-                and table.size(1) == batch_size
-                and table.size(2) == 1
-            ):
-                return tuple(preproc_output)
             if table.size(1) != 1 or table.size(2) != 1:
                 raise RuntimeError(
                     "Unsupported rotary positional embedding shape for packed gather: "
@@ -371,7 +363,7 @@ def build_training_runtime(
         print("Resolved inductor cache_dir():", inductor_cache_dir())
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
-    _install_gpt_preprocess_hook(model)
+    provider_bundle.handler.install_preprocess_patch(model)
     if _compile_enabled():
         install_torch_compile_workarounds()
         for chunk in model:
