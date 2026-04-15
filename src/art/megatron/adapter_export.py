@@ -18,20 +18,6 @@ from art.megatron.lora import (
 )
 
 
-def _ensure_bridge_qwen35_adapter_name_map() -> None:
-    from megatron.bridge.models.conversion import peft_bridge
-
-    extra_entries = {
-        ".in_proj_qkv.weight": "adapter_qkv",
-        ".in_proj_z.weight": "adapter_z",
-        ".in_proj_b.weight": "adapter_b",
-        ".in_proj_a.weight": "adapter_a",
-    }
-    for suffix, adapter_key in extra_entries.items():
-        peft_bridge.ADAPTER_NAME_MAP.setdefault(suffix, adapter_key)
-        peft_bridge.ADAPTER_KEY_TO_SUFFIX.setdefault(adapter_key, suffix)
-
-
 def layer_base_prefix(module: TransformerLayer) -> str:
     return f"language_model.decoder.layers.{module.layer_number - 1}"
 
@@ -103,43 +89,6 @@ def _simple_adapter_weight(
         dim=dim,
         linear_in=linear_in,
         linear_out=linear_out,
-    )
-
-
-def _fused_gdn_adapter_weight(
-    base_prefix: str,
-    handler: GatedDeltaNetInProjLoRA,
-) -> AdapterWeight:
-    qkv_linear_in, qkv_linear_out = _adapter_tensors(handler.qkv_lora)
-    z_linear_in, z_linear_out = _adapter_tensors(handler.z_lora)
-    assert math.isclose(float(handler.qkv_lora.scale), float(handler.z_lora.scale))
-    total_dim = int(qkv_linear_in.shape[0] + z_linear_in.shape[0])
-    alpha = round(float(handler.qkv_lora.scale) * total_dim)
-
-    qkv_rank = int(qkv_linear_in.shape[0])
-    z_rank = int(z_linear_in.shape[0])
-    qkv_out = int(qkv_linear_out.shape[0])
-    z_out = int(z_linear_out.shape[0])
-    beta_alpha_out = int(handler.num_value_heads_per_partition)
-
-    qkv_padding = qkv_linear_out.new_zeros((qkv_out, z_rank))
-    z_padding = z_linear_out.new_zeros((z_out, qkv_rank))
-    zeros = qkv_linear_out.new_zeros((beta_alpha_out, total_dim))
-    return _adapter_weight(
-        base_prefix=base_prefix,
-        adapter_key=None,
-        alpha=alpha,
-        dim=total_dim,
-        linear_in=torch.cat([qkv_linear_in, z_linear_in], dim=0),
-        linear_out=torch.cat(
-            [
-                torch.cat([qkv_linear_out, qkv_padding], dim=1),
-                torch.cat([z_padding, z_linear_out], dim=1),
-                zeros,
-                zeros.clone(),
-            ],
-            dim=0,
-        ),
     )
 
 
@@ -242,8 +191,6 @@ def add_gated_delta_net_adapter_weights(
     layer_prefix: str,
     self_attention: Any,
 ) -> None:
-    _ensure_bridge_qwen35_adapter_name_map()
-
     out_proj = getattr(self_attention, "out_proj", None)
     if isinstance(out_proj, SelfAttentionLinearProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.out_proj"

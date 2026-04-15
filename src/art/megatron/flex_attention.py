@@ -1,6 +1,7 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
 import math
+import os
 from typing import Any, ClassVar, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -29,11 +30,18 @@ class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
     # Torchtitan inductor options for compiling flex attention.
-    _compile_options = {
-        "max_autotune": True,
-        "coordinate_descent_tuning": True,
-        "triton.cudagraphs": False,
-    }
+    _compile_options = None
+    if os.environ.get("ART_FAST_DEBUG_DISABLE_FLEX_MAX_AUTOTUNE", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        _compile_options = {
+            "max_autotune": True,
+            "coordinate_descent_tuning": True,
+            "triton.cudagraphs": False,
+        }
     _compiled_flex_attention: ClassVar = torch.compile(
         flex_attention,
         options=_compile_options,

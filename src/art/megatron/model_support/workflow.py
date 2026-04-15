@@ -1,5 +1,6 @@
 import importlib
 import importlib.metadata
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -26,6 +27,7 @@ MANDATORY_VALIDATION_STAGES = (
     "merged_vllm_serving",
     "correctness_sensitivity",
     "chat_template_rollout",
+    "packed_position_ids",
     "yes_no_trainability",
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
@@ -36,6 +38,7 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "merged_vllm_serving",
         "correctness_sensitivity",
         "chat_template_rollout",
+        "packed_position_ids",
         "yes_no_trainability",
     }
 )
@@ -130,6 +133,7 @@ def _run_stage_in_subprocess(
             completed = subprocess.run(
                 cmd,
                 cwd=str(REPO_ROOT),
+                env=os.environ.copy(),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -358,6 +362,31 @@ def run_yes_no_trainability_stage(
     )
 
 
+def run_packed_position_ids_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    packed_position_ids = _import_integration_module(
+        "integration.megatron_packed_position_ids"
+    )
+    report = packed_position_ids.run_packed_position_ids(
+        base_model=base_model,
+        num_layers=max(1, architecture.recommended_min_layers),
+    )
+    metrics = report.model_dump(mode="json")
+    passed = bool(metrics["scenarios"]) and all(
+        scenario["matched"] and scenario["checked_token_count"] > 0
+        for scenario in metrics["scenarios"]
+    )
+    return ValidationStageResult(
+        name="packed_position_ids",
+        passed=passed,
+        metrics=metrics,
+        artifact_dir=report.output_dir,
+    )
+
+
 def build_validation_report(
     *,
     base_model: str,
@@ -374,6 +403,7 @@ def build_validation_report(
         "merged_vllm_serving": run_merged_vllm_serving_stage,
         "correctness_sensitivity": run_correctness_sensitivity_stage,
         "chat_template_rollout": run_chat_template_rollout_stage,
+        "packed_position_ids": run_packed_position_ids_stage,
         "yes_no_trainability": run_yes_no_trainability_stage,
     }
     stage_results: dict[str, ValidationStageResult] = {}

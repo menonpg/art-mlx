@@ -15,6 +15,7 @@ from art.megatron.model_support.workflow import (
     run_correctness_sensitivity_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
+    run_packed_position_ids_stage,
     run_yes_no_trainability_stage,
 )
 
@@ -81,6 +82,21 @@ def test_build_validation_report_populates_architecture_stage(
                     "packed_num_sequences": 1,
                 },
                 artifact_dir="/tmp/chat-template",
+            ),
+            "packed_position_ids": ValidationStageResult(
+                name="packed_position_ids",
+                passed=True,
+                metrics={
+                    "num_layers": 4,
+                    "scenarios": [
+                        {
+                            "name": "stop_early",
+                            "matched": True,
+                            "checked_token_count": 40,
+                        }
+                    ],
+                },
+                artifact_dir="/tmp/packed-position-ids",
             ),
             "yes_no_trainability": ValidationStageResult(
                 name="yes_no_trainability",
@@ -156,6 +172,21 @@ def test_build_validation_report_populates_architecture_stage(
         "packed_num_sequences": 1,
     }
     assert chat_template_stage.artifact_dir == "/tmp/chat-template"
+    position_id_stage = next(
+        stage for stage in report.stages if stage.name == "packed_position_ids"
+    )
+    assert position_id_stage.passed is True
+    assert position_id_stage.metrics == {
+        "num_layers": 4,
+        "scenarios": [
+            {
+                "name": "stop_early",
+                "matched": True,
+                "checked_token_count": 40,
+            }
+        ],
+    }
+    assert position_id_stage.artifact_dir == "/tmp/packed-position-ids"
     trainability_stage = next(
         stage for stage in report.stages if stage.name == "yes_no_trainability"
     )
@@ -350,6 +381,46 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 
     assert result.passed is True
     assert result.artifact_dir == "/tmp/trainability"
+
+
+def test_run_packed_position_ids_stage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(
+            run_packed_position_ids=lambda *, base_model, num_layers: SimpleNamespace(
+                output_dir="/tmp/packed-position-ids",
+                model_dump=lambda mode="json": {
+                    "base_model": base_model,
+                    "num_layers": num_layers,
+                    "scenarios": [
+                        {
+                            "name": "stop_early",
+                            "matched": True,
+                            "checked_token_count": 40,
+                        },
+                        {
+                            "name": "truncate",
+                            "matched": True,
+                            "checked_token_count": 44,
+                        },
+                    ],
+                },
+            )
+        ),
+    )
+
+    result = run_packed_position_ids_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            recommended_min_layers=4,
+        ),
+    )
+
+    assert result.passed is True
+    assert result.artifact_dir == "/tmp/packed-position-ids"
 
 
 def test_assess_minimal_layer_coverage_passes_when_prefix_covers_all_families(

@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 import importlib
 import json
@@ -153,6 +153,11 @@ class MegatronService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
+    _previous_signal_handlers: dict[int, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def is_dedicated(self) -> bool:
@@ -191,6 +196,37 @@ class MegatronService:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("", 0))
             return int(sock.getsockname()[1])
+
+    def _install_parent_signal_cleanup(self) -> None:
+        if self._previous_signal_handlers:
+            return
+
+        def _default_signal_exit(signum: int) -> None:
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(128 + signum)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous = signal.getsignal(signum)
+            self._previous_signal_handlers[signum] = previous
+
+            def _handler(received_signum, frame, *, _previous=previous):
+                self.close()
+                if callable(_previous):
+                    _previous(received_signum, frame)
+                    return
+                if _previous == signal.SIG_IGN:
+                    return
+                _default_signal_exit(received_signum)
+
+            signal.signal(signum, _handler)
+
+    def _restore_parent_signal_cleanup(self) -> None:
+        if not self._previous_signal_handlers:
+            return
+        for signum, previous in self._previous_signal_handlers.items():
+            signal.signal(signum, previous)
+        self._previous_signal_handlers.clear()
 
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
@@ -363,10 +399,13 @@ class MegatronService:
         self._vllm_process = subprocess.Popen(
             cmd,
             cwd=str(get_vllm_runtime_project_root()),
+            env=os.environ.copy(),
             stdout=self._vllm_log_file,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            start_new_session=True,
         )
+        self._install_parent_signal_cleanup()
         self._vllm_port = port
 
         timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 600))
@@ -489,14 +528,9 @@ class MegatronService:
         else:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
-        runtime_dir = str(Path(jobs_dir).parent)
         env["MODEL_IDENTIFIER"] = self.base_model
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
-        env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(runtime_dir, "torchinductor")
-        env["TRITON_CACHE_DIR"] = os.path.join(runtime_dir, "triton")
-        os.makedirs(env["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
-        os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
         master_addr = env.get("MASTER_ADDR", "127.0.0.1")
         master_port = str(self._allocate_master_port())
         env["MASTER_ADDR"] = master_addr
@@ -517,6 +551,7 @@ class MegatronService:
             env=env,
             start_new_session=True,
         )
+        self._install_parent_signal_cleanup()
 
     def _clear_pending_jobs(self) -> None:
         jobs_dir, _training_log_dir, _wake_lock_path = self._megatron_runtime_paths()
@@ -747,11 +782,24 @@ class MegatronService:
 
     def _stop_vllm_subprocess(self) -> None:
         if self._vllm_process is not None:
-            self._vllm_process.terminate()
+            if self._vllm_process.poll() is None:
+                try:
+                    os.killpg(
+                        os.getpgid(self._vllm_process.pid),
+                        signal.SIGTERM,
+                    )
+                except ProcessLookupError:
+                    pass
             try:
                 self._vllm_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._vllm_process.kill()
+                try:
+                    os.killpg(
+                        os.getpgid(self._vllm_process.pid),
+                        signal.SIGKILL,
+                    )
+                except ProcessLookupError:
+                    pass
                 self._vllm_process.wait()
             self._vllm_process = None
         if self._vllm_log_file is not None:
@@ -775,6 +823,7 @@ class MegatronService:
     def close(self) -> None:
         self._stop_vllm_subprocess()
         self._stop_megatron_process()
+        self._restore_parent_signal_cleanup()
 
     @cached_property
     def llm(self) -> asyncio.Task[AsyncLLM]:

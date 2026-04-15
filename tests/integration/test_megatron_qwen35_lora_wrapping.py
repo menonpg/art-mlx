@@ -276,8 +276,13 @@ def test_qwen35_handler_builds_canonical_adapter_weights_by_base() -> None:
             if key.endswith(".self_attention.in_proj.weight")
         )
         gdn_weights = adapter_weights_by_base[gdn_key]
-        assert len(gdn_weights) == 1
-        assert gdn_weights[0].adapter_key is None
+        assert len(gdn_weights) == 4
+        assert {weight.adapter_key for weight in gdn_weights} == {
+            "adapter_qkv",
+            "adapter_z",
+            "adapter_b",
+            "adapter_a",
+        }
 
         shared_fc1_key = next(
             key

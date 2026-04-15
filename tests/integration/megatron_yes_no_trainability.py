@@ -210,32 +210,6 @@ def _wandb_disabled() -> Iterator[None]:
                 os.environ[name] = value
 
 
-@contextmanager
-def _server_monitor_disabled() -> Iterator[None]:
-    saved = os.environ.get("ART_DISABLE_SERVER_MONITOR")
-    os.environ["ART_DISABLE_SERVER_MONITOR"] = "1"
-    try:
-        yield
-    finally:
-        if saved is None:
-            os.environ.pop("ART_DISABLE_SERVER_MONITOR", None)
-        else:
-            os.environ["ART_DISABLE_SERVER_MONITOR"] = saved
-
-
-@contextmanager
-def _megatron_compile_disabled() -> Iterator[None]:
-    saved = os.environ.get("ART_DISABLE_MEGATRON_COMPILE")
-    os.environ["ART_DISABLE_MEGATRON_COMPILE"] = "1"
-    try:
-        yield
-    finally:
-        if saved is None:
-            os.environ.pop("ART_DISABLE_MEGATRON_COMPILE", None)
-        else:
-            os.environ["ART_DISABLE_MEGATRON_COMPILE"] = saved
-
-
 async def _evaluate_model(
     model: art.TrainableModel,
     *,
@@ -395,7 +369,7 @@ async def _run_yes_no_trainability(base_model: str) -> YesNoTrainabilityReport:
         report_metrics=[],
     )
 
-    with _wandb_disabled(), _server_monitor_disabled(), _megatron_compile_disabled():
+    with _wandb_disabled():
         async with MegatronBackend(path=str(output_dir), in_process=True) as backend:
             print(
                 f"[yes_no_trainability] registering model in {output_dir}", flush=True

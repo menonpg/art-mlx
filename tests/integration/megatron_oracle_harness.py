@@ -201,8 +201,10 @@ class PackedTensorConfig(BaseModel):
     num_sequences: int = 4
     sequence_length: int = 256
     prefill_tokens: int = 64
-    decode_tokens: int = 64
+    completion_branches_per_prefix: int = Field(default=2, ge=1)
     decode_tokens_jitter: int = Field(default=32, ge=0)
+    decode_tokens: int = 64
+    packing_mode: Literal["stop_early", "truncate"] = "stop_early"
     vocab_high: int = 8192
 
 
@@ -643,37 +645,23 @@ def _build_packed_tensors(
         raise ValueError("num_sequences must be greater than 1")
     shape = (config.num_sequences, config.sequence_length)
     generator = torch.Generator().manual_seed(seed)
-    tokens = torch.randint(
-        low=10,
-        high=config.vocab_high,
-        size=shape,
-        dtype=torch.long,
-        generator=generator,
-    )
-    # Ensure paired cross-DP rows are never token-identical.
-    half = config.num_sequences // 2
-    if half > 0 and config.num_sequences % 2 == 0:
-        for pair_index in range(half):
-            left_index = pair_index
-            right_index = pair_index + half
-            if torch.equal(tokens[left_index], tokens[right_index]):
-                token_span = max(1, config.vocab_high - 10)
-                tokens[right_index] = ((tokens[right_index] - 10 + 1) % token_span) + 10
-    group_ids = torch.zeros(shape, dtype=torch.long)
+    tokens = torch.zeros(shape, dtype=torch.long)
+    token_low = 10
+    token_span = max(1, config.vocab_high - token_low)
+    group_ids = torch.full(shape, -1, dtype=torch.long)
     parent_ids = torch.full(shape, -1, dtype=torch.long)
-    input_pos = (
-        torch.arange(config.sequence_length, dtype=torch.long)
-        .unsqueeze(0)
-        .expand(config.num_sequences, -1)
-        .clone()
-    )
-    prefix_length = max(1, min(config.sequence_length - 1, config.prefill_tokens))
     assistant_mask = torch.zeros(shape, dtype=torch.bool)
-    max_decode_tokens = max(1, config.sequence_length - prefix_length)
-    base_decode_tokens = max(1, min(config.decode_tokens, max_decode_tokens))
-    jitter_width = min(config.decode_tokens_jitter, max_decode_tokens - 1)
-    candidate_decode_lengths: list[int] = []
-    for _ in range(config.num_sequences):
+    input_pos = torch.zeros(shape, dtype=torch.long)
+    logprobs = torch.full(shape, float("nan"), dtype=torch.float32)
+    advantages = torch.zeros(shape, dtype=torch.float32)
+    weights = torch.zeros(shape, dtype=torch.float32)
+
+    prefix_length = max(1, min(config.sequence_length - 1, config.prefill_tokens))
+    max_completion_tokens = max(1, config.sequence_length - prefix_length)
+    base_completion_tokens = max(1, min(config.decode_tokens, max_completion_tokens))
+    jitter_width = min(config.decode_tokens_jitter, max_completion_tokens - 1)
+
+    def _sample_completion_length() -> int:
         if jitter_width > 0:
             jitter = int(
                 torch.randint(
@@ -686,58 +674,159 @@ def _build_packed_tensors(
             )
         else:
             jitter = 0
-        decode_length = max(
+        return max(
             1,
-            min(max_decode_tokens, base_decode_tokens + jitter),
+            min(max_completion_tokens, base_completion_tokens + jitter),
         )
-        candidate_decode_lengths.append(decode_length)
-    # Keep jitter local around the configured decode length, but force pairwise
-    # differences across halves so default DP rank shards see different lengths.
+
+    def _sample_token_block(length: int) -> torch.Tensor:
+        return torch.randint(
+            low=token_low,
+            high=config.vocab_high,
+            size=(length,),
+            dtype=torch.long,
+            generator=generator,
+        )
+
+    def _sample_logprob_block(length: int) -> torch.Tensor:
+        return (
+            torch.randn(
+                (length,),
+                generator=generator,
+                dtype=torch.float32,
+            )
+            * 0.25
+            - 1.75
+        )
+
+    def _sample_advantage_value() -> float:
+        return float(
+            (
+                torch.randn(
+                    (1,),
+                    generator=generator,
+                    dtype=torch.float32,
+                )
+                * 0.5
+            ).item()
+        )
+
+    for sequence_index in range(config.num_sequences):
+        cursor = 0
+        next_group_id = 0
+        while cursor < config.sequence_length:
+            prompt_group_id = next_group_id
+            next_group_id += 1
+            completion_lengths = [
+                _sample_completion_length()
+                for _ in range(config.completion_branches_per_prefix)
+            ]
+            remaining = config.sequence_length - cursor
+
+            if config.packing_mode == "stop_early":
+                included_completion_lengths = list(completion_lengths)
+                while (
+                    included_completion_lengths
+                    and (prefix_length + sum(included_completion_lengths)) > remaining
+                ):
+                    included_completion_lengths.pop()
+                if not included_completion_lengths:
+                    break
+
+                prompt_end = cursor + prefix_length
+                tokens[sequence_index, cursor:prompt_end] = _sample_token_block(
+                    prefix_length
+                )
+                group_ids[sequence_index, cursor:prompt_end] = prompt_group_id
+                parent_ids[sequence_index, cursor:prompt_end] = prompt_group_id
+                input_pos[sequence_index, cursor:prompt_end] = torch.arange(
+                    prefix_length, dtype=torch.long
+                )
+                cursor = prompt_end
+
+                for completion_length in included_completion_lengths:
+                    completion_group_id = next_group_id
+                    next_group_id += 1
+                    completion_end = cursor + completion_length
+                    tokens[sequence_index, cursor:completion_end] = _sample_token_block(
+                        completion_length
+                    )
+                    group_ids[sequence_index, cursor:completion_end] = (
+                        completion_group_id
+                    )
+                    parent_ids[sequence_index, cursor:completion_end] = prompt_group_id
+                    input_pos[sequence_index, cursor:completion_end] = torch.arange(
+                        prefix_length,
+                        prefix_length + completion_length,
+                        dtype=torch.long,
+                    )
+                    assistant_mask[sequence_index, cursor:completion_end] = True
+                    logprobs[sequence_index, cursor:completion_end] = (
+                        _sample_logprob_block(completion_length)
+                    )
+                    advantages[sequence_index, cursor:completion_end] = (
+                        _sample_advantage_value()
+                    )
+                    weights[sequence_index, cursor:completion_end] = 1.0
+                    cursor = completion_end
+                continue
+
+            prompt_take = min(prefix_length, remaining)
+            prompt_end = cursor + prompt_take
+            tokens[sequence_index, cursor:prompt_end] = _sample_token_block(prompt_take)
+            group_ids[sequence_index, cursor:prompt_end] = prompt_group_id
+            parent_ids[sequence_index, cursor:prompt_end] = prompt_group_id
+            input_pos[sequence_index, cursor:prompt_end] = torch.arange(
+                prompt_take, dtype=torch.long
+            )
+            cursor = prompt_end
+            if cursor >= config.sequence_length:
+                break
+
+            for completion_length in completion_lengths:
+                if cursor >= config.sequence_length:
+                    break
+                completion_group_id = next_group_id
+                next_group_id += 1
+                remaining = config.sequence_length - cursor
+                completion_take = min(completion_length, remaining)
+                completion_end = cursor + completion_take
+                tokens[sequence_index, cursor:completion_end] = _sample_token_block(
+                    completion_take
+                )
+                group_ids[sequence_index, cursor:completion_end] = completion_group_id
+                parent_ids[sequence_index, cursor:completion_end] = prompt_group_id
+                input_pos[sequence_index, cursor:completion_end] = torch.arange(
+                    prefix_length,
+                    prefix_length + completion_take,
+                    dtype=torch.long,
+                )
+                assistant_mask[sequence_index, cursor:completion_end] = True
+                logprobs[sequence_index, cursor:completion_end] = _sample_logprob_block(
+                    completion_take
+                )
+                advantages[sequence_index, cursor:completion_end] = (
+                    _sample_advantage_value()
+                )
+                weights[sequence_index, cursor:completion_end] = 1.0
+                cursor = completion_end
+
+    half = config.num_sequences // 2
     if half > 0 and config.num_sequences % 2 == 0:
+        valid_lengths = (group_ids != -1).sum(dim=1)
         for pair_index in range(half):
             left_index = pair_index
             right_index = pair_index + half
-            if (
-                candidate_decode_lengths[left_index]
-                != candidate_decode_lengths[right_index]
-            ):
+            left_valid = int(valid_lengths[left_index].item())
+            right_valid = int(valid_lengths[right_index].item())
+            if left_valid != right_valid or left_valid == 0:
                 continue
-            if candidate_decode_lengths[right_index] < max_decode_tokens:
-                candidate_decode_lengths[right_index] += 1
-            elif candidate_decode_lengths[right_index] > 1:
-                candidate_decode_lengths[right_index] -= 1
-
-    for sequence_index, decode_length in enumerate(candidate_decode_lengths):
-        active_stop = prefix_length + decode_length
-        assistant_mask[sequence_index, prefix_length:active_stop] = True
-        decode_span = max(1, min(config.decode_tokens, decode_length))
-        cursor = prefix_length
-        branch = 1
-        while cursor < active_stop:
-            end = min(active_stop, cursor + decode_span)
-            group_ids[sequence_index, cursor:end] = branch
-            parent_ids[sequence_index, cursor:end] = 0
-            cursor = end
-            branch += 1
-    logprobs = (
-        torch.randn(
-            shape,
-            generator=generator,
-            dtype=torch.float32,
-        )
-        * 0.25
-        - 1.75
-    )
-    advantages = (
-        torch.randn(
-            shape,
-            generator=generator,
-            dtype=torch.float32,
-        )
-        * 0.1
-        + 1.0
-    )
-    weights = torch.ones(shape, dtype=torch.float32)
+            if torch.equal(
+                tokens[left_index, :left_valid], tokens[right_index, :right_valid]
+            ):
+                tokens[right_index, 0] = (
+                    (tokens[right_index, 0] - token_low + 1) % token_span
+                ) + token_low
     return {
         "tokens": tokens,
         "group_ids": group_ids,

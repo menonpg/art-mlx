@@ -60,6 +60,7 @@ from art.megatron.model_chunks import (
     unwrap_megatron_chunk,
     validate_model_chunks,
 )
+from art.megatron.offload import OffloadState, offload_to_cpu, reload_to_gpu
 from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
 from art.megatron.provider_common import ProviderBundle
 from art.megatron.routing_replay import (
@@ -220,8 +221,6 @@ def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
             preproc_output = list(_preprocess(*args, **kwargs))
             preproc_output[0].requires_grad = True  # type: ignore[index]
             position_ids = kwargs["position_ids"]
-            if position_ids.ndim != 2:
-                return tuple(preproc_output)
             table = preproc_output[1]  # [S, B, 1, D]  # type: ignore[index]
             embedding_dim = table.size(-1)
             table_flat = table.view(table.size(0), embedding_dim)
@@ -1367,6 +1366,7 @@ def _sync_merged_weights_to_vllm(
 
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
+    offload_state = OffloadState()
     wake_lock_path = os.environ.get(
         "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
     )
@@ -1375,6 +1375,9 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         while os.path.exists(wake_lock_path):
             time.sleep(0.2)
 
+    def before_job() -> None:
+        reload_to_gpu(runtime.model, runtime.rank, offload_state)
+
     def after_job() -> None:
         optimizer = runtime.optimizer
         runtime.optimizer = None
@@ -1382,11 +1385,14 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             del optimizer
         gc.collect()
         torch.cuda.empty_cache()
+        offload_to_cpu(runtime.model, runtime.rank, offload_state)
 
+    after_job()
     run_megatron_worker_loop(
         runtime,
         supports_sft=True,
         wait_until_ready=wait_until_ready,
+        before_job=before_job,
         after_job=after_job,
     )
 

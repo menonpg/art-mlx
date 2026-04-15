@@ -198,6 +198,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         )
         from art.megatron.lora import _is_language_transformer_layer_name
 
+        _ensure_bridge_qwen35_adapter_name_map()
         adapter_weights_by_base: dict[str, list[Any]] = {}
         gated_delta_net_type = _optional_gated_delta_net_type()
         for chunk in model_chunks:
@@ -253,6 +254,20 @@ class Qwen35MoeHandler(DefaultDenseHandler):
 
 
 QWEN3_5_MOE_HANDLER = Qwen35MoeHandler()
+
+
+def _ensure_bridge_qwen35_adapter_name_map() -> None:
+    from megatron.bridge.models.conversion import peft_bridge
+
+    extra_entries = {
+        ".in_proj_qkv.weight": "adapter_qkv",
+        ".in_proj_z.weight": "adapter_z",
+        ".in_proj_b.weight": "adapter_b",
+        ".in_proj_a.weight": "adapter_a",
+    }
+    for suffix, adapter_key in extra_entries.items():
+        peft_bridge.ADAPTER_NAME_MAP.setdefault(suffix, adapter_key)
+        peft_bridge.ADAPTER_KEY_TO_SUFFIX.setdefault(adapter_key, suffix)
 
 
 def supported_qwen_moe_bridge_types() -> tuple[type[Any], ...]:

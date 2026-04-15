@@ -501,10 +501,14 @@ class LocalBackend(Backend):
     async def _monitor_openai_server(
         self, model: AnyTrainableModel, base_url: str, api_key: str
     ) -> None:
-        del api_key
         model_name = model.name
+        openai_client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+        )
         consecutive_failures = 0
         max_consecutive_failures = 3
+        first_health_check = True
         async with aiohttp.ClientSession() as session:
             while True:
                 # Wait 30 seconds before checking again
@@ -514,6 +518,11 @@ class LocalBackend(Backend):
                     if await self._services[model_name].vllm_engine_is_sleeping():
                         consecutive_failures = 0
                         continue
+                    async with session.get(
+                        f"{base_url.split('/v1')[0]}/health",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as response:
+                        response.raise_for_status()
                     # Check the metrics with a timeout
                     async with session.get(
                         f"{base_url.split('/v1')[0]}/metrics",
@@ -528,21 +537,29 @@ class LocalBackend(Backend):
                             running_requests = int(float(line.split()[1]))
                         elif line.startswith("vllm:num_requests_waiting"):
                             pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, send a cheap API probe.
+                    # If there are no running or pending requests, verify the model can
+                    # still serve a real generation request. The first idle probe gets
+                    # a longer timeout to tolerate cold-start compile.
                     if running_requests == 0 and pending_requests == 0:
                         try:
-                            async with session.get(
-                                f"{base_url}/models",
-                                timeout=aiohttp.ClientTimeout(
-                                    total=float(
-                                        os.environ.get(
-                                            "ART_SERVER_MONITOR_TIMEOUT", 5.0
-                                        )
-                                    )
-                                ),
-                            ) as response:
-                                response.raise_for_status()
-                                await response.text()
+                            timeout = float(
+                                os.environ.get(
+                                    (
+                                        "ART_SERVER_MONITOR_INITIAL_TIMEOUT"
+                                        if first_health_check
+                                        else "ART_SERVER_MONITOR_TIMEOUT"
+                                    ),
+                                    60.0 if first_health_check else 5.0,
+                                )
+                            )
+                            await openai_client.completions.create(
+                                model=self._model_inference_name(model),
+                                prompt="Hi",
+                                max_tokens=1,
+                                temperature=0.0,
+                                timeout=timeout,
+                            )
+                            first_health_check = False
                         except Exception as e:
                             # If the server is sleeping, a failed health check is okay
                             if await self._services[
