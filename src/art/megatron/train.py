@@ -219,12 +219,37 @@ def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
 
         def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
             preproc_output = list(_preprocess(*args, **kwargs))
-            preproc_output[0].requires_grad = True  # type: ignore[index]
+            decoder_input = cast(torch.Tensor, preproc_output[0])
+            if not decoder_input.requires_grad and decoder_input.is_leaf:
+                decoder_input.requires_grad_(True)
             position_ids = kwargs["position_ids"]
             table = preproc_output[1]  # [S, B, 1, D]  # type: ignore[index]
+            if table is None:
+                return tuple(preproc_output)
+            if not isinstance(table, torch.Tensor):
+                raise TypeError(
+                    "Expected rotary positional embedding tensor or None, got "
+                    f"{type(table).__name__}"
+                )
+            if table.ndim != 4:
+                raise RuntimeError(
+                    "Unsupported rotary positional embedding rank: "
+                    f"expected 4, got {table.ndim}"
+                )
             embedding_dim = table.size(-1)
-            table_flat = table.view(table.size(0), embedding_dim)
             batch_size, sequence_length = position_ids.shape
+            if (
+                table.size(0) == sequence_length
+                and table.size(1) == batch_size
+                and table.size(2) == 1
+            ):
+                return tuple(preproc_output)
+            if table.size(1) != 1 or table.size(2) != 1:
+                raise RuntimeError(
+                    "Unsupported rotary positional embedding shape for packed gather: "
+                    f"{tuple(table.shape)}"
+                )
+            table_flat = table.view(table.size(0), embedding_dim)
             gathered = table_flat.index_select(0, position_ids.reshape(-1))
             gathered = (
                 gathered.view(batch_size, sequence_length, embedding_dim)

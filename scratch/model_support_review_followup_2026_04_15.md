@@ -133,8 +133,8 @@ That stage:
 
 - uses realistic packed sequences with multiple whole prompt families and multiple completion branches
 - instantiates the real reduced Megatron provider/model path
-- installs the real GPT preprocess hook
-- validates that gathered position embeddings match `input_pos` across the packed sequences
+- compares the unhooked real GPT `_preprocess` output against the hooked real `_preprocess` output on the same packed tensors
+- validates that the hook either gathers correctly from a lookup-table rotary output or correctly no-ops on already batch-aligned Qwen3.5 mRoPE output
 
 This is now wired into the model-support workflow as a mandatory stage.
 

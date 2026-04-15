@@ -119,6 +119,29 @@ def _prompt_family_count(group_ids: torch.Tensor, parent_ids: torch.Tensor) -> i
     return families
 
 
+def _expected_hooked_rotary(
+    rotary_table: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, sequence_length = position_ids.shape
+    if (
+        rotary_table.ndim == 4
+        and rotary_table.shape[0] == sequence_length
+        and rotary_table.shape[1] == batch_size
+        and rotary_table.shape[2] == 1
+    ):
+        return rotary_table
+    embedding_dim = int(rotary_table.shape[-1])
+    table_flat = rotary_table.view(rotary_table.shape[0], embedding_dim)
+    gathered = table_flat.index_select(0, position_ids.reshape(-1))
+    gathered = (
+        gathered.view(batch_size, sequence_length, embedding_dim)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+    return gathered.unsqueeze(2)
+
+
 def run_packed_position_ids(
     *,
     base_model: str,
@@ -182,54 +205,27 @@ def run_packed_position_ids(
             ),
         )
         gpt_module = _locate_gpt_module(model_chunks)
-
-        def _fake_preprocess(
-            *args: Any, **kwargs: Any
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            del args
-            position_ids = cast(torch.Tensor, kwargs["position_ids"])
-            batch_size, sequence_length = position_ids.shape
-            embedding_dim = 4
-            hidden = torch.zeros(
-                (sequence_length, batch_size, embedding_dim),
-                device=position_ids.device,
-                dtype=torch.float32,
-            )
-            max_position = int(position_ids.max().item()) + 1
-            table = torch.arange(
-                max_position * embedding_dim,
-                device=position_ids.device,
-                dtype=torch.float32,
-            ).view(max_position, 1, 1, embedding_dim)
-            return hidden, table
-
-        gpt_module._preprocess = _fake_preprocess  # type: ignore[attr-defined]
+        original_preprocess = gpt_module._preprocess
         megatron_train._install_gpt_preprocess_hook(model_chunks)
+        hooked_preprocess = gpt_module._preprocess
 
         for scenario_name, packed_config in scenarios:
             packed_tensors = _build_packed_tensors(packed_config, case_config.seed)
             position_ids = cast(torch.Tensor, packed_tensors["input_pos"]).cuda()
-            input_ids = torch.zeros_like(position_ids)
+            input_ids = cast(torch.Tensor, packed_tensors["tokens"]).cuda()
             group_ids = cast(torch.Tensor, packed_tensors["group_ids"])
             parent_ids = cast(torch.Tensor, packed_tensors["parent_ids"])
-            _hidden, rotary = gpt_module._preprocess(
+            original_output = original_preprocess(
                 input_ids=input_ids,
                 position_ids=position_ids,
             )
-            embedding_dim = int(rotary.shape[-1])
-            max_position = int(position_ids.max().item()) + 1
-            expected_table = torch.arange(
-                max_position * embedding_dim,
-                device=position_ids.device,
-                dtype=torch.float32,
-            ).view(max_position, embedding_dim)
-            expected = (
-                expected_table.index_select(0, position_ids.reshape(-1))
-                .view(position_ids.shape[0], position_ids.shape[1], embedding_dim)
-                .permute(1, 0, 2)
-                .contiguous()
-                .unsqueeze(2)
+            hooked_output = hooked_preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
             )
+            original_rotary = cast(torch.Tensor, original_output[1])
+            hooked_rotary = cast(torch.Tensor, hooked_output[1])
+            expected = _expected_hooked_rotary(original_rotary, position_ids)
             report.scenarios.append(
                 PackedPositionIdScenario(
                     name=scenario_name,
@@ -237,7 +233,7 @@ def run_packed_position_ids(
                     sequence_length=int(position_ids.shape[1]),
                     checked_token_count=int((group_ids != -1).sum().item()),
                     prompt_family_count=_prompt_family_count(group_ids, parent_ids),
-                    matched=torch.equal(rotary, expected),
+                    matched=torch.equal(hooked_rotary, expected),
                 )
             )
         del model_chunks, provider_bundle
