@@ -822,6 +822,10 @@ class UnslothService:
 
     @cached_property
     def _state(self) -> UnslothTrainContext:
+        from .dtype_patch import ensure_dtype_patch
+
+        ensure_dtype_patch()
+
         init_args = dict(self.config.get("init_args", {}))
         checkpoint_dir = get_last_checkpoint_dir(self.output_dir)
         if checkpoint_dir:

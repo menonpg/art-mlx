@@ -247,17 +247,6 @@ class UnslothTrainContext:
         except Exception as exc:
             raise RuntimeError(f"Failed to set LoRA weights in-place: {exc}") from exc
 
-        # Cast LoRA weights to match base model dtype (e.g. bf16 on H200).
-        base_dtype = next(
-            (p.dtype for p in self.peft_model.base_model.parameters() if not p.requires_grad),
-            None,
-        )
-        if base_dtype is not None:
-            with torch.no_grad():
-                for p in self.peft_model.parameters():
-                    if p.requires_grad and p.dtype != base_dtype:
-                        p.data = p.data.to(base_dtype)
-
         try:
             torch.cuda.synchronize()
         except Exception:
