@@ -37,7 +37,15 @@ def install_torch_compile_workarounds() -> None:
         if "already has a fake impl registered" not in str(exc):
             raise
 
+    moe_utils.permute = _disable(moe_utils.permute)
+    moe_utils.unpermute = _disable(moe_utils.unpermute)
+    moe_utils.sort_chunks_by_idxs = _disable(moe_utils.sort_chunks_by_idxs)
     moe_utils.maybe_move_tensor_to_cpu = _disable(moe_utils.maybe_move_tensor_to_cpu)
+    token_dispatcher.permute = _disable(token_dispatcher.permute)
+    token_dispatcher.unpermute = _disable(token_dispatcher.unpermute)
+    token_dispatcher.sort_chunks_by_idxs = _disable(
+        token_dispatcher.sort_chunks_by_idxs
+    )
     token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = _disable(
         token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
     )

@@ -203,6 +203,46 @@ def _compile_enabled() -> bool:
     }
 
 
+def _compile_enabled_for_handler(handler_key: str | None) -> bool:
+    if not _compile_enabled():
+        return False
+    # Qwen3.5 MoE currently trips a compiled-backward stream bookkeeping bug in
+    # Torch during RL trainability. Run this handler eagerly until that path is fixed.
+    return handler_key != "qwen3_5_moe"
+
+
+def _maybe_rewrite_packed_rotary_pos_emb(
+    rotary_pos_emb: torch.Tensor | None,
+    *,
+    position_ids: torch.Tensor,
+    position_embedding_type: str | None,
+) -> torch.Tensor | None:
+    if rotary_pos_emb is None or position_embedding_type == "mrope":
+        return rotary_pos_emb
+    if position_ids.ndim != 2:
+        return rotary_pos_emb
+    if rotary_pos_emb.ndim != 4:
+        raise RuntimeError(
+            "Unsupported rotary positional embedding rank: "
+            f"expected 4, got {rotary_pos_emb.ndim}"
+        )
+    if rotary_pos_emb.size(1) != 1 or rotary_pos_emb.size(2) != 1:
+        raise RuntimeError(
+            "Unsupported rotary positional embedding shape for packed gather: "
+            f"{tuple(rotary_pos_emb.shape)}"
+        )
+    embedding_dim = rotary_pos_emb.size(-1)
+    batch_size, sequence_length = position_ids.shape
+    table_flat = rotary_pos_emb.view(rotary_pos_emb.size(0), embedding_dim)
+    gathered = table_flat.index_select(0, position_ids.reshape(-1))
+    return (
+        gathered.view(batch_size, sequence_length, embedding_dim)
+        .permute(1, 0, 2)
+        .contiguous()
+        .unsqueeze(2)
+    )
+
+
 def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
     for chunk in model_chunks:
         module: Any = unwrap_megatron_chunk(chunk)
@@ -224,31 +264,22 @@ def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
                 decoder_input.requires_grad_(True)
             position_ids = kwargs["position_ids"]
             table = preproc_output[1]  # [S, B, 1, D]  # type: ignore[index]
+            if table is None:
+                return tuple(preproc_output)
             if not isinstance(table, torch.Tensor):
                 raise TypeError(
                     "Expected rotary positional embedding tensor, got "
                     f"{type(table).__name__}"
                 )
-            if table.ndim != 4:
-                raise RuntimeError(
-                    "Unsupported rotary positional embedding rank: "
-                    f"expected 4, got {table.ndim}"
-                )
-            embedding_dim = table.size(-1)
-            batch_size, sequence_length = position_ids.shape
-            if table.size(1) != 1 or table.size(2) != 1:
-                raise RuntimeError(
-                    "Unsupported rotary positional embedding shape for packed gather: "
-                    f"{tuple(table.shape)}"
-                )
-            table_flat = table.view(table.size(0), embedding_dim)
-            gathered = table_flat.index_select(0, position_ids.reshape(-1))
-            gathered = (
-                gathered.view(batch_size, sequence_length, embedding_dim)
-                .permute(1, 0, 2)
-                .contiguous()
+            preproc_output[1] = _maybe_rewrite_packed_rotary_pos_emb(
+                table,
+                position_ids=position_ids,
+                position_embedding_type=getattr(
+                    gpt_module,
+                    "position_embedding_type",
+                    None,
+                ),
             )
-            preproc_output[1] = gathered.unsqueeze(2)  # [S, B, 1, D]
             return tuple(preproc_output)
 
         gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
@@ -364,7 +395,7 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     provider_bundle.handler.install_preprocess_patch(model)
-    if _compile_enabled():
+    if _compile_enabled_for_handler(getattr(provider_bundle.handler, "key", None)):
         install_torch_compile_workarounds()
         for chunk in model:
             _compile_transformer_layers(chunk)
@@ -765,6 +796,7 @@ def maybe_load_adapter_into_model(
     adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
     if not os.path.exists(adapter_model_path):
         print0(rank, "No adapter model found at", adapter_model_path)
+        _enable_lora_parameters(model_chunks)
         return {}
     print0(rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_adapter_state_dict(lora_path)
@@ -866,6 +898,15 @@ def iter_modules(model_chunks: ModelChunks) -> Any:
             yield module
 
 
+def _enable_lora_parameters(model_chunks: ModelChunks) -> None:
+    for module in iter_modules(model_chunks):
+        get_lora_params = getattr(module, "_lora_params", None)
+        if not callable(get_lora_params):
+            continue
+        for _name, param in get_lora_params():
+            param.requires_grad = True
+
+
 def load_adapter_into_model(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
@@ -875,6 +916,7 @@ def load_adapter_into_model(
         for module in iter_modules(model_chunks):
             if hasattr(module, "load_lora"):
                 module.load_lora(adapter_model)  # type: ignore[attr-defined]
+    _enable_lora_parameters(model_chunks)
 
     if optimizer is None:
         return

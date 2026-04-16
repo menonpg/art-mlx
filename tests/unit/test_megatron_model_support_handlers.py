@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
@@ -66,3 +68,19 @@ def test_qwen_handler_collects_expected_layer_families() -> None:
         LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
         LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
     ]
+
+
+def test_qwen_handler_installs_gpt_preprocess_hook() -> None:
+    calls: list[object] = []
+
+    def _record(model_chunks: object) -> None:
+        calls.append(model_chunks)
+
+    with patch(
+        "art.megatron.train._install_gpt_preprocess_hook",
+        side_effect=_record,
+    ):
+        chunks = [object()]
+        QWEN3_5_MOE_HANDLER.install_preprocess_patch(chunks)
+
+    assert calls == [chunks]

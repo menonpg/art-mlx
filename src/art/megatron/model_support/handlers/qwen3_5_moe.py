@@ -1,6 +1,7 @@
 from types import MethodType
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 
+from art.megatron.model_chunks import ModelChunks
 from art.megatron.model_support.handlers.default_dense import DefaultDenseHandler
 from art.megatron.model_support.spec import LayerFamilyInstance
 from art.megatron.provider_common import patch_layer_spec_tree
@@ -10,7 +11,9 @@ class Qwen35MoeHandler(DefaultDenseHandler):
     key = "qwen3_5_moe"
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
-        del model_chunks
+        from art.megatron.train import _install_gpt_preprocess_hook
+
+        _install_gpt_preprocess_hook(cast(ModelChunks, list(model_chunks)))
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         linear_attention_pattern = _linear_attention_pattern(provider)
