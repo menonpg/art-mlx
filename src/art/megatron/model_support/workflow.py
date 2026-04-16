@@ -1,3 +1,4 @@
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import importlib
 import importlib.metadata
 import os
@@ -18,6 +19,11 @@ from art.megatron.model_support.spec import (
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TESTS_DIR = REPO_ROOT / "tests"
+LOCAL_LOG_DIR = REPO_ROOT / ".local"
+CORRECTNESS_LOG_PATH = LOCAL_LOG_DIR / "correctness.log"
+SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
+LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
+ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -99,6 +105,28 @@ def _subprocess_log_tail(log_path: Path, *, max_lines: int = 40) -> str:
         return ""
     lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(lines[-max_lines:])
+
+
+@contextmanager
+def _redirect_output(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        with redirect_stdout(log_file), redirect_stderr(log_file):
+            yield
+
+
+@contextmanager
+def _temporary_env(**updates: str):
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+                continue
+            os.environ[key] = value
 
 
 def _run_stage_in_subprocess(
@@ -249,11 +277,16 @@ def run_correctness_sensitivity_stage(
             "Need "
             f"{required_gpu_count} GPUs for correctness/sensitivity, found {available_gpu_count}"
         )
-    suite_reports = oracle_harness.run_suite(case_config=case_config)
-    sensitivity_reports = oracle_harness.run_sensitivity_suite(
-        case_config=case_config,
-        mutations=mutations,
-    )
+    LIVE_TRAINING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_TRAINING_LOG_PATH.write_text("", encoding="utf-8")
+    with _temporary_env(**{ORACLE_LIVE_TRAINING_LOG_ENV: str(LIVE_TRAINING_LOG_PATH)}):
+        with _redirect_output(CORRECTNESS_LOG_PATH):
+            suite_reports = oracle_harness.run_suite(case_config=case_config)
+        with _redirect_output(SENSITIVITY_LOG_PATH):
+            sensitivity_reports = oracle_harness.run_sensitivity_suite(
+                case_config=case_config,
+                mutations=mutations,
+            )
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     return ValidationStageResult(
         name="correctness_sensitivity",

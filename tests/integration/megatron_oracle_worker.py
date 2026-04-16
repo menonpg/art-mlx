@@ -63,16 +63,43 @@ def run_worker_subprocess(
         "--run-request",
         str(request_path),
     ]
-    run = subprocess.run(
-        command,
-        cwd=str(worker_cwd),
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    combined_output = f"{run.stdout}\n{run.stderr}".strip()
-    (topology_dir / "worker.log").write_text(combined_output + "\n", encoding="utf-8")
+    combined_lines: list[str] = []
+    worker_log_path = topology_dir / "worker.log"
+    live_log_raw = os.environ.get("ART_ORACLE_LIVE_TRAINING_LOG")
+    live_log_path = None if not live_log_raw else Path(live_log_raw)
+    worker_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with worker_log_path.open("w", encoding="utf-8") as worker_log:
+        live_log = None
+        try:
+            if live_log_path is not None:
+                live_log_path.parent.mkdir(parents=True, exist_ok=True)
+                live_log = live_log_path.open("a", encoding="utf-8")
+                live_log.write(
+                    f"\n=== {request.objective} {request.topology.slug()} ===\n"
+                )
+                live_log.flush()
+            run = subprocess.Popen(
+                command,
+                cwd=str(worker_cwd),
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert run.stdout is not None
+            for line in run.stdout:
+                combined_lines.append(line)
+                worker_log.write(line)
+                worker_log.flush()
+                if live_log is not None:
+                    live_log.write(line)
+                    live_log.flush()
+            run.returncode = run.wait()
+        finally:
+            if live_log is not None:
+                live_log.close()
+    combined_output = "".join(combined_lines).strip()
     if run.returncode != 0:
         tail = "\n".join(combined_output.splitlines()[-80:])
         raise RuntimeError(

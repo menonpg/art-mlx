@@ -133,9 +133,9 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.expert_tensor_parallel_size = 1
 
 
-def _tp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
-    return int(provider.tensor_model_parallel_size) * int(
-        provider.expert_model_parallel_size
+def _expert_parallel_domain_size(provider: GPTModelProvider) -> int:
+    return int(provider.expert_model_parallel_size) * int(
+        provider.expert_tensor_parallel_size or 1
     )
 
 
@@ -150,7 +150,7 @@ def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> 
 
 
 def _apply_art_training_runtime_finalize_defaults(provider: GPTModelProvider) -> None:
-    if _tp_ep_parallel_domain_size(provider) <= 1:
+    if _expert_parallel_domain_size(provider) <= 1:
         return
     # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
     # compute, so these are very beneficial
