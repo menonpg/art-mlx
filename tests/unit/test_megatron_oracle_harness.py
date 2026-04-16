@@ -1,3 +1,4 @@
+import importlib
 from pathlib import Path
 import sys
 
@@ -7,10 +8,9 @@ import torch
 TESTS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TESTS_ROOT))
 
-from integration.megatron_oracle_harness import (
-    PackedTensorConfig,
-    _build_packed_tensors,
-)
+megatron_oracle_harness = importlib.import_module("integration.megatron_oracle_harness")
+PackedTensorConfig = megatron_oracle_harness.PackedTensorConfig
+_build_packed_tensors = megatron_oracle_harness._build_packed_tensors
 
 
 def _row_runs(

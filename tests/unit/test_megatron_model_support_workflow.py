@@ -78,8 +78,9 @@ def test_build_validation_report_populates_architecture_stage(
                 name="chat_template_rollout",
                 passed=True,
                 metrics={
-                    "assistant_token_count": 8,
-                    "packed_num_sequences": 1,
+                    "passed": True,
+                    "scenario_count": 6,
+                    "failed_scenarios": [],
                 },
                 artifact_dir="/tmp/chat-template",
             ),
@@ -168,8 +169,9 @@ def test_build_validation_report_populates_architecture_stage(
     )
     assert chat_template_stage.passed is True
     assert chat_template_stage.metrics == {
-        "assistant_token_count": 8,
-        "packed_num_sequences": 1,
+        "passed": True,
+        "scenario_count": 6,
+        "failed_scenarios": [],
     }
     assert chat_template_stage.artifact_dir == "/tmp/chat-template"
     position_id_stage = next(
@@ -320,16 +322,14 @@ def test_run_chat_template_rollout_stage(monkeypatch) -> None:
         "art.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
             run_chat_template_rollout=lambda *, base_model: SimpleNamespace(
-                assistant_token_count=12,
-                packed_num_sequences=2,
-                requires_mapping_tool_arguments=True,
-                normalized_mapping_tool_arguments=True,
+                passed=True,
+                scenario_count=6,
+                failed_scenarios=[],
                 output_dir="/tmp/chat-template",
                 model_dump=lambda mode="json": {
-                    "assistant_token_count": 12,
-                    "packed_num_sequences": 2,
-                    "requires_mapping_tool_arguments": True,
-                    "normalized_mapping_tool_arguments": True,
+                    "passed": True,
+                    "scenario_count": 6,
+                    "failed_scenarios": [],
                 },
             )
         ),

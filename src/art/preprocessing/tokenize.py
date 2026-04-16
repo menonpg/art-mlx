@@ -14,6 +14,7 @@ from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
+from ..types import MessagesAndChoices
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 
@@ -64,6 +65,14 @@ def _normalize_tool_call_arguments_for_chat_template(
         normalized_messages.append({**message, "tool_calls": normalized_tool_calls})
 
     return normalized_messages
+
+
+def _messages_for_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    messages_and_choices: MessagesAndChoices,
+) -> list[dict[str, Any]]:
+    messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
+    return _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
 
 
 @dataclass
@@ -260,10 +269,7 @@ def tokenize_trajectory(
     if last_assistant_index == -1:
         return None
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
-    messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
-    # Qwen3.5's chat template uses `tool_call.arguments|items`, so it needs a
-    # mapping here instead of the OpenAI JSON string.
-    messages = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
+    messages = _messages_for_chat_template(tokenizer, messages_and_choices)
     tools = _normalize_tools_for_chat_template(history.tools)
     chat = cast(
         str,
@@ -494,14 +500,17 @@ def tokenize_sft_batch(
     num_tokens = 0
     num_trainable_tokens = 0
     for trajectory in trajectory_batch:
-        messages = trajectory.messages_and_choices
-        tools = trajectory.tools
+        messages = _messages_for_chat_template(
+            tokenizer,
+            trajectory.messages_and_choices,
+        )
+        tools = _normalize_tools_for_chat_template(trajectory.tools)
 
         # Single-step tokenization: apply_chat_template with tokenize=True
         input_ids = _apply_chat_template_token_ids(
             tokenizer,
-            cast(Any, messages),
-            tools=cast(Any, tools),
+            messages,
+            tools=tools,
             tokenize=True,
             add_generation_prompt=False,
         )

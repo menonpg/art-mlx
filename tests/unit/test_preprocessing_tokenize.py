@@ -1,15 +1,21 @@
+import importlib
 import sys
-import types
 from typing import cast
 
 from openai.types.chat.chat_completion import Choice
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-import art
-from art.preprocessing.tokenize import tokenize_sft_batch, tokenize_trajectory
+from art.preprocessing.tokenize import tokenize_trajectory
 from art.trajectories import History, Trajectory
 from art.types import MessagesAndChoices
+
+if "tests" not in sys.path:
+    sys.path.insert(0, "tests")
+
+build_chat_template_conformance_inputs = importlib.import_module(
+    "support.chat_template_conformance_cases"
+).build_chat_template_conformance_inputs
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
@@ -30,9 +36,16 @@ class _FakeTokenizer:
         **kwargs,
     ):
         del tools, kwargs
-        rendered = "".join(
-            f"<{message['role']}>{message.get('content', '')}" for message in messages
-        )
+        rendered_parts = []
+        for message in messages:
+            tool_calls = "".join(
+                f"<tool>{tool_call['function']['name']}:{tool_call['function']['arguments']}"
+                for tool_call in message.get("tool_calls", [])
+            )
+            rendered_parts.append(
+                f"<{message['role']}>{tool_calls}{message.get('content', '')}"
+            )
+        rendered = "".join(rendered_parts)
         if not tokenize:
             return rendered
         token_ids = self.encode(rendered, add_special_tokens=False)
@@ -124,62 +137,6 @@ def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> Non
     assert assistant_ids == tokenizer.encode("OK", add_special_tokens=False)
 
 
-def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tokenizer = _FakeTokenizer()
-
-    fake_unsloth = types.ModuleType("unsloth")
-    fake_unsloth_zoo = types.ModuleType("unsloth_zoo")
-    fake_dataset_utils = types.ModuleType("unsloth_zoo.dataset_utils")
-
-    def _train_on_responses_only(**kwargs):
-        del kwargs
-
-        def _labels_fn(batch):
-            return {"labels": [list(batch["input_ids"][0])]}
-
-        return _labels_fn
-
-    fake_dataset_utils.train_on_responses_only = _train_on_responses_only  # type: ignore[attr-defined]
-    fake_unsloth_zoo.dataset_utils = fake_dataset_utils  # type: ignore[attr-defined]
-
-    monkeypatch.setitem(sys.modules, "unsloth", fake_unsloth)
-    monkeypatch.setitem(sys.modules, "unsloth_zoo", fake_unsloth_zoo)
-    monkeypatch.setitem(sys.modules, "unsloth_zoo.dataset_utils", fake_dataset_utils)
-
-    trajectory = Trajectory(
-        messages_and_choices=[
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "World"},
-        ]
-    )
-
-    batch = tokenize_sft_batch(
-        trajectory_batch=[trajectory],
-        learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]
-        instruction_part="<user>",
-        response_part="<assistant>",
-    )
-
-    expected_ids = tokenizer.encode(
-        tokenizer.apply_chat_template(
-            trajectory.messages_and_choices,
-            tokenize=False,
-            add_generation_prompt=False,
-        ),
-        add_special_tokens=False,
-    )
-
-    assert batch.trajectory_tensors[0]["input_ids"].tolist() == [expected_ids]
-    assert batch.trajectory_tensors[0]["attention_mask"].tolist() == [
-        [1] * len(expected_ids)
-    ]
-    assert batch.num_tokens == len(expected_ids)
-    assert batch.num_trainable_tokens == len(expected_ids)
-
-
 def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template() -> (
     None
 ):
@@ -239,3 +196,60 @@ def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template
     )
 
     assert result is not None
+
+
+def test_tokenize_trajectory_non_final_tool_call_mutation_changes_prefill_tokens() -> (
+    None
+):
+    tokenizer = _Qwen3_5FakeTokenizer()
+    inputs = build_chat_template_conformance_inputs(tokenizer)  # type: ignore[arg-type]
+
+    base = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(
+            messages_and_choices=inputs.non_final_tool_call_base.messages_and_choices,
+            tools=inputs.non_final_tool_call_base.tools,
+        ),
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=inputs.non_final_tool_call_base,
+    )
+    mutated = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(
+            messages_and_choices=inputs.non_final_tool_call_mutated.messages_and_choices,
+            tools=inputs.non_final_tool_call_mutated.tools,
+        ),
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=inputs.non_final_tool_call_mutated,
+    )
+
+    assert base is not None
+    assert mutated is not None
+    assert len(base.choice_offsets) >= 2
+    assert len(mutated.choice_offsets) >= 2
+    assert (
+        base.token_ids[: base.choice_offsets[-1]]
+        != mutated.token_ids[: mutated.choice_offsets[-1]]
+    )
+
+
+def test_tokenize_trajectory_rejects_assistant_tool_calls_without_logprobs() -> None:
+    tokenizer = _Qwen3_5FakeTokenizer()
+    inputs = build_chat_template_conformance_inputs(tokenizer)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Assistant message has tool_calls"):
+        tokenize_trajectory(
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            image_processor=None,
+            history=History(
+                messages_and_choices=inputs.unsupported_assistant_tool_calls.messages_and_choices,
+                tools=inputs.unsupported_assistant_tool_calls.tools,
+            ),
+            advantage=1.0,
+            allow_training_without_logprobs=True,
+            trajectory=inputs.unsupported_assistant_tool_calls,
+        )

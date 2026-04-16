@@ -325,12 +325,7 @@ def run_chat_template_rollout_stage(
     report = chat_template_rollout.run_chat_template_rollout(base_model=base_model)
     return ValidationStageResult(
         name="chat_template_rollout",
-        passed=report.assistant_token_count > 0
-        and report.packed_num_sequences > 0
-        and (
-            not report.requires_mapping_tool_arguments
-            or report.normalized_mapping_tool_arguments
-        ),
+        passed=report.passed,
         metrics=report.model_dump(mode="json"),
         artifact_dir=report.output_dir,
     )
