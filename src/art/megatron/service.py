@@ -32,6 +32,7 @@ from ..vllm import get_llm, openai_server_task, run_on_workers
 from ..vllm.runtime_project import (
     build_dedicated_vllm_server_cmd,
     get_vllm_runtime_project_root,
+    wait_for_dedicated_vllm_server,
 )
 from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
 from .jobs import (
@@ -408,33 +409,40 @@ class MegatronService:
         self._install_parent_signal_cleanup()
         self._vllm_port = port
 
-        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 600))
-        elapsed = 0.0
+        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
         async with httpx.AsyncClient() as client:
-            while elapsed < timeout:
-                if self._vllm_process.poll() is not None:
-                    raise RuntimeError(
-                        "vLLM subprocess exited with code "
-                        f"{self._vllm_process.returncode}. "
-                        f"Check logs at {log_dir}/vllm-dedicated.log"
-                    )
-                try:
-                    response = await client.get(
-                        f"{self._vllm_base_url}/v1/models",
-                        timeout=5.0,
-                    )
-                    if response.status_code == 200:
-                        break
-                except (httpx.ConnectError, httpx.ReadTimeout):
-                    pass
-                await asyncio.sleep(1.0)
-                elapsed += 1.0
-            else:
+            try:
+                await wait_for_dedicated_vllm_server(
+                    process=self._vllm_process,
+                    host=self._vllm_host,
+                    port=self._vllm_port,
+                    timeout=timeout,
+                )
+            except TimeoutError as exc:
                 self._stop_vllm_subprocess()
                 raise TimeoutError(
                     f"vLLM subprocess did not become ready within {timeout}s. "
                     f"Check logs at {log_dir}/vllm-dedicated.log"
+                ) from exc
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "vLLM subprocess exited with code "
+                    f"{self._vllm_process.returncode}. "
+                    f"Check logs at {log_dir}/vllm-dedicated.log"
+                ) from exc
+
+            try:
+                response = await client.get(
+                    f"{self._vllm_base_url}/v1/models",
+                    timeout=5.0,
                 )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                self._stop_vllm_subprocess()
+                raise RuntimeError(
+                    "vLLM passed /health but /v1/models was not reachable. "
+                    f"Check logs at {log_dir}/vllm-dedicated.log"
+                ) from exc
 
         atexit.register(self.close)
         return self._vllm_host, self._vllm_port
