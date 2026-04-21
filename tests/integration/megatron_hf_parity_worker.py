@@ -458,6 +458,7 @@ def _build_megatron_runtime(
         ),
         optimizer_config=_build_optimizer_config(request.case_config),
         print_env=False,
+        trainable_parameter_mode="base_model",
     )
 
 

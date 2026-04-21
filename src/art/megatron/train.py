@@ -20,7 +20,7 @@ import os
 import random
 import shutil
 import time
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -150,6 +150,25 @@ def freeze_model(model_chunks: list[MegatronModule]) -> list[MegatronModule]:
         for param in module.parameters():
             param.requires_grad = False
     return model_chunks
+
+
+def _register_trainable_parameter_mode(
+    provider: Any,
+    *,
+    trainable_parameter_mode: Literal["lora", "base_model"],
+) -> None:
+    if trainable_parameter_mode == "lora":
+        provider.register_pre_wrap_hook(freeze_model)
+        provider.register_pre_wrap_hook(
+            lambda chunks: apply_lora_adapters(chunks, provider)
+        )
+        return
+    if trainable_parameter_mode == "base_model":
+        return
+    raise ValueError(
+        "trainable_parameter_mode must be 'lora' or 'base_model', got "
+        f"{trainable_parameter_mode!r}"
+    )
 
 
 def _frozen_linear_grad_input(
@@ -299,6 +318,7 @@ def build_training_runtime(
     moe_routing_replay_strict: bool = True,
     print_env: bool = True,
     build_optimizer: bool = True,
+    trainable_parameter_mode: Literal["lora", "base_model"] = "lora",
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -318,9 +338,9 @@ def build_training_runtime(
     if provider_configure is not None:
         provider_configure(provider)
     finalize_provider_bundle(provider_bundle)
-    provider.register_pre_wrap_hook(freeze_model)
-    provider.register_pre_wrap_hook(
-        lambda chunks: apply_lora_adapters(chunks, provider)
+    _register_trainable_parameter_mode(
+        provider,
+        trainable_parameter_mode=trainable_parameter_mode,
     )
 
     model = cast(

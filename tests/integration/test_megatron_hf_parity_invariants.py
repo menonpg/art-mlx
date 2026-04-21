@@ -317,6 +317,7 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     assert kwargs["provider_torch_dtype"] == torch.float32
     assert kwargs["provider_bundle_configure"] is hf_parity_worker_module._install_bridge_timing_debug
     assert kwargs["print_env"] is False
+    assert kwargs["trainable_parameter_mode"] == "base_model"
     configured_provider = SimpleNamespace()
     kwargs["provider_configure"](configured_provider)
     optimizer_config = kwargs["optimizer_config"]
