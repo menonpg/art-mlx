@@ -1,16 +1,62 @@
 from typing import Any, Sequence, cast
 
+from megatron.core.models.gpt.gpt_model import GPTModel
+import torch
+
 from art.megatron.model_chunks import ModelChunks
 from art.megatron.model_support.handlers.default_dense import DefaultDenseHandler
+from art.megatron.model_support.spec import CompileWorkaroundConfig
+
+_QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
+    "alltoall_dtoh",
+    "alltoall_dispatch_preprocess",
+)
 
 
 class Qwen3MoeHandler(DefaultDenseHandler):
     key = "qwen3_moe"
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
-        from art.megatron.train import _install_gpt_preprocess_hook
+        for chunk in cast(ModelChunks, list(model_chunks)):
+            module: Any = chunk
+            while hasattr(module, "module"):
+                module = module.module
+            gpt_module = (
+                module
+                if isinstance(module, GPTModel)
+                else cast(GPTModel, getattr(module, "language_model"))
+            )
+            preprocess = gpt_module._preprocess
 
-        _install_gpt_preprocess_hook(cast(ModelChunks, list(model_chunks)))
+            def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
+                preproc_output = list(_preprocess(*args, **kwargs))
+                decoder_input = cast(torch.Tensor, preproc_output[0])
+                if not decoder_input.requires_grad and decoder_input.is_leaf:
+                    decoder_input.requires_grad_(True)
+                position_ids = cast(torch.Tensor, kwargs["position_ids"])
+                table = cast(torch.Tensor, preproc_output[1])
+                embedding_dim = int(table.shape[-1])
+                batch_size, sequence_length = position_ids.shape
+                gathered = table.view(table.shape[0], embedding_dim).index_select(
+                    0,
+                    position_ids.reshape(-1),
+                )
+                preproc_output[1] = (
+                    gathered.view(batch_size, sequence_length, embedding_dim)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                    .unsqueeze(2)
+                )
+                return tuple(preproc_output)
+
+            gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
+
+    def compile_workaround_config(
+        self,
+        provider: Any,
+    ) -> CompileWorkaroundConfig:
+        del provider
+        return CompileWorkaroundConfig(flags=_QWEN3_MOE_COMPILE_WORKAROUND_FLAGS)
 
 
 QWEN3_MOE_HANDLER = Qwen3MoeHandler()

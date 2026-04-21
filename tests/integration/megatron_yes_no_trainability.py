@@ -17,6 +17,9 @@ from art import dev
 from art.megatron.backend import MegatronBackend
 from art.megatron.model_support.registry import get_model_support_spec
 
+from .megatron_oracle_harness import ORACLE_TOPOLOGY
+from .megatron_oracle_worker import provider_topology_env
+
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 
@@ -370,103 +373,105 @@ async def _run_yes_no_trainability(base_model: str) -> YesNoTrainabilityReport:
     )
 
     with _wandb_disabled():
-        async with MegatronBackend(path=str(output_dir), in_process=True) as backend:
-            print(
-                f"[yes_no_trainability] registering model in {output_dir}", flush=True
-            )
-            await model.register(backend)
-            print("[yes_no_trainability] model registered", flush=True)
-            print("[yes_no_trainability] warming inference path", flush=True)
-            await _warmup_model(
-                model,
-                base_model=base_model,
-                prompt=prompts[0],
-            )
-            print("[yes_no_trainability] warmup complete", flush=True)
-            initial_eval_reward = await _evaluate_model(
-                model,
-                base_model=base_model,
-                prompts=eval_prompts,
-                step=0,
-            )
-            print(
-                f"[yes_no_trainability] initial_eval_reward={initial_eval_reward:.4f}",
-                flush=True,
-            )
-            report = YesNoTrainabilityReport(
-                base_model=base_model,
-                output_dir=str(output_dir),
-                trainer_gpu_ids=trainer_gpu_ids,
-                inference_gpu_ids=inference_gpu_ids,
-                rollout_weights_mode=spec.default_rollout_weights_mode,
-                reward_threshold=reward_threshold,
-                max_steps=max_steps,
-                prompt_count=len(prompts),
-                eval_prompt_count=len(eval_prompts),
-                rollouts_per_prompt=rollouts_per_prompt,
-                latest_step=0,
-                initial_eval_reward=initial_eval_reward,
-            )
-
-            for _ in range(max_steps):
-                print("[yes_no_trainability] building train groups", flush=True)
-                train_groups = await _build_trainable_groups(
-                    model,
-                    base_model=base_model,
-                    prompts=prompts,
-                    rollouts_per_prompt=rollouts_per_prompt,
-                )
-                print("[yes_no_trainability] starting train step", flush=True)
-                result = await backend.train(
-                    model,
-                    train_groups,
-                    learning_rate=_get_env_float(
-                        "ART_MODEL_SUPPORT_YES_NO_LEARNING_RATE", 1e-4
-                    ),
-                    loss_fn="cispo",
-                    allow_training_without_logprobs=True,
-                    packed_sequence_length=packed_sequence_length,
-                )
+        with provider_topology_env(ORACLE_TOPOLOGY):
+            async with MegatronBackend(path=str(output_dir), in_process=True) as backend:
                 print(
-                    f"[yes_no_trainability] train step complete step={result.step}",
+                    f"[yes_no_trainability] registering model in {output_dir}",
                     flush=True,
                 )
-                eval_reward = await _evaluate_model(
+                await model.register(backend)
+                print("[yes_no_trainability] model registered", flush=True)
+                print("[yes_no_trainability] warming inference path", flush=True)
+                await _warmup_model(
+                    model,
+                    base_model=base_model,
+                    prompt=prompts[0],
+                )
+                print("[yes_no_trainability] warmup complete", flush=True)
+                initial_eval_reward = await _evaluate_model(
                     model,
                     base_model=base_model,
                     prompts=eval_prompts,
-                    step=result.step,
+                    step=0,
                 )
                 print(
-                    f"[yes_no_trainability] eval_reward={eval_reward:.4f} step={result.step}",
+                    f"[yes_no_trainability] initial_eval_reward={initial_eval_reward:.4f}",
                     flush=True,
                 )
-                report.latest_step = int(result.step)
-                report.final_eval_reward = float(eval_reward)
-                report.steps.append(
-                    TrainabilityStepReport(
-                        step=int(result.step),
-                        eval_reward=float(eval_reward),
-                        train_reward=sum(
-                            trajectory.reward
-                            for group in train_groups
-                            for trajectory in group.trajectories
-                        )
-                        / max(
-                            1,
-                            sum(len(group.trajectories) for group in train_groups),
-                        ),
-                        train_metrics={
-                            key: float(value)
-                            for key, value in result.metrics.items()
-                            if isinstance(value, int | float)
-                        },
-                    )
+                report = YesNoTrainabilityReport(
+                    base_model=base_model,
+                    output_dir=str(output_dir),
+                    trainer_gpu_ids=trainer_gpu_ids,
+                    inference_gpu_ids=inference_gpu_ids,
+                    rollout_weights_mode=spec.default_rollout_weights_mode,
+                    reward_threshold=reward_threshold,
+                    max_steps=max_steps,
+                    prompt_count=len(prompts),
+                    eval_prompt_count=len(eval_prompts),
+                    rollouts_per_prompt=rollouts_per_prompt,
+                    latest_step=0,
+                    initial_eval_reward=initial_eval_reward,
                 )
-                if eval_reward >= reward_threshold:
-                    report.saturated_step = int(result.step)
-                    break
-            return report
+
+                for _ in range(max_steps):
+                    print("[yes_no_trainability] building train groups", flush=True)
+                    train_groups = await _build_trainable_groups(
+                        model,
+                        base_model=base_model,
+                        prompts=prompts,
+                        rollouts_per_prompt=rollouts_per_prompt,
+                    )
+                    print("[yes_no_trainability] starting train step", flush=True)
+                    result = await backend.train(
+                        model,
+                        train_groups,
+                        learning_rate=_get_env_float(
+                            "ART_MODEL_SUPPORT_YES_NO_LEARNING_RATE", 1e-4
+                        ),
+                        loss_fn="cispo",
+                        allow_training_without_logprobs=True,
+                        packed_sequence_length=packed_sequence_length,
+                    )
+                    print(
+                        f"[yes_no_trainability] train step complete step={result.step}",
+                        flush=True,
+                    )
+                    eval_reward = await _evaluate_model(
+                        model,
+                        base_model=base_model,
+                        prompts=eval_prompts,
+                        step=result.step,
+                    )
+                    print(
+                        f"[yes_no_trainability] eval_reward={eval_reward:.4f} step={result.step}",
+                        flush=True,
+                    )
+                    report.latest_step = int(result.step)
+                    report.final_eval_reward = float(eval_reward)
+                    report.steps.append(
+                        TrainabilityStepReport(
+                            step=int(result.step),
+                            eval_reward=float(eval_reward),
+                            train_reward=sum(
+                                trajectory.reward
+                                for group in train_groups
+                                for trajectory in group.trajectories
+                            )
+                            / max(
+                                1,
+                                sum(len(group.trajectories) for group in train_groups),
+                            ),
+                            train_metrics={
+                                key: float(value)
+                                for key, value in result.metrics.items()
+                                if isinstance(value, int | float)
+                            },
+                        )
+                    )
+                    if eval_reward >= reward_threshold:
+                        report.saturated_step = int(result.step)
+                        break
+                return report
 
 
 def run_yes_no_trainability(base_model: str) -> YesNoTrainabilityReport:

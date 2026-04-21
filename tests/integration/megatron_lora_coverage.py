@@ -6,7 +6,6 @@ import socket
 from typing import Any
 
 from megatron.core import parallel_state as ps
-from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from pydantic import BaseModel, Field
 import torch
@@ -16,11 +15,11 @@ from torch.distributed import (
     is_initialized,
 )
 
-from art.megatron.lora import LoRA, apply_lora_adapters
-from art.megatron.provider import get_provider_bundle
+from art.megatron import train as megatron_train
+from art.megatron.lora import LoRA
 
 from .megatron_oracle_harness import ORACLE_TOPOLOGY, OracleCaseConfig
-from .megatron_oracle_worker import _configure_provider
+from .megatron_oracle_worker import _configure_provider, provider_topology_env
 
 _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
     "q_proj": (".self_attn.q_proj",),
@@ -129,35 +128,29 @@ def _covered_exported_target_modules(
 
 def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
     with _single_rank_model_parallel():
-        provider_bundle = get_provider_bundle(
-            case_config.base_model,
-            torch_dtype=torch.float32,
-            runtime_profile="single_gpu_parity",
-        )
-        provider = provider_bundle.provider
-        _configure_provider(provider, ORACLE_TOPOLOGY, case_config)
-        model_chunks = list(
-            provider.provide_distributed_model(
-                ddp_config=DistributedDataParallelConfig(
-                    grad_reduce_in_fp32=True,
-                    average_in_collective=False,
+        with provider_topology_env(ORACLE_TOPOLOGY):
+            runtime = megatron_train.build_training_runtime(
+                model_identifier=case_config.base_model,
+                provider_torch_dtype=torch.float32,
+                provider_configure=lambda provider: _configure_provider(
+                    provider, ORACLE_TOPOLOGY, case_config
                 ),
-                data_parallel_random_init=False,
-                mixed_precision_wrapper=None,
+                print_env=False,
+                build_optimizer=False,
             )
-        )
-        apply_lora_adapters(model_chunks, provider)
         adapter_prefixes = {
             module.adapter_model_prefix
-            for chunk in model_chunks
+            for chunk in runtime.model
             for module in chunk.modules()
             if isinstance(module, LoRA)
         }
-        adapter_weights_by_base = provider_bundle.handler.build_adapter_weights_by_base(
-            model_chunks
+        adapter_weights_by_base = (
+            runtime.provider_bundle.handler.build_adapter_weights_by_base(
+                runtime.model
+            )
         )
 
-    target_modules = list(provider_bundle.spec.default_target_modules)
+    target_modules = list(runtime.provider_bundle.spec.default_target_modules)
     wrapped_target_modules = sorted(_covered_wrapped_target_modules(adapter_prefixes))
     exported_target_modules = sorted(
         _covered_exported_target_modules(adapter_weights_by_base)

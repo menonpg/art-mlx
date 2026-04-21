@@ -9,14 +9,11 @@ import sys
 import time
 from typing import Any, cast
 
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.transformer.utils import get_default_causal_mask
 import torch
 import torch.nn.functional as F
 
 from art.megatron import train as megatron_train
 from art.megatron.merged_weight_export import build_art_conversion_tasks
-from art.megatron.provider import get_provider_bundle
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     RouterCallRoute,
@@ -452,40 +449,15 @@ def _run_hf_sft_step(
 def _build_megatron_runtime(
     request: HfParityRunRequest,
 ) -> megatron_train.TrainingRuntime:
-    _debug("building Megatron provider bundle")
-    provider_bundle = get_provider_bundle(
-        request.case_config.base_model,
-        torch_dtype=torch.float32,
-        runtime_profile="single_gpu_parity",
-    )
-    _debug("Megatron provider bundle built")
-    _install_bridge_timing_debug(provider_bundle)
-    provider = provider_bundle.provider
-    _configure_provider(provider, ORACLE_TOPOLOGY, request.case_config)
-    _debug("Megatron provider configured for oracle topology")
-    model = cast(
-        list[Any],
-        provider.provide_distributed_model(
-            ddp_config=DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                average_in_collective=False,
-            ),
-            data_parallel_random_init=False,
-            mixed_precision_wrapper=None,
-        ),
-    )
-    _debug("Megatron model instantiated")
-    provider_bundle.handler.install_preprocess_patch(model)
-    return megatron_train.TrainingRuntime(
-        provider_bundle=provider_bundle,
-        provider=provider,
-        model=model,
-        optimizer=megatron_train._build_optimizer(
-            model, _build_optimizer_config(request.case_config)
+    return megatron_train.build_training_runtime(
+        model_identifier=request.case_config.base_model,
+        provider_torch_dtype=torch.float32,
+        provider_bundle_configure=_install_bridge_timing_debug,
+        provider_configure=lambda provider: _configure_provider(
+            provider, ORACLE_TOPOLOGY, request.case_config
         ),
         optimizer_config=_build_optimizer_config(request.case_config),
-        rank=torch.distributed.get_rank(),  # ty: ignore[possibly-missing-attribute]
-        world_size=torch.distributed.get_world_size(),  # ty: ignore[possibly-missing-attribute]
+        print_env=False,
     )
 
 
@@ -625,9 +597,6 @@ def _run_megatron_sft_step(
             sample_index=sample_indices,
             global_grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
         )
-    uses_standard_attention_path = (
-        getattr(runtime.provider, "_art_runtime_profile", None) == "single_gpu_parity"
-    )
     _debug("initializing Megatron optimizer state")
     megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
     tasks = [
@@ -647,23 +616,20 @@ def _run_megatron_sft_step(
     loss_sum = torch.tensor(0.0, device=device)
     token_count = 0
     trainable_losses: list[torch.Tensor] = []
-    for micro in micro_inputs:
+    for micro_order, micro in enumerate(micro_inputs):
+        if runtime.moe_routing_replay_controller is not None:
+            runtime.moe_routing_replay_controller.begin_micro(
+                sample_indices[micro_order],
+                micro_order,
+            )
         input_ids, position_ids, shifted_labels, mask, seq_len = (
             megatron_train._prepare_sft_micro_inputs(micro, device)
         )
         attention_mask = megatron_train._placeholder_attention_mask(device)
-        if uses_standard_attention_path:
-            attention_mask = get_default_causal_mask(seq_len).view(
-                1, 1, seq_len, seq_len
-            )
-            forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
-                runtime.model[0]
-            )
-        else:
-            forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
-                runtime.model[0],
-                attention_bias=megatron_train._causal_attention_state(seq_len, device),
-            )
+        forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
+            runtime.model[0],
+            attention_bias=megatron_train._causal_attention_state(seq_len, device),
+        )
         per_token_loss = runtime.model[0](
             input_ids=input_ids,
             position_ids=position_ids,

@@ -108,6 +108,26 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     )
 
 
+def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    fake_bridge = _FakeBridge(
+        model_bridge=object.__new__(Qwen3MoEBridge),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+
+    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
+
+    assert resolved.moe_shared_expert_overlap is False
+
+
 def test_get_provider_rejects_unsupported_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -196,7 +216,7 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     assert getattr(provider, "sequence_parallel") is False
 
 
-def test_get_provider_bundle_single_gpu_parity_uses_clean_runtime_defaults(
+def test_get_provider_bundle_honors_single_gpu_env_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _FakeProvider()
@@ -210,11 +230,11 @@ def test_get_provider_bundle_single_gpu_parity_uses_clean_runtime_defaults(
         lambda *args, **kwargs: fake_bridge,
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setenv("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "1")
 
-    bundle = provider_module.get_provider_bundle(
-        "unused-model",
-        runtime_profile="single_gpu_parity",
-    )
+    bundle = provider_module.get_provider_bundle("unused-model")
     resolved = bundle.provider
 
     assert resolved.tensor_model_parallel_size == 1
@@ -223,15 +243,65 @@ def test_get_provider_bundle_single_gpu_parity_uses_clean_runtime_defaults(
     assert resolved.expert_model_parallel_size == 1
     assert resolved.expert_tensor_parallel_size == 1
     assert resolved.sequence_parallel is False
-    assert resolved.recompute_granularity is None
-    assert resolved.recompute_method is None
-    assert resolved.recompute_num_layers is None
-    assert resolved.overlap_moe_expert_parallel_comm is False
-    assert resolved.moe_token_dispatcher_type == "alltoall"
-    assert resolved.moe_shared_expert_overlap is False
+    assert resolved.recompute_granularity == "full"
+    assert resolved.recompute_method == "uniform"
+    assert resolved.recompute_num_layers == 1
 
     layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
-        is not FlexDotProductAttention
+        is FlexDotProductAttention
     )
+
+
+def test_get_provider_bundle_disables_recompute_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    fake_bridge = _FakeBridge(
+        model_bridge=object.__new__(Qwen3MoEBridge),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setenv("ART_MEGATRON_RECOMPUTE_GRANULARITY", "disabled")
+    monkeypatch.setenv("ART_MEGATRON_RECOMPUTE_METHOD", "disabled")
+    monkeypatch.setenv("ART_MEGATRON_RECOMPUTE_NUM_LAYERS", "disabled")
+    monkeypatch.setenv("ART_MEGATRON_RECOMPUTE_MODULES", "disabled")
+
+    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
+
+    assert resolved.recompute_granularity is None
+    assert resolved.recompute_method is None
+    assert resolved.recompute_num_layers is None
+    assert resolved.recompute_modules is None
+
+
+def test_get_provider_bundle_honors_expert_parallel_env_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    fake_bridge = _FakeBridge(
+        model_bridge=object.__new__(Qwen3MoEBridge),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setenv("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "2")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "2")
+
+    resolved = provider_module.get_provider("unused-model")
+
+    assert resolved.tensor_model_parallel_size == 2
+    assert resolved.expert_model_parallel_size == 1
+    assert resolved.expert_tensor_parallel_size == 2
+    assert resolved.sequence_parallel is True

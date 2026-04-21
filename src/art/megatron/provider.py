@@ -1,20 +1,15 @@
 import os
-from pathlib import Path
 from typing import Any, Literal, cast
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
-from megatron.bridge.models.hf_pretrained.state import (
-    SafeTensorsStateSource,
-    StateDict,
-    StateSource,
-)
 from megatron.bridge.training.flex_dispatcher_backend import (
     apply_flex_dispatcher_backend,
 )
 from megatron.core.transformer.enums import AttnBackend
 import torch
 
+from art.megatron.bridge_runtime import install_art_bridge_runtime_patches
 from art.megatron.flex_attention import FlexDotProductAttention
 from art.megatron.model_support.handlers.qwen3_5_moe import (
     supported_qwen_moe_bridge_types,
@@ -29,30 +24,7 @@ from art.megatron.provider_common import (
     resolve_layer_spec,
 )
 
-RuntimeProfile = Literal["art_training", "single_gpu_parity"]
-
-
-class _CastingStateSource(StateSource):
-    def __init__(self, source: StateSource, *, dtype: torch.dtype):
-        self._source = source
-        self._dtype = dtype
-
-    def get_all_keys(self) -> list[str]:
-        return self._source.get_all_keys()
-
-    def load_tensors(self, keys: list[str]) -> dict[str, torch.Tensor]:
-        loaded = self._source.load_tensors(keys)
-        return {
-            key: (
-                value.to(dtype=self._dtype)
-                if torch.is_floating_point(value) and value.dtype != self._dtype
-                else value
-            )
-            for key, value in loaded.items()
-        }
-
-    def has_glob(self, pattern: str) -> bool:
-        return self._source.has_glob(pattern)
+install_art_bridge_runtime_patches()
 
 
 def _env_flag(name: str) -> bool | None:
@@ -133,9 +105,9 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.expert_tensor_parallel_size = 1
 
 
-def _expert_parallel_domain_size(provider: GPTModelProvider) -> int:
-    return int(provider.expert_model_parallel_size) * int(
-        provider.expert_tensor_parallel_size or 1
+def _etp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
+    return int(provider.expert_tensor_parallel_size) * int(
+        provider.expert_model_parallel_size
     )
 
 
@@ -145,60 +117,14 @@ def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> 
     provider.recompute_num_layers = 1
     provider.moe_shared_expert_overlap = True
     _apply_default_parallel_topology(provider)
-    _apply_runtime_env_overrides(provider)
-    provider.sequence_parallel = provider.tensor_model_parallel_size > 1
 
 
 def _apply_art_training_runtime_finalize_defaults(provider: GPTModelProvider) -> None:
-    if _expert_parallel_domain_size(provider) <= 1:
+    if _etp_ep_parallel_domain_size(provider) <= 1:
         return
     # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
     # compute, so these are very beneficial
     apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
-
-
-def _apply_single_gpu_parity_runtime_prepare_defaults(
-    provider: GPTModelProvider,
-) -> None:
-    provider.tensor_model_parallel_size = 1
-    provider.context_parallel_size = 1
-    provider.pipeline_model_parallel_size = 1
-    provider.expert_model_parallel_size = 1
-    provider.expert_tensor_parallel_size = 1
-    provider.sequence_parallel = False
-    provider.recompute_granularity = None
-    provider.recompute_method = None
-    provider.recompute_num_layers = None
-    provider.overlap_moe_expert_parallel_comm = False
-    provider.moe_token_dispatcher_type = "alltoall"
-    provider.moe_shared_expert_overlap = False
-
-
-def _apply_runtime_profile_prepare_defaults(
-    provider: GPTModelProvider,
-    *,
-    runtime_profile: RuntimeProfile,
-) -> None:
-    if runtime_profile == "art_training":
-        _apply_art_training_runtime_prepare_defaults(provider)
-        return
-    if runtime_profile == "single_gpu_parity":
-        _apply_single_gpu_parity_runtime_prepare_defaults(provider)
-        return
-    raise ValueError(f"Unsupported runtime profile: {runtime_profile}")
-
-
-def _apply_runtime_profile_finalize_defaults(
-    provider: GPTModelProvider,
-    *,
-    runtime_profile: RuntimeProfile,
-) -> None:
-    if runtime_profile == "art_training":
-        _apply_art_training_runtime_finalize_defaults(provider)
-        return
-    if runtime_profile == "single_gpu_parity":
-        return
-    raise ValueError(f"Unsupported runtime profile: {runtime_profile}")
 
 
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
@@ -247,6 +173,22 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     )
     if found and tensor_model_parallel_size is not None:
         provider.tensor_model_parallel_size = tensor_model_parallel_size
+
+    found, expert_model_parallel_size = _env_optional_int(
+        "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE"
+    )
+    if found and expert_model_parallel_size is not None:
+        provider.expert_model_parallel_size = expert_model_parallel_size
+
+    found, expert_tensor_parallel_size = _env_optional_int(
+        "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE"
+    )
+    if not found:
+        found, expert_tensor_parallel_size = _env_optional_int(
+            "ART_MEGATRON_EXPERT_TENSOR_MODEL_PARALLEL_SIZE"
+        )
+    if found and expert_tensor_parallel_size is not None:
+        provider.expert_tensor_parallel_size = expert_tensor_parallel_size
 
     recompute_granularity_found, recompute_granularity = (
         _env_optional_recompute_granularity("ART_MEGATRON_RECOMPUTE_GRANULARITY")
@@ -304,7 +246,6 @@ def _build_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype,
-    runtime_profile: RuntimeProfile,
 ) -> ProviderBundle:
     spec = get_model_support_spec(model)
     handler = get_model_support_handler(model)
@@ -316,15 +257,7 @@ def _build_provider_bundle(
     assert isinstance(bridge._model_bridge, supported_qwen_moe_bridge_types()), (
         "Only Qwen3 and Qwen3.5 MoE models are supported"
     )
-    if torch_dtype != torch.bfloat16 and runtime_profile != "single_gpu_parity":
-        model_name_or_path = bridge.hf_pretrained.model_name_or_path
-        assert model_name_or_path is not None
-        bridge.hf_pretrained._state_dict_accessor = StateDict(
-            _CastingStateSource(
-                SafeTensorsStateSource(cast(str | Path, model_name_or_path)),
-                dtype=torch_dtype,
-            )
-        )
+    handler.patch_bridge(bridge)
     return ProviderBundle(
         provider=bridge.to_megatron_provider(),
         bridge=bridge,
@@ -337,17 +270,14 @@ def prepare_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
-    runtime_profile: RuntimeProfile = "art_training",
 ) -> ProviderBundle:
     bundle = _build_provider_bundle(
         model,
         torch_dtype=torch_dtype,
-        runtime_profile=runtime_profile,
     )
     provider = bundle.provider
     setattr(provider, "_art_model_support_handler", bundle.handler)
     setattr(provider, "_art_model_support_spec", bundle.spec)
-    setattr(provider, "_art_runtime_profile", runtime_profile)
     provider.attention_backend = AttnBackend.auto
     provider.moe_permute_fusion = True
     provider.moe_router_dtype = "fp32"
@@ -356,26 +286,18 @@ def prepare_provider_bundle(
     provider.moe_aux_loss_coeff = 0.0
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
-    _apply_runtime_profile_prepare_defaults(
-        provider,
-        runtime_profile=runtime_profile,
-    )
-    if runtime_profile == "art_training":
-        _install_art_training_flex_attention(provider)
+    _apply_art_training_runtime_prepare_defaults(provider)
+    bundle.handler.configure_provider_for_runtime(provider)
+    _apply_runtime_env_overrides(provider)
+    provider.sequence_parallel = provider.tensor_model_parallel_size > 1
+    _install_art_training_flex_attention(provider)
     bundle.handler.patch_provider(provider, bundle.bridge)
     return bundle
 
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     provider = cast(GPTModelProvider, provider_bundle.provider)
-    runtime_profile = cast(
-        RuntimeProfile,
-        getattr(provider, "_art_runtime_profile", "art_training"),
-    )
-    _apply_runtime_profile_finalize_defaults(
-        provider,
-        runtime_profile=runtime_profile,
-    )
+    _apply_art_training_runtime_finalize_defaults(provider)
     provider.finalize()
     return provider_bundle
 
@@ -384,13 +306,11 @@ def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
-    runtime_profile: RuntimeProfile = "art_training",
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
             torch_dtype=torch_dtype,
-            runtime_profile=runtime_profile,
         )
     )
 

@@ -22,6 +22,9 @@ def canonical_art_param_name(name: str) -> str:
     canonical: list[str] = []
     i = 0
     while i < len(segments):
+        if segments[i] == "_orig_mod":
+            i += 1
+            continue
         if i + 1 < len(segments):
             current = segments[i]
             nxt = segments[i + 1]

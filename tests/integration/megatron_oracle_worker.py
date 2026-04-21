@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, contextmanager
+import faulthandler
 import hashlib
 import os
 from pathlib import Path
 import random
 import subprocess
 import sys
+import time
 from types import MethodType
 from typing import Any, Callable
 
@@ -36,6 +38,37 @@ from .megatron_oracle_harness import (
     _write_json,
 )
 from .megatron_test_inputs import build_sft_trajectory_tensors_from_packed_tensors
+
+_TOPOLOGY_ENV_VARS = {
+    "tp": "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE",
+    "ep": "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE",
+    "etp": "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
+}
+_ORACLE_DEBUG_ENV = "ART_ORACLE_DEBUG"
+_ORACLE_DEBUG_START_TIME = time.perf_counter()
+
+
+def _oracle_debug_enabled() -> bool:
+    return os.environ.get(_ORACLE_DEBUG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug(message: str) -> None:
+    if not _oracle_debug_enabled():
+        return
+    elapsed = time.perf_counter() - _ORACLE_DEBUG_START_TIME
+    print(f"[oracle-debug +{elapsed:.2f}s] {message}", flush=True)
+
+
+def _enable_debug_traceback_dump() -> None:
+    if not _oracle_debug_enabled():
+        return
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(60, repeat=True)
 
 
 def run_worker_subprocess(
@@ -78,10 +111,12 @@ def run_worker_subprocess(
                     f"\n=== {request.objective} {request.topology.slug()} ===\n"
                 )
                 live_log.flush()
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            env["ART_DISABLE_MEGATRON_COMPILE"] = "1"
             run = subprocess.Popen(
                 command,
                 cwd=str(worker_cwd),
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -117,6 +152,30 @@ def _set_deterministic_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def provider_topology_env_vars(topology: Topology) -> dict[str, str]:
+    return {
+        _TOPOLOGY_ENV_VARS["tp"]: str(topology.tp),
+        _TOPOLOGY_ENV_VARS["ep"]: str(topology.ep),
+        _TOPOLOGY_ENV_VARS["etp"]: str(topology.etp),
+    }
+
+
+@contextmanager
+def provider_topology_env(topology: Topology):
+    previous = {
+        name: os.environ.get(name) for name in _TOPOLOGY_ENV_VARS.values()
+    }
+    os.environ.update(provider_topology_env_vars(topology))
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+                continue
+            os.environ[name] = value
 
 
 def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
@@ -286,13 +345,7 @@ def _configure_provider(
     case_config: OracleCaseConfig,
 ) -> None:
     """Applies deterministic topology/model overrides to provider config."""
-    provider.tensor_model_parallel_size = topology.tp
-    provider.expert_model_parallel_size = topology.ep
-    provider.expert_tensor_parallel_size = topology.etp
-    # These are intentionally pinned to 1 for now
-    provider.pipeline_model_parallel_size = 1
-    provider.context_parallel_size = 1
-    provider.sequence_parallel = topology.sp
+    del topology
     provider.num_layers = case_config.num_layers
     if case_config.precision == "fp32":
         provider.bf16 = False
@@ -782,21 +835,29 @@ def _worker_run(request: WorkerRunRequest) -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend="nccl")  # ty: ignore[possibly-missing-attribute]
+    _enable_debug_traceback_dump()
     _set_deterministic_seed(request.case_config.seed)
     _configure_cuda_precision(request.case_config)
 
-    runtime = megatron_train.build_training_runtime(
-        model_identifier=request.case_config.base_model,
-        provider_torch_dtype=(
-            torch.float32 if request.case_config.precision == "fp32" else torch.bfloat16
-        ),
-        provider_configure=lambda provider: _configure_provider(
-            provider, request.topology, request.case_config
-        ),
-        optimizer_config=_build_optimizer_config(request.case_config),
-        print_env=False,
-        print_optimizer_stats=False,
-    )
+    with provider_topology_env(request.topology):
+        _debug(
+            f"starting build_training_runtime objective={request.objective} "
+            f"topology={request.topology.slug()} local_rank={local_rank}"
+        )
+        runtime = megatron_train.build_training_runtime(
+            model_identifier=request.case_config.base_model,
+            provider_torch_dtype=(
+                torch.float32
+                if request.case_config.precision == "fp32"
+                else torch.bfloat16
+            ),
+            provider_configure=lambda provider: _configure_provider(
+                provider, request.topology, request.case_config
+            ),
+            optimizer_config=_build_optimizer_config(request.case_config),
+            print_env=False,
+        )
+        _debug("finished build_training_runtime")
     model_chunks = runtime.model
     optimizer = runtime.optimizer
     megatron_train.configure_moe_routing_replay(
@@ -891,6 +952,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         ),
         _patch_lora_for_fp32(model_chunks, optimizer),
     ):
+        _debug("starting training loop")
         for step_index in range(request.case_config.num_steps):
             micro_sample_indices = megatron_train.build_micro_sample_indices(
                 step_index=step_index,
@@ -899,6 +961,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
             )
             forward_trace_capture.set_step(step_index, micro_sample_indices)
             captured_grads = None
+            _debug(f"starting step_index={step_index}")
             if request.objective == "rl":
                 micro_inputs = megatron_train.select_micro_inputs(
                     packed_tensors,
@@ -935,6 +998,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     global_grad_accumulation_sequences=global_grad_accumulation_sequences,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 )
+            _debug(f"finished step_index={step_index}")
             ordered_micro_outputs = forward_trace_capture.ordered_step_outputs()
             forward_trace_capture.save_current_step(traces_dir)
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]

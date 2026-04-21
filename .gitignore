@@ -21,3 +21,4 @@ trajectories/
 !/src/art/wandb/
 !/src/art/wandb/**
 /src/art/wandb/__pycache__/
+scratch/

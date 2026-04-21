@@ -6,6 +6,8 @@ import torch
 
 from art.megatron.model_support.spec import MinimalLayerCoverageReport
 
+from . import megatron_hf_parity as hf_parity_module
+from . import megatron_hf_parity_worker as hf_parity_worker_module
 from .megatron_hf_parity import (
     HF_PARITY_OUTPUT_DIRNAME,
     HF_PARITY_REPORT_FILENAME,
@@ -66,7 +68,8 @@ def test_set_hf_config_num_layers_updates_nested_text_config() -> None:
 
 def test_run_hf_parity_rejects_uncovered_toy_model(monkeypatch) -> None:
     monkeypatch.setattr(
-        "integration.megatron_hf_parity.assess_minimal_layer_coverage",
+        hf_parity_module,
+        "assess_minimal_layer_coverage",
         lambda **_: SimpleNamespace(
             covered=False,
             missing_layer_families=["standard_attention"],
@@ -116,11 +119,13 @@ def test_run_hf_parity_always_reruns_existing_report(
     )
 
     monkeypatch.setattr(
-        "integration.megatron_hf_parity.assess_minimal_layer_coverage",
+        hf_parity_module,
+        "assess_minimal_layer_coverage",
         lambda **_: coverage,
     )
     monkeypatch.setattr(
-        "integration.megatron_hf_parity.ensure_case_artifacts",
+        hf_parity_module,
+        "ensure_case_artifacts",
         lambda _: SimpleNamespace(
             case_id="fresh-case",
             case_dir=str(case_dir),
@@ -150,10 +155,7 @@ def test_run_hf_parity_always_reruns_existing_report(
             encoding="utf-8",
         )
 
-    monkeypatch.setattr(
-        "integration.megatron_hf_parity.run_hf_parity_subprocess",
-        _fake_subprocess,
-    )
+    monkeypatch.setattr(hf_parity_module, "run_hf_parity_subprocess", _fake_subprocess)
 
     report = run_hf_parity(
         case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B")
@@ -162,6 +164,42 @@ def test_run_hf_parity_always_reruns_existing_report(
     assert calls == ["fresh-case"]
     assert report.case_id == "fresh-case"
     assert report.pass_count == 1
+
+
+def test_run_hf_parity_subprocess_does_not_override_recompute(monkeypatch, tmp_path) -> None:
+    request = HfParityRunRequest(
+        case_id="case-id",
+        case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
+        packed_tensors=DiskPackedTensorsSpec(
+            dir=str(tmp_path / "packed"),
+            num_sequences=4,
+            sequence_length=8,
+        ),
+        output_dir=str(tmp_path),
+        coverage=MinimalLayerCoverageReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            requested_num_layers=4,
+            recommended_min_layers=4,
+            covered=True,
+        ),
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_run(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(hf_parity_module.subprocess, "run", _fake_run)
+
+    hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
+
+    env = cast(dict[str, str], captured["env"])
+    assert "ART_MEGATRON_RECOMPUTE_GRANULARITY" not in env
+    assert "ART_MEGATRON_RECOMPUTE_METHOD" not in env
+    assert "ART_MEGATRON_RECOMPUTE_NUM_LAYERS" not in env
+    assert "ART_MEGATRON_RECOMPUTE_MODULES" not in env
 
 
 def test_normalize_hf_tensor_map_for_bridge_adds_language_model_prefix() -> None:
@@ -242,54 +280,17 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
     }
 
 
-def test_build_megatron_runtime_uses_single_gpu_parity_provider_bundle(
+def test_build_megatron_runtime_uses_training_provider_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, object]] = []
-    fake_model = torch.nn.Linear(1, 1)
-    fake_model.config = SimpleNamespace(num_layers=4)  # type: ignore[attr-defined]
-
-    class _FakeProvider:
-        def provide_distributed_model(self, **kwargs):
-            return [fake_model]
-
-    fake_provider = _FakeProvider()
-    fake_bundle = SimpleNamespace(
-        provider=fake_provider,
-        bridge="bridge",
-        handler=SimpleNamespace(install_preprocess_patch=lambda model: None),
-        spec="spec",
-    )
+    calls: list[dict[str, Any]] = []
+    runtime = SimpleNamespace(provider="provider", model=["model"])
 
     monkeypatch.setattr(
-        "integration.megatron_hf_parity_worker.get_provider_bundle",
-        lambda *args, **kwargs: (
-            calls.append(("bundle", {"args": args, "kwargs": kwargs})) or fake_bundle
-        ),
+        hf_parity_worker_module.megatron_train,
+        "build_training_runtime",
+        lambda **kwargs: calls.append(kwargs) or runtime,
     )
-    monkeypatch.setattr(
-        "integration.megatron_hf_parity_worker._configure_provider",
-        lambda provider, topology, case_config: calls.append(
-            (
-                "configure",
-                {
-                    "provider": provider,
-                    "topology": topology,
-                    "case_config": case_config,
-                },
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        "integration.megatron_hf_parity_worker.megatron_train._build_optimizer",
-        lambda model, optimizer_config: "optimizer",
-    )
-    monkeypatch.setattr(
-        "integration.megatron_hf_parity_worker.megatron_train.TrainingRuntime",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
 
     request = HfParityRunRequest(
         case_id="case",
@@ -307,21 +308,20 @@ def test_build_megatron_runtime_uses_single_gpu_parity_provider_bundle(
         ),
     )
 
-    runtime = _build_megatron_runtime(request)
+    built_runtime = _build_megatron_runtime(request)
 
-    assert runtime.provider is fake_provider
-    bundle_call = next(payload for name, payload in calls if name == "bundle")
-    assert bundle_call["kwargs"]["runtime_profile"] == "single_gpu_parity"
-    assert [name for name, _ in calls] == ["bundle", "configure"]
-    assert calls[0][1] == {
-        "args": ("Qwen/Qwen3.5-35B-A3B",),
-        "kwargs": {
-            "torch_dtype": torch.float32,
-            "runtime_profile": "single_gpu_parity",
-        },
-    }
-    configured = cast(dict[str, Any], calls[1][1])
-    assert configured["provider"] is fake_provider
+    assert built_runtime is runtime
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["model_identifier"] == "Qwen/Qwen3.5-35B-A3B"
+    assert kwargs["provider_torch_dtype"] == torch.float32
+    assert kwargs["provider_bundle_configure"] is hf_parity_worker_module._install_bridge_timing_debug
+    assert kwargs["print_env"] is False
+    configured_provider = SimpleNamespace()
+    kwargs["provider_configure"](configured_provider)
+    optimizer_config = kwargs["optimizer_config"]
+    assert configured_provider.num_layers == request.case_config.num_layers
+    assert optimizer_config.params_dtype == torch.float32
 
 
 def test_mapping_supports_derivative_parity_rejects_affine_weight_exports() -> None:

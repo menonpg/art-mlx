@@ -11,7 +11,12 @@ import torch
 from art import dev
 from art.megatron.service import MegatronService
 
-from .megatron_oracle_harness import OracleCaseConfig, ensure_case_artifacts
+from .megatron_oracle_harness import (
+    ORACLE_TOPOLOGY,
+    OracleCaseConfig,
+    ensure_case_artifacts,
+)
+from .megatron_oracle_worker import provider_topology_env
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -74,60 +79,61 @@ async def _run_merged_vllm_serving(
         rollout_weights_mode="merged",
     )
     dev.validate_dedicated_config(internal_config)
-    service = MegatronService(
-        model_name=service_name,
-        base_model=case_config.base_model,
-        config=internal_config,
-        output_dir=output_dir,
-    )
-    port = _find_free_port()
-    try:
-        host, resolved_port = await service.start_openai_server(
-            {"server_args": {"port": port}}
-        )
-        import httpx
-
-        async with httpx.AsyncClient() as client:
-            models_response = await client.get(
-                f"http://{host}:{resolved_port}/v1/models",
-                timeout=60.0,
-            )
-            models_response.raise_for_status()
-            model_ids = [
-                str(model_info["id"])
-                for model_info in models_response.json().get("data", [])
-                if isinstance(model_info, dict) and "id" in model_info
-            ]
-
-            served_model_name = f"{service_name}@{service._latest_step}"
-            completion_response = await client.post(
-                f"http://{host}:{resolved_port}/v1/completions",
-                json={
-                    "model": served_model_name,
-                    "prompt": "Hello",
-                    "max_tokens": 1,
-                    "temperature": 0.0,
-                },
-                timeout=900.0,
-            )
-            completion_response.raise_for_status()
-            completion_json = completion_response.json()
-            completion_text = str(
-                completion_json.get("choices", [{}])[0].get("text", "")
-            )
-        return MergedVllmServingReport(
+    with provider_topology_env(ORACLE_TOPOLOGY):
+        service = MegatronService(
+            model_name=service_name,
             base_model=case_config.base_model,
+            config=internal_config,
             output_dir=output_dir,
-            host=host,
-            port=resolved_port,
-            trainer_gpu_ids=trainer_gpu_ids,
-            inference_gpu_ids=inference_gpu_ids,
-            served_model_name=served_model_name,
-            model_ids=model_ids,
-            completion_text=completion_text,
         )
-    finally:
-        service.close()
+        port = _find_free_port()
+        try:
+            host, resolved_port = await service.start_openai_server(
+                {"server_args": {"port": port}}
+            )
+            import httpx
+
+            async with httpx.AsyncClient() as client:
+                models_response = await client.get(
+                    f"http://{host}:{resolved_port}/v1/models",
+                    timeout=60.0,
+                )
+                models_response.raise_for_status()
+                model_ids = [
+                    str(model_info["id"])
+                    for model_info in models_response.json().get("data", [])
+                    if isinstance(model_info, dict) and "id" in model_info
+                ]
+
+                served_model_name = f"{service_name}@{service._latest_step}"
+                completion_response = await client.post(
+                    f"http://{host}:{resolved_port}/v1/completions",
+                    json={
+                        "model": served_model_name,
+                        "prompt": "Hello",
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                    },
+                    timeout=900.0,
+                )
+                completion_response.raise_for_status()
+                completion_json = completion_response.json()
+                completion_text = str(
+                    completion_json.get("choices", [{}])[0].get("text", "")
+                )
+            return MergedVllmServingReport(
+                base_model=case_config.base_model,
+                output_dir=output_dir,
+                host=host,
+                port=resolved_port,
+                trainer_gpu_ids=trainer_gpu_ids,
+                inference_gpu_ids=inference_gpu_ids,
+                served_model_name=served_model_name,
+                model_ids=model_ids,
+                completion_text=completion_text,
+            )
+        finally:
+            service.close()
 
 
 def run_merged_vllm_serving(

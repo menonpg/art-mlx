@@ -45,6 +45,43 @@ async def test_start_openai_server_syncs_initial_merged_weights(
     sync_merged.assert_awaited_once_with(lora_path="/tmp/lora", step=0)
 
 
+def test_resolve_active_lora_path_materializes_identity_adapter_for_merged_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [0],
+            "inference_gpu_ids": [1],
+            "rollout_weights_mode": "merged",
+        },
+        output_dir=str(tmp_path),
+    )
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        "art.megatron.service.get_last_checkpoint_dir",
+        lambda _output_dir: None,
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_identity_lora",
+        lambda path: calls.append(("identity", path)),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_lora_adapter_config",
+        lambda path, source_path=None: calls.append(("config", path)),
+    )
+
+    path = service._resolve_active_lora_path()
+
+    assert path == str(tmp_path / "checkpoints" / "0000")
+    assert calls == [("identity", path), ("config", path)]
+
+
 @pytest.mark.asyncio
 async def test_dedicated_train_uses_merged_job_and_updates_latest_step(
     tmp_path: Path,

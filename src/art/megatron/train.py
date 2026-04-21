@@ -24,7 +24,6 @@ from typing import Any, Callable, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -57,10 +56,13 @@ from art.megatron.merged_weight_export import (
 from art.megatron.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
-    unwrap_megatron_chunk,
     validate_model_chunks,
 )
-from art.megatron.offload import OffloadState, offload_to_cpu, reload_to_gpu
+from art.megatron.offload import (
+    OffloadState,
+    offload_to_cpu,
+    reload_to_gpu,
+)
 from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
 from art.megatron.provider_common import ProviderBundle
 from art.megatron.routing_replay import (
@@ -80,6 +82,7 @@ safe_open = safetensors.safe_open
 save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+_optimizer_stats_printed = False
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -203,88 +206,6 @@ def _compile_enabled() -> bool:
     }
 
 
-def _compile_enabled_for_handler(handler_key: str | None) -> bool:
-    if not _compile_enabled():
-        return False
-    # Qwen3.5 MoE currently trips a compiled-backward stream bookkeeping bug in
-    # Torch during RL trainability. Run this handler eagerly until that path is fixed.
-    return handler_key != "qwen3_5_moe"
-
-
-def _maybe_rewrite_packed_rotary_pos_emb(
-    rotary_pos_emb: torch.Tensor | None,
-    *,
-    position_ids: torch.Tensor,
-    position_embedding_type: str | None,
-) -> torch.Tensor | None:
-    if rotary_pos_emb is None or position_embedding_type == "mrope":
-        return rotary_pos_emb
-    if position_ids.ndim != 2:
-        return rotary_pos_emb
-    if rotary_pos_emb.ndim != 4:
-        raise RuntimeError(
-            "Unsupported rotary positional embedding rank: "
-            f"expected 4, got {rotary_pos_emb.ndim}"
-        )
-    if rotary_pos_emb.size(1) != 1 or rotary_pos_emb.size(2) != 1:
-        raise RuntimeError(
-            "Unsupported rotary positional embedding shape for packed gather: "
-            f"{tuple(rotary_pos_emb.shape)}"
-        )
-    embedding_dim = rotary_pos_emb.size(-1)
-    batch_size, sequence_length = position_ids.shape
-    table_flat = rotary_pos_emb.view(rotary_pos_emb.size(0), embedding_dim)
-    gathered = table_flat.index_select(0, position_ids.reshape(-1))
-    return (
-        gathered.view(batch_size, sequence_length, embedding_dim)
-        .permute(1, 0, 2)
-        .contiguous()
-        .unsqueeze(2)
-    )
-
-
-def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
-    for chunk in model_chunks:
-        module: Any = unwrap_megatron_chunk(chunk)
-        while hasattr(module, "module"):
-            module = module.module
-        gpt_module = module if isinstance(module, GPTModel) else None
-        if gpt_module is None:
-            language_model = getattr(module, "language_model", None)
-            if isinstance(language_model, GPTModel):
-                gpt_module = language_model
-        if gpt_module is None:
-            continue
-        preprocess = gpt_module._preprocess
-
-        def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
-            preproc_output = list(_preprocess(*args, **kwargs))
-            decoder_input = cast(torch.Tensor, preproc_output[0])
-            if not decoder_input.requires_grad and decoder_input.is_leaf:
-                decoder_input.requires_grad_(True)
-            position_ids = kwargs["position_ids"]
-            table = preproc_output[1]  # [S, B, 1, D]  # type: ignore[index]
-            if table is None:
-                return tuple(preproc_output)
-            if not isinstance(table, torch.Tensor):
-                raise TypeError(
-                    "Expected rotary positional embedding tensor, got "
-                    f"{type(table).__name__}"
-                )
-            preproc_output[1] = _maybe_rewrite_packed_rotary_pos_emb(
-                table,
-                position_ids=position_ids,
-                position_embedding_type=getattr(
-                    gpt_module,
-                    "position_embedding_type",
-                    None,
-                ),
-            )
-            return tuple(preproc_output)
-
-        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
-
-
 def _default_optimizer_config() -> OptimizerConfig:
     return OptimizerConfig(
         bf16=True,
@@ -297,11 +218,40 @@ def _default_optimizer_config() -> OptimizerConfig:
     )
 
 
-def _build_optimizer(model: ModelChunks, optimizer_config: OptimizerConfig) -> Any:
-    return get_megatron_optimizer(
+def _maybe_print_optimizer_stats(
+    optimizer: Any,
+    model: ModelChunks,
+) -> None:
+    global _optimizer_stats_printed
+    if _optimizer_stats_printed:
+        return
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
+            _optimizer_stats_printed = True
+            return
+    num_params = sum(
+        p.numel()
+        for group in optimizer.param_groups
+        if not group["is_decoupled_lr"]
+        for p in group["params"]
+    )
+    print(f"Number of parameters in optimizer: {num_params:,}")
+    total_params = sum(p.numel() for module in model for p in module.parameters())
+    percent = (num_params / total_params) * 100 if total_params > 0 else 0
+    print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
+    _optimizer_stats_printed = True
+
+
+def _build_optimizer(
+    model: ModelChunks,
+    optimizer_config: OptimizerConfig,
+) -> Any:
+    optimizer = get_megatron_optimizer(
         config=optimizer_config,
         model_chunks=as_megatron_api_chunks(model),
     )
+    _maybe_print_optimizer_stats(optimizer, model)
+    return optimizer
 
 
 def configure_moe_routing_replay(
@@ -341,13 +291,14 @@ def build_training_runtime(
     *,
     model_identifier: str | None = None,
     provider_torch_dtype: torch.dtype = torch.bfloat16,
+    provider_bundle_configure: Callable[[ProviderBundle], None] | None = None,
     provider_configure: Callable[[Any], None] | None = None,
     optimizer_config: OptimizerConfig | None = None,
     moe_routing_replay_path: str | None = None,
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
     moe_routing_replay_strict: bool = True,
     print_env: bool = True,
-    print_optimizer_stats: bool = True,
+    build_optimizer: bool = True,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -361,6 +312,8 @@ def build_training_runtime(
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
     )
+    if provider_bundle_configure is not None:
+        provider_bundle_configure(provider_bundle)
     provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
@@ -379,6 +332,7 @@ def build_training_runtime(
                 average_in_collective=False,
             ),
             data_parallel_random_init=False,
+            init_model_with_meta_device=True,
         ),
     )
 
@@ -395,25 +349,18 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     provider_bundle.handler.install_preprocess_patch(model)
-    if _compile_enabled_for_handler(getattr(provider_bundle.handler, "key", None)):
-        install_torch_compile_workarounds()
+    compile_workaround_config = provider_bundle.handler.compile_workaround_config(
+        provider
+    )
+    if _compile_enabled() and not compile_workaround_config.disable_compile:
+        install_torch_compile_workarounds(compile_workaround_config)
         for chunk in model:
             _compile_transformer_layers(chunk)
 
     optimizer_config = optimizer_config or _default_optimizer_config()
-    optimizer = _build_optimizer(model, optimizer_config)
-
-    if rank == 0 and print_optimizer_stats:
-        num_params = sum(
-            p.numel()
-            for group in optimizer.param_groups
-            if not group["is_decoupled_lr"]
-            for p in group["params"]
-        )
-        print(f"Number of parameters in optimizer: {num_params:,}")
-        total_params = sum(p.numel() for module in model for p in module.parameters())
-        percent = (num_params / total_params) * 100 if total_params > 0 else 0
-        print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
+    optimizer = (
+        _build_optimizer(model, optimizer_config) if build_optimizer else None
+    )
 
     runtime = TrainingRuntime(
         provider_bundle=provider_bundle,
@@ -728,7 +675,8 @@ def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
 
 def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
     if isinstance(job, MegatronSyncJob):
-        maybe_load_adapter_into_model(runtime.model, job.lora_path, rank=runtime.rank)
+        adapter_model = _load_adapter_into_model(runtime.model, job.lora_path, runtime.rank)
+        del adapter_model
         _sync_merged_weights_to_vllm(
             runtime,
             job.merged_weight_transfer,
@@ -761,12 +709,15 @@ def _load_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
-    adapter_model = maybe_load_adapter_into_model(
+    adapter_model = _load_adapter_into_model(
         runtime.model,
         lora_path,
-        rank=runtime.rank,
+        runtime.rank,
     )
-    runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
+    runtime.optimizer = _build_optimizer(
+        runtime.model,
+        runtime.optimizer_config,
+    )
     assert runtime.optimizer is not None
 
     optimizer_shard_path = os.path.join(
@@ -787,20 +738,16 @@ def _load_lora_and_optimizer(
     return adapter_model
 
 
-def maybe_load_adapter_into_model(
+def _load_adapter_into_model(
     model_chunks: ModelChunks,
     lora_path: str,
-    *,
     rank: int,
+    *,
+    optimizer: Any | None = None,
 ) -> dict[str, torch.Tensor]:
-    adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
-    if not os.path.exists(adapter_model_path):
-        print0(rank, "No adapter model found at", adapter_model_path)
-        _enable_lora_parameters(model_chunks)
-        return {}
     print0(rank, "Loading adapter model from", lora_path)
     adapter_model = load_lora_adapter_state_dict(lora_path)
-    load_adapter_into_model(model_chunks, adapter_model)
+    load_adapter_into_model(model_chunks, adapter_model, optimizer)
     return adapter_model
 
 
@@ -898,15 +845,6 @@ def iter_modules(model_chunks: ModelChunks) -> Any:
             yield module
 
 
-def _enable_lora_parameters(model_chunks: ModelChunks) -> None:
-    for module in iter_modules(model_chunks):
-        get_lora_params = getattr(module, "_lora_params", None)
-        if not callable(get_lora_params):
-            continue
-        for _name, param in get_lora_params():
-            param.requires_grad = True
-
-
 def load_adapter_into_model(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
@@ -916,7 +854,6 @@ def load_adapter_into_model(
         for module in iter_modules(model_chunks):
             if hasattr(module, "load_lora"):
                 module.load_lora(adapter_model)  # type: ignore[attr-defined]
-    _enable_lora_parameters(model_chunks)
 
     if optimizer is None:
         return
@@ -1205,7 +1142,12 @@ def run_megatron_sft_step(
     raw_loss_sum: torch.Tensor | None = None
     num_tokens = _local_trainable_sft_token_count_tensor(micro_inputs, device=device)
 
-    for micro in micro_inputs:
+    for micro_order, micro in enumerate(micro_inputs):
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(
+                micro_sample_indices[micro_order],
+                micro_order,
+            )
         input_ids, position_ids, shifted_labels, mask, seq_len = (
             _prepare_sft_micro_inputs(micro, device)
         )
@@ -1310,7 +1252,12 @@ def run_training_step(
     probs_corr_sum = 0.0
     new_logprobs_list: list[torch.Tensor] = []
 
-    for micro in micro_inputs:
+    for micro_order, micro in enumerate(micro_inputs):
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(
+                micro_sample_indices[micro_order],
+                micro_order,
+            )
         _move_inputs_to_device(micro, device)
         attention_state = create_shared_prefix_attention_state(
             group_ids=micro["group_ids"],
@@ -1438,10 +1385,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         reload_to_gpu(runtime.model, runtime.rank, offload_state)
 
     def after_job() -> None:
-        optimizer = runtime.optimizer
         runtime.optimizer = None
-        if optimizer is not None:
-            del optimizer
         gc.collect()
         torch.cuda.empty_cache()
         offload_to_cpu(runtime.model, runtime.rank, offload_state)
@@ -1458,7 +1402,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
 def main() -> None:
     runtime = build_training_runtime(
-        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER)
+        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        build_optimizer=False,
     )
     _run_service_loop(runtime)
 

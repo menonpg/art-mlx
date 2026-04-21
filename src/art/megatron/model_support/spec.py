@@ -4,6 +4,11 @@ from pydantic import BaseModel, Field
 
 RolloutWeightsMode = Literal["lora", "merged"]
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
+SharedExpertCompileState = Literal[
+    "none",
+    "shared_experts",
+    "shared_expert_overlap",
+]
 
 
 class DependencyFloor(BaseModel):
@@ -55,6 +60,12 @@ class ValidationReport(BaseModel):
     stages: list[ValidationStageResult] = Field(default_factory=list)
 
 
+class CompileWorkaroundConfig(BaseModel):
+    flags: tuple[str, ...] = ()
+    shared_expert_state: SharedExpertCompileState = "none"
+    disable_compile: bool = False
+
+
 class ModelSupportSpec(BaseModel):
     key: str
     handler_key: str
@@ -68,7 +79,20 @@ class ModelSupportSpec(BaseModel):
 class ModelSupportHandler(Protocol):
     key: str
 
+    def identity_lora_model_config(self, base_config: Any) -> Any: ...
+
+    def identity_lora_target_parameters(
+        self,
+        model: Any,
+        *,
+        target_modules: list[str],
+    ) -> list[str]: ...
+
+    def patch_bridge(self, bridge: Any) -> None: ...
+
     def patch_provider(self, provider: Any, bridge: Any) -> None: ...
+
+    def configure_provider_for_runtime(self, provider: Any) -> None: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
@@ -88,5 +112,10 @@ class ModelSupportHandler(Protocol):
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]: ...
+
+    def compile_workaround_config(
+        self,
+        provider: Any,
+    ) -> CompileWorkaroundConfig: ...
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]: ...

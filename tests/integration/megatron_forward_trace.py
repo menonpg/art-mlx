@@ -186,6 +186,7 @@ def _extract_tensor_attr(value: Any, attr_name: str) -> Any:
     return None
 
 
+@torch._dynamo.disable
 def _extract_router_topk(output: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not isinstance(output, tuple) or len(output) < 2:
         return None
@@ -359,40 +360,44 @@ class ForwardTraceCapture:
             hints["router_topk_scores"] = concat_dim0
         return hints
 
+    @torch._dynamo.disable
+    def _record_module_hook(self, name: str, module: Any, inputs: Any, output: Any) -> None:
+        if self.current_step_index is None:
+            return
+        micro_call_index = self.current_micro_module_call_counts.get(name, 0)
+        self.current_micro_module_call_counts[name] = micro_call_index + 1
+        trace_item: dict[str, Any] = {
+            "micro_call_index": micro_call_index,
+            "micro_order": self.current_micro_order,
+            "micro_sample_index": self.current_micro_sample_index,
+            "module_type": module.__class__.__name__,
+            "rank_meta": _rank_metadata(),
+            "merge_hints": self._build_merge_hints(name, module),
+            "inputs": _materialize_trace_value(inputs),
+            "output": _materialize_trace_value(output),
+            "primary_input": self.guess_primary_tensor(inputs),
+            "primary_output": self.guess_primary_tensor(output),
+        }
+        if ROUTER_NAME_TOKEN in name:
+            router_topk = _extract_router_topk(output)
+            if router_topk is not None:
+                topk_ids, topk_scores = router_topk
+                trace_item["router_topk_ids"] = topk_ids
+                trace_item["router_topk_scores"] = topk_scores
+        trace_items = self._split_expert_trace_items(
+            module_name=name,
+            module=module,
+            inputs=inputs,
+            trace_item=trace_item,
+        )
+        trace_calls = self.current_step_trace.setdefault(name, [])
+        for split_item in trace_items:
+            split_item["call_index"] = len(trace_calls)
+            trace_calls.append(split_item)
+
     def _make_hook(self, name: str, module: Any):
         def _hook(_module: Any, inputs: Any, output: Any) -> None:
-            if self.current_step_index is None:
-                return
-            micro_call_index = self.current_micro_module_call_counts.get(name, 0)
-            self.current_micro_module_call_counts[name] = micro_call_index + 1
-            trace_item: dict[str, Any] = {
-                "micro_call_index": micro_call_index,
-                "micro_order": self.current_micro_order,
-                "micro_sample_index": self.current_micro_sample_index,
-                "module_type": module.__class__.__name__,
-                "rank_meta": _rank_metadata(),
-                "merge_hints": self._build_merge_hints(name, module),
-                "inputs": _materialize_trace_value(inputs),
-                "output": _materialize_trace_value(output),
-                "primary_input": self.guess_primary_tensor(inputs),
-                "primary_output": self.guess_primary_tensor(output),
-            }
-            if ROUTER_NAME_TOKEN in name:
-                router_topk = _extract_router_topk(output)
-                if router_topk is not None:
-                    topk_ids, topk_scores = router_topk
-                    trace_item["router_topk_ids"] = topk_ids
-                    trace_item["router_topk_scores"] = topk_scores
-            trace_items = self._split_expert_trace_items(
-                module_name=name,
-                module=module,
-                inputs=inputs,
-                trace_item=trace_item,
-            )
-            trace_calls = self.current_step_trace.setdefault(name, [])
-            for split_item in trace_items:
-                split_item["call_index"] = len(trace_calls)
-                trace_calls.append(split_item)
+            self._record_module_hook(name, module, inputs, output)
 
         return _hook
 
@@ -408,6 +413,7 @@ class ForwardTraceCapture:
             return self.current_step_sample_indices[micro_order]
         return None
 
+    @torch._dynamo.disable
     def _root_pre_hook(self, _module: Any, _args: Any) -> None:
         if self.current_step_index is None:
             return
@@ -415,6 +421,7 @@ class ForwardTraceCapture:
         sample_index = self._sample_index_for_micro(micro_order)
         self.begin_micro(sample_index=sample_index, micro_order=micro_order)
 
+    @torch._dynamo.disable
     def _root_post_hook(self, _module: Any, _inputs: Any, output: Any) -> None:
         if self.current_step_index is None:
             return

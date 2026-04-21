@@ -13,6 +13,7 @@ from art.megatron.model_support.workflow import assess_minimal_layer_coverage
 
 from .megatron_oracle_harness import (
     NON_FINITE_METRIC_VALUE,
+    ORACLE_TOPOLOGY,
     DiffAccumulator,
     DiskPackedTensorsSpec,
     OracleCaseConfig,
@@ -22,6 +23,7 @@ from .megatron_oracle_harness import (
     _write_json,
     ensure_case_artifacts,
 )
+from .megatron_oracle_worker import provider_topology_env
 
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
 HF_PARITY_OUTPUT_DIRNAME = "hf_parity_sft"
@@ -259,10 +261,11 @@ def run_hf_parity_subprocess(request: HfParityRunRequest, output_dir: Path) -> N
         "--run-request",
         str(request_path),
     ]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     run = subprocess.run(
         command,
         cwd=str(worker_cwd),
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -309,7 +312,8 @@ def run_hf_parity(
         output_dir=str(output_dir),
         coverage=coverage,
     )
-    run_hf_parity_subprocess(request, output_dir)
+    with provider_topology_env(ORACLE_TOPOLOGY):
+        run_hf_parity_subprocess(request, output_dir)
     report = HfParityReport.model_validate(_read_json(report_path))
     assert_hf_parity_pass(report, report_path=report_path)
     return report

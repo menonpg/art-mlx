@@ -16,9 +16,20 @@ from art.megatron.lora import (
     SharedExpertsLinearFC1LoRA,
     SharedExpertsLinearFC2LoRA,
 )
+from art.megatron.param_name_canonicalization import canonical_art_param_name
 
 
-def layer_base_prefix(module: TransformerLayer) -> str:
+def layer_base_prefix(
+    module: TransformerLayer,
+    *,
+    module_name: str | None = None,
+) -> str:
+    if module_name is not None:
+        canonical_name = canonical_art_param_name(module_name)
+        if canonical_name.startswith(
+            ("decoder.layers.", "language_model.decoder.layers.")
+        ):
+            return canonical_name
     return f"language_model.decoder.layers.{module.layer_number - 1}"
 
 

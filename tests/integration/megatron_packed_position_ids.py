@@ -21,7 +21,7 @@ from .megatron_oracle_harness import (
     PackedTensorConfig,
     _build_packed_tensors,
 )
-from .megatron_oracle_worker import _configure_provider
+from .megatron_oracle_worker import _configure_provider, provider_topology_env
 
 
 def _slugify(value: str) -> str:
@@ -141,6 +141,22 @@ def _expected_hooked_rotary(
     return gathered.unsqueeze(2)
 
 
+def _reference_preprocess_position_ids(
+    gpt_module: GPTModel,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        getattr(gpt_module, "position_embedding_type", None) == "mrope"
+        and position_ids.ndim == 2
+    ):
+        return position_ids.unsqueeze(0).expand(
+            3,
+            position_ids.shape[0],
+            position_ids.shape[1],
+        )
+    return position_ids
+
+
 def run_packed_position_ids(
     *,
     base_model: str,
@@ -185,11 +201,11 @@ def run_packed_position_ids(
             precision="fp32",
             num_layers=num_layers,
         )
-        provider_bundle = get_provider_bundle(
-            base_model,
-            torch_dtype=torch.float32,
-            runtime_profile="single_gpu_parity",
-        )
+        with provider_topology_env(ORACLE_TOPOLOGY):
+            provider_bundle = get_provider_bundle(
+                base_model,
+                torch_dtype=torch.float32,
+            )
         provider = provider_bundle.provider
         _configure_provider(provider, ORACLE_TOPOLOGY, case_config)
         model_chunks = cast(
@@ -218,9 +234,13 @@ def run_packed_position_ids(
             for row_index in range(int(position_ids.shape[0])):
                 row_position_ids = position_ids[row_index : row_index + 1]
                 row_input_ids = input_ids[row_index : row_index + 1]
+                reference_position_ids = _reference_preprocess_position_ids(
+                    gpt_module,
+                    row_position_ids,
+                )
                 original_output = original_preprocess(
                     input_ids=row_input_ids,
-                    position_ids=row_position_ids,
+                    position_ids=reference_position_ids,
                 )
                 hooked_output = hooked_preprocess(
                     input_ids=row_input_ids,

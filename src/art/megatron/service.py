@@ -75,12 +75,17 @@ def create_identity_lora(
     from peft import get_peft_model
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from .model_support import get_model_support_handler
+
     if random_state is not None:
         torch.manual_seed(random_state)
+    target_modules = default_target_modules(base_model)
+    handler = get_model_support_handler(base_model)
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    model_config = handler.identity_lora_model_config(base_config)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            base_config, torch_dtype=torch.bfloat16, trust_remote_code=True
+            model_config, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
     model.name_or_path = base_model
 
@@ -89,20 +94,10 @@ def create_identity_lora(
         r=rank,
         lora_alpha=lora_alpha,
         target_modules=[],
-        target_parameters=[
-            name
-            for name, _ in model.named_parameters()
-            if name.endswith(
-                (
-                    "q_proj.weight",
-                    "k_proj.weight",
-                    "v_proj.weight",
-                    "o_proj.weight",
-                    "mlp.experts.gate_up_proj",
-                    "mlp.experts.down_proj",
-                )
-            )
-        ],
+        target_parameters=handler.identity_lora_target_parameters(
+            model,
+            target_modules=target_modules,
+        ),
         bias="none",
     )
 
@@ -129,7 +124,7 @@ def create_identity_lora(
         base_model_name_or_path=base_model,
         r=rank,
         lora_alpha=lora_alpha,
-        target_modules=default_target_modules(base_model),
+        target_modules=target_modules,
         bias="none",
     ).save_pretrained(lora_path)
 
@@ -305,8 +300,7 @@ class MegatronService:
             self._latest_step = 0
         else:
             self._latest_step = get_step_from_dir(self.output_dir)
-        if self.rollout_weights_mode == "lora":
-            self._ensure_identity_lora(lora_path)
+        self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
 

@@ -13,6 +13,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
@@ -102,6 +103,16 @@ def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
     return getattr(linear, "parallel_mode", "") is None or getattr(
         linear, "explicit_expert_comm", False
     )
+
+
+def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
+    if _linear_disables_tensor_parallel_comm(linear):
+        return x
+    if bool(getattr(linear, "sequence_parallel", False)) and int(
+        getattr(linear, "tp_size", 1)
+    ) > 1:
+        return gather_from_sequence_parallel_region(x)
+    return x
 
 
 def _set_lora_parallel_metadata(
@@ -898,7 +909,11 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc1(x)
-        adapter_out = torch.cat([self.gate_lora(x), self.up_lora(x)], dim=-1)
+        lora_input = _column_parallel_lora_input(x, self.linear_fc1)
+        adapter_out = torch.cat(
+            [self.gate_lora(lora_input), self.up_lora(lora_input)],
+            dim=-1,
+        )
         return base_out + adapter_out, bias_out
 
 

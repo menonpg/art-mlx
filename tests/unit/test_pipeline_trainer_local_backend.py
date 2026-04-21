@@ -12,7 +12,7 @@ from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
-from art.megatron.train import load_adapter_into_model, maybe_load_adapter_into_model
+from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir
@@ -331,30 +331,6 @@ def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
 
     assert module.loaded_adapter is adapter_model
     assert optimizer.reload_calls == 1
-
-
-def test_maybe_load_adapter_into_model_keeps_fresh_lora_trainable(
-    tmp_path: Path,
-) -> None:
-    class FakeLoRA(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-
-        def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
-            return [("weight", self.weight)]
-
-    module = FakeLoRA()
-
-    adapter_model = maybe_load_adapter_into_model(
-        [module],
-        str(tmp_path),
-        rank=0,
-    )
-
-    assert adapter_model == {}
-    assert module.weight.requires_grad is True
-
 
 @pytest.mark.asyncio
 async def test_local_backend_async_context_manager_awaits_async_cleanup(
