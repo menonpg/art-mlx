@@ -111,6 +111,8 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
 def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from art.megatron.model_support.handlers import qwen3_5_moe as qwen35_handler_module
+
     provider = _FakeProvider()
     fake_bridge = _FakeBridge(
         model_bridge=object.__new__(Qwen3MoEBridge),
@@ -122,10 +124,26 @@ def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
         lambda *args, **kwargs: fake_bridge,
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        qwen35_handler_module,
+        "_optional_qwen35_provider_type",
+        lambda: _FakeProvider,
+    )
+    monkeypatch.setattr(
+        qwen35_handler_module,
+        "_require_qwen35_provider_symbols",
+        lambda: (
+            object(),
+            _FakeProvider,
+            lambda block_spec, attention_module: None,
+            provider._base_layer_spec,
+        ),
+    )
 
     resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
 
     assert resolved.moe_shared_expert_overlap is False
+    assert resolved.scatter_embedding_sequence_parallel is True
 
 
 def test_get_provider_rejects_unsupported_bridge(

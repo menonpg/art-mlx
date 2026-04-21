@@ -132,6 +132,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             )
 
         if isinstance(provider, qwen35_provider_type):
+            provider.scatter_embedding_sequence_parallel = True
             provider.transformer_layer_spec = _qwen35_layer_spec
             provider.provide = MethodType(_provide_qwen35_with_flex_attention, provider)
             setattr(provider, "_art_text_only_language_model", True)
