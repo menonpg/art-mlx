@@ -99,6 +99,31 @@ def _normalize_axis(axis: int, ndim: int) -> int:
     return axis
 
 
+def _shard_weight_by_components(
+    weight: torch.Tensor,
+    *,
+    axis: int,
+    component_sizes: Sequence[int],
+    world_size: int,
+    rank: int,
+) -> torch.Tensor:
+    if sum(component_sizes) != weight.shape[axis]:
+        raise ValueError(
+            f"Component sizes {tuple(component_sizes)} do not match axis {axis} "
+            f"extent {weight.shape[axis]}"
+        )
+    local_components: list[torch.Tensor] = []
+    for component in torch.split(weight, list(component_sizes), dim=axis):
+        if component.shape[axis] % world_size != 0:
+            raise ValueError(
+                f"Component shape {tuple(component.shape)} is not divisible by "
+                f"world size {world_size} on axis {axis}"
+            )
+        local_size = component.shape[axis] // world_size
+        local_components.append(component.narrow(axis, rank * local_size, local_size))
+    return torch.cat(local_components, dim=axis).contiguous()
+
+
 def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
     return getattr(linear, "parallel_mode", "") is None or getattr(
         linear, "explicit_expert_comm", False
@@ -160,6 +185,16 @@ def _set_lora_parallel_metadata(
         setattr(param, "tensor_model_parallel", False)
         setattr(param, "partition_dim", -1)
         setattr(param, "partition_stride", 1)
+
+
+def _set_lora_layout_metadata(
+    param: torch.nn.Parameter,
+    *,
+    layout: str,
+    component_sizes: Sequence[int],
+) -> None:
+    setattr(param, "lora_tp_layout", layout)
+    setattr(param, "lora_tp_component_sizes", tuple(int(size) for size in component_sizes))
 
 
 class LoRA(torch.nn.Module):
@@ -293,20 +328,43 @@ class LoRA(torch.nn.Module):
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
-            if weight.shape[axis] % world_size != 0:
-                raise ValueError(
-                    f"{self.adapter_model_prefix}: weight shape {tuple(weight.shape)} is not divisible by world size "
-                    f"{world_size} on axis {axis}"
+            layout = getattr(into, "lora_tp_layout", None)
+            if layout == "gdn_qkv":
+                component_sizes = tuple(
+                    int(size)
+                    for size in getattr(into, "lora_tp_component_sizes", ())
                 )
-            local_size = weight.shape[axis] // world_size
-            if into.shape[axis] != local_size:
-                raise ValueError(
-                    f"{self.adapter_model_prefix}: expected local shard size {into.shape[axis]}, got {local_size}"
+                if not component_sizes:
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: missing component sizes for layout={layout}"
+                    )
+                weight = _shard_weight_by_components(
+                    weight,
+                    axis=axis,
+                    component_sizes=component_sizes,
+                    world_size=world_size,
+                    rank=rank,
                 )
-            weight = weight.narrow(axis, rank * local_size, local_size)
+            else:
+                if weight.shape[axis] % world_size != 0:
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: weight shape {tuple(weight.shape)} is not divisible by world size "
+                        f"{world_size} on axis {axis}"
+                    )
+                local_size = weight.shape[axis] // world_size
+                if into.shape[axis] != local_size:
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: expected local shard size {into.shape[axis]}, got {local_size}"
+                    )
+                weight = weight.narrow(axis, rank * local_size, local_size)
         elif tuple(weight.shape) != tuple(into.shape):
             raise ValueError(
                 f"{self.adapter_model_prefix}: unsharded load shape mismatch, got {tuple(weight.shape)} "
+                f"expected {tuple(into.shape)}"
+            )
+        if tuple(weight.shape) != tuple(into.shape):
+            raise ValueError(
+                f"{self.adapter_model_prefix}: sharded load shape mismatch, got {tuple(weight.shape)} "
                 f"expected {tuple(into.shape)}"
             )
         into.data.copy_(weight)
@@ -332,7 +390,7 @@ class LoRA(torch.nn.Module):
         return _get_shard_rank(param.lora_shard_domain) == 0  # ty: ignore[unresolved-attribute]
 
     def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
-        return {
+        manifest = {
             "domain": param.lora_shard_domain,  # ty: ignore[unresolved-attribute]
             "sharded": param.lora_tp_sharded,  # ty: ignore[unresolved-attribute]
             "shard_dim": param.lora_tp_shard_dim,  # ty: ignore[unresolved-attribute]
@@ -343,6 +401,13 @@ class LoRA(torch.nn.Module):
             if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
             else 0,
         }
+        layout = getattr(param, "lora_tp_layout", None)
+        if layout is not None:
+            manifest["layout"] = layout
+            manifest["component_sizes"] = list(
+                getattr(param, "lora_tp_component_sizes", ())
+            )
+        return manifest
 
     def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
         return [
@@ -376,6 +441,22 @@ class LoRA(torch.nn.Module):
         for key, param, expert in self._export_items():
             state[key] = param.data[expert].T if expert is not None else param.data.T
         return state
+
+    def sharded_lora_grad_dict(self) -> dict[str, torch.Tensor]:
+        grads: dict[str, torch.Tensor] = {}
+        for key, param, expert in self._export_items():
+            if not hasattr(param, "main_grad"):
+                raise RuntimeError(
+                    f"LoRA param missing main_grad attribute for key '{key}'"
+                )
+            grad = param.main_grad
+            if grad is None:
+                raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
+            if hasattr(grad, "_local_tensor"):
+                grad = grad._local_tensor
+            local_grad = grad[expert] if expert is not None else grad
+            grads[key] = local_grad.T
+        return grads
 
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
@@ -638,6 +719,15 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             out_features=qkv_out_features_per_partition,
+        )
+        _set_lora_layout_metadata(
+            self.qkv_lora.B_T,
+            layout="gdn_qkv",
+            component_sizes=(
+                gated_delta_net.qk_dim,
+                gated_delta_net.qk_dim,
+                gated_delta_net.v_dim,
+            ),
         )
         self.z_lora = self._build_in_proj_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.in_proj_z",

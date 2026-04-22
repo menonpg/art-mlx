@@ -180,24 +180,24 @@ def provider_topology_env(topology: Topology):
 
 def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
     """Merges rank-sharded LoRA tensors into a full state dict on rank 0."""
-    import torch
+    from art.megatron.merge import merge_sharded_adapter_entries
 
-    merged: dict[str, list[Any]] = {}
-    for rank_shards in shards_by_rank:
-        for key, tensor in rank_shards.items():
-            merged.setdefault(key, []).append(tensor.detach().cpu())
-    full_state: dict[str, Any] = {}
-    for key, shards in merged.items():
-        if len(shards) == 1:
-            full_state[key] = shards[0].contiguous()
-            continue
-        concat_dim = 1 if ".lora_A." in key else 0
-        full_state[key] = torch.cat(shards, dim=concat_dim).contiguous()
-    return full_state
+    entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = {}
+    for rank_entry in shards_by_rank:
+        rank_state = rank_entry["state"]
+        rank_manifest = rank_entry["manifest"]
+        for key, tensor in rank_state.items():
+            if key not in rank_manifest:
+                raise RuntimeError(f"Missing manifest entry for sharded key '{key}'")
+            entries_by_key.setdefault(key, []).append(
+                (rank_manifest[key], tensor.detach().cpu())
+            )
+    return merge_sharded_adapter_entries(entries_by_key)
 
 
 def _gather_full_state(
     local_state: dict[str, Any],
+    local_manifest: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Gathers local state dicts to rank 0 and merges them."""
     import torch
@@ -206,7 +206,9 @@ def _gather_full_state(
     world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
     gathered = [None for _ in range(world_size)] if rank == 0 else None
     torch.distributed.gather_object(  # ty: ignore[possibly-missing-attribute]
-        local_state, gathered, dst=0
+        {"state": local_state, "manifest": local_manifest},
+        gathered,
+        dst=0,
     )
     if rank != 0:
         return None
@@ -220,8 +222,17 @@ def _collect_lora_state(
 ) -> dict[str, Any] | None:
     """Collects full LoRA adapter state for validation and delta computation."""
     local_state: dict[str, Any] = {}
+    local_manifest: dict[str, Any] = {}
     for chunk in model_chunks:
         for module in chunk.modules():
+            if hasattr(module, "sharded_lora_manifest"):
+                module_manifest = module.sharded_lora_manifest()
+                for key, value in module_manifest.items():
+                    if key in local_manifest and local_manifest[key] != value:
+                        raise RuntimeError(
+                            f"Duplicate manifest key while collecting state: {key}"
+                        )
+                    local_manifest[key] = value
             if not hasattr(module, "sharded_lora_state_dict"):
                 continue
             module_state = module.sharded_lora_state_dict()
@@ -231,33 +242,35 @@ def _collect_lora_state(
                         f"Duplicate LoRA key while collecting state: {key}"
                     )
                 local_state[key] = value.detach().cpu()
-    return _gather_full_state(local_state)
+    return _gather_full_state(local_state, local_manifest)
 
 
 def _collect_lora_grads(
     model_chunks: list[Any],
 ) -> dict[str, Any] | None:
     """Collects full LoRA gradient tensors across all ranks."""
-    from art.megatron.lora import LoRA
-
     local_grads: dict[str, Any] = {}
+    local_manifest: dict[str, Any] = {}
     for chunk in model_chunks:
         for module in chunk.modules():
-            if not isinstance(module, LoRA):
+            if hasattr(module, "sharded_lora_manifest"):
+                module_manifest = module.sharded_lora_manifest()
+                for key, value in module_manifest.items():
+                    if key in local_manifest and local_manifest[key] != value:
+                        raise RuntimeError(
+                            f"Duplicate manifest key while collecting grads: {key}"
+                        )
+                    local_manifest[key] = value
+            if not hasattr(module, "sharded_lora_grad_dict"):
                 continue
-            for key, param, expert in module._export_items():  # type: ignore[attr-defined]
-                if not hasattr(param, "main_grad"):
+            module_grads = module.sharded_lora_grad_dict()
+            for key, value in module_grads.items():
+                if key in local_grads:
                     raise RuntimeError(
-                        f"LoRA param missing main_grad attribute for key '{key}'"
+                        f"Duplicate LoRA grad key while collecting grads: {key}"
                     )
-                grad = param.main_grad
-                if grad is None:
-                    raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
-                if hasattr(grad, "_local_tensor"):
-                    grad = grad._local_tensor
-                captured_grad = grad[expert] if expert is not None else grad
-                local_grads[key] = captured_grad.detach().cpu().T
-    return _gather_full_state(local_grads)
+                local_grads[key] = value.detach().cpu()
+    return _gather_full_state(local_grads, local_manifest)
 
 
 def _apply_save_mutation_to_tensor_map(

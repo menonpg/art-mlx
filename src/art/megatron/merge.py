@@ -11,6 +11,85 @@ safe_open = safetensors.safe_open
 save_file = safetensors_torch.save_file
 
 
+def _merge_sharded_tensor(
+    key: str,
+    *,
+    ordered_shards: list[torch.Tensor],
+    manifest: dict[str, Any],
+) -> torch.Tensor:
+    layout = manifest.get("layout")
+    if layout == "gdn_qkv":
+        component_sizes = [int(size) for size in manifest.get("component_sizes", [])]
+        world_size = int(manifest["shard_world_size"])
+        if not component_sizes:
+            raise RuntimeError(f"Missing component_sizes for key={key} layout={layout}")
+        local_sizes = []
+        for size in component_sizes:
+            if size % world_size != 0:
+                raise RuntimeError(
+                    f"Component size {size} is not divisible by shard_world_size={world_size} for key={key}"
+                )
+            local_sizes.append(size // world_size)
+        split_shards = [torch.split(shard, local_sizes, dim=0) for shard in ordered_shards]
+        merged_components = [
+            torch.cat([parts[index] for parts in split_shards], dim=0)
+            for index in range(len(local_sizes))
+        ]
+        return torch.cat(merged_components, dim=0).contiguous()
+    concat_dim = 1 if "lora_A" in key else 0
+    return torch.cat(ordered_shards, dim=concat_dim).contiguous()
+
+
+def merge_sharded_adapter_entries(
+    entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]],
+) -> dict[str, torch.Tensor]:
+    adapter_model: dict[str, torch.Tensor] = {}
+    for key, key_entries in entries_by_key.items():
+        first_manifest = key_entries[0][0]
+        sharded = bool(first_manifest["sharded"])
+        shard_world_size = int(first_manifest["shard_world_size"])
+        for manifest_entry, _tensor in key_entries:
+            if bool(manifest_entry["sharded"]) != sharded:
+                raise RuntimeError(f"Inconsistent sharded flag for key={key}")
+            if int(manifest_entry["shard_world_size"]) != shard_world_size:
+                raise RuntimeError(f"Inconsistent shard world size for key={key}")
+
+        if not sharded:
+            if len(key_entries) != 1:
+                raise RuntimeError(
+                    f"Replicated key={key} expected 1 shard, got {len(key_entries)}"
+                )
+            adapter_model[key] = key_entries[0][1]
+            continue
+
+        shard_rank_to_tensor: dict[int, torch.Tensor] = {}
+        for manifest_entry, shard_tensor in key_entries:
+            shard_rank = int(manifest_entry["shard_rank"])
+            if shard_rank in shard_rank_to_tensor:
+                raise RuntimeError(
+                    f"Duplicate shard_rank={shard_rank} for key={key}"
+                )
+            shard_rank_to_tensor[shard_rank] = shard_tensor
+
+        expected_shard_ranks = set(range(shard_world_size))
+        if set(shard_rank_to_tensor) != expected_shard_ranks:
+            raise RuntimeError(
+                f"Shard rank coverage mismatch for key={key}: "
+                f"expected {sorted(expected_shard_ranks)}, got {sorted(shard_rank_to_tensor)}"
+            )
+
+        ordered_shards = [
+            shard_rank_to_tensor[shard_rank]
+            for shard_rank in range(shard_world_size)
+        ]
+        adapter_model[key] = _merge_sharded_tensor(
+            key,
+            ordered_shards=ordered_shards,
+            manifest=first_manifest,
+        )
+    return adapter_model
+
+
 def _load_adapter_shards(
     base_dir: Path,
 ) -> tuple[
@@ -57,47 +136,7 @@ def _load_adapter_shards(
         for key, tensor in shard_tensors.items():
             entries_by_key.setdefault(key, []).append((shard_manifest[key], tensor))
 
-    adapter_model: dict[str, torch.Tensor] = {}
-    for key, key_entries in entries_by_key.items():
-        first_manifest = key_entries[0][0]
-        sharded = bool(first_manifest["sharded"])
-        shard_world_size = int(first_manifest["shard_world_size"])
-        for manifest_entry, _tensor in key_entries:
-            if bool(manifest_entry["sharded"]) != sharded:
-                raise RuntimeError(f"Inconsistent sharded flag for key={key}")
-            if int(manifest_entry["shard_world_size"]) != shard_world_size:
-                raise RuntimeError(f"Inconsistent shard world size for key={key}")
-
-        if not sharded:
-            if len(key_entries) != 1:
-                raise RuntimeError(
-                    f"Replicated key={key} expected 1 shard, got {len(key_entries)}"
-                )
-            tensor = key_entries[0][1]
-        else:
-            shard_rank_to_tensor: dict[int, torch.Tensor] = {}
-            for manifest_entry, shard_tensor in key_entries:
-                shard_rank = int(manifest_entry["shard_rank"])
-                if shard_rank in shard_rank_to_tensor:
-                    raise RuntimeError(
-                        f"Duplicate shard_rank={shard_rank} for key={key}"
-                    )
-                shard_rank_to_tensor[shard_rank] = shard_tensor
-
-            expected_shard_ranks = set(range(shard_world_size))
-            if set(shard_rank_to_tensor) != expected_shard_ranks:
-                raise RuntimeError(
-                    f"Shard rank coverage mismatch for key={key}: "
-                    f"expected {sorted(expected_shard_ranks)}, got {sorted(shard_rank_to_tensor)}"
-                )
-
-            ordered_shards = [
-                shard_rank_to_tensor[shard_rank]
-                for shard_rank in range(shard_world_size)
-            ]
-            concat_dim = 1 if "lora_A" in key else 0
-            tensor = torch.cat(ordered_shards, dim=concat_dim)
-        adapter_model[key] = tensor
+    adapter_model = merge_sharded_adapter_entries(entries_by_key)
     return adapter_model, shard_filenames, manifest_filenames
 
 
