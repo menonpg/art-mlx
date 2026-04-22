@@ -17,6 +17,8 @@ import json
 import os
 import uuid
 
+os.environ.setdefault("ACCELERATE_MIXED_PRECISION", "bf16")
+
 from dotenv import load_dotenv
 import openai
 
@@ -29,7 +31,7 @@ from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 BASE_MODEL_NAME = "ynm-fork-pipeline-llama-31-8b-base"
 PROJECT = "yes-no-maybe-fork-pipeline"
-TRAIN_STEPS = 10
+TRAIN_STEPS = 2
 ROLLOUTS_PER_SCENARIO = 8
 PROMPTS = ["Say yes", "Say no", "Say maybe"]
 STEP0_PASS_RATE_FILE = os.path.expanduser(
@@ -39,6 +41,17 @@ STEP0_PASS_RATE_FILE = os.path.expanduser(
 DEDICATED_CONFIG: art.dev.InternalModelConfig = {
     "trainer_gpu_ids": [0],
     "inference_gpu_ids": [1],
+    "init_args": {
+        "max_seq_length": 2048,
+        "load_in_4bit": False,
+        "load_in_16bit": True,
+    },
+    "engine_args": {
+        "gpu_memory_utilization": 0.4,
+        "max_model_len": 2048,
+        "max_num_seqs": 16,
+        "enforce_eager": True,
+    },
 }
 
 
@@ -86,6 +99,8 @@ async def _rollout(
         max_tokens=10,
         timeout=60,
         temperature=1,
+        logprobs=True,
+        top_logprobs=0,
     )
     choice = chat_completion.choices[0]
     return art.Trajectory(
@@ -115,6 +130,8 @@ def make_rollout_fn():
             timeout=60,
             temperature=1,
             n=ROLLOUTS_PER_SCENARIO,
+            logprobs=True,
+            top_logprobs=0,
         )
         return art.TrajectoryGroup(
             [
@@ -280,6 +297,7 @@ async def main() -> None:
                 config=None,
                 num_rollout_workers=len(PROMPTS),
                 min_batch_size=len(PROMPTS),
+                max_batch_size=len(PROMPTS),
                 max_steps=TRAIN_STEPS - start_step,
                 learning_rate=1e-4,
                 loss_fn="cispo",
@@ -347,6 +365,7 @@ async def main() -> None:
         config=None,
         num_rollout_workers=len(PROMPTS),
         min_batch_size=len(PROMPTS),
+        max_batch_size=len(PROMPTS),
         max_steps=2,
         learning_rate=1e-4,
         loss_fn="cispo",
