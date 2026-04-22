@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import torch
 
 pytest.importorskip("megatron.bridge")
 pytest.importorskip("megatron.bridge.models.qwen.qwen3_moe_bridge")
@@ -232,6 +233,49 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     assert dispatcher_calls == []
     assert provider.finalized is True
     assert getattr(provider, "sequence_parallel") is False
+
+
+def test_finalize_provider_bundle_skips_deepep_for_fp32_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    setattr(provider, "num_moe_experts", 8)
+    provider.params_dtype = torch.float32
+    provider.pipeline_dtype = torch.float32
+    provider.bf16 = False
+    provider.fp16 = False
+    fake_bridge = _FakeBridge(
+        model_bridge=object.__new__(Qwen3MoEBridge),
+        provider=provider,
+    )
+    dispatcher_calls: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        provider_module,
+        "apply_flex_dispatcher_backend",
+        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
+            (
+                int(provider.tensor_model_parallel_size),
+                int(provider.expert_model_parallel_size),
+                cast(str, moe_flex_dispatcher_backend),
+            )
+        ),
+    )
+
+    bundle = provider_module.prepare_provider_bundle("unused-model")
+    bundle.provider.tensor_model_parallel_size = 2
+    bundle.provider.expert_model_parallel_size = 2
+    bundle.provider.expert_tensor_parallel_size = 1
+
+    provider_module.finalize_provider_bundle(bundle)
+
+    assert dispatcher_calls == []
+    assert provider.finalized is True
 
 
 def test_get_provider_bundle_honors_single_gpu_env_topology(

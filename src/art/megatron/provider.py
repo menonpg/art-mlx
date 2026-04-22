@@ -96,6 +96,24 @@ def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
     return sm_count if sm_count >= 2 else 20
 
 
+def _provider_supports_deepep_dtype(provider: GPTModelProvider) -> bool:
+    supported_dtypes = {torch.float16, torch.bfloat16}
+    configured_dtypes = [
+        dtype
+        for dtype in (
+            getattr(provider, "params_dtype", None),
+            getattr(provider, "pipeline_dtype", None),
+        )
+        if dtype is not None
+    ]
+    if configured_dtypes:
+        return all(dtype in supported_dtypes for dtype in configured_dtypes)
+    return not (
+        getattr(provider, "bf16", False) is False
+        and getattr(provider, "fp16", False) is False
+    )
+
+
 def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     visible_gpu_count = max(torch.cuda.device_count(), 1)
     provider.tensor_model_parallel_size = visible_gpu_count
@@ -121,6 +139,8 @@ def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> 
 
 def _apply_art_training_runtime_finalize_defaults(provider: GPTModelProvider) -> None:
     if _etp_ep_parallel_domain_size(provider) <= 1:
+        return
+    if not _provider_supports_deepep_dtype(provider):
         return
     # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
     # compute, so these are very beneficial
