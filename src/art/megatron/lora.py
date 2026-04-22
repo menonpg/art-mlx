@@ -187,14 +187,33 @@ def _set_lora_parallel_metadata(
         setattr(param, "partition_stride", 1)
 
 
-def _set_lora_layout_metadata(
+def _set_lora_shard_strategy_metadata(
     param: torch.nn.Parameter,
     *,
-    layout: str,
-    component_sizes: Sequence[int],
+    strategy: str,
+    component_sizes: Sequence[int] | None = None,
 ) -> None:
-    setattr(param, "lora_tp_layout", layout)
-    setattr(param, "lora_tp_component_sizes", tuple(int(size) for size in component_sizes))
+    setattr(param, "lora_tp_shard_strategy", strategy)
+    if component_sizes is not None:
+        setattr(
+            param,
+            "lora_tp_component_sizes",
+            tuple(int(size) for size in component_sizes),
+        )
+
+
+def _exported_shard_dim(param: torch.nn.Parameter) -> int:
+    axis = _normalize_axis(param.lora_tp_shard_dim, param.ndim)  # ty: ignore[unresolved-attribute]
+    # LoRA exports always serialize a 2D tensor:
+    # - non-expert params export `param.T`
+    # - expert params export `param[expert].T`
+    if param.ndim == 3:
+        if axis == 0:
+            raise ValueError("LoRA expert shard_dim cannot reference the expert axis")
+        axis -= 1
+    if axis not in (0, 1):
+        raise ValueError(f"Unsupported exported LoRA shard axis {axis} for ndim={param.ndim}")
+    return 1 - axis
 
 
 class LoRA(torch.nn.Module):
@@ -328,15 +347,15 @@ class LoRA(torch.nn.Module):
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
-            layout = getattr(into, "lora_tp_layout", None)
-            if layout == "gdn_qkv":
+            strategy = getattr(into, "lora_tp_shard_strategy", "uniform")
+            if strategy == "componentwise":
                 component_sizes = tuple(
                     int(size)
                     for size in getattr(into, "lora_tp_component_sizes", ())
                 )
                 if not component_sizes:
                     raise ValueError(
-                        f"{self.adapter_model_prefix}: missing component sizes for layout={layout}"
+                        f"{self.adapter_model_prefix}: missing component sizes for shard strategy={strategy}"
                     )
                 weight = _shard_weight_by_components(
                     weight,
@@ -345,7 +364,7 @@ class LoRA(torch.nn.Module):
                     world_size=world_size,
                     rank=rank,
                 )
-            else:
+            elif strategy == "uniform":
                 if weight.shape[axis] % world_size != 0:
                     raise ValueError(
                         f"{self.adapter_model_prefix}: weight shape {tuple(weight.shape)} is not divisible by world size "
@@ -357,6 +376,10 @@ class LoRA(torch.nn.Module):
                         f"{self.adapter_model_prefix}: expected local shard size {into.shape[axis]}, got {local_size}"
                     )
                 weight = weight.narrow(axis, rank * local_size, local_size)
+            else:
+                raise ValueError(
+                    f"{self.adapter_model_prefix}: unsupported shard strategy={strategy}"
+                )
         elif tuple(weight.shape) != tuple(into.shape):
             raise ValueError(
                 f"{self.adapter_model_prefix}: unsharded load shape mismatch, got {tuple(weight.shape)} "
@@ -401,12 +424,16 @@ class LoRA(torch.nn.Module):
             if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
             else 0,
         }
-        layout = getattr(param, "lora_tp_layout", None)
-        if layout is not None:
-            manifest["layout"] = layout
-            manifest["component_sizes"] = list(
-                getattr(param, "lora_tp_component_sizes", ())
+        if param.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
+            manifest["export_shard_dim"] = _exported_shard_dim(param)
+            manifest["export_shard_strategy"] = getattr(
+                param,
+                "lora_tp_shard_strategy",
+                "uniform",
             )
+            component_sizes = list(getattr(param, "lora_tp_component_sizes", ()))
+            if component_sizes:
+                manifest["component_sizes"] = component_sizes
         return manifest
 
     def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
@@ -720,9 +747,9 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             alpha=alpha,
             out_features=qkv_out_features_per_partition,
         )
-        _set_lora_layout_metadata(
+        _set_lora_shard_strategy_metadata(
             self.qkv_lora.B_T,
-            layout="gdn_qkv",
+            strategy="componentwise",
             component_sizes=(
                 gated_delta_net.qk_dim,
                 gated_delta_net.qk_dim,

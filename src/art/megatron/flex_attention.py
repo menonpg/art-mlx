@@ -71,7 +71,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-_compiled_create_block_mask = torch.compile(create_block_mask)
+_compiled_create_block_mask = torch.compile(create_block_mask, backend="aot_eager")
 
 
 def create_shared_prefix_attention_state(

@@ -17,12 +17,21 @@ def _merge_sharded_tensor(
     ordered_shards: list[torch.Tensor],
     manifest: dict[str, Any],
 ) -> torch.Tensor:
-    layout = manifest.get("layout")
-    if layout == "gdn_qkv":
+    strategy = manifest.get("export_shard_strategy")
+    if strategy is None:
+        layout = manifest.get("layout")
+        if layout == "gdn_qkv":
+            strategy = "componentwise"
+        else:
+            strategy = "uniform"
+    axis = int(manifest.get("export_shard_dim", 1 if "lora_A" in key else 0))
+    if strategy == "componentwise":
         component_sizes = [int(size) for size in manifest.get("component_sizes", [])]
         world_size = int(manifest["shard_world_size"])
         if not component_sizes:
-            raise RuntimeError(f"Missing component_sizes for key={key} layout={layout}")
+            raise RuntimeError(
+                f"Missing component_sizes for key={key} shard strategy={strategy}"
+            )
         local_sizes = []
         for size in component_sizes:
             if size % world_size != 0:
@@ -30,14 +39,17 @@ def _merge_sharded_tensor(
                     f"Component size {size} is not divisible by shard_world_size={world_size} for key={key}"
                 )
             local_sizes.append(size // world_size)
-        split_shards = [torch.split(shard, local_sizes, dim=0) for shard in ordered_shards]
+        split_shards = [
+            torch.split(shard, local_sizes, dim=axis) for shard in ordered_shards
+        ]
         merged_components = [
-            torch.cat([parts[index] for parts in split_shards], dim=0)
+            torch.cat([parts[index] for parts in split_shards], dim=axis)
             for index in range(len(local_sizes))
         ]
-        return torch.cat(merged_components, dim=0).contiguous()
-    concat_dim = 1 if "lora_A" in key else 0
-    return torch.cat(ordered_shards, dim=concat_dim).contiguous()
+        return torch.cat(merged_components, dim=axis).contiguous()
+    if strategy != "uniform":
+        raise RuntimeError(f"Unsupported shard strategy={strategy} for key={key}")
+    return torch.cat(ordered_shards, dim=axis).contiguous()
 
 
 def merge_sharded_adapter_entries(
