@@ -383,6 +383,8 @@ class TinkerNativeBackend(Backend):
         loss_fn: str = "importance_sampling",
         normalize_advantages: bool = False,
         grpo_weight: float = 0.0,
+        kl_direction: Literal["forward", "reverse"] = "reverse",
+        distillation_topk: int = 20,
         save_checkpoint: bool = False,
         loss_fn_config: dict | None = None,
         adam_params: tinker.AdamParams | None = None,
@@ -390,10 +392,17 @@ class TinkerNativeBackend(Backend):
         """Train using on-policy distillation from the same model with modified system prompts.
 
         This implements distribution-level KL distillation where the teacher is the same model
-        but with a modified system prompt. At each token position, per-token advantages are
-        computed as log(p_student[token] / p_teacher[token]) and used with importance sampling loss.
+        but with a modified system prompt. The teacher distributions are computed with stopgrad,
+        so only the student model is updated.
 
-        The teacher distributions are computed with stopgrad, so only the student model is updated.
+        The KL direction controls student behavior:
+          - "reverse" (default, mode-seeking): minimizes KL(student || teacher). Iterates over
+            the student's top-k tokens with advantage p_student * (log p_teacher - log p_student).
+            Summed across ranks, this approximates -KL(student || teacher); maximizing it pushes
+            the student to concentrate on a dominant teacher mode.
+          - "forward" (mean-seeking): minimizes KL(teacher || student). Iterates over the teacher's
+            top-k tokens with advantage p_teacher (weighted cross-entropy to teacher). This pushes
+            the student to cover all teacher modes.
 
         Note: Group size doesn't matter here since the loss is computed per-token based on
         distribution-level KL divergence. Groups of size 1 are typical.
@@ -407,6 +416,11 @@ class TinkerNativeBackend(Backend):
             learning_rate: Learning rate for optimization
             loss_fn: Loss function to use (default: "importance_sampling")
             normalize_advantages: Ignored for distillation loss (kept for API compatibility)
+            grpo_weight: If > 0, also add GRPO datums with z-scored reward advantages.
+            kl_direction: "forward" (mean-seeking, KL(T||S)) or "reverse" (mode-seeking, KL(S||T)).
+            distillation_topk: Number of top-k ranks used when constructing distillation datums.
+                One datum per rank, so larger values mean a finer KL approximation at the cost of
+                more datums per trajectory.
             save_checkpoint: Whether to save full checkpoint
             loss_fn_config: Additional loss function configuration
             adam_params: Adam optimizer parameters
@@ -425,6 +439,15 @@ class TinkerNativeBackend(Backend):
                     f"number of trajectory_groups ({len(groups_list)})"
                 )
 
+        if kl_direction not in ("forward", "reverse"):
+            raise ValueError(
+                f"kl_direction must be 'forward' or 'reverse', got {kl_direction!r}"
+            )
+        if distillation_topk < 1:
+            raise ValueError(
+                f"distillation_topk must be >= 1, got {distillation_topk}"
+            )
+
         # Compute teacher logprobs with modified system prompts and build datums
         datums = await self._trajectory_groups_to_datums_with_teacher_logprobs(
             groups_list,
@@ -432,6 +455,8 @@ class TinkerNativeBackend(Backend):
             prompts_list,
             normalize_advantages,
             grpo_weight=grpo_weight,
+            kl_direction=kl_direction,
+            distillation_topk=distillation_topk,
         )
 
         metrics: dict[str, float] = {
@@ -914,6 +939,8 @@ class TinkerNativeBackend(Backend):
         teacher_system_prompts: list[str],
         normalize_advantages: bool,
         grpo_weight: float = 0.0,
+        kl_direction: Literal["forward", "reverse"] = "reverse",
+        distillation_topk: int = 20,
     ) -> list[tinker.Datum]:
         """Convert trajectory groups to datums using distribution-level KL distillation.
 
@@ -1081,7 +1108,7 @@ class TinkerNativeBackend(Backend):
                         f"KL={kl_per_token[i]:.4f}"
                     )
 
-            # Build k datums (one per rank) for mean-seeking KL distillation
+            # Build k datums (one per rank) for distribution-level KL distillation
             traj_datums = self._build_datums_with_distributions(
                 prompt_tokens=item.prompt_tokens,
                 completion_tokens=item.completion_tokens,
@@ -1089,6 +1116,8 @@ class TinkerNativeBackend(Backend):
                 teacher_topk=teacher_topk,
                 student_tail_mass=student_tail_mass,
                 teacher_tail_mass=teacher_tail_mass,
+                kl_direction=kl_direction,
+                distillation_topk=distillation_topk,
                 trajectory_id=trajectory_count,
             )
             datums.extend(traj_datums)
@@ -1353,22 +1382,31 @@ class TinkerNativeBackend(Backend):
         teacher_topk: list[list[tuple[int, float]]],
         student_tail_mass: list[float],
         teacher_tail_mass: list[float],
+        kl_direction: Literal["forward", "reverse"] = "reverse",
+        distillation_topk: int = 20,
         trajectory_id: int = 0,
         reward_scale: float = 1.0,
     ) -> list[tinker.Datum]:
-        """Build k datums for top-k SDPO with probability-weighted advantages.
+        """Build k datums for top-k KL distillation with probability-weighted advantages.
 
-        Creates k datums where datum[r] contains:
-        - target_tokens: [seq_len] - rank-r token from STUDENT's top-k at each position
-        - advantages: [seq_len] - p_student[r] * (log p_teacher[r] - log p_student[r])
-        - logprobs: [seq_len] - student's logprob (for importance sampling)
+        Uses standard importance_sampling loss with per-token advantages. One datum per rank.
 
-        The probability weighting ensures that when losses are summed across all k datums,
-        we approximate: -KL(student || teacher) = -Σ p_student * log(p_student / p_teacher)
-                                                 = Σ p_student * (log p_teacher - log p_student)
+        Reverse KL (mode-seeking, default):
+          Iterates over the student's top-k. At each position, rank r:
+            target_tokens = student's rank-r token
+            advantages = p_student[r] * (log p_teacher[r] - log p_student[r]) * reward_scale
+            logprobs (IS old) = student's logprob for its rank-r token
+          Summed across ranks, the advantage approximates -KL(student || teacher); maximizing
+          this minimizes KL(student || teacher).
 
-        Iterates through student's top-k (mean-seeking KL) and finds corresponding teacher probs.
-        Uses standard importance_sampling loss with per-token advantages.
+        Forward KL (mean-seeking):
+          Iterates over the teacher's top-k. At each position, rank r:
+            target_tokens = teacher's rank-r token
+            advantages = p_teacher[r] * reward_scale
+            logprobs (IS old) = student's logprob for teacher's rank-r token (looked up in
+                student's top-k; falls back to student tail-mass estimate).
+          Equivalent to weighted cross-entropy from teacher to student; minimizes
+          KL(teacher || student).
         """
         import torch
         import math
@@ -1376,7 +1414,20 @@ class TinkerNativeBackend(Backend):
         if not prompt_tokens or not completion_tokens:
             return []
 
-        k = min(1, len(student_topk[0]) if student_topk else 20)  # Limit k to avoid too many datums
+        # Source distribution = the one we iterate / weight by (student for reverse, teacher for forward)
+        if kl_direction == "reverse":
+            source_topk_all = student_topk
+            other_topk_all = teacher_topk
+            other_tail_all = teacher_tail_mass
+        else:
+            source_topk_all = teacher_topk
+            other_topk_all = student_topk
+            other_tail_all = student_tail_mass
+
+        available_k = len(source_topk_all[0]) if source_topk_all else 0
+        k = min(distillation_topk, available_k)
+        if k < 1:
+            return []
 
         # Build input tokens
         ob_len = max(len(prompt_tokens) - 1, 0)
@@ -1388,11 +1439,10 @@ class TinkerNativeBackend(Backend):
         if seq_len != ob_len + completion_len:
             return []
 
-        # Create k datums, one for each rank in student's top-k
         datums = []
         for rank in range(k):
             target_tokens_list = []
-            student_logprobs_list = []
+            logprobs_list = []
             advantages_list = []
             mask_list = []
             has_nonzero_prob = False
@@ -1401,59 +1451,62 @@ class TinkerNativeBackend(Backend):
                 if pos_idx < ob_len:
                     # Prompt position: dummy values
                     target_tokens_list.append(0)
-                    student_logprobs_list.append(0.0)
+                    logprobs_list.append(0.0)
                     advantages_list.append(0.0)
                     mask_list.append(0.0)
+                    continue
+
+                completion_pos = pos_idx - ob_len
+                source_topk_at_pos = source_topk_all[completion_pos]
+                other_topk_at_pos = other_topk_all[completion_pos]
+                other_tail_at_pos = other_tail_all[completion_pos]
+
+                if rank >= len(source_topk_at_pos):
+                    # Fewer than k tokens at this position
+                    target_tokens_list.append(0)
+                    logprobs_list.append(0.0)
+                    advantages_list.append(0.0)
+                    mask_list.append(0.0)
+                    continue
+
+                source_tok_id, source_logp = source_topk_at_pos[rank]
+                source_prob = math.exp(source_logp)
+
+                if source_prob < 1e-10:
+                    # Negligible probability — further ranks won't contribute either
+                    target_tokens_list.append(0)
+                    logprobs_list.append(0.0)
+                    advantages_list.append(0.0)
+                    mask_list.append(0.0)
+                    continue
+
+                # Look up this token's logprob in the other distribution's top-k
+                other_logp = None
+                for t_tok_id, t_logp in other_topk_at_pos:
+                    if t_tok_id == source_tok_id:
+                        other_logp = t_logp
+                        break
+                if other_logp is None:
+                    # Not in other top-k — estimate from tail mass, spread over missing slots
+                    other_logp = math.log(max(1e-10, other_tail_at_pos / max(1, k)))
+
+                has_nonzero_prob = True
+
+                if kl_direction == "reverse":
+                    # source = student, other = teacher
+                    # advantage = p_student * (log p_teacher - log p_student), IS ref = p_student
+                    advantage = source_prob * (other_logp - source_logp) * reward_scale
+                    is_ref_logp = source_logp
                 else:
-                    # Completion position: rank-r token from STUDENT's top-k
-                    completion_pos = pos_idx - ob_len
-                    student_topk_at_pos = student_topk[completion_pos]
-                    teacher_topk_at_pos = teacher_topk[completion_pos]
+                    # source = teacher, other = student
+                    # advantage = p_teacher (weighted cross-entropy), IS ref = student's logprob
+                    advantage = source_prob * reward_scale
+                    is_ref_logp = other_logp
 
-                    if rank < len(student_topk_at_pos):
-                        # Student's rank-r token
-                        student_tok_id, student_logp = student_topk_at_pos[rank]
-                        student_prob = math.exp(student_logp)
-
-                        # Check if this rank has near-zero probability (numerical issues)
-                        if student_prob < 1e-10:
-                            # This rank and higher have negligible probability, skip
-                            target_tokens_list.append(0)
-                            student_logprobs_list.append(0.0)
-                            advantages_list.append(0.0)
-                            mask_list.append(0.0)
-                            continue
-
-                        has_nonzero_prob = True
-
-                        # Find this token's logprob in teacher's top-k
-                        teacher_logp = None
-                        for t_tok_id, t_logp in teacher_topk_at_pos:
-                            if t_tok_id == student_tok_id:
-                                teacher_logp = t_logp
-                                break
-
-                        if teacher_logp is None:
-                            # Token not in teacher's top-k, estimate from tail
-                            # Distribute tail mass uniformly among missing tokens
-                            teacher_logp = math.log(max(1e-10, teacher_tail_mass[completion_pos] / max(1, k)))
-
-                        # PROBABILITY-WEIGHTED advantage for top-k KL approximation
-                        # advantage = p_student * (log p_teacher - log p_student) * reward_scale
-                        # This ensures the sum over k datums approximates KL divergence
-                        # reward_scale weights trajectories by normalized reward when use_rewards=True
-                        advantage = student_prob * (teacher_logp - student_logp) * reward_scale
-
-                        target_tokens_list.append(int(student_tok_id))
-                        student_logprobs_list.append(float(student_logp))
-                        advantages_list.append(advantage)
-                        mask_list.append(1.0)
-                    else:
-                        # Less than k tokens at this position
-                        target_tokens_list.append(0)
-                        student_logprobs_list.append(0.0)
-                        advantages_list.append(0.0)
-                        mask_list.append(0.0)
+                target_tokens_list.append(int(source_tok_id))
+                logprobs_list.append(float(is_ref_logp))
+                advantages_list.append(float(advantage))
+                mask_list.append(1.0)
 
             # Skip this datum if it has no non-zero probabilities (all ranks exhausted)
             if not has_nonzero_prob:
@@ -1461,13 +1514,12 @@ class TinkerNativeBackend(Backend):
 
             # Debug logging for first datum
             if rank == 0 and trajectory_id == 0:
-                print(f"\n[SDPO Datum Creation Debug]")
-                print(f"seq_len: {seq_len}, k: {k}, ob_len: {ob_len}, completion_len: {completion_len}")
-                # Only show positions that exist
+                print(f"\n[Distillation Datum Debug] kl_direction={kl_direction} topk={k}")
+                print(f"seq_len: {seq_len}, ob_len: {ob_len}, completion_len: {completion_len}")
                 n_show = min(3, completion_len)
                 if n_show > 0:
                     print(f"Sample advantages (first {n_show} completion positions): {advantages_list[ob_len:ob_len+n_show]}")
-                    print(f"Sample student probs (first {n_show} completion positions): {[math.exp(student_logprobs_list[i]) for i in range(ob_len, ob_len+n_show)]}")
+                    print(f"Sample IS-ref probs (first {n_show} completion positions): {[math.exp(logprobs_list[i]) for i in range(ob_len, ob_len+n_show)]}")
 
             datum = tinker.Datum(
                 model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
@@ -1476,7 +1528,7 @@ class TinkerNativeBackend(Backend):
                         torch.tensor(target_tokens_list, dtype=torch.int64)
                     ),
                     "logprobs": tinker.TensorData.from_torch(
-                        torch.tensor(student_logprobs_list, dtype=torch.float32)
+                        torch.tensor(logprobs_list, dtype=torch.float32)
                     ),
                     "advantages": tinker.TensorData.from_torch(
                         torch.tensor(advantages_list, dtype=torch.float32)
