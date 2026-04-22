@@ -215,10 +215,12 @@ class ForwardTraceCapture:
         enabled: bool,
         capture_name_tokens: tuple[str, ...] = CAPTURE_NAME_TOKENS,
         micro_start_callback: Callable[[int | None, int], None] | None = None,
+        strict_output_match: bool = True,
     ) -> None:
         self.enabled = enabled
         self.capture_name_tokens = capture_name_tokens
         self.micro_start_callback = micro_start_callback
+        self.strict_output_match = strict_output_match
         self.current_step_index: int | None = None
         self.current_step_trace: dict[str, list[dict[str, Any]]] = {}
         self.current_micro_sample_index: int | None = None
@@ -924,13 +926,17 @@ class ForwardTraceCapture:
         return cast(list[dict[str, list[dict[str, Any]]]], gathered)
 
     @staticmethod
-    def _merge_group_tensor(tensors: list[torch.Tensor]) -> torch.Tensor:
+    def _merge_group_tensor(
+        tensors: list[torch.Tensor], *, strict: bool = True
+    ) -> torch.Tensor:
         if len(tensors) == 1:
             return tensors[0]
         first = tensors[0]
         if all(tensor.shape == first.shape for tensor in tensors[1:]) and all(
             torch.equal(first, tensor) for tensor in tensors[1:]
         ):
+            return first
+        if not strict:
             return first
         raise RuntimeError(
             "Mismatched output captures for the same micro output across non-DP ranks"
@@ -972,7 +978,10 @@ class ForwardTraceCapture:
             key=lambda item: _captured_output_sort_key(item[0], item[2], item[1]),
         )
         return [
-            self._merge_group_tensor(grouped[group_key])
+            self._merge_group_tensor(
+                grouped[group_key],
+                strict=self.strict_output_match,
+            )
             for group_key in ordered_group_keys
         ]
 

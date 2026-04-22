@@ -592,6 +592,11 @@ def _apply_o_proj_forward_mutation(
         for module in chunk.modules():
             if not isinstance(module, SelfAttentionLinearProjLoRA):
                 continue
+            if not module.reduce_output:
+                continue
+            adapter_prefix = module.lora.adapter_model_prefix
+            if not adapter_prefix.endswith((".o_proj", ".out_proj")):
+                continue
             original_forwards.append((module, module.forward))
 
             def _mutated_forward(self: Any, x: Any):
@@ -978,6 +983,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         model_chunks,
         enabled=True,
         micro_start_callback=micro_start_callback,
+        strict_output_match=request.mutation is None,
     )
 
     def _capture_lora_grads() -> None:
