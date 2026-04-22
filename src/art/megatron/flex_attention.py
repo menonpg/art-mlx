@@ -10,7 +10,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 from pydantic import BaseModel, ConfigDict
-from art.megatron.compile_state import megatron_compile_enabled
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
@@ -43,18 +42,10 @@ class FlexAttentionWrapper(torch.nn.Module):
             "coordinate_descent_tuning": True,
             "triton.cudagraphs": False,
         }
-    _compiled_flex_attention: ClassVar[Any | None] = None
-
-    @classmethod
-    def _resolve_impl(cls) -> Any:
-        if not megatron_compile_enabled():
-            return flex_attention
-        if cls._compiled_flex_attention is None:
-            cls._compiled_flex_attention = torch.compile(
-                flex_attention,
-                options=cls._compile_options,
-            )
-        return cls._compiled_flex_attention
+    _compiled_flex_attention: ClassVar = torch.compile(
+        flex_attention,
+        options=_compile_options,
+    )
 
     def forward(
         self,
@@ -69,7 +60,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         # q, k, v are [B, H, S, D] tensors expected by torch.flex_attention.
         return cast(
             Tensor,
-            self._resolve_impl()(
+            FlexAttentionWrapper._compiled_flex_attention(
                 q,
                 k,
                 v,
@@ -80,16 +71,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-_compiled_create_block_mask: Any | None = None
-
-
-def _resolve_create_block_mask() -> Any:
-    global _compiled_create_block_mask
-    if not megatron_compile_enabled():
-        return create_block_mask
-    if _compiled_create_block_mask is None:
-        _compiled_create_block_mask = torch.compile(create_block_mask)
-    return _compiled_create_block_mask
+_compiled_create_block_mask = torch.compile(create_block_mask)
 
 
 def create_shared_prefix_attention_state(
@@ -119,7 +101,7 @@ def create_shared_prefix_attention_state(
         parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
 
-    block_mask = _resolve_create_block_mask()(
+    block_mask = _compiled_create_block_mask(
         _shared_prefix_mask,
         group_ids.shape[0],
         None,

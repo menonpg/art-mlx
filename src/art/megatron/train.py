@@ -33,7 +33,6 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
-from art.megatron.compile_state import megatron_compile_enabled
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
@@ -219,7 +218,11 @@ def _eager_initialize_optimizer_state(optimizer: Any) -> None:
 
 
 def _compile_enabled() -> bool:
-    return megatron_compile_enabled()
+    return os.environ.get("ART_DISABLE_MEGATRON_COMPILE", "0") in {
+        "0",
+        "false",
+        "False",
+    }
 
 
 def _default_optimizer_config() -> OptimizerConfig:
