@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
   id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
@@ -36,6 +38,11 @@ jobs:
 
       - name: Build package
         run: uv run hatch build
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: 'dist/*'
 
       - name: Get version from pyproject.toml
         id: get_version
