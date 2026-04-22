@@ -375,6 +375,33 @@ def _configure_provider(
         provider.hidden_dropout = 0.0
 
 
+@contextmanager
+def _patch_finalize_provider_bundle_for_oracle(
+    megatron_train_module: Any,
+    case_config: OracleCaseConfig,
+):
+    original_finalize_provider_bundle = megatron_train_module.finalize_provider_bundle
+
+    def _oracle_finalize_provider_bundle(provider_bundle: Any) -> Any:
+        provider = provider_bundle.provider
+        if case_config.precision == "fp32":
+            provider.moe_token_dispatcher_type = "alltoall"
+            provider.moe_flex_dispatcher_backend = None
+            provider.moe_shared_expert_overlap = True
+            provider.overlap_moe_expert_parallel_comm = False
+            provider.delay_wgrad_compute = False
+            provider.ep_overlap_early_attn_memory_release = False
+            provider.finalize()
+            return provider_bundle
+        return original_finalize_provider_bundle(provider_bundle)
+
+    megatron_train_module.finalize_provider_bundle = _oracle_finalize_provider_bundle
+    try:
+        yield
+    finally:
+        megatron_train_module.finalize_provider_bundle = original_finalize_provider_bundle
+
+
 def _build_optimizer_config(case_config: OracleCaseConfig):
     """Builds Megatron optimizer settings for deterministic harness runs."""
     from megatron.core.optimizer import OptimizerConfig
@@ -857,19 +884,22 @@ def _worker_run(request: WorkerRunRequest) -> None:
             f"starting build_training_runtime objective={request.objective} "
             f"topology={request.topology.slug()} local_rank={local_rank}"
         )
-        runtime = megatron_train.build_training_runtime(
-            model_identifier=request.case_config.base_model,
-            provider_torch_dtype=(
-                torch.float32
-                if request.case_config.precision == "fp32"
-                else torch.bfloat16
-            ),
-            provider_configure=lambda provider: _configure_provider(
-                provider, request.topology, request.case_config
-            ),
-            optimizer_config=_build_optimizer_config(request.case_config),
-            print_env=False,
-        )
+        with _patch_finalize_provider_bundle_for_oracle(
+            megatron_train, request.case_config
+        ):
+            runtime = megatron_train.build_training_runtime(
+                model_identifier=request.case_config.base_model,
+                provider_torch_dtype=(
+                    torch.float32
+                    if request.case_config.precision == "fp32"
+                    else torch.bfloat16
+                ),
+                provider_configure=lambda provider: _configure_provider(
+                    provider, request.topology, request.case_config
+                ),
+                optimizer_config=_build_optimizer_config(request.case_config),
+                print_env=False,
+            )
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
     optimizer = runtime.optimizer
