@@ -206,9 +206,7 @@ def push_to_wandb(model: art.TrainableModel, backend: LocalBackend, step: int) -
     if "WANDB_API_KEY" not in os.environ:
         print("WANDB_API_KEY not set, skipping W&B upload.")
         return
-    checkpoint_path = get_step_checkpoint_dir(
-        get_model_dir(model, backend._path), step
-    )
+    checkpoint_path = get_step_checkpoint_dir(get_model_dir(model, backend._path), step)
     deploy_wandb(model, checkpoint_path, step, verbose=True)
 
 
@@ -307,6 +305,7 @@ async def main() -> None:
                 eval_fn=make_eval_fn(on_eval),
                 eval_step_0=base_pass_rate is None,
                 eval_every_n_steps=TRAIN_STEPS,
+                discard_queue_multiplier=10000,
             )
             print(f"Training base model from step {start_step} → {TRAIN_STEPS}...")
             await trainer_a.train()
@@ -375,6 +374,7 @@ async def main() -> None:
         eval_fn=make_eval_fn(on_forked_eval),
         eval_step_0=False,
         eval_every_n_steps=1,
+        discard_queue_multiplier=10000,
     )
     print("Training forked model for 2 more steps...")
     await trainer_b.train()
@@ -396,10 +396,14 @@ async def main() -> None:
     else:
         print(f"  Base model   (step  0):  N/A")
     if "rate" in base_final_pass_rate:
-        print(f"  Base model   (step {final_step_a:2d}): {base_final_pass_rate['rate']:.1%}  ← trained performance")
+        print(
+            f"  Base model   (step {final_step_a:2d}): {base_final_pass_rate['rate']:.1%}  ← trained performance"
+        )
     else:
         print(f"  Base model   (step {final_step_a:2d}): N/A  (used cached checkpoint)")
-    print(f"  Forked model (step {step_b:2d}): {forked_pass_rate:.1%}  ← should match base model step {final_step_a}")
+    print(
+        f"  Forked model (step {step_b:2d}): {forked_pass_rate:.1%}  ← should match base model step {final_step_a}"
+    )
     print(f"----------------------------\n")
     print(f"Success: forked model trained from step {step_b} → {final_step_b}.")
 
