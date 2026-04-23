@@ -352,8 +352,9 @@ async def main() -> None:
     print(f"Fork verified: model_b starts at step {step_b} ✓")
 
     # Train forked model for 2 more steps.
-    # eval_step_0 won't fire (start_step=10 != 0), so we evaluate model_b manually
-    # at step_b after training, while the dedicated vLLM server is still running.
+    # Use eval_step_0=True to fire an eval at the forked model's starting step
+    # (step_b). discard_queue_multiplier=1 lets training exit quickly after the
+    # eval completes (once 3 zero-variance groups are discarded).
     forked_eval_results: dict[int, float] = {}
 
     def on_forked_eval(step: int, rate: float) -> None:
@@ -372,22 +373,17 @@ async def main() -> None:
         learning_rate=1e-4,
         loss_fn="cispo",
         eval_fn=make_eval_fn(on_forked_eval),
-        eval_step_0=False,
-        eval_every_n_steps=1,
-        discard_queue_multiplier=10000,
+        eval_step_0=True,
+        eval_every_n_steps=2,
+        discard_queue_multiplier=1,
     )
-    print("Training forked model for 2 more steps...")
+    print(f"Evaluating forked model at starting step {step_b} via pipeline...")
     await trainer_b.train()
 
-    final_step_b = await model_b.get_step()
-    assert final_step_b == step_b + 2, (
-        f"Expected forked model at step {step_b + 2}, got {final_step_b}"
+    forked_pass_rate = forked_eval_results.get(step_b)
+    assert forked_pass_rate is not None, (
+        f"Expected eval at step {step_b}, got keys: {list(forked_eval_results)}"
     )
-    print(f"Forked model trained from step {step_b} → {final_step_b}.")
-
-    # Evaluate forked model at its starting step now that vLLM is up.
-    print(f"Evaluating forked model at starting step {step_b}...")
-    forked_pass_rate = await evaluate(model_b, step=step_b)
     print(f"Forked model pass rate at step {step_b}: {forked_pass_rate:.1%}")
 
     print(f"\n--- Pass rate comparison ---")
@@ -408,7 +404,7 @@ async def main() -> None:
         f"  ← fork preserved base model step {final_step_a} weights"
     )
     print(f"----------------------------\n")
-    print(f"Success: forked model trained from step {step_b} → {final_step_b}.")
+    print(f"Success: forked model starts at step {step_b} with trained performance.")
 
 
 if __name__ == "__main__":

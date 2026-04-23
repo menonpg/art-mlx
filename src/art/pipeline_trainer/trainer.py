@@ -193,7 +193,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
 
-        if self.eval_fn is not None and self.eval_step_0 and start_step == 0:
+        if self.eval_fn is not None and self.eval_step_0:
             await self._eval_queue.put(start_step)
             self.state.last_eval_step = start_step
             self._persist_state(start_step)
