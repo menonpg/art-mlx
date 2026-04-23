@@ -15,7 +15,7 @@ def patch_transformers_v5_compat() -> None:
 def _patch_rope_validation_ignore_keys() -> None:
     from transformers.configuration_utils import PretrainedConfig
 
-    original = PretrainedConfig.convert_rope_params_to_dict
+    original = PretrainedConfig.convert_rope_params_to_dict  # type: ignore[attr-defined]
 
     # Return if already patched
     if getattr(original, "__art_patched__", False):
