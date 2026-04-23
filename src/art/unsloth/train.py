@@ -863,7 +863,22 @@ async def run_unsloth_rl_training(
                     "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"
                 )
             for task in done:
-                result = task.result()
+                if task is ctx.train_task:
+                    try:
+                        result = task.result()
+                    except Exception as e:
+                        print(
+                            f"[run_unsloth_rl_training] train_task raised exception: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        raise
+                    print(
+                        f"[run_unsloth_rl_training] train_task returned (should never happen): "
+                        f"result={result!r}"
+                    )
+                    assert result is not None, "The training task should never finish."
+                else:
+                    result = task.result()
                 assert result is not None, "The training task should never finish."
                 ctx.results_queue.task_done()
                 if warmup:
