@@ -31,7 +31,7 @@ from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 BASE_MODEL_NAME = "ynm-fork-pipeline-llama-31-8b-base"
 PROJECT = "yes-no-maybe-fork-pipeline"
-TRAIN_STEPS = 2
+TRAIN_STEPS = 10
 ROLLOUTS_PER_SCENARIO = 8
 PROMPTS = ["Say yes", "Say no", "Say maybe"]
 STEP0_PASS_RATE_FILE = os.path.expanduser(
@@ -282,12 +282,15 @@ async def main() -> None:
         if start_step == 0 and try_pull_from_wandb(model_a, backend, TRAIN_STEPS):
             start_step = await model_a.get_step()
         else:
-            # Capture step-0 pass rate from PipelineTrainer's eval_step_0 callback.
+            # Capture step-0 and final-step pass rates from PipelineTrainer callbacks.
             step0_captured: dict[str, float] = {}
+            base_final_pass_rate: dict[str, float] = {}
 
             def on_eval(step: int, rate: float) -> None:
                 if step == 0 and base_pass_rate is None:
                     step0_captured["rate"] = rate
+                if step == TRAIN_STEPS:
+                    base_final_pass_rate["rate"] = rate
 
             trainer_a = PipelineTrainer(
                 model=model_a,
@@ -389,10 +392,14 @@ async def main() -> None:
 
     print(f"\n--- Pass rate comparison ---")
     if base_pass_rate is not None:
-        print(f"  Base model   (step  0): {base_pass_rate:.1%}")
+        print(f"  Base model   (step  0):  {base_pass_rate:.1%}")
     else:
-        print(f"  Base model   (step  0): N/A")
-    print(f"  Forked model (step {step_b:2d}): {forked_pass_rate:.1%}")
+        print(f"  Base model   (step  0):  N/A")
+    if "rate" in base_final_pass_rate:
+        print(f"  Base model   (step {final_step_a:2d}): {base_final_pass_rate['rate']:.1%}  ← trained performance")
+    else:
+        print(f"  Base model   (step {final_step_a:2d}): N/A  (used cached checkpoint)")
+    print(f"  Forked model (step {step_b:2d}): {forked_pass_rate:.1%}  ← should match base model step {final_step_a}")
     print(f"----------------------------\n")
     print(f"Success: forked model trained from step {step_b} → {final_step_b}.")
 
