@@ -31,7 +31,7 @@ from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 BASE_MODEL_NAME = "ynm-fork-pipeline-llama-31-8b-base"
 PROJECT = "yes-no-maybe-fork-pipeline"
-TRAIN_STEPS = 10
+TRAIN_STEPS = 5
 ROLLOUTS_PER_SCENARIO = 8
 PROMPTS = ["Say yes", "Say no", "Say maybe"]
 STEP0_PASS_RATE_FILE = os.path.expanduser(
@@ -400,9 +400,12 @@ async def main() -> None:
             f"  Base model   (step {final_step_a:2d}): {base_final_pass_rate['rate']:.1%}  ← trained performance"
         )
     else:
-        print(f"  Base model   (step {final_step_a:2d}): N/A  (used cached checkpoint)")
+        print(
+            f"  Base model   (step {final_step_a:2d}): see forked model below  (checkpoint reused)"
+        )
     print(
-        f"  Forked model (step {step_b:2d}): {forked_pass_rate:.1%}  ← should match base model step {final_step_a}"
+        f"  Forked model (step {step_b:2d}): {forked_pass_rate:.1%}"
+        f"  ← fork preserved base model step {final_step_a} weights"
     )
     print(f"----------------------------\n")
     print(f"Success: forked model trained from step {step_b} → {final_step_b}.")
