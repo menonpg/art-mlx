@@ -274,15 +274,17 @@ async def main() -> None:
             base_pass_rate = json.load(f)["pass_rate"]
         print(f"Loaded step-0 pass rate from cache: {base_pass_rate:.1%}")
 
+    # Capture final-step pass rate from PipelineTrainer callback (populated only when training runs).
+    base_final_pass_rate: dict[str, float] = {}
+
     if start_step >= TRAIN_STEPS:
         print(f"Base model already at step {start_step}, skipping training.")
     else:
         if start_step == 0 and try_pull_from_wandb(model_a, backend, TRAIN_STEPS):
             start_step = await model_a.get_step()
         else:
-            # Capture step-0 and final-step pass rates from PipelineTrainer callbacks.
+            # Capture step-0 pass rate from PipelineTrainer callback.
             step0_captured: dict[str, float] = {}
-            base_final_pass_rate: dict[str, float] = {}
 
             def on_eval(step: int, rate: float) -> None:
                 if step == 0 and base_pass_rate is None:
