@@ -767,7 +767,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _log_zero_variance_groups(self, step: int) -> None:
         if not self._discard_queue:
             return
-        discarded = list(self._discard_queue)
+        # Cap logged groups to avoid huge parquet files when many discards accumulate.
+        discarded = list(self._discard_queue[:50])
         await self.model.log(discarded, split="discarded", step=step)
         self._discard_queue.clear()
 
