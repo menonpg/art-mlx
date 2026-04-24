@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from art.megatron import train as megatron_train
 from art.megatron.merged_weight_export import build_art_conversion_tasks
+from art.megatron.model_support import get_model_support_handler
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     RouterCallRoute,
@@ -679,8 +680,13 @@ def _normalize_hf_grads_for_bridge(
     hf_grads: dict[str, torch.Tensor],
     *,
     expected_grad_keys: set[str],
+    model_support_handler: Any,
 ) -> dict[str, torch.Tensor]:
     hf_grads = _filter_language_only_tensor_map(hf_grads)
+    hf_grads = model_support_handler.hf_tensor_map_to_art_canonical(
+        hf_grads,
+        expected_keys=expected_grad_keys,
+    )
     normalized_hf_grads = _normalize_hf_tensor_map_for_bridge(
         hf_grads,
         expected_grad_keys,
@@ -725,6 +731,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
     device = torch.device("cuda", 0)
     try:
         _debug("starting HF parity worker")
+        model_support_handler = get_model_support_handler(request.case_config.base_model)
         hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
@@ -744,6 +751,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
         normalized_hf_grads = _normalize_hf_grads_for_bridge(
             hf_grads,
             expected_grad_keys=set(megatron_grads.keys()),
+            model_support_handler=model_support_handler,
         )
         active_embedding_rows = _active_embedding_token_rows(micro_inputs)
         active_router_rows = _active_router_rows_by_layer(moe_routing_replay_bundle)

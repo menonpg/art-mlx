@@ -15,10 +15,13 @@ from .megatron_packed_position_ids import run_packed_position_ids
 def test_run_packed_position_ids_qwen35() -> None:
     report = run_packed_position_ids(
         base_model="Qwen/Qwen3.5-35B-A3B",
-        num_layers=4,
     )
 
     assert len(report.scenarios) == 2
     assert all(scenario.matched for scenario in report.scenarios)
     assert all(scenario.checked_token_count > 0 for scenario in report.scenarios)
     assert all(scenario.prompt_family_count >= 2 for scenario in report.scenarios)
+    assert all(scenario.rotary_grouping_checked for scenario in report.scenarios)
+    assert all(scenario.repeated_position_key_count > 0 for scenario in report.scenarios)
+    assert all(scenario.completion_pair_count > 0 for scenario in report.scenarios)
+    assert all(scenario.logits_mean_abs_pct <= 0.01 for scenario in report.scenarios)

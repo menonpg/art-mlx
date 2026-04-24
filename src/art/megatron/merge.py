@@ -18,12 +18,7 @@ def _merge_sharded_tensor(
     manifest: dict[str, Any],
 ) -> torch.Tensor:
     strategy = manifest.get("export_shard_strategy")
-    if strategy is None:
-        layout = manifest.get("layout")
-        if layout == "gdn_qkv":
-            strategy = "componentwise"
-        else:
-            strategy = "uniform"
+    assert strategy is not None
     axis = int(manifest.get("export_shard_dim", 1 if "lora_A" in key else 0))
     if strategy == "componentwise":
         component_sizes = [int(size) for size in manifest.get("component_sizes", [])]

@@ -113,6 +113,22 @@ class ModelSupportHandler(Protocol):
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]: ...
 
+    def hf_tensor_map_to_art_canonical(
+        self,
+        hf_tensor_map: dict[str, Any],
+        *,
+        expected_keys: set[str],
+    ) -> dict[str, Any]:
+        """
+        Testing-only hook for canonicalizing raw HuggingFace tensor maps into the
+        ART tensor-map keyspace expected by model-support probes.
+
+        This currently exists to support validations such as HF parity, where the
+        raw HF model can expose fused parameter names or layouts that differ from
+        the canonical names ART compares against.
+        """
+        ...
+
     def compile_workaround_config(
         self,
         provider: Any,

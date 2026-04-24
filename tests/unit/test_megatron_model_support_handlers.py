@@ -340,3 +340,70 @@ def test_qwen35_handler_identity_lora_targets_linear_attn_and_shared_experts() -
         "model.layers.0.mlp.experts.gate_up_proj",
         "model.layers.0.mlp.experts.down_proj",
     ]
+
+
+def test_qwen3_handler_unfuses_hf_expert_tensor_map_for_expected_per_expert_keys() -> None:
+    gate_up = torch.arange(2 * 8 * 3, dtype=torch.float32).reshape(2, 8, 3)
+    down = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+
+    canonical = QWEN3_MOE_HANDLER.hf_tensor_map_to_art_canonical(
+        {
+            "model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.layers.0.mlp.experts.down_proj": down,
+        },
+        expected_keys={
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight",
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+        },
+    )
+
+    assert "model.layers.0.mlp.experts.gate_up_proj" not in canonical
+    assert "model.layers.0.mlp.experts.down_proj" not in canonical
+    assert torch.equal(
+        canonical["model.layers.0.mlp.experts.0.gate_proj.weight"],
+        gate_up[0, :4],
+    )
+    assert torch.equal(
+        canonical["model.layers.0.mlp.experts.0.up_proj.weight"],
+        gate_up[0, 4:],
+    )
+    assert torch.equal(
+        canonical["model.layers.0.mlp.experts.1.gate_proj.weight"],
+        gate_up[1, :4],
+    )
+    assert torch.equal(
+        canonical["model.layers.0.mlp.experts.1.up_proj.weight"],
+        gate_up[1, 4:],
+    )
+    assert torch.equal(
+        canonical["model.layers.0.mlp.experts.0.down_proj.weight"],
+        down[0],
+    )
+    assert torch.equal(
+        canonical["model.layers.0.mlp.experts.1.down_proj.weight"],
+        down[1],
+    )
+
+
+def test_default_dense_handler_preserves_fused_hf_expert_tensors_without_per_expert_expectation() -> None:
+    gate_up = torch.arange(2 * 8 * 3, dtype=torch.float32).reshape(2, 8, 3)
+    down = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+
+    canonical = DEFAULT_DENSE_HANDLER.hf_tensor_map_to_art_canonical(
+        {
+            "model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.layers.0.mlp.experts.down_proj": down,
+        },
+        expected_keys={
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+        },
+    )
+
+    assert set(canonical) == {
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "model.layers.0.mlp.experts.down_proj",
+    }
+    assert torch.equal(canonical["model.layers.0.mlp.experts.gate_up_proj"], gate_up)
+    assert torch.equal(canonical["model.layers.0.mlp.experts.down_proj"], down)

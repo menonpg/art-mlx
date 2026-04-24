@@ -31,17 +31,6 @@ class FlexAttentionWrapper(torch.nn.Module):
 
     # Torchtitan inductor options for compiling flex attention.
     _compile_options = None
-    if os.environ.get("ART_FAST_DEBUG_DISABLE_FLEX_MAX_AUTOTUNE", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        _compile_options = {
-            "max_autotune": True,
-            "coordinate_descent_tuning": True,
-            "triton.cudagraphs": False,
-        }
     _compiled_flex_attention: ClassVar = torch.compile(
         flex_attention,
         options=_compile_options,
@@ -69,7 +58,6 @@ class FlexAttentionWrapper(torch.nn.Module):
                 enable_gqa=enable_gqa,
             ),
         )
-
 
 _compiled_create_block_mask = torch.compile(create_block_mask, backend="aot_eager")
 
