@@ -28,10 +28,14 @@ PROJECT = "yes-no-maybe-fork"
 TRAIN_STEPS = 10
 ROLLOUTS_PER_GROUP = 8
 PROMPTS = ["Say yes", "Say no", "Say maybe"]
-STEP0_PASS_RATE_FILE = os.path.expanduser("~/.art_data/yes-no-maybe-fork-step0-pass-rate.json")
+STEP0_PASS_RATE_FILE = os.path.expanduser(
+    "~/.art_data/yes-no-maybe-fork-step0-pass-rate.json"
+)
 
 
-async def rollout(client: openai.AsyncOpenAI, model_name: str, prompt: str) -> art.Trajectory:
+async def rollout(
+    client: openai.AsyncOpenAI, model_name: str, prompt: str
+) -> art.Trajectory:
     messages: art.Messages = [{"role": "user", "content": prompt}]
     chat_completion = await client.chat.completions.create(
         messages=messages,
@@ -86,7 +90,10 @@ async def run_training_steps(
         train_groups = await art.gather_trajectory_groups(
             [
                 art.TrajectoryGroup(
-                    [rollout(client, model_name, prompt) for _ in range(ROLLOUTS_PER_GROUP)]
+                    [
+                        rollout(client, model_name, prompt)
+                        for _ in range(ROLLOUTS_PER_GROUP)
+                    ]
                 )
                 for prompt in PROMPTS
             ]
@@ -127,9 +134,7 @@ def push_to_wandb(model: art.TrainableModel, backend: LocalBackend, step: int) -
     if "WANDB_API_KEY" not in os.environ:
         print("WANDB_API_KEY not set, skipping W&B upload.")
         return
-    checkpoint_path = get_step_checkpoint_dir(
-        get_model_dir(model, backend._path), step
-    )
+    checkpoint_path = get_step_checkpoint_dir(get_model_dir(model, backend._path), step)
     deploy_wandb(model, checkpoint_path, step, verbose=True)
 
 
@@ -191,6 +196,7 @@ async def main() -> None:
 
     # Load persisted step-0 pass rate if available (survives W&B checkpoint pulls).
     import json as _json
+
     base_pass_rate: float | None = None
     if os.path.exists(STEP0_PASS_RATE_FILE):
         with open(STEP0_PASS_RATE_FILE) as f:
