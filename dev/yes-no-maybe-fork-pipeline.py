@@ -305,7 +305,7 @@ async def main() -> None:
                 learning_rate=1e-4,
                 loss_fn="cispo",
                 eval_fn=make_eval_fn(on_eval),
-                eval_step_0=base_pass_rate is None,
+                eval_at_start=base_pass_rate is None,
                 eval_every_n_steps=TRAIN_STEPS,
                 discard_queue_multiplier=10000,
             )
@@ -354,7 +354,7 @@ async def main() -> None:
     print(f"Fork verified: model_b starts at step {step_b} ✓")
 
     # Train forked model for 2 more steps.
-    # Use eval_step_0=True to fire an eval at the forked model's starting step
+    # Use eval_at_start=True to fire an eval at the forked model's starting step
     # (step_b). discard_queue_multiplier=1 lets training exit quickly after the
     # eval completes (once 3 zero-variance groups are discarded).
     forked_eval_results: dict[int, float] = {}
@@ -375,7 +375,7 @@ async def main() -> None:
         learning_rate=1e-4,
         loss_fn="cispo",
         eval_fn=make_eval_fn(on_forked_eval),
-        eval_step_0=True,
+        eval_at_start=True,
         eval_every_n_steps=2,
         discard_queue_multiplier=1,
     )
