@@ -371,7 +371,7 @@ def run_yes_no_trainability_stage(
 ) -> ValidationStageResult:
     del architecture
     yes_no_trainability = _import_integration_module(
-        "integration.megatron_yes_no_trainability"
+        "integration.vllm_separation.yes_no_trainability"
     )
     report = yes_no_trainability.run_yes_no_trainability(base_model=base_model)
     passed = (

@@ -16,7 +16,7 @@ from art.megatron.service import MegatronService
 
 from tests.integration.megatron_oracle_harness import ORACLE_TOPOLOGY, Topology
 from tests.integration.megatron_oracle_worker import provider_topology_env
-from tests.integration.megatron_yes_no_trainability import (
+from tests.integration.vllm_separation.yes_no_trainability import (
     _build_trainable_groups,
     _engine_args_for_yes_no_trainability,
     _evaluate_model,
@@ -32,7 +32,7 @@ DEFAULT_MAX_SEQ_LENGTH = 128
 DEFAULT_PACKED_SEQUENCE_LENGTH = 128
 DEDICATED_MERGED_ENV = "ART_RUN_LIVE_MEGATRON_MERGED_SMOKE"
 SHARED_LORA_ENV = "ART_RUN_LIVE_MEGATRON_SHARED_SMOKE"
-SHARED_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
+SHARED_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
 
 
 def _base_model() -> str:
@@ -86,6 +86,8 @@ def _shared_live_config() -> dev.InternalModelConfig:
         "rollout_weights_mode": "lora",
         "engine_args": {
             **_engine_args_for_yes_no_trainability(inference_gpu_ids=[0, 1]),
+            "tensor_parallel_size": 2,
+            "enable_expert_parallel": True,
             "enable_sleep_mode": True,
         },
         "init_args": {"max_seq_length": _max_seq_length()},

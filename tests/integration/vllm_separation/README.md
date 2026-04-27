@@ -14,6 +14,7 @@ Live smokes:
 
 - `test_live_runtime_server_smoke.py` validates the external runtime directly.
 - `test_live_megatron_backend_smoke.py` validates ART-level Megatron shared and dedicated runtime flows.
+- `test_live_yes_no_trainability.py` validates workflow-style yes/no trainability on the requested backend/mode matrix.
 - `test_live_local_backend_smoke.py` validates the ART `LocalBackend` path.
 - Both are opt-in and are expected to write artifacts for every attempted run.
 
