@@ -43,6 +43,13 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
         assert route in source
 
 
+def test_runtime_general_plugin_loads_full_patch_set() -> None:
+    pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
+    assert (
+        'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
+    )
+
+
 def test_runtime_project_restores_nccl_unique_id_from_raw_bytes(
     artifact_dir: Path,
 ) -> None:

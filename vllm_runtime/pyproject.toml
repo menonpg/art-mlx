@@ -12,7 +12,7 @@ dependencies = [
 art-vllm-runtime-server = "art_vllm_runtime.dedicated_server:main"
 
 [project.entry-points."vllm.general_plugins"]
-art = "art_vllm_runtime.patches:patch_transformers_v5_compat"
+art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"
 
 [build-system]
 requires = ["hatchling"]
