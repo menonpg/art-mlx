@@ -37,7 +37,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _patch_art_runtime_routes() -> None:
     from fastapi import APIRouter, FastAPI, Query, Request
     from fastapi.responses import JSONResponse
-    from vllm.engine.protocol import PauseMode
     from vllm.entrypoints.openai import api_server
     from vllm.tasks import SupportedTask
 
@@ -60,7 +59,7 @@ def _patch_art_runtime_routes() -> None:
         async def sleep(
             raw_request: Request,
             level: int = Query(default=1, ge=0, le=2),
-            mode: PauseMode = Query(default="abort"),
+            mode: str = Query(default="abort", pattern="^(abort|wait|keep)$"),
         ) -> JSONResponse:
             try:
                 await engine(raw_request).sleep(level=level, mode=mode)
