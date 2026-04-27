@@ -69,10 +69,7 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
                 "'art.megatron.service', "
                 "'art.megatron.merged_weight_export'"
                 "]; "
-                "loaded = []; "
-                "for name in modules: "
-                "    importlib.import_module(name); "
-                "    loaded.append(name); "
+                "loaded = [importlib.import_module(name).__name__ for name in modules]; "
                 "print(json.dumps({'loaded': loaded}))"
             ),
         ],
