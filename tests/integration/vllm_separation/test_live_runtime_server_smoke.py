@@ -120,6 +120,21 @@ async def test_external_runtime_server_live_smoke(
                 for model_info in renamed_models_response.json()["data"]
             ]
 
+            sleep_response = await client.post(
+                "/sleep",
+                params={"level": 1, "mode": "wait"},
+            )
+            sleep_response.raise_for_status()
+            sleeping_response = await client.get("/is_sleeping")
+            sleeping_response.raise_for_status()
+            sleeping_before_wake = bool(sleeping_response.json()["is_sleeping"])
+
+            wake_response = await client.post("/wake_up")
+            wake_response.raise_for_status()
+            awake_response = await client.get("/is_sleeping")
+            awake_response.raise_for_status()
+            sleeping_after_wake = bool(awake_response.json()["is_sleeping"])
+
             completion_response = await client.post(
                 "/v1/chat/completions",
                 json={
@@ -140,6 +155,8 @@ async def test_external_runtime_server_live_smoke(
                     "base_model": launch_config.base_model,
                     "original_model_ids": original_model_ids,
                     "renamed_model_ids": renamed_model_ids,
+                    "sleeping_before_wake": sleeping_before_wake,
+                    "sleeping_after_wake": sleeping_after_wake,
                     "text": completion["choices"][0]["message"]["content"],
                     "has_logprobs": completion["choices"][0]["logprobs"] is not None,
                 },
@@ -151,6 +168,8 @@ async def test_external_runtime_server_live_smoke(
         )
         assert served_model_name in original_model_ids
         assert renamed_model_name in renamed_model_ids
+        assert sleeping_before_wake is True
+        assert sleeping_after_wake is False
         assert completion["choices"][0]["logprobs"] is not None
     finally:
         process.terminate()
