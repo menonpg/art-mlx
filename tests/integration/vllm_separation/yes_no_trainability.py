@@ -288,8 +288,7 @@ def _build_variant(variant_name: _VARIANT_NAME) -> _TrainabilityVariant:
 
 
 def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
-    default = 1024 if variant.backend_name == "local" else 128
-    return _get_env_int("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", default)
+    return _get_env_int("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", 1024)
 
 
 def _variant_train_kwargs(variant: _TrainabilityVariant) -> dict[str, object]:

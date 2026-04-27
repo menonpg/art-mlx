@@ -19,9 +19,9 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
         inference_gpu_ids=[0, 1],
     )
 
-    assert _variant_packed_sequence_length(variant) == 128
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 128}
-    assert _build_internal_config(variant)["init_args"]["max_seq_length"] == 128
+    assert _variant_packed_sequence_length(variant) == 1024
+    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
+    assert _build_internal_config(variant)["init_args"]["max_seq_length"] == 1024
     assert _variant_rollouts_per_prompt(variant) == 4
     assert _variant_max_steps(variant) == 4
 
