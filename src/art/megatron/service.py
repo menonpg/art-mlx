@@ -138,6 +138,8 @@ class MegatronService:
     _is_sleeping: bool = False
     _latest_step: int = 0
     _megatron_process: asyncio.subprocess.Process | None = None
+    _megatron_log_file: Any = None
+    _megatron_log_path: str | None = None
     _vllm_process: subprocess.Popen[Any] | None = None
     _vllm_log_file: Any = None
     _vllm_host: str = "127.0.0.1"
@@ -480,7 +482,12 @@ class MegatronService:
             log_path=log_path,
         )
         write_megatron_job(job, job_path=job_path)
-        async for _ in stream_megatron_job(job, job_path=job_path):
+        async for _ in stream_megatron_job(
+            job,
+            job_path=job_path,
+            process=self._megatron_process,
+            process_log_path=self._megatron_log_path,
+        ):
             pass
         self._latest_step = step
 
@@ -558,10 +565,20 @@ class MegatronService:
             f"--master-port {shlex.quote(master_port)} "
             f"--nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
         )
+        log_dir = Path(self.output_dir) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._megatron_log_path = str(log_dir / "megatron-runtime.log")
+        self._megatron_log_file = open(
+            self._megatron_log_path,
+            "w",
+            buffering=1,
+        )
         self._megatron_process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(project_root),
             env=env,
+            stdout=self._megatron_log_file,
+            stderr=self._megatron_log_file,
             start_new_session=True,
         )
         self._install_parent_signal_cleanup()
@@ -699,7 +716,12 @@ class MegatronService:
                     log_path=log_path,
                 )
             write_megatron_job(job, job_path=job_path)
-            async for result in stream_megatron_job(job, job_path=job_path):
+            async for result in stream_megatron_job(
+                job,
+                job_path=job_path,
+                process=self._megatron_process,
+                process_log_path=self._megatron_log_path,
+            ):
                 yield {key: float(value) for key, value in result.items()}
 
             new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
@@ -729,7 +751,12 @@ class MegatronService:
         )
         write_megatron_job(job, job_path=job_path)
 
-        async for result in stream_megatron_job(job, job_path=job_path):
+        async for result in stream_megatron_job(
+            job,
+            job_path=job_path,
+            process=self._megatron_process,
+            process_log_path=self._megatron_log_path,
+        ):
             yield {key: float(value) for key, value in result.items()}
 
         await self._publish_training_checkpoint(lora_path=lora_path)
@@ -761,7 +788,12 @@ class MegatronService:
         )
         write_megatron_job(job, job_path=job_path)
 
-        async for result in stream_megatron_job(job, job_path=job_path):
+        async for result in stream_megatron_job(
+            job,
+            job_path=job_path,
+            process=self._megatron_process,
+            process_log_path=self._megatron_log_path,
+        ):
             yield {
                 "loss/train": float(result["loss"]),
                 "loss/learning_rate": float(result["learning_rate"]),
@@ -802,6 +834,10 @@ class MegatronService:
 
     def _stop_megatron_process(self) -> None:
         if self._megatron_process is None:
+            if self._megatron_log_file is not None:
+                self._megatron_log_file.close()
+                self._megatron_log_file = None
+            self._megatron_log_path = None
             return
         if self._megatron_process.returncode is None:
             try:
@@ -812,6 +848,10 @@ class MegatronService:
             except ProcessLookupError:
                 pass
         self._megatron_process = None
+        if self._megatron_log_file is not None:
+            self._megatron_log_file.close()
+            self._megatron_log_file = None
+        self._megatron_log_path = None
 
     def close(self) -> None:
         self._stop_vllm_subprocess()

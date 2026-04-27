@@ -34,12 +34,19 @@ async def stream_megatron_job(
     job: MegatronJob,
     *,
     job_path: str,
+    process: Any | None = None,
+    process_log_path: str | None = None,
     poll_interval: float = 0.1,
 ) -> AsyncIterator[dict[str, Any]]:
     num_lines = 0
     try:
         while True:
             await asyncio.sleep(poll_interval)
+            if process is not None and process.returncode is not None:
+                raise RuntimeError(
+                    f"Megatron worker exited with code {process.returncode}. "
+                    f"Check logs at {process_log_path or job.log_path}"
+                )
             try:
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
                     log_file.seek(0)
