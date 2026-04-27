@@ -27,6 +27,10 @@ def _run(
     return result
 
 
+def _load_json_from_stdout(stdout: str) -> dict[str, object]:
+    return json.loads(stdout.strip().splitlines()[-1])
+
+
 def test_art_import_does_not_require_vllm_or_mutate_compile_threads(
     artifact_dir: Path,
 ) -> None:
@@ -51,7 +55,7 @@ def test_art_import_does_not_require_vllm_or_mutate_compile_threads(
         artifact_dir=artifact_dir,
         env=env,
     )
-    payload = json.loads(result.stdout.strip())
+    payload = _load_json_from_stdout(result.stdout)
     assert payload["has_vllm"] is False
     assert payload["before"] is None
     assert payload["after"] is None
@@ -75,7 +79,7 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
         ],
         artifact_dir=artifact_dir,
     )
-    payload = json.loads(result.stdout.strip())
+    payload = _load_json_from_stdout(result.stdout)
     assert payload["loaded"] == [
         "art.unsloth.service",
         "art.megatron.service",
