@@ -291,10 +291,7 @@ def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
     default = _get_env_int("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", 128)
     if variant.backend_name != "local":
         return default
-    chunk_size = _get_env_int(
-        "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOGPROB_CHUNK_SIZE",
-        _get_env_int("ART_MODEL_SUPPORT_YES_NO_LOGPROB_CALCULATION_CHUNK_SIZE", 1024),
-    )
+    chunk_size = _variant_logprob_chunk_size(variant)
     requested = _get_env_int(
         "ART_MODEL_SUPPORT_YES_NO_LOCAL_PACKED_SEQUENCE_LENGTH",
         default,
@@ -302,14 +299,22 @@ def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
     return max(requested, chunk_size)
 
 
+def _variant_logprob_chunk_size(variant: _TrainabilityVariant) -> int:
+    if variant.backend_name != "local":
+        return _get_env_int("ART_MODEL_SUPPORT_YES_NO_LOGPROB_CALCULATION_CHUNK_SIZE", 1024)
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOGPROB_CHUNK_SIZE",
+        128,
+    )
+
+
 def _variant_train_kwargs(variant: _TrainabilityVariant) -> dict[str, object]:
     train_kwargs: dict[str, object] = {
         "packed_sequence_length": _variant_packed_sequence_length(variant),
     }
     if variant.backend_name == "local":
-        train_kwargs["logprob_calculation_chunk_size"] = _get_env_int(
-            "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOGPROB_CHUNK_SIZE",
-            _get_env_int("ART_MODEL_SUPPORT_YES_NO_LOGPROB_CALCULATION_CHUNK_SIZE", 1024),
+        train_kwargs["logprob_calculation_chunk_size"] = _variant_logprob_chunk_size(
+            variant
         )
     return train_kwargs
 
@@ -327,6 +332,16 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dict[str, object]:
             "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOAD_IN_16BIT", True
         )
     return init_args
+
+
+def _variant_max_steps(variant: _TrainabilityVariant) -> int:
+    default = 6 if variant.backend_name == "local" else 4
+    return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_STEPS", default)
+
+
+def _variant_rollouts_per_prompt(variant: _TrainabilityVariant) -> int:
+    default = 8 if variant.backend_name == "local" else 4
+    return _get_env_int("ART_MODEL_SUPPORT_YES_NO_ROLLOUTS_PER_PROMPT", default)
 
 
 def _build_internal_config(variant: _TrainabilityVariant) -> dev.InternalModelConfig:
@@ -555,8 +570,8 @@ async def run_yes_no_trainability_async(
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
     backend_root.mkdir(parents=True, exist_ok=True)
     reward_threshold = _get_env_float("ART_MODEL_SUPPORT_YES_NO_REWARD_THRESHOLD", 0.95)
-    max_steps = _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_STEPS", 4)
-    rollouts_per_prompt = _get_env_int("ART_MODEL_SUPPORT_YES_NO_ROLLOUTS_PER_PROMPT", 4)
+    max_steps = _variant_max_steps(variant)
+    rollouts_per_prompt = _variant_rollouts_per_prompt(variant)
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
     eval_prompts = prompts[:eval_prompt_count]

@@ -2,7 +2,9 @@ from .yes_no_trainability import (
     _TrainabilityVariant,
     _build_internal_config,
     _variant_init_args,
+    _variant_max_steps,
     _variant_packed_sequence_length,
+    _variant_rollouts_per_prompt,
     _variant_train_kwargs,
 )
 
@@ -20,6 +22,8 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
     assert _variant_packed_sequence_length(variant) == 128
     assert _variant_train_kwargs(variant) == {"packed_sequence_length": 128}
     assert _build_internal_config(variant)["init_args"]["max_seq_length"] == 128
+    assert _variant_rollouts_per_prompt(variant) == 4
+    assert _variant_max_steps(variant) == 4
 
 
 def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None:
@@ -40,18 +44,20 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
         inference_gpu_ids=[1],
     )
 
-    assert _variant_packed_sequence_length(variant) == 1024
+    assert _variant_packed_sequence_length(variant) == 128
     assert _variant_train_kwargs(variant) == {
-        "packed_sequence_length": 1024,
-        "logprob_calculation_chunk_size": 1024,
+        "packed_sequence_length": 128,
+        "logprob_calculation_chunk_size": 128,
     }
     assert _variant_init_args(variant) == {
-        "max_seq_length": 1024,
+        "max_seq_length": 128,
         "load_in_4bit": False,
         "load_in_16bit": True,
     }
     assert _build_internal_config(variant)["init_args"] == {
-        "max_seq_length": 1024,
+        "max_seq_length": 128,
         "load_in_4bit": False,
         "load_in_16bit": True,
     }
+    assert _variant_rollouts_per_prompt(variant) == 8
+    assert _variant_max_steps(variant) == 6
