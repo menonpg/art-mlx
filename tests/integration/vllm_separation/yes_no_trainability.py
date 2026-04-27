@@ -304,7 +304,7 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dict[str, object]:
 
 
 def _variant_max_steps(variant: _TrainabilityVariant) -> int:
-    default = 6 if variant.backend_name == "local" else 4
+    default = 12 if variant.backend_name == "local" else 4
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_STEPS", default)
 
 

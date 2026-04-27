@@ -495,7 +495,9 @@ class LocalBackend(Backend):
         api_key = server_args.get("api_key") or "default"
 
         def done_callback(_: asyncio.Task[None]) -> None:
-            close_proxy(self._services.pop(model.name))
+            service = self._services.pop(model.name, None)
+            if service is not None:
+                close_proxy(service)
 
         if os.environ.get("ART_DISABLE_SERVER_MONITOR", "").lower() not in {
             "1",

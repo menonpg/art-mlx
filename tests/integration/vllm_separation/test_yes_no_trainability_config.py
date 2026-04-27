@@ -41,4 +41,4 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
     assert _variant_init_args(variant) == {"max_seq_length": 1024}
     assert _build_internal_config(variant)["init_args"] == {"max_seq_length": 1024}
     assert _variant_rollouts_per_prompt(variant) == 8
-    assert _variant_max_steps(variant) == 6
+    assert _variant_max_steps(variant) == 12
