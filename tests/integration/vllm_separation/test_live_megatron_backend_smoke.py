@@ -169,10 +169,8 @@ async def _megatron_backend_context(
 @pytest.mark.asyncio
 async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
     artifact_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_opt_in(SHARED_LORA_ENV)
-    monkeypatch.setenv("ART_DISABLE_SERVER_MONITOR", "1")
     backend_root = artifact_dir / "art_workspace"
     backend_root.mkdir(parents=True, exist_ok=True)
 
@@ -205,7 +203,6 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
                 train_groups,
                 learning_rate=float(os.environ.get("ART_TEST_MEGATRON_LR", "1e-4")),
                 loss_fn="cispo",
-                allow_training_without_logprobs=True,
                 packed_sequence_length=_packed_sequence_length(),
             )
         )
@@ -266,10 +263,8 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
 @pytest.mark.asyncio
 async def test_megatron_backend_dedicated_merged_live_smoke(
     artifact_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_opt_in(DEDICATED_MERGED_ENV)
-    monkeypatch.setenv("ART_DISABLE_SERVER_MONITOR", "1")
     backend_root = artifact_dir / "art_workspace"
     backend_root.mkdir(parents=True, exist_ok=True)
 
@@ -301,7 +296,6 @@ async def test_megatron_backend_dedicated_merged_live_smoke(
             train_groups,
             learning_rate=float(os.environ.get("ART_TEST_MEGATRON_LR", "1e-4")),
             loss_fn="cispo",
-            allow_training_without_logprobs=True,
             packed_sequence_length=_packed_sequence_length(),
         )
         latest_step = int(result.step)

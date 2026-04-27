@@ -56,10 +56,8 @@ def _write_report(artifact_dir: Path, name: str, report) -> None:
 @pytest.mark.asyncio
 async def test_megatron_shared_yes_no_trainability_live(
     artifact_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_opt_in()
-    monkeypatch.setenv("ART_DISABLE_SERVER_MONITOR", "1")
     report = await run_yes_no_trainability_async(
         base_model=_base_model(),
         variant_name="megatron_shared",
@@ -76,10 +74,8 @@ async def test_megatron_shared_yes_no_trainability_live(
 @pytest.mark.asyncio
 async def test_megatron_dedicated_yes_no_trainability_live(
     artifact_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_opt_in()
-    monkeypatch.setenv("ART_DISABLE_SERVER_MONITOR", "1")
     report = await run_yes_no_trainability_async(
         base_model=_base_model(),
         variant_name="megatron_dedicated",
@@ -96,10 +92,8 @@ async def test_megatron_dedicated_yes_no_trainability_live(
 @pytest.mark.asyncio
 async def test_unsloth_dedicated_yes_no_trainability_live(
     artifact_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_opt_in()
-    monkeypatch.setenv("ART_DISABLE_SERVER_MONITOR", "1")
     report = await run_yes_no_trainability_async(
         base_model=_unsloth_base_model(),
         variant_name="unsloth_dedicated",
