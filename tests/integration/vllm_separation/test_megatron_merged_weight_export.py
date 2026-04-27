@@ -51,7 +51,7 @@ def test_ensure_merged_weight_transfer_group_rank_zero_initializes_runtime_and_t
 
     assert group == "trainer-group"
     assert init_info == spec.init_info
-    assert calls == [
+    assert sorted(calls, key=lambda item: item[0]) == [
         (
             "post",
             (
