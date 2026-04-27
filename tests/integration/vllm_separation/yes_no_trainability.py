@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, contextmanager, nullcontext
+import gc
 from itertools import permutations
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any, AsyncIterator, Iterator, Literal, cast
 import uuid
 
@@ -138,16 +140,60 @@ def _safe_gpu_memory_utilization(device_ids: list[int]) -> float:
     min_free_gib = float(
         os.environ.get("ART_MODEL_SUPPORT_YES_NO_MIN_FREE_GPU_GIB", "8")
     )
-    free_ratios: list[float] = []
-    for device in sorted(set(device_ids)):
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        free_gib = free_bytes / (1024**3)
-        if free_gib < min_free_gib:
-            raise RuntimeError(
-                f"GPU {device} has only {free_gib:.1f} GiB free < {min_free_gib:.1f} GiB required"
+    min_utilization = min(
+        requested,
+        float(
+            os.environ.get(
+                "ART_MODEL_SUPPORT_YES_NO_MIN_GPU_MEMORY_UTILIZATION",
+                "0.5",
             )
-        free_ratios.append(free_bytes / total_bytes)
-    return max(0.02, min(requested, min(free_ratios) * 0.95))
+        ),
+    )
+    attempts = _get_env_int("ART_MODEL_SUPPORT_YES_NO_GPU_MEMORY_RETRY_ATTEMPTS", 12)
+    sleep_s = _get_env_float("ART_MODEL_SUPPORT_YES_NO_GPU_MEMORY_RETRY_SLEEP_S", 5.0)
+    devices = sorted(set(device_ids))
+    last_message = "no GPU memory samples collected"
+
+    for attempt in range(attempts):
+        free_ratios: list[float] = []
+        low_free: list[str] = []
+        for device in devices:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            free_gib = free_bytes / (1024**3)
+            if free_gib < min_free_gib:
+                low_free.append(
+                    f"GPU {device} has only {free_gib:.1f} GiB free < {min_free_gib:.1f} GiB required"
+                )
+            free_ratios.append(free_bytes / total_bytes)
+
+        utilization = max(0.02, min(requested, min(free_ratios) * 0.95))
+        if not low_free and utilization >= min_utilization:
+            return utilization
+
+        ratio_summary = ", ".join(
+            f"GPU {device}: free_ratio={ratio:.3f}"
+            for device, ratio in zip(devices, free_ratios, strict=True)
+        )
+        last_message = "; ".join(
+            [
+                *low_free,
+                f"computed gpu_memory_utilization={utilization:.3f}",
+                ratio_summary,
+            ]
+        )
+        if attempt == attempts - 1:
+            break
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        time.sleep(sleep_s)
+
+    raise RuntimeError(
+        "Unable to recover enough free GPU memory for yes/no validation runtime startup. "
+        f"{last_message}"
+    )
 
 
 def reward_for_answer(text: str) -> float:
