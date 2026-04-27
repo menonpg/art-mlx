@@ -1,6 +1,7 @@
 from .yes_no_trainability import (
     _TrainabilityVariant,
     _build_internal_config,
+    _variant_init_args,
     _variant_packed_sequence_length,
     _variant_train_kwargs,
 )
@@ -28,6 +29,8 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
     monkeypatch.delenv(
         "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOGPROB_CHUNK_SIZE", raising=False
     )
+    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_LOCAL_LOAD_IN_4BIT", raising=False)
+    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_LOCAL_LOAD_IN_16BIT", raising=False)
     monkeypatch.setenv("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", "128")
     variant = _TrainabilityVariant(
         name="unsloth_dedicated",
@@ -42,4 +45,13 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
         "packed_sequence_length": 1024,
         "logprob_calculation_chunk_size": 1024,
     }
-    assert _build_internal_config(variant)["init_args"]["max_seq_length"] == 1024
+    assert _variant_init_args(variant) == {
+        "max_seq_length": 1024,
+        "load_in_4bit": False,
+        "load_in_16bit": True,
+    }
+    assert _build_internal_config(variant)["init_args"] == {
+        "max_seq_length": 1024,
+        "load_in_4bit": False,
+        "load_in_16bit": True,
+    }

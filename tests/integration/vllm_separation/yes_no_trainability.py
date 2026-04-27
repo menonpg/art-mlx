@@ -180,6 +180,18 @@ def _get_env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value for {name}: {raw!r}")
+
+
 def _max_tokens() -> int:
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS", 5)
 
@@ -302,8 +314,22 @@ def _variant_train_kwargs(variant: _TrainabilityVariant) -> dict[str, object]:
     return train_kwargs
 
 
+def _variant_init_args(variant: _TrainabilityVariant) -> dict[str, object]:
+    init_args: dict[str, object] = {
+        "max_seq_length": _variant_packed_sequence_length(variant)
+    }
+    if variant.backend_name == "local":
+        # Match ART's existing local yes/no convergence harness defaults for Qwen.
+        init_args["load_in_4bit"] = _get_env_bool(
+            "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOAD_IN_4BIT", False
+        )
+        init_args["load_in_16bit"] = _get_env_bool(
+            "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOAD_IN_16BIT", True
+        )
+    return init_args
+
+
 def _build_internal_config(variant: _TrainabilityVariant) -> dev.InternalModelConfig:
-    packed_sequence_length = _variant_packed_sequence_length(variant)
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = (
         variant.inference_gpu_ids if not shared else _resolve_shared_gpu_ids()
@@ -316,7 +342,7 @@ def _build_internal_config(variant: _TrainabilityVariant) -> dev.InternalModelCo
             enable_expert_parallel=shared and variant.backend_name == "megatron",
             enable_sleep_mode=True if shared else None,
         ),
-        init_args={"max_seq_length": packed_sequence_length},
+        init_args=_variant_init_args(variant),
     )
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids
