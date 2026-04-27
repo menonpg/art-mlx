@@ -318,8 +318,6 @@ class UnslothService:
                     timeout=300.0,
                 )
             )
-            # TODO: replace this with a real readiness handshake if this ever flakes.
-            await asyncio.sleep(1.0)
             self._weight_transfer_group = await asyncio.to_thread(
                 trainer_init,
                 {

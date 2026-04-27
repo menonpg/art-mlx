@@ -1,6 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
-import time
 from typing import Any, Iterator, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -185,6 +184,34 @@ def iter_merged_vllm_weights(
         yield from converted_weights_dict.items()
 
 
+def _is_sender_rank(rank: int) -> bool:
+    return rank == 0
+
+
+def _maybe_distributed_barrier(world_size: int) -> None:
+    if world_size <= 1:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    torch.distributed.barrier()
+
+
+def _drain_merged_vllm_weights(
+    weight_export: MergedWeightExport,
+    *,
+    names: list[str] | None = None,
+    dtype_names: list[str] | None = None,
+    shapes: list[list[int]] | None = None,
+) -> None:
+    for name, tensor in iter_merged_vllm_weights(weight_export):
+        if names is not None:
+            assert dtype_names is not None
+            assert shapes is not None
+            names.append(name)
+            dtype_names.append(str(tensor.dtype).removeprefix("torch."))
+            shapes.append(list(tensor.shape))
+
+
 def ensure_merged_weight_transfer_group(
     *,
     rank: int,
@@ -193,34 +220,31 @@ def ensure_merged_weight_transfer_group(
     merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None,
     spec: MergedWeightTransferSpec,
 ) -> tuple[Any, MergedWeightTransferInitInfo]:
-    assert rank == 0
-    assert world_size == 1
     if merged_weight_transfer_init_info == spec.init_info:
-        assert merged_weight_transfer_group is not None
+        if _is_sender_rank(rank):
+            assert merged_weight_transfer_group is not None
         assert merged_weight_transfer_init_info is not None
+        _maybe_distributed_barrier(world_size)
         return merged_weight_transfer_group, merged_weight_transfer_init_info
 
     import httpx
 
-    def _remote_init() -> None:
-        response = httpx.post(
-            f"{spec.vllm_base_url}/init_weight_transfer_engine",
-            json={"init_info": spec.init_info.model_dump()},
-            timeout=300.0,
-        )
-        response.raise_for_status()
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        remote_future = executor.submit(_remote_init)
-        time.sleep(1.0)
-        merged_weight_transfer_group = trainer_init(
-            {
-                "master_address": spec.init_info.master_address,
-                "master_port": spec.init_info.master_port,
-                "world_size": spec.init_info.world_size,
-            }
-        )
-        remote_future.result()
+    if _is_sender_rank(rank):
+        init_kwargs = {
+            "master_address": spec.init_info.master_address,
+            "master_port": spec.init_info.master_port,
+            "world_size": spec.init_info.world_size,
+        }
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            trainer_future = executor.submit(trainer_init, init_kwargs)
+            response = httpx.post(
+                f"{spec.vllm_base_url}/init_weight_transfer_engine",
+                json={"init_info": spec.init_info.model_dump()},
+                timeout=300.0,
+            )
+            response.raise_for_status()
+            merged_weight_transfer_group = trainer_future.result()
+    _maybe_distributed_barrier(world_size)
     return merged_weight_transfer_group, spec.init_info
 
 
@@ -236,9 +260,6 @@ def sync_merged_weights_to_vllm(
     spec: MergedWeightTransferSpec,
     pause_generation: bool,
 ) -> tuple[Any, MergedWeightTransferInitInfo]:
-    assert rank == 0
-    assert world_size == 1
-
     import httpx
 
     (
@@ -258,6 +279,7 @@ def sync_merged_weights_to_vllm(
     )
 
     def _send_weights() -> None:
+        assert merged_weight_transfer_group is not None
         trainer_send_weights(
             iter_merged_vllm_weights(weight_export),
             {
@@ -268,6 +290,24 @@ def sync_merged_weights_to_vllm(
             },
         )
 
+    torch.cuda.synchronize()
+    names: list[str] = []
+    dtype_names: list[str] = []
+    shapes: list[list[int]] = []
+    _drain_merged_vllm_weights(
+        weight_export,
+        names=names if _is_sender_rank(rank) else None,
+        dtype_names=dtype_names if _is_sender_rank(rank) else None,
+        shapes=shapes if _is_sender_rank(rank) else None,
+    )
+    _maybe_distributed_barrier(world_size)
+
+    if not _is_sender_rank(rank):
+        _maybe_distributed_barrier(world_size)
+        _drain_merged_vllm_weights(weight_export)
+        _maybe_distributed_barrier(world_size)
+        return merged_weight_transfer_group, merged_weight_transfer_init_info
+
     with httpx.Client() as client:
         if pause_generation:
             response = client.post(
@@ -276,15 +316,8 @@ def sync_merged_weights_to_vllm(
                 timeout=300.0,
             )
             response.raise_for_status()
+        _maybe_distributed_barrier(world_size)
         try:
-            torch.cuda.synchronize()
-            names: list[str] = []
-            dtype_names: list[str] = []
-            shapes: list[list[int]] = []
-            for name, tensor in iter_merged_vllm_weights(weight_export):
-                names.append(name)
-                dtype_names.append(str(tensor.dtype).removeprefix("torch."))
-                shapes.append(list(tensor.shape))
             with ThreadPoolExecutor(max_workers=1) as executor:
                 send_future = executor.submit(_send_weights)
                 response = client.post(
@@ -292,16 +325,16 @@ def sync_merged_weights_to_vllm(
                     json={
                         "update_info": {
                             "names": names,
-                        "dtype_names": dtype_names,
-                        "shapes": shapes,
-                        "is_checkpoint_format": True,
-                        "packed": True,
-                        "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-                        "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
-                    }
-                },
-                timeout=600.0,
-            )
+                            "dtype_names": dtype_names,
+                            "shapes": shapes,
+                            "is_checkpoint_format": True,
+                            "packed": True,
+                            "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                            "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+                        }
+                    },
+                    timeout=600.0,
+                )
                 response.raise_for_status()
                 send_future.result()
             response = client.post(
@@ -312,6 +345,7 @@ def sync_merged_weights_to_vllm(
             response.raise_for_status()
             torch.cuda.synchronize()
         finally:
+            _maybe_distributed_barrier(world_size)
             if pause_generation:
                 response = client.post(
                     f"{spec.vllm_base_url}/resume",
