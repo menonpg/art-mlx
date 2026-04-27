@@ -13,7 +13,15 @@ from pydantic import BaseModel
 
 TEST_ROOT = Path(__file__).resolve().parent
 ARTIFACTS_ROOT = TEST_ROOT / "artifacts"
-REPO_ROOT = TEST_ROOT.parents[3]
+REPO_ROOT = Path(
+    subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=TEST_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+)
 
 
 class ArtifactMetadata(BaseModel):
