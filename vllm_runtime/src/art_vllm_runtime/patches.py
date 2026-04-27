@@ -176,15 +176,37 @@ def _restore_nccl_unique_id_payload(
     return unique_id
 
 
+def _normalize_nccl_comm_init_rank_unique_id(library: Any, unique_id: object) -> object:
+    if isinstance(unique_id, (bytes, bytearray)):
+        return library.unique_id_from_bytes(bytes(unique_id))
+    return unique_id
+
+
 def patch_nccl_unique_id_bootstrap() -> None:
+    from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
     from vllm.distributed.utils import StatelessProcessGroup
 
-    original = StatelessProcessGroup.broadcast_obj
-    if getattr(original, "__art_patched__", False):
+    original_broadcast = StatelessProcessGroup.broadcast_obj
+    if not getattr(original_broadcast, "__art_patched__", False):
+
+        def patched_broadcast(self: Any, obj: Any | None, src: int) -> Any:
+            return _restore_nccl_unique_id_payload(original_broadcast(self, obj, src), obj)
+
+        patched_broadcast.__art_patched__ = True  # type: ignore[attr-defined]
+        StatelessProcessGroup.broadcast_obj = patched_broadcast  # type: ignore[method-assign]
+
+    original_comm_init_rank = NCCLLibrary.ncclCommInitRank
+    if getattr(original_comm_init_rank, "__art_patched__", False):
         return
 
-    def patched(self: Any, obj: Any | None, src: int) -> Any:
-        return _restore_nccl_unique_id_payload(original(self, obj, src), obj)
+    def patched_comm_init_rank(
+        self: Any,
+        world_size: int,
+        unique_id: object,
+        rank: int,
+    ) -> Any:
+        unique_id = _normalize_nccl_comm_init_rank_unique_id(self, unique_id)
+        return original_comm_init_rank(self, world_size, unique_id, rank)
 
-    patched.__art_patched__ = True  # type: ignore[attr-defined]
-    StatelessProcessGroup.broadcast_obj = patched  # type: ignore[method-assign]
+    patched_comm_init_rank.__art_patched__ = True  # type: ignore[attr-defined]
+    NCCLLibrary.ncclCommInitRank = patched_comm_init_rank  # type: ignore[method-assign]

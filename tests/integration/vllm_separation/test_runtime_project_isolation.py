@@ -75,3 +75,33 @@ def test_runtime_project_restores_nccl_unique_id_from_raw_bytes(
     (artifact_dir / "restore_stderr.txt").write_text(result.stderr)
     payload = json.loads(result.stdout.strip())
     assert payload == {"type": "ncclUniqueId", "matches": True}
+
+
+def test_runtime_project_nccl_wrapper_accepts_raw_bytes(artifact_dir: Path) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json; "
+                "from art_vllm_runtime.patches import _normalize_nccl_comm_init_rank_unique_id; "
+                "class FakeLibrary: "
+                "    def unique_id_from_bytes(self, data): "
+                "        return {'restored': len(data)}; "
+                "restored = _normalize_nccl_comm_init_rank_unique_id(FakeLibrary(), bytes(range(128))); "
+                "print(json.dumps(restored))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "nccl_wrapper_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "nccl_wrapper_stderr.txt").write_text(result.stderr)
+    payload = json.loads(result.stdout.strip())
+    assert payload == {"restored": 128}
