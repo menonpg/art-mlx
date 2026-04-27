@@ -31,10 +31,6 @@ def get_model_config(
         max_seq_length=32768,
         model_name=base_model,
     )
-    # fast_inference triggers in-process vLLM via Unsloth; dedicated mode runs vLLM as a subprocess
-    if not dedicated:
-        init_args["fast_inference"] = False
-
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,

@@ -29,21 +29,6 @@ if os.getenv("SUPPRESS_LITELLM_SERIALIZATION_WARNINGS", "1") == "1":
 
     suppress_litellm_serialization_warnings()
 
-# Create a dummy GuidedDecodingParams class and inject it into vllm.sampling_params for trl compatibility
-try:
-    import vllm.sampling_params
-
-    class GuidedDecodingParams:
-        """Shim for vLLM 0.13+ where GuidedDecodingParams was removed."""
-
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-
-    vllm.sampling_params.GuidedDecodingParams = GuidedDecodingParams  # type: ignore
-except ImportError:
-    pass  # vllm not installed
-
 # torch.cuda.MemPool doesn't currently support expandable_segments which is used in sleep mode
 conf = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "").split(",")
 if "expandable_segments:True" in conf:

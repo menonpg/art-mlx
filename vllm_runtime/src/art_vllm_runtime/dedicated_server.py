@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from http import HTTPStatus
 import json
 import os
 
@@ -33,13 +34,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _patch_art_dedicated_routes() -> None:
-    from fastapi import APIRouter, FastAPI, Request
+def _patch_art_runtime_routes() -> None:
+    from fastapi import APIRouter, FastAPI, Query, Request
     from fastapi.responses import JSONResponse
+    from vllm.engine.protocol import PauseMode
     from vllm.entrypoints.openai import api_server
     from vllm.tasks import SupportedTask
 
-    if getattr(api_server, "_art_dedicated_routes_patched", False):
+    if getattr(api_server, "_art_runtime_routes_patched", False):
         return
 
     original_build_app = api_server.build_app
@@ -50,6 +52,37 @@ def _patch_art_dedicated_routes() -> None:
     ) -> FastAPI:
         app = original_build_app(args, supported_tasks)
         router = APIRouter()
+
+        def engine(request: Request):
+            return request.app.state.engine_client
+
+        @router.post("/sleep")
+        async def sleep(
+            raw_request: Request,
+            level: int = Query(default=1, ge=0, le=2),
+            mode: PauseMode = Query(default="abort"),
+        ) -> JSONResponse:
+            try:
+                await engine(raw_request).sleep(level=level, mode=mode)
+            except ValueError as err:
+                return JSONResponse(
+                    content={"error": str(err)},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            return JSONResponse(
+                content={"status": "sleeping", "level": level, "mode": mode}
+            )
+
+        @router.post("/wake_up")
+        async def wake_up(raw_request: Request) -> JSONResponse:
+            await engine(raw_request).wake_up()
+            return JSONResponse(content={"status": "awake"})
+
+        @router.get("/is_sleeping")
+        async def is_sleeping(raw_request: Request) -> JSONResponse:
+            return JSONResponse(
+                content={"is_sleeping": await engine(raw_request).is_sleeping()}
+            )
 
         @router.post("/art/set_served_model_name")
         async def set_served_model_name(raw_request: Request) -> JSONResponse:
@@ -65,7 +98,7 @@ def _patch_art_dedicated_routes() -> None:
         return app
 
     setattr(api_server, "build_app", art_build_app)
-    setattr(api_server, "_art_dedicated_routes_patched", True)
+    setattr(api_server, "_art_runtime_routes_patched", True)
 
 
 def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
@@ -114,8 +147,7 @@ def main(argv: list[str] | None = None) -> None:
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
 
-    if args.rollout_weights_mode == "merged":
-        _patch_art_dedicated_routes()
+    _patch_art_runtime_routes()
 
     vllm_args = [
         f"--model={args.model}",

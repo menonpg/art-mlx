@@ -15,6 +15,12 @@ from art.megatron.param_name_canonicalization import (
     canonical_art_param_name,
     is_art_adapter_param_name,
 )
+from art.weight_transfer import (
+    DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+    DEFAULT_PACKED_NUM_BUFFERS,
+    trainer_init,
+    trainer_send_weights,
+)
 
 
 class MergedWeightExport(BaseModel):
@@ -195,7 +201,6 @@ def ensure_merged_weight_transfer_group(
         return merged_weight_transfer_group, merged_weight_transfer_init_info
 
     import httpx
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
     def _remote_init() -> None:
         response = httpx.post(
@@ -208,7 +213,7 @@ def ensure_merged_weight_transfer_group(
     with ThreadPoolExecutor(max_workers=1) as executor:
         remote_future = executor.submit(_remote_init)
         time.sleep(1.0)
-        merged_weight_transfer_group = NCCLWeightTransferEngine.trainer_init(
+        merged_weight_transfer_group = trainer_init(
             {
                 "master_address": spec.init_info.master_address,
                 "master_port": spec.init_info.master_port,
@@ -235,7 +240,6 @@ def sync_merged_weights_to_vllm(
     assert world_size == 1
 
     import httpx
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
     (
         merged_weight_transfer_group,
@@ -254,9 +258,14 @@ def sync_merged_weights_to_vllm(
     )
 
     def _send_weights() -> None:
-        NCCLWeightTransferEngine.trainer_send_weights(
+        trainer_send_weights(
             iter_merged_vllm_weights(weight_export),
-            {"group": merged_weight_transfer_group},
+            {
+                "group": merged_weight_transfer_group,
+                "packed": True,
+                "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+            },
         )
 
     with httpx.Client() as client:
@@ -283,13 +292,16 @@ def sync_merged_weights_to_vllm(
                     json={
                         "update_info": {
                             "names": names,
-                            "dtype_names": dtype_names,
-                            "shapes": shapes,
-                            "is_checkpoint_format": True,
-                        }
-                    },
-                    timeout=600.0,
-                )
+                        "dtype_names": dtype_names,
+                        "shapes": shapes,
+                        "is_checkpoint_format": True,
+                        "packed": True,
+                        "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                        "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+                    }
+                },
+                timeout=600.0,
+            )
                 response.raise_for_status()
                 send_future.result()
             response = client.post(

@@ -42,6 +42,12 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
             "(set both trainer_gpu_ids and inference_gpu_ids)"
         )
 
+    if config.get("init_args", {}).get("fast_inference"):
+        raise ValueError(
+            "fast_inference is no longer supported; ART always uses an external "
+            "vLLM runtime"
+        )
+
     if not has_trainer:
         return
 
@@ -73,17 +79,10 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
             "trainer_gpu_ids must be contiguous starting from 0 (e.g., [0], [0,1])"
         )
 
-    # Reject settings that are incompatible with dedicated mode
-    if config.get("init_args", {}).get("fast_inference"):
-        raise ValueError(
-            "fast_inference is incompatible with dedicated mode "
-            "(dedicated mode runs vLLM as a subprocess, not in-process)"
-        )
-
     if config.get("engine_args", {}).get("enable_sleep_mode"):
         raise ValueError(
             "enable_sleep_mode is incompatible with dedicated mode "
-            "(dedicated mode runs vLLM on a separate GPU, sleep/wake is not needed)"
+            "(shared-GPU mode uses runtime sleep/wake; dedicated mode does not)"
         )
 
     if _is_qwen3_5_moe_model(config) and rollout_weights_mode == "lora":

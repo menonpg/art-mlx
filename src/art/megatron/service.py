@@ -1,8 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
-from functools import cached_property
 import importlib
-import json
 import os
 from pathlib import Path
 import shlex
@@ -14,9 +12,6 @@ from typing import Any, AsyncIterator, Literal, cast
 
 from peft.tuners.lora.config import LoraConfig
 import torch
-from vllm import AsyncEngineArgs
-from vllm.lora.request import LoRARequest
-from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
 from ..dev.get_model_config import default_target_modules
@@ -24,15 +19,15 @@ from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
-from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
+from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, openai_server_task, run_on_workers
-from ..vllm.runtime_project import (
-    build_dedicated_vllm_server_cmd,
+from ..vllm_runtime import (
+    VllmRuntimeLaunchConfig,
+    build_vllm_runtime_server_cmd,
     get_vllm_runtime_project_root,
-    wait_for_dedicated_vllm_server,
+    wait_for_vllm_runtime,
 )
 from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
 from .jobs import (
@@ -142,7 +137,6 @@ class MegatronService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
-    _lora_id_counter: int = 1
     _megatron_process: asyncio.subprocess.Process | None = None
     _vllm_process: subprocess.Popen[Any] | None = None
     _vllm_log_file: Any = None
@@ -224,9 +218,47 @@ class MegatronService:
             signal.signal(signum, previous)
         self._previous_signal_handlers.clear()
 
-    def _next_lora_id(self) -> int:
-        self._lora_id_counter += 1
-        return self._lora_id_counter
+    def _runtime_cuda_visible_devices(self) -> str:
+        if self.is_dedicated:
+            return ",".join(str(gpu_id) for gpu_id in self.config["inference_gpu_ids"])
+        if visible := os.environ.get("CUDA_VISIBLE_DEVICES"):
+            return visible
+        return ",".join(str(index) for index in range(torch.cuda.device_count()))
+
+    def _runtime_engine_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        engine_args = dict(self.config.get("engine_args", {}))
+        if config and "engine_args" in config:
+            engine_args.update(dict(config["engine_args"]))
+        engine_args.setdefault("generation_config", "vllm")
+        if self.rollout_weights_mode == "merged":
+            engine_args["weight_transfer_config"] = {"backend": "nccl"}
+            engine_args.pop("enable_lora", None)
+            engine_args.pop("max_loras", None)
+        else:
+            engine_args["enable_lora"] = True
+            engine_args.setdefault("max_loras", 2)
+        for key in ("model", "served_model_name"):
+            engine_args.pop(key, None)
+        return engine_args
+
+    def _runtime_server_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        server_args: dict[str, object] = {
+            "return_tokens_as_token_ids": True,
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+        }
+        if config and "server_args" in config:
+            server_args.update(dict(config["server_args"]))
+        for key in ("port", "host", "lora_modules", "api_key"):
+            server_args.pop(key, None)
+        return server_args
+
+    def _sleep_mode_enabled(self) -> bool:
+        return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
 
     def _get_optimizer_state_path(self, job_type: Literal["rl", "sft"]) -> str:
         optimizer_state_path = os.path.join(
@@ -345,49 +377,24 @@ class MegatronService:
 
         import httpx
 
-        inference_gpu_ids = self.config["inference_gpu_ids"]
-        cuda_devices = ",".join(str(gpu_id) for gpu_id in inference_gpu_ids)
-
-        server_args: dict[str, object] = {
-            "return_tokens_as_token_ids": True,
-            "enable_auto_tool_choice": True,
-            "tool_call_parser": "hermes",
-        }
-        if config and "server_args" in config:
-            server_args.update(dict(config["server_args"]))
-        for key in ("port", "host", "lora_modules", "api_key"):
-            server_args.pop(key, None)
-
-        engine_args = dict(self.config.get("engine_args", {}))
-        if config and "engine_args" in config:
-            engine_args.update(dict(config["engine_args"]))
-        engine_args.setdefault("generation_config", "vllm")
-        if self.rollout_weights_mode == "merged":
-            engine_args["weight_transfer_config"] = {"backend": "nccl"}
-            engine_args.pop("enable_lora", None)
-            engine_args.pop("max_loras", None)
-        else:
-            engine_args["enable_lora"] = True
-            engine_args.setdefault("max_loras", 2)
-        for key in ("model", "served_model_name", "enable_sleep_mode"):
-            engine_args.pop(key, None)
-
-        cmd = build_dedicated_vllm_server_cmd(
-            base_model=self.base_model,
-            port=port,
-            host=self._vllm_host,
-            cuda_visible_devices=cuda_devices,
-            lora_path=lora_path,
-            served_model_name=f"{self.model_name}@{self._latest_step}",
-            rollout_weights_mode=self.rollout_weights_mode,
-            engine_args=engine_args,
-            server_args=server_args,
+        cmd = build_vllm_runtime_server_cmd(
+            VllmRuntimeLaunchConfig(
+                base_model=self.base_model,
+                port=port,
+                host=self._vllm_host,
+                cuda_visible_devices=self._runtime_cuda_visible_devices(),
+                lora_path=lora_path,
+                served_model_name=f"{self.model_name}@{self._latest_step}",
+                rollout_weights_mode=self.rollout_weights_mode,
+                engine_args=self._runtime_engine_args(config),
+                server_args=self._runtime_server_args(config),
+            )
         )
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
         self._vllm_log_file = open(
-            os.path.join(log_dir, "vllm-dedicated.log"),
+            os.path.join(log_dir, "vllm-runtime.log"),
             "w",
             buffering=1,
         )
@@ -406,7 +413,7 @@ class MegatronService:
         timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
         async with httpx.AsyncClient() as client:
             try:
-                await wait_for_dedicated_vllm_server(
+                await wait_for_vllm_runtime(
                     process=self._vllm_process,
                     host=self._vllm_host,
                     port=self._vllm_port,
@@ -416,13 +423,13 @@ class MegatronService:
                 self._stop_vllm_subprocess()
                 raise TimeoutError(
                     f"vLLM subprocess did not become ready within {timeout}s. "
-                    f"Check logs at {log_dir}/vllm-dedicated.log"
+                    f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
             except RuntimeError as exc:
                 raise RuntimeError(
                     "vLLM subprocess exited with code "
                     f"{self._vllm_process.returncode}. "
-                    f"Check logs at {log_dir}/vllm-dedicated.log"
+                    f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
 
             try:
@@ -435,7 +442,7 @@ class MegatronService:
                 self._stop_vllm_subprocess()
                 raise RuntimeError(
                     "vLLM passed /health but /v1/models was not reachable. "
-                    f"Check logs at {log_dir}/vllm-dedicated.log"
+                    f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
 
         atexit.register(self.close)
@@ -477,31 +484,35 @@ class MegatronService:
             pass
         self._latest_step = step
 
-    async def _add_lora_aliases(
-        self, llm: AsyncLLM, step: int, checkpoint_dir: str
-    ) -> None:
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
+    async def _sleep_runtime(self) -> None:
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/sleep",
+                params={"level": 1, "mode": "wait"},
+                timeout=300.0,
             )
-        )
-        if not added:
-            raise RuntimeError(f"Failed to add LoRA adapter for step {step}")
-        self._latest_step = step
+            response.raise_for_status()
+        self._is_sleeping = True
+
+    async def _wake_runtime(self) -> None:
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/wake_up",
+                timeout=300.0,
+            )
+            response.raise_for_status()
+        self._is_sleeping = False
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
-        if self.is_dedicated:
-            if self.rollout_weights_mode == "merged":
-                await self._set_served_model_name(step)
-            else:
-                await self._reload_adapter(checkpoint_dir, step)
-            return
-        llm = await self.llm
-        await llm.pause_generation()
-        await self._add_lora_aliases(llm, step, checkpoint_dir)
-        await llm.resume_generation()
+        if self.rollout_weights_mode == "merged":
+            await self._set_served_model_name(step)
+        else:
+            await self._reload_adapter(checkpoint_dir, step)
+        self._latest_step = step
 
     async def _ensure_megatron_running(self) -> None:
         """Lazily start Megatron training process if not running."""
@@ -578,23 +589,18 @@ class MegatronService:
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
 
-    async def _prepare_for_training(self) -> tuple[AsyncLLM, str]:
-        llm = await self.llm
-        await llm.pause_generation()
-        await llm.reset_prefix_cache()
-        await run_on_workers(llm, do_sleep, level=2)
-        self._is_sleeping = True
+    async def _prepare_for_training(self) -> str:
+        await self._sleep_runtime()
         gc_and_empty_cuda_cache()
 
         await self._ensure_megatron_running()
         lora_path = self._resolve_training_lora_path()
         self._clear_pending_jobs()
-        return llm, lora_path
+        return lora_path
 
     async def _publish_training_checkpoint(
         self,
         *,
-        llm: AsyncLLM,
         lora_path: str,
     ) -> None:
         next_step = self._latest_step + 1
@@ -610,49 +616,34 @@ class MegatronService:
         try:
             with open(wake_lock_path, "w") as lock_file:
                 lock_file.write("waking vllm\n")
-            await run_on_workers(llm, do_wake_up)
-            self._is_sleeping = False
+            await self._wake_runtime()
         finally:
             if os.path.exists(wake_lock_path):
                 os.remove(wake_lock_path)
 
-        await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
-        await llm.resume_generation()
+        await self._reload_adapter(new_checkpoint_dir, next_step)
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
         lora_path = self._resolve_active_lora_path()
 
-        if self.is_dedicated:
-            port = (config or {}).get("server_args", {}).get("port", 8000)
-            location = await self._start_vllm_subprocess(lora_path, port, config)
-            if self.rollout_weights_mode == "merged":
-                await self._sync_dedicated_merged_weights(
-                    lora_path=lora_path,
-                    step=self._latest_step,
-                )
-            return location
+        if not self.is_dedicated and not self._sleep_mode_enabled():
+            raise ValueError(
+                "Shared-GPU mode requires engine_args.enable_sleep_mode=True "
+                "for the external vLLM runtime"
+            )
 
-        lora_path_for_server = (
-            lora_path if self._adapter_has_weights(lora_path) else None
-        )
-        server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path_for_server,
-            config=config,
-        )
-        await openai_server_task(engine=await self.llm, config=server_config)
-        return (
-            server_config.get("server_args", {}).get("host") or "0.0.0.0",
-            server_config.get("server_args", {}).get("port", 8000),
-        )
+        port = (config or {}).get("server_args", {}).get("port", 8000)
+        location = await self._start_vllm_subprocess(lora_path, port, config)
+        if self.rollout_weights_mode == "merged":
+            await self._sync_dedicated_merged_weights(
+                lora_path=lora_path,
+                step=self._latest_step,
+            )
+        return location
 
     async def vllm_engine_is_sleeping(self) -> bool:
-        if self.is_dedicated:
-            return False
         return self._is_sleeping
 
     async def train(
@@ -724,7 +715,7 @@ class MegatronService:
                 await self._reload_adapter(new_checkpoint_dir, next_step)
             return
 
-        llm, lora_path = await self._prepare_for_training()
+        lora_path = await self._prepare_for_training()
         job_path, log_path = self._create_megatron_job_paths()
         job = MegatronTrainingJob(
             lora_path=lora_path,
@@ -741,7 +732,7 @@ class MegatronService:
         async for result in stream_megatron_job(job, job_path=job_path):
             yield {key: float(value) for key, value in result.items()}
 
-        await self._publish_training_checkpoint(llm=llm, lora_path=lora_path)
+        await self._publish_training_checkpoint(lora_path=lora_path)
 
     async def train_sft(
         self,
@@ -753,7 +744,7 @@ class MegatronService:
             raise NotImplementedError(
                 "train_sft is not yet supported in dedicated mode"
             )
-        llm, lora_path = await self._prepare_for_training()
+        lora_path = await self._prepare_for_training()
         serialized_batches = materialize_sft_batches(batches)
         job_path, log_path = self._create_megatron_job_paths()
         grad_accumulation_sequences = (
@@ -777,7 +768,7 @@ class MegatronService:
                 "loss/grad_norm": float(result["grad_norm"]),
             }
 
-        await self._publish_training_checkpoint(llm=llm, lora_path=lora_path)
+        await self._publish_training_checkpoint(lora_path=lora_path)
 
     async def aclose(self) -> None:
         self.close()
@@ -826,14 +817,3 @@ class MegatronService:
         self._stop_vllm_subprocess()
         self._stop_megatron_process()
         self._restore_parent_signal_cleanup()
-
-    @cached_property
-    def llm(self) -> asyncio.Task[AsyncLLM]:
-        engine_args = {
-            **self.config.get("engine_args", {}),
-            "enable_lora": True,
-            "max_loras": self.config.get("engine_args", {}).get("max_loras", 2),
-        }
-        for key in ["enable_log_requests", "disable_log_requests"]:
-            engine_args.pop(key, None)
-        return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))  # type: ignore
