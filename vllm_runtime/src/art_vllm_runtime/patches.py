@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 def apply_vllm_runtime_patches() -> None:
     patch_transformers_v5_compat()
+    patch_fused_moe_ep_lora_support()
     subclass_chat_completion_request()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
@@ -93,6 +94,99 @@ def _patch_qwen3_5_lora() -> None:
         ]
 
     MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a  # ty:ignore[invalid-assignment]
+
+
+def _ep_local_expert_global_indices(expert_map: "Tensor") -> "Tensor":
+    import torch
+
+    local_mask = expert_map >= 0
+    global_indices = torch.nonzero(local_mask, as_tuple=False).flatten()
+    local_indices = expert_map.index_select(0, global_indices).to(torch.int64)
+    return global_indices.index_select(0, torch.argsort(local_indices))
+
+
+def _slice_ep_local_experts(
+    lora_tensor: "Tensor | None",
+    expert_map: "Tensor",
+    local_num_experts: int,
+) -> "Tensor | None":
+    if lora_tensor is None or lora_tensor.shape[0] == local_num_experts:
+        return lora_tensor
+    global_indices = _ep_local_expert_global_indices(expert_map)
+    assert global_indices.numel() == local_num_experts, (
+        f"Expected {local_num_experts} EP-local experts, found "
+        f"{global_indices.numel()} in expert_map"
+    )
+    return lora_tensor.index_select(0, global_indices.to(lora_tensor.device))
+
+
+def patch_fused_moe_ep_lora_support() -> None:
+    from vllm.lora.layers import base
+    from vllm.lora.layers import fused_moe
+
+    original_init = fused_moe.FusedMoEWithLoRA.__init__
+    if not getattr(original_init, "__art_patched__", False):
+
+        def patched_init(self: Any, base_layer: Any) -> None:
+            base.BaseLayerWithLoRA.__init__(self)
+            self.base_layer = base_layer
+            self.tp_size = fused_moe.get_tensor_model_parallel_world_size()
+            self.tp_rank = fused_moe.get_tensor_model_parallel_rank()
+            self.device = fused_moe._get_lora_device(base_layer)
+            self._w13_slices = 2 if base_layer.moe_config.is_act_and_mul else 1
+            self._inject_lora_into_fused_moe()
+
+        patched_init.__art_patched__ = True  # type: ignore[attr-defined]
+        fused_moe.FusedMoEWithLoRA.__init__ = patched_init  # type: ignore[method-assign]
+
+    def localize_loras(self: Any, loras: object) -> object:
+        if not self.base_layer.use_ep:
+            return loras
+        expert_map = getattr(self.base_layer, "_expert_map", None)
+        assert expert_map is not None, "Expected _expert_map when EP LoRA is enabled"
+        assert isinstance(loras, list)
+        return [
+            _slice_ep_local_experts(lora, expert_map, self.base_layer.local_num_experts)
+            for lora in loras
+        ]
+
+    original_set_lora = fused_moe.FusedMoEWithLoRA.set_lora
+    if not getattr(original_set_lora, "__art_patched__", False):
+
+        def patched_set_lora(
+            self: Any,
+            index: int,
+            lora_a: object,
+            lora_b: object,
+        ) -> None:
+            return original_set_lora(
+                self,
+                index,
+                localize_loras(self, lora_a),
+                localize_loras(self, lora_b),
+            )
+
+        patched_set_lora.__art_patched__ = True  # type: ignore[attr-defined]
+        fused_moe.FusedMoEWithLoRA.set_lora = patched_set_lora  # type: ignore[method-assign]
+
+    original_3d_set_lora = fused_moe.FusedMoE3DWithLoRA.set_lora
+    if not getattr(original_3d_set_lora, "__art_patched__", False):
+
+        def patched_3d_set_lora(
+            self: Any,
+            index: int,
+            lora_a: object,
+            lora_b: object,
+        ) -> None:
+            return original_3d_set_lora(
+                self,
+                index,
+                localize_loras(self, lora_a),
+                localize_loras(self, lora_b),
+            )
+
+        patched_3d_set_lora.__art_patched__ = True  # type: ignore[attr-defined]
+        fused_moe.FusedMoE3DWithLoRA.set_lora = patched_3d_set_lora  # type: ignore[method-assign]
 
 
 def subclass_chat_completion_request() -> None:

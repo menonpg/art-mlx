@@ -110,3 +110,36 @@ def test_runtime_project_nccl_wrapper_accepts_raw_bytes(artifact_dir: Path) -> N
     (artifact_dir / "nccl_wrapper_stderr.txt").write_text(result.stderr)
     payload = json.loads(result.stdout.strip())
     assert payload == {"restored": 128}
+
+
+def test_runtime_project_localizes_ep_moe_lora_experts(artifact_dir: Path) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json, torch; "
+                "from art_vllm_runtime.patches import _ep_local_expert_global_indices, _slice_ep_local_experts; "
+                "expert_map = torch.tensor([1, -1, 0, -1], dtype=torch.int32); "
+                "weights = torch.arange(12, dtype=torch.float32).reshape(4, 3); "
+                "indices = _ep_local_expert_global_indices(expert_map).tolist(); "
+                "local = _slice_ep_local_experts(weights, expert_map, 2).tolist(); "
+                "print(json.dumps({'indices': indices, 'local': local}))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "ep_localize_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "ep_localize_stderr.txt").write_text(result.stderr)
+    payload = json.loads(result.stdout.strip())
+    assert payload == {
+        "indices": [2, 0],
+        "local": [[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]],
+    }
