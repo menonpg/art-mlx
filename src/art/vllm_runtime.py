@@ -29,7 +29,7 @@ def get_vllm_runtime_project_root() -> Path:
     override = os.environ.get("ART_VLLM_RUNTIME_PROJECT_ROOT")
     if override:
         return Path(override).resolve()
-    return Path(__file__).resolve().parents[3] / "vllm_runtime"
+    return Path(__file__).resolve().parents[2] / "vllm_runtime"
 
 
 def _runtime_command_prefix() -> list[str]:
