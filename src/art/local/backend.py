@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import logging
 import math
@@ -197,6 +198,11 @@ class LocalBackend(Backend):
             else:
                 await aclose()
             close_proxy(service)
+        self._services.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def _close(self) -> None:
         for service in self._services.values():
@@ -204,6 +210,11 @@ class LocalBackend(Backend):
             if close is not None:
                 close()
             close_proxy(service)
+        self._services.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     async def register(
         self,
