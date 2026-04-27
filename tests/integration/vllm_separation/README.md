@@ -10,6 +10,12 @@ Rules:
 - Any code involved in a test run must be committed before the test starts.
 - Every artifact set must include the exact commit hash it ran from.
 
+Live smokes:
+
+- `test_live_runtime_server_smoke.py` validates the external runtime directly.
+- `test_live_local_backend_smoke.py` validates the ART `LocalBackend` path.
+- Both are opt-in and are expected to write artifacts for every attempted run.
+
 Use the `artifact_dir` fixture from [conftest.py](./conftest.py) for artifact output.
 
 That fixture:
