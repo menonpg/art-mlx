@@ -275,11 +275,35 @@ def _build_variant(variant_name: _VARIANT_NAME) -> _TrainabilityVariant:
     )
 
 
-def _build_internal_config(variant: _TrainabilityVariant) -> dev.InternalModelConfig:
-    packed_sequence_length = _get_env_int(
-        "ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH",
-        128,
+def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
+    default = _get_env_int("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", 128)
+    if variant.backend_name != "local":
+        return default
+    chunk_size = _get_env_int(
+        "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOGPROB_CHUNK_SIZE",
+        _get_env_int("ART_MODEL_SUPPORT_YES_NO_LOGPROB_CALCULATION_CHUNK_SIZE", 1024),
     )
+    requested = _get_env_int(
+        "ART_MODEL_SUPPORT_YES_NO_LOCAL_PACKED_SEQUENCE_LENGTH",
+        default,
+    )
+    return max(requested, chunk_size)
+
+
+def _variant_train_kwargs(variant: _TrainabilityVariant) -> dict[str, object]:
+    train_kwargs: dict[str, object] = {
+        "packed_sequence_length": _variant_packed_sequence_length(variant),
+    }
+    if variant.backend_name == "local":
+        train_kwargs["logprob_calculation_chunk_size"] = _get_env_int(
+            "ART_MODEL_SUPPORT_YES_NO_LOCAL_LOGPROB_CHUNK_SIZE",
+            _get_env_int("ART_MODEL_SUPPORT_YES_NO_LOGPROB_CALCULATION_CHUNK_SIZE", 1024),
+        )
+    return train_kwargs
+
+
+def _build_internal_config(variant: _TrainabilityVariant) -> dev.InternalModelConfig:
+    packed_sequence_length = _variant_packed_sequence_length(variant)
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = (
         variant.inference_gpu_ids if not shared else _resolve_shared_gpu_ids()
@@ -517,10 +541,7 @@ async def run_yes_no_trainability_async(
         _internal_config=_build_internal_config(variant),
         report_metrics=[],
     )
-    packed_sequence_length = _get_env_int(
-        "ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH",
-        128,
-    )
+    train_kwargs = _variant_train_kwargs(variant)
 
     async with _backend_context(variant, backend_root=backend_root) as backend:
         await model.register(backend)
@@ -573,7 +594,7 @@ async def run_yes_no_trainability_async(
                 ),
                 loss_fn="cispo",
                 allow_training_without_logprobs=True,
-                packed_sequence_length=packed_sequence_length,
+                **train_kwargs,
             )
             await model.log(
                 train_groups,
