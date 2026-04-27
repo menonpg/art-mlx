@@ -140,6 +140,8 @@ def patch_punica_ep_moe_lora_alignment() -> None:
         pad_sorted_ids: bool = False,
         naive_block_assignment: bool = False,
     ) -> tuple[Any, Any, Any, Any]:
+        import torch
+
         (token_lora_mapping, _, _, _, lora_ids, _, _) = (
             self.token_mapping_meta.meta_args(
                 num_tokens, self.lora_config.specialize_active_lora
@@ -147,7 +149,6 @@ def patch_punica_ep_moe_lora_alignment() -> None:
         )
         if expert_map is not None:
             expert_map = expert_map.to(topk_ids.device)
-            num_experts = int(expert_map.shape[0])
             naive_block_assignment = False
 
         if naive_block_assignment:
@@ -166,7 +167,12 @@ def patch_punica_ep_moe_lora_alignment() -> None:
             max_num_m_blocks = punica_gpu.triton.cdiv(
                 max_num_tokens_padded, block_size
             )
-            expert_ids = topk_ids.new_empty((max_loras * max_num_m_blocks,))
+            expert_ids = torch.full(
+                (max_loras * max_num_m_blocks,),
+                -1,
+                dtype=torch.int32,
+                device=topk_ids.device,
+            )
             num_tokens_post_pad = topk_ids.new_empty((max_loras,))
 
             punica_gpu.ops.moe_lora_align_block_size(
@@ -182,9 +188,8 @@ def patch_punica_ep_moe_lora_alignment() -> None:
                 num_tokens_post_pad,
                 adapter_enabled,
                 lora_ids,
+                expert_map,
             )
-            if expert_map is not None:
-                expert_ids = expert_map[expert_ids]
 
         return None, sorted_ids, expert_ids, num_tokens_post_pad
 
