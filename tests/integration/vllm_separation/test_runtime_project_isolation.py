@@ -89,9 +89,7 @@ def test_runtime_project_nccl_wrapper_accepts_raw_bytes(artifact_dir: Path) -> N
             (
                 "import json; "
                 "from art_vllm_runtime.patches import _normalize_nccl_comm_init_rank_unique_id; "
-                "class FakeLibrary: "
-                "    def unique_id_from_bytes(self, data): "
-                "        return {'restored': len(data)}; "
+                "FakeLibrary = type('FakeLibrary', (), {'unique_id_from_bytes': lambda self, data: {'restored': len(data)}}); "
                 "restored = _normalize_nccl_comm_init_rank_unique_id(FakeLibrary(), bytes(range(128))); "
                 "print(json.dumps(restored))"
             ),
