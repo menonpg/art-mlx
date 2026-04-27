@@ -252,6 +252,7 @@ class TrainerNcclCommunicator:
             rank=rank,
             world_size=world_size,
         )
+        self._bootstrap_group = bootstrap_group
         self.rank = rank
         self.world_size = world_size
         self.device = (
