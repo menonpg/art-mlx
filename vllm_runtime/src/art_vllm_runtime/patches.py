@@ -1,5 +1,6 @@
 """Monkey patches and bootstrap contract for the ART-owned vLLM runtime."""
 
+import ctypes
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -11,6 +12,7 @@ def apply_vllm_runtime_patches() -> None:
     subclass_chat_completion_request()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
+    patch_nccl_unique_id_bootstrap()
 
 
 def patch_transformers_v5_compat() -> None:
@@ -155,3 +157,34 @@ def patch_tool_parser_manager() -> None:
 
     patched_get_tool_parser.__art_patched__ = True  # type: ignore[attr-defined]
     ToolParserManager.get_tool_parser = patched_get_tool_parser  # ty:ignore[invalid-assignment]
+
+
+def _restore_nccl_unique_id_payload(
+    payload: object,
+    template: object | None,
+) -> object:
+    from vllm.distributed.device_communicators.pynccl_wrapper import ncclUniqueId
+
+    if not isinstance(payload, (bytes, bytearray)) or not isinstance(
+        template, ncclUniqueId
+    ):
+        return payload
+    raw = bytes(payload)
+    assert len(raw) == ctypes.sizeof(ncclUniqueId)
+    unique_id = ncclUniqueId()
+    ctypes.memmove(ctypes.byref(unique_id), raw, len(raw))
+    return unique_id
+
+
+def patch_nccl_unique_id_bootstrap() -> None:
+    from vllm.distributed.utils import StatelessProcessGroup
+
+    original = StatelessProcessGroup.broadcast_obj
+    if getattr(original, "__art_patched__", False):
+        return
+
+    def patched(self: Any, obj: Any | None, src: int) -> Any:
+        return _restore_nccl_unique_id_payload(original(self, obj, src), obj)
+
+    patched.__art_patched__ = True  # type: ignore[attr-defined]
+    StatelessProcessGroup.broadcast_obj = patched  # type: ignore[method-assign]

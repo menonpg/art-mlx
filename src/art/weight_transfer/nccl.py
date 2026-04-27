@@ -179,6 +179,17 @@ class _NcclLibrary:
         )
 
 
+def _nccl_unique_id_to_bytes(unique_id: _NcclUniqueId) -> bytes:
+    return ctypes.string_at(ctypes.byref(unique_id), ctypes.sizeof(unique_id))
+
+
+def _nccl_unique_id_from_bytes(payload: bytes) -> _NcclUniqueId:
+    assert len(payload) == ctypes.sizeof(_NcclUniqueId)
+    unique_id = _NcclUniqueId()
+    ctypes.memmove(ctypes.byref(unique_id), payload, len(payload))
+    return unique_id
+
+
 class _BootstrapGroup:
     def __init__(
         self,
@@ -247,8 +258,12 @@ class TrainerNcclCommunicator:
             torch.device(f"cuda:{device}") if isinstance(device, int) else device
         )
         self._nccl = _NcclLibrary()
-        unique_id = self._nccl.get_unique_id() if rank == 0 else _NcclUniqueId()
-        unique_id = bootstrap_group.broadcast_obj(unique_id, src=0)
+        unique_id_bytes = (
+            _nccl_unique_id_to_bytes(self._nccl.get_unique_id()) if rank == 0 else None
+        )
+        unique_id = _nccl_unique_id_from_bytes(
+            bootstrap_group.broadcast_obj(unique_id_bytes, src=0)
+        )
         with torch.cuda.device(self.device):
             self._comm = self._nccl.init_rank(world_size, unique_id, rank)
             stream = torch.cuda.current_stream(self.device)

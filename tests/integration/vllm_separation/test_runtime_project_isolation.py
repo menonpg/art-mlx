@@ -41,3 +41,37 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
     ).read_text()
     for route in ("/sleep", "/wake_up", "/is_sleeping", "/art/set_served_model_name"):
         assert route in source
+
+
+def test_runtime_project_restores_nccl_unique_id_from_raw_bytes(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import ctypes, json; "
+                "from art_vllm_runtime.patches import _restore_nccl_unique_id_payload; "
+                "from vllm.distributed.device_communicators.pynccl_wrapper import ncclUniqueId; "
+                "payload = bytes(range(128)); "
+                "restored = _restore_nccl_unique_id_payload(payload, ncclUniqueId()); "
+                "print(json.dumps({"
+                "'type': type(restored).__name__, "
+                "'matches': ctypes.string_at(ctypes.byref(restored), ctypes.sizeof(restored)).hex() == payload.hex()"
+                "}))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "restore_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "restore_stderr.txt").write_text(result.stderr)
+    payload = json.loads(result.stdout.strip())
+    assert payload == {"type": "ncclUniqueId", "matches": True}
