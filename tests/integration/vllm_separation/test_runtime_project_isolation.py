@@ -143,3 +143,54 @@ def test_runtime_project_localizes_ep_moe_lora_experts(artifact_dir: Path) -> No
         "indices": [2, 0],
         "local": [[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]],
     }
+
+
+def test_runtime_project_uses_global_expert_space_for_ep_moe_lora_alignment(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json, torch; "
+                "from art_vllm_runtime.patches import patch_punica_ep_moe_lora_alignment; "
+                "from vllm.lora.punica_wrapper import punica_gpu; "
+                "patch_punica_ep_moe_lora_alignment(); "
+                "captured = {}; "
+                "def fake_meta_args(num_tokens, specialize): "
+                "    return (torch.zeros(num_tokens, dtype=torch.int32), None, None, None, torch.zeros(1, dtype=torch.int32), None, None); "
+                "class FakeMeta: "
+                "    meta_args = staticmethod(fake_meta_args); "
+                "class FakeConfig: "
+                "    specialize_active_lora = False; "
+                "class FakeWrapper: "
+                "    token_mapping_meta = FakeMeta(); "
+                "    lora_config = FakeConfig(); "
+                "def fake_align(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids): "
+                "    captured['num_experts'] = int(num_experts); "
+                "    expert_ids.fill_(-1); "
+                "    expert_ids[:2] = torch.tensor([64, 65], device=expert_ids.device, dtype=expert_ids.dtype); "
+                "    num_tokens_post_pad.zero_(); "
+                "punica_gpu.ops.moe_lora_align_block_size = fake_align; "
+                "wrapper = FakeWrapper(); "
+                "expert_map = torch.full((128,), -1, dtype=torch.int32); "
+                "expert_map[64] = 0; "
+                "expert_map[65] = 1; "
+                "_, _, expert_ids, _ = punica_gpu.PunicaWrapperGPU.moe_lora_align_block_size(wrapper, torch.tensor([[64, 65]], dtype=torch.int32), 1, 16, 2, 2, torch.tensor([1, 1], dtype=torch.int32), expert_map=expert_map); "
+                "print(json.dumps({'num_experts': captured['num_experts'], 'expert_ids': expert_ids[:2].tolist()}))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "ep_align_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "ep_align_stderr.txt").write_text(result.stderr)
+    payload = json.loads(result.stdout.strip())
+    assert payload == {"num_experts": 128, "expert_ids": [0, 1]}
