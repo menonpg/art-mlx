@@ -538,6 +538,13 @@ def tokenize_sft_batch(
         num_tokens += sum(attention_mask)
         num_trainable_tokens += sum(1 for l in labels if l != -100)
 
+    if num_dropped_trajectories:
+        print(
+            "WARNING: Dropped "
+            f"{num_dropped_trajectories}/{len(trajectory_batch)} SFT trajectories "
+            f"because they exceed max_seq_length={max_seq_length}."
+        )
+
     return SFTBatch(
         trajectory_tensors=trajectory_tensors,
         learning_rate=learning_rate,
