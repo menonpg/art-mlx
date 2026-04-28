@@ -530,11 +530,12 @@ class MegatronService:
 
         try:
             import megatron.bridge  # type: ignore
-
-            setup_cmd = ""
-        except ImportError:
-            setup_script = Path(__file__).parent / "setup.sh"
-            setup_cmd = f"bash {setup_script} && "
+        except ImportError as exc:
+            raise RuntimeError(
+                "Megatron dependencies are not available in the active ART environment. "
+                "Build the project venv with `uv sync --extra backend --extra megatron` "
+                "before starting Megatron training."
+            ) from exc
 
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
@@ -560,7 +561,7 @@ class MegatronService:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
 
         command = (
-            f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "
+            f"uv run --project {shlex.quote(str(project_root))} "
             f"torchrun --master-addr {shlex.quote(master_addr)} "
             f"--master-port {shlex.quote(master_port)} "
             f"--nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
