@@ -642,6 +642,9 @@ def run_megatron_sft_job(
             batch_dir = os.path.join(job.sft_data_dir, f"batch_{batch_idx:06d}")
             batch_metadata, trajectory_tensors = load_sft_batch_from_disk(batch_dir)
             num_trajectories = int(batch_metadata["num_trajectories"])
+            num_dropped_trajectories = int(
+                batch_metadata.get("num_dropped_trajectories", 0)
+            )
             if num_trajectories != len(trajectory_tensors):
                 raise RuntimeError(
                     "SFT batch metadata does not match trajectory count: "
@@ -707,6 +710,9 @@ def run_megatron_sft_job(
                             "num_trajectories": float(num_trajectories),
                             "num_tokens": float(global_tokens),
                             "num_trainable_tokens": float(global_trainable_tokens),
+                            "num_dropped_trajectories": float(
+                                num_dropped_trajectories
+                            ),
                             "tokens_per_second": tokens_per_second,
                         }
                     )

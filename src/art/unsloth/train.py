@@ -941,5 +941,6 @@ async def run_unsloth_sft_training(
             "num_trajectories": float(batch.num_trajectories),
             "num_tokens": float(batch.num_tokens),
             "num_trainable_tokens": float(batch.num_trainable_tokens),
+            "num_dropped_trajectories": float(batch.num_dropped_trajectories),
             "tokens_per_second": tokens_per_second,
         }
