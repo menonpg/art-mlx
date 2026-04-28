@@ -4,12 +4,10 @@ from typing import cast
 
 from openai.types.chat.chat_completion import Choice
 import pytest
-import torch
 from transformers.tokenization_utils_base import BatchEncoding
 
 import art
 from art.preprocessing.tokenize import (
-    sft_trajectory_exceeds_max_seq_length,
     tokenize_sft_batch,
     tokenize_trajectory,
 )
@@ -181,41 +179,23 @@ def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(
     assert batch.trajectory_tensors[0]["attention_mask"].tolist() == [
         [1] * len(expected_ids)
     ]
+    assert batch.num_dropped_trajectories == 0
     assert batch.num_tokens == len(expected_ids)
     assert batch.num_trainable_tokens == len(expected_ids)
 
-
-def test_sft_trajectory_exceeds_max_seq_length() -> None:
-    trajectory_tensor = {
-        "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-        "labels": torch.tensor([[-100, 2, 3, -100, 5]]),
-    }
-
-    assert (
-        sft_trajectory_exceeds_max_seq_length(trajectory_tensor, max_seq_length=3)
-        is True
+    dropped_batch = tokenize_sft_batch(
+        trajectory_batch=[trajectory],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        instruction_part="<user>",
+        response_part="<assistant>",
+        max_seq_length=len(expected_ids) - 1,
     )
-    assert (
-        sft_trajectory_exceeds_max_seq_length(trajectory_tensor, max_seq_length=5)
-        is False
-    )
-
-
-def test_sft_trajectory_exceeds_max_seq_length_without_limit() -> None:
-    trajectory_tensor = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "attention_mask": torch.tensor([[1, 1]]),
-        "labels": torch.tensor([[-100, 2]]),
-    }
-
-    assert (
-        sft_trajectory_exceeds_max_seq_length(
-            trajectory_tensor,
-            max_seq_length=None,
-        )
-        is False
-    )
+    assert dropped_batch.trajectory_tensors == []
+    assert dropped_batch.num_trajectories == 0
+    assert dropped_batch.num_tokens == 0
+    assert dropped_batch.num_trainable_tokens == 0
+    assert dropped_batch.num_dropped_trajectories == 1
 
 
 def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template() -> (

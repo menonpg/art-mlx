@@ -774,16 +774,12 @@ class MegatronService:
         grad_accumulation_sequences = (
             config.batch_size if isinstance(config.batch_size, int) else None
         )
-        max_seq_length = self.config.get("init_args", {}).get("max_seq_length")
         job = MegatronSFTTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._get_optimizer_state_path("sft"),
             sft_data_dir=serialized_batches.sft_data_dir,
             num_batches=serialized_batches.num_batches,
             learning_rates=serialized_batches.learning_rates,
-            max_seq_length=(
-                int(max_seq_length) if isinstance(max_seq_length, int) else None
-            ),
             grad_accumulation_sequences=grad_accumulation_sequences,
             log_path=log_path,
         )

@@ -123,6 +123,7 @@ class SFTBatch:
         num_trajectories: Number of trajectories in this batch.
         num_tokens: Total number of non-padding tokens (attention_mask != 0).
         num_trainable_tokens: Total number of tokens being trained on (labels != -100).
+        num_dropped_trajectories: Number of overlength trajectories dropped while tokenizing.
     """
 
     trajectory_tensors: list[dict[str, torch.Tensor]]
@@ -130,18 +131,14 @@ class SFTBatch:
     num_trajectories: int
     num_tokens: int
     num_trainable_tokens: int
+    num_dropped_trajectories: int = 0
 
 
-def sft_trajectory_exceeds_max_seq_length(
-    trajectory_tensor: dict[str, torch.Tensor],
-    max_seq_length: int | None,
-) -> bool:
-    """Return whether an SFT trajectory exceeds the runtime sequence limit."""
+def _validate_max_seq_length(max_seq_length: int | None) -> None:
     if max_seq_length is None:
-        return False
+        return
     if max_seq_length < 1:
         raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
-    return trajectory_tensor["input_ids"].shape[-1] > max_seq_length
 
 
 def _apply_chat_template_token_ids(
@@ -477,6 +474,7 @@ def tokenize_sft_batch(
     tokenizer: PreTrainedTokenizerBase,
     instruction_part: str,
     response_part: str,
+    max_seq_length: int | None = None,
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -486,10 +484,14 @@ def tokenize_sft_batch(
         tokenizer: Tokenizer to use for encoding
         instruction_part: Instruction template part (e.g., "<|im_start|>user")
         response_part: Response template part (e.g., "<|im_start|>assistant")
+        max_seq_length: Optional maximum tokenized trajectory length. Trajectories
+            longer than this limit are dropped before tensors are created.
 
     Returns:
         SFTBatch object for this batch
     """
+    _validate_max_seq_length(max_seq_length)
+
     import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
     from unsloth_zoo.dataset_utils import train_on_responses_only
 
@@ -505,6 +507,7 @@ def tokenize_sft_batch(
     trajectory_tensors = []
     num_tokens = 0
     num_trainable_tokens = 0
+    num_dropped_trajectories = 0
     for trajectory in trajectory_batch:
         messages = trajectory.messages_and_choices
         tools = trajectory.tools
@@ -517,6 +520,9 @@ def tokenize_sft_batch(
             tokenize=True,
             add_generation_prompt=False,
         )
+        if max_seq_length is not None and len(input_ids) > max_seq_length:
+            num_dropped_trajectories += 1
+            continue
 
         attention_mask = [1] * len(input_ids)
 
@@ -538,4 +544,5 @@ def tokenize_sft_batch(
         num_trajectories=len(trajectory_tensors),
         num_tokens=num_tokens,
         num_trainable_tokens=num_trainable_tokens,
+        num_dropped_trajectories=num_dropped_trajectories,
     )

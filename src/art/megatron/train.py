@@ -80,7 +80,6 @@ from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
 )
-from art.preprocessing.tokenize import sft_trajectory_exceeds_max_seq_length
 
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
@@ -643,22 +642,11 @@ def run_megatron_sft_job(
             batch_dir = os.path.join(job.sft_data_dir, f"batch_{batch_idx:06d}")
             batch_metadata, trajectory_tensors = load_sft_batch_from_disk(batch_dir)
             num_trajectories = int(batch_metadata["num_trajectories"])
-            if not trajectory_tensors:
-                raise RuntimeError(f"SFT batch {batch_idx} is empty")
             if num_trajectories != len(trajectory_tensors):
                 raise RuntimeError(
                     "SFT batch metadata does not match trajectory count: "
                     f"{num_trajectories} != {len(trajectory_tensors)}"
                 )
-            trajectory_tensors = [
-                inputs
-                for inputs in trajectory_tensors
-                if not sft_trajectory_exceeds_max_seq_length(
-                    inputs,
-                    job.max_seq_length,
-                )
-            ]
-            num_trajectories = len(trajectory_tensors)
 
             global_tokens = sum(_sft_actual_len(inputs) for inputs in trajectory_tensors)
             global_trainable_tokens = sum(
@@ -685,7 +673,6 @@ def run_megatron_sft_job(
                     step_index=batch_idx,
                     sample_index=micro_indices,
                     global_grad_accumulation_sequences=grad_accumulation_sequences,
-                    max_seq_length=job.max_seq_length,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 )
                 loss = step_result.reduced_loss.item()
@@ -1202,7 +1189,6 @@ def run_megatron_sft_step(
     step_index: int,
     sample_index: int | list[int | None],
     global_grad_accumulation_sequences: int | None,
-    max_seq_length: int | None = None,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
@@ -1220,26 +1206,7 @@ def run_megatron_sft_step(
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
 
-    filtered_micro_inputs: list[dict[str, torch.Tensor]] = []
-    filtered_micro_sample_indices: list[int | None] = []
-    for micro, micro_sample_index in zip(micro_inputs, micro_sample_indices):
-        if sft_trajectory_exceeds_max_seq_length(micro, max_seq_length):
-            continue
-        filtered_micro_inputs.append(micro)
-        filtered_micro_sample_indices.append(micro_sample_index)
-    micro_inputs = filtered_micro_inputs
-    micro_sample_indices = filtered_micro_sample_indices
-
     device = next(model_chunks[0].parameters()).device
-    if not micro_inputs:
-        return TrainStepResult(
-            reduced_loss=torch.tensor(0.0, device=device),
-            probs_corr=1.0,
-            new_logprobs=None,
-            update_successful=True,
-            grad_norm=0.0,
-            num_zeros_in_grad=None,
-        )
 
     if moe_routing_replay_controller is not None:
         resolved_global_grad_accumulation_sequences = (

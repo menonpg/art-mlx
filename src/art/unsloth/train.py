@@ -33,10 +33,7 @@ from ..preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
 )
-from ..preprocessing.tokenize import (
-    SFTBatch,
-    sft_trajectory_exceeds_max_seq_length,
-)
+from ..preprocessing.tokenize import SFTBatch
 from ..types import TrainConfig
 
 nest_asyncio.apply()
@@ -83,30 +80,6 @@ class _StopTrainInputs:
 
 _STOP_TRAIN_INPUT = _StopTrainInputs()
 _TrainLoopInput = TrainInputs | _StopTrainInputs
-
-
-def _get_runtime_max_seq_length(*roots: object) -> int | None:
-    """Find an initialized backend model's runtime sequence cap, if exposed."""
-    seen: set[int] = set()
-    stack: list[tuple[object, int]] = [(root, 0) for root in roots if root is not None]
-    while stack:
-        obj, depth = stack.pop()
-        obj_id = id(obj)
-        if obj_id in seen:
-            continue
-        seen.add(obj_id)
-
-        max_seq_length = getattr(obj, "max_seq_length", None)
-        if isinstance(max_seq_length, int) and max_seq_length > 0:
-            return max_seq_length
-
-        if depth >= 3:
-            continue
-        for attr in ("base_model", "model", "module"):
-            child = getattr(obj, attr, None)
-            if child is not None:
-                stack.append((child, depth + 1))
-    return None
 
 
 class CausalLM(PreTrainedModel, GenerationMixin):
@@ -912,7 +885,6 @@ async def run_unsloth_sft_training(
 
     ctx.peft_model.train()
     device = next(ctx.peft_model.parameters()).device
-    max_seq_length = _get_runtime_max_seq_length(ctx.peft_model, ctx.model)
 
     for batch_idx, batch in enumerate(batches):
         batch_start_time = time.perf_counter()
@@ -921,31 +893,14 @@ async def run_unsloth_sft_training(
         for param_group in optimizer.param_groups:
             param_group["lr"] = batch.learning_rate
 
-        effective_trajectory_tensors: list[dict[str, torch.Tensor]] = []
-        effective_num_tokens = 0
-        effective_num_trainable_tokens = 0
-        for trajectory_tensor in batch.trajectory_tensors:
-            if sft_trajectory_exceeds_max_seq_length(
-                trajectory_tensor,
-                max_seq_length,
-            ):
-                continue
-            effective_num_tokens += int(
-                trajectory_tensor["attention_mask"].sum().item()
-            )
-            effective_num_trainable_tokens += int(
-                (trajectory_tensor["labels"] != -100).sum().item()
-            )
-            effective_trajectory_tensors.append(trajectory_tensor)
-
         num_trainable_tokens = torch.tensor(
-            effective_num_trainable_tokens,
+            batch.num_trainable_tokens,
             dtype=torch.long,
             device=device,
         )
 
-        if effective_trajectory_tensors:
-            for trajectory_tensor in effective_trajectory_tensors:
+        if batch.trajectory_tensors:
+            for trajectory_tensor in batch.trajectory_tensors:
                 input_ids = trajectory_tensor["input_ids"].to(device)
                 attention_mask = trajectory_tensor["attention_mask"].to(device)
                 labels = trajectory_tensor["labels"].to(device)
@@ -971,9 +926,7 @@ async def run_unsloth_sft_training(
             grad_norm = 0.0
 
         batch_time = time.perf_counter() - batch_start_time
-        tokens_per_second = (
-            effective_num_tokens / batch_time if batch_time > 0 else 0.0
-        )
+        tokens_per_second = batch.num_tokens / batch_time if batch_time > 0 else 0.0
 
         if verbose:
             print(
@@ -985,8 +938,8 @@ async def run_unsloth_sft_training(
             "loss": batch_loss,
             "learning_rate": batch.learning_rate,
             "grad_norm": grad_norm,
-            "num_trajectories": float(len(effective_trajectory_tensors)),
-            "num_tokens": float(effective_num_tokens),
-            "num_trainable_tokens": float(effective_num_trainable_tokens),
+            "num_trajectories": float(batch.num_trajectories),
+            "num_tokens": float(batch.num_tokens),
+            "num_trainable_tokens": float(batch.num_trainable_tokens),
             "tokens_per_second": tokens_per_second,
         }
