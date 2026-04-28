@@ -35,13 +35,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(monkeypatch) -> None:
             server_args={"tool_call_parser": "hermes"},
         )
     )
-    assert command[:5] == [
-        "uv",
-        "run",
-        "--project",
-        "/tmp/custom-runtime",
-        "art-vllm-runtime-server",
-    ]
+    assert command[0] == "/tmp/custom-runtime/.venv/bin/art-vllm-runtime-server"
     assert "--model=Qwen/Qwen3-14B" in command
     assert '--engine-args-json={"weight_transfer_config": {"backend": "nccl"}}' in command
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command

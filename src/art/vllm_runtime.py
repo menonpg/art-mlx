@@ -36,13 +36,15 @@ def _runtime_command_prefix() -> list[str]:
     override = os.environ.get("ART_VLLM_RUNTIME_BIN")
     if override:
         return shlex.split(override)
-    return [
-        "uv",
-        "run",
-        "--project",
-        str(get_vllm_runtime_project_root()),
-        "art-vllm-runtime-server",
-    ]
+    runtime_bin = (
+        get_vllm_runtime_project_root() / ".venv" / "bin" / "art-vllm-runtime-server"
+    )
+    if not runtime_bin.exists():
+        raise RuntimeError(
+            "vLLM runtime env is not built. Run `uv sync` in "
+            f"{get_vllm_runtime_project_root()} or set ART_VLLM_RUNTIME_BIN."
+        )
+    return [str(runtime_bin)]
 
 
 def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
