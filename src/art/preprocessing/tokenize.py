@@ -132,6 +132,18 @@ class SFTBatch:
     num_trainable_tokens: int
 
 
+def sft_trajectory_exceeds_max_seq_length(
+    trajectory_tensor: dict[str, torch.Tensor],
+    max_seq_length: int | None,
+) -> bool:
+    """Return whether an SFT trajectory exceeds the runtime sequence limit."""
+    if max_seq_length is None:
+        return False
+    if max_seq_length < 1:
+        raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
+    return trajectory_tensor["input_ids"].shape[-1] > max_seq_length
+
+
 def _apply_chat_template_token_ids(
     tokenizer: PreTrainedTokenizerBase,
     messages: list[dict[str, Any]],
