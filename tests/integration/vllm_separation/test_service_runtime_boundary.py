@@ -1,4 +1,6 @@
 from pathlib import Path
+import shlex
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -164,3 +166,54 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
     assert location == ("127.0.0.1", 8000)
     start_vllm.assert_awaited_once()
     sync_merged.assert_awaited_once_with(lora_path="/tmp/lora", step=0)
+
+
+@pytest.mark.asyncio
+async def test_megatron_worker_uses_active_python_for_torchrun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("megatron.bridge")
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [0],
+            "inference_gpu_ids": [1],
+            "rollout_weights_mode": "lora",
+        },
+        output_dir=str(tmp_path),
+    )
+    recorded: dict[str, object] = {}
+
+    async def _fake_create_subprocess_shell(
+        command: str,
+        *,
+        cwd: str,
+        env: dict[str, str],
+        stdout,
+        stderr,
+        start_new_session: bool,
+    ) -> SimpleNamespace:
+        recorded["command"] = command
+        recorded["cwd"] = cwd
+        recorded["env"] = env
+        recorded["stdout"] = stdout
+        recorded["stderr"] = stderr
+        recorded["start_new_session"] = start_new_session
+        return SimpleNamespace(returncode=None)
+
+    monkeypatch.setattr(
+        "art.megatron.service.asyncio.create_subprocess_shell",
+        _fake_create_subprocess_shell,
+    )
+    monkeypatch.setattr(service, "_install_parent_signal_cleanup", lambda: None)
+    monkeypatch.setattr(service, "_allocate_master_port", lambda: 12345)
+
+    await service._ensure_megatron_running()
+    assert recorded["command"].startswith(
+        f"{shlex.quote(sys.executable)} -m torch.distributed.run "
+    )
+    assert "uv run" not in recorded["command"]
+    assert recorded["cwd"] == str(Path(__file__).resolve().parents[3])
+    service._megatron_log_file.close()

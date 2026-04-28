@@ -8,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 from typing import Any, AsyncIterator, Literal, cast
 
 from peft.tuners.lora.config import LoraConfig
@@ -561,8 +562,8 @@ class MegatronService:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
 
         command = (
-            f"uv run --project {shlex.quote(str(project_root))} "
-            f"torchrun --master-addr {shlex.quote(master_addr)} "
+            f"{shlex.quote(sys.executable)} -m torch.distributed.run "
+            f"--master-addr {shlex.quote(master_addr)} "
             f"--master-port {shlex.quote(master_port)} "
             f"--nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
         )
