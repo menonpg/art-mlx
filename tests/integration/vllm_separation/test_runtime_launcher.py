@@ -19,9 +19,16 @@ def test_get_vllm_runtime_project_root_honors_override(monkeypatch) -> None:
     assert runtime.get_vllm_runtime_project_root() == Path("/tmp/custom-runtime")
 
 
-def test_build_runtime_server_cmd_uses_runtime_project(monkeypatch) -> None:
+def test_build_runtime_server_cmd_uses_runtime_project(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     monkeypatch.delenv("ART_VLLM_RUNTIME_BIN", raising=False)
-    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", "/tmp/custom-runtime")
+    runtime_root = tmp_path / "custom-runtime"
+    runtime_bin = runtime_root / ".venv" / "bin" / "art-vllm-runtime-server"
+    runtime_bin.parent.mkdir(parents=True, exist_ok=True)
+    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
+    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
     command = runtime.build_vllm_runtime_server_cmd(
         runtime.VllmRuntimeLaunchConfig(
             base_model="Qwen/Qwen3-14B",
@@ -35,7 +42,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(monkeypatch) -> None:
             server_args={"tool_call_parser": "hermes"},
         )
     )
-    assert command[0] == "/tmp/custom-runtime/.venv/bin/art-vllm-runtime-server"
+    assert command[0] == str(runtime_bin)
     assert "--model=Qwen/Qwen3-14B" in command
     assert '--engine-args-json={"weight_transfer_config": {"backend": "nccl"}}' in command
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command
