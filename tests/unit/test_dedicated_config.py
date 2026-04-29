@@ -157,9 +157,16 @@ def test_get_model_config_shared_mode():
 
 @pytest.mark.parametrize(
     "base_model",
-    ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B"],
+    [
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3.6-35B-A3B",
+        "Qwen/Qwen3.6-27B",
+    ],
 )
-def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
+def test_get_model_config_qwen3_5_deltanet_target_modules(base_model: str):
     from art.dev.get_model_config import get_model_config
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -254,7 +261,7 @@ def test_merged_rollout_weights_requires_dedicated_mode():
 
 @pytest.mark.parametrize(
     "base_model",
-    ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B"],
+    ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3.6-35B-A3B"],
 )
 def test_qwen3_5_moe_allows_default_lora_rollout_weights(base_model: str):
     validate_dedicated_config(
