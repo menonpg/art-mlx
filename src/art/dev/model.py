@@ -127,6 +127,9 @@ class InternalModelConfig(TypedDict, total=False):
             - "lora": load LoRA adapters into vLLM directly
             - "merged": keep training LoRA adapters, but push merged weights
               into vLLM for inference
+        chat_template_kwargs: Extra keyword arguments passed to tokenizer
+            chat-template rendering for both rollout inference and local training
+            tokenization.
     """
 
     init_args: "InitArgs"
@@ -138,6 +141,7 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     rollout_weights_mode: "RolloutWeightsMode"
+    chat_template_kwargs: dict[str, object]
 
 
 class TinkerArgs(TypedDict, total=False):

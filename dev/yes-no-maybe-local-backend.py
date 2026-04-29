@@ -50,13 +50,17 @@ async def main():
     load_dotenv()
 
     backend = LocalBackend()
-    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3.6-27B")
+    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3.5-4B")
     model = art.TrainableModel(
         name=os.environ.get("MODEL_NAME", f"yes-no-maybe-local-{uuid.uuid4().hex[:8]}"),
         project="yes-no-maybe",
         base_model=base_model,
         _internal_config=art.dev.InternalModelConfig(
             engine_args=art.dev.EngineArgs(enforce_eager=True),
+            chat_template_kwargs={
+                "enable_thinking": False,
+                "preserve_thinking": True,
+            },
         ),
     )
 
@@ -71,11 +75,17 @@ async def main():
                 list(p) for n in [3, 2] for p in permutations(["yes", "no", "maybe"], n)
             )
         ]
+        prompts = prompts[: int(os.environ.get("PROMPTS_LIMIT", str(len(prompts))))]
 
         openai_client = model.openai_client()
         max_steps = int(os.environ.get("NUM_STEPS", "20"))
-        groups_per_step = int(os.environ.get("GROUPS_PER_STEP", "8"))
-        rollouts_per_group = int(os.environ.get("ROLLOUTS_PER_GROUP", "4"))
+        groups_per_step = int(os.environ.get("GROUPS_PER_STEP", str(len(prompts))))
+        rollouts_per_group = int(
+            os.environ.get(
+                "ROLLOUTS_PER_GROUP",
+                os.environ.get("ROLLOUTS_PER_PROMPT", "32"),
+            )
+        )
         start_step = await model.get_step()
         for _ in range(start_step, start_step + max_steps):
             step_prompts = random.sample(

@@ -140,6 +140,7 @@ def tokenize_trajectory_groups(
     shuffle_group_trajectories: bool = True,
     drop_zero_advantage_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -173,6 +174,7 @@ def tokenize_trajectory_groups(
                     advantage,
                     allow_training_without_logprobs,
                     trajectory,
+                    chat_template_kwargs=chat_template_kwargs,
                 ):
                     trajectory_results.append(result)
             weight = 1 / (
@@ -222,6 +224,7 @@ def tokenize_trajectory(
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -255,6 +258,7 @@ def tokenize_trajectory(
             tools=tools,
             continue_final_message=True,
             tokenize=False,
+            **(chat_template_kwargs or {}),
         ),
     )
     original_token_ids = cast(
@@ -264,6 +268,7 @@ def tokenize_trajectory(
             tools=tools,
             continue_final_message=True,
             return_dict=False,
+            **(chat_template_kwargs or {}),
         ),
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
@@ -298,6 +303,7 @@ def tokenize_trajectory(
             tools=tools,
             continue_final_message=True,
             return_dict=False,
+            **(chat_template_kwargs or {}),
         ),
     )
     assistant_mask: list[int] = [0] * len(token_ids)
@@ -454,6 +460,7 @@ def tokenize_sft_batch(
     tokenizer: PreTrainedTokenizerBase,
     instruction_part: str,
     response_part: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -495,6 +502,7 @@ def tokenize_sft_batch(
                 tokenize=True,
                 add_generation_prompt=False,
                 return_dict=False,
+                **(chat_template_kwargs or {}),
             ),
         )
 

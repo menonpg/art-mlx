@@ -27,7 +27,9 @@ from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
-from ..utils.convert_moe_lora import convert_checkpoint_if_needed
+from ..utils.convert_megatron_moe_lora import (
+    convert_checkpoint_to_megatron_moe_lora_if_needed,
+)
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -57,9 +59,10 @@ def create_identity_lora(
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
-    For MoE models, this targets fused expert parameters and converts them to
-    per-expert format. The conversion swaps lora_A/lora_B, producing A=zeros and
-    B=Kaiming — which is critical for stable training when alpha/rank is large.
+    PEFT saves MoE expert LoRA for target_parameters in a fused format, while
+    ART's Megatron loader currently expects per-expert gate/up/down LoRA keys.
+    Long term, we can teach Megatron's LoRA loader to accept PEFT fused
+    target_parameters directly, then delete convert_megatron_moe_lora.py entirely.
 
     Args:
         base_model: HuggingFace model identifier.
@@ -132,7 +135,7 @@ def create_identity_lora(
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)
-    convert_checkpoint_if_needed(lora_path)
+    convert_checkpoint_to_megatron_moe_lora_if_needed(lora_path)
 
     # Write final adapter_config with per-expert target_modules
     LoraConfig(

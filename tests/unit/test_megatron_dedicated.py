@@ -196,13 +196,17 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
         def save_pretrained(self, lora_path: str) -> None:
             Path(lora_path).mkdir(parents=True, exist_ok=True)
 
+    def fake_model_from_config(config: Any, **_kwargs: Any) -> FakeModel:
+        seen["config"] = config
+        return FakeModel()
+
     monkeypatch.setattr(
         "transformers.AutoConfig.from_pretrained",
         lambda *_args, **_kwargs: top_level_config,
     )
     monkeypatch.setattr(
         "transformers.AutoModelForCausalLM.from_config",
-        lambda config, **_kwargs: seen.setdefault("config", config) or FakeModel(),
+        fake_model_from_config,
     )
     monkeypatch.setattr("accelerate.init_empty_weights", nullcontext)
     monkeypatch.setattr(
@@ -212,7 +216,7 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
         ),
     )
     monkeypatch.setattr(
-        "art.megatron.service.convert_checkpoint_if_needed",
+        "art.megatron.service.convert_checkpoint_to_megatron_moe_lora_if_needed",
         lambda _path: None,
     )
 

@@ -1,6 +1,6 @@
 import sys
 import types
-from typing import cast
+from typing import Any, cast
 
 from openai.types.chat.chat_completion import Choice
 import pytest
@@ -20,6 +20,9 @@ class _FakeTokenizer:
     eos_token = "\x00"
     eos_token_id = 0
 
+    def __init__(self) -> None:
+        self.apply_chat_template_kwargs: list[dict[str, Any]] = []
+
     def apply_chat_template(
         self,
         messages,
@@ -28,7 +31,8 @@ class _FakeTokenizer:
         return_dict=None,
         **kwargs,
     ):
-        del tools, kwargs
+        del tools
+        self.apply_chat_template_kwargs.append(dict(kwargs))
         rendered = "".join(
             f"<{message['role']}>{message.get('content', '')}" for message in messages
         )
@@ -68,7 +72,6 @@ class _Qwen3_5FakeTokenizer(_FakeTokenizer):
         return_dict=None,
         **kwargs,
     ):
-        del kwargs
         for message in messages:
             tool_calls = message.get("tool_calls")
             if tool_calls is None:
@@ -84,6 +87,7 @@ class _Qwen3_5FakeTokenizer(_FakeTokenizer):
             tools=tools,
             tokenize=tokenize,
             return_dict=return_dict,
+            **kwargs,
         )
 
 
@@ -115,6 +119,39 @@ def test_tokenize_trajectory_requests_list_chat_template_output() -> None:
         if mask
     ]
     assert assistant_ids == tokenizer.encode("OK", add_special_tokens=False)
+
+
+def test_tokenize_trajectory_passes_chat_template_kwargs() -> None:
+    tokenizer = _FakeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "OK"},
+        ],
+    )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
+
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=history,
+        advantage=1.0,
+        allow_training_without_logprobs=True,
+        trajectory=trajectory,
+        chat_template_kwargs={
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
+    )
+
+    assert result is not None
+    assert tokenizer.apply_chat_template_kwargs
+    assert all(
+        call.get("enable_thinking") is False and call.get("preserve_thinking") is True
+        for call in tokenizer.apply_chat_template_kwargs
+    )
 
 
 def test_tokenize_sft_batch_requests_list_chat_template_output(

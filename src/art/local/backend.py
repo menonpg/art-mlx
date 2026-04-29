@@ -341,6 +341,9 @@ class LocalBackend(Backend):
             except Exception:
                 self._image_processors[model.base_model] = None
         tokenizer = self._tokenizers[model.base_model]
+        chat_template_kwargs = (
+            model._internal_config or dev.InternalModelConfig()
+        ).get("chat_template_kwargs")
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -348,6 +351,7 @@ class LocalBackend(Backend):
                 allow_training_without_logprobs,
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
+                chat_template_kwargs=chat_template_kwargs,
             )
         )
         if not tokenized_results:
@@ -955,6 +959,9 @@ class LocalBackend(Backend):
         instruction_part, response_part = get_instruction_response_parts(
             model.base_model, tokenizer
         )
+        chat_template_kwargs = (
+            model._internal_config or dev.InternalModelConfig()
+        ).get("chat_template_kwargs")
 
         if verbose:
             print(f"Using instruction_part: {instruction_part!r}")
@@ -982,6 +989,7 @@ class LocalBackend(Backend):
                     tokenizer=tokenizer,
                     instruction_part=instruction_part,
                     response_part=response_part,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
             )
 
