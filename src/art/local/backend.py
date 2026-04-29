@@ -109,6 +109,7 @@ class LocalBackend(Backend):
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
+        self._supports_result_packing = False
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -413,6 +414,7 @@ class LocalBackend(Backend):
             pad_token_id=tokenizer.eos_token_id,
             truncate_long_results=False,
             advantage_balance=advantage_balance,
+            pack_results=self._supports_result_packing,
         )
         if (
             not allow_training_without_logprobs
