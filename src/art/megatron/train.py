@@ -651,7 +651,9 @@ def run_megatron_sft_job(
                     f"{num_trajectories} != {len(trajectory_tensors)}"
                 )
 
-            global_tokens = sum(_sft_actual_len(inputs) for inputs in trajectory_tensors)
+            global_tokens = sum(
+                _sft_actual_len(inputs) for inputs in trajectory_tensors
+            )
             global_trainable_tokens = sum(
                 _count_sft_trainable_tokens(inputs) for inputs in trajectory_tensors
             )
@@ -710,9 +712,7 @@ def run_megatron_sft_job(
                             "num_trajectories": float(num_trajectories),
                             "num_tokens": float(global_tokens),
                             "num_trainable_tokens": float(global_trainable_tokens),
-                            "num_dropped_trajectories": float(
-                                num_dropped_trajectories
-                            ),
+                            "num_dropped_trajectories": float(num_dropped_trajectories),
                             "tokens_per_second": tokens_per_second,
                         }
                     )
@@ -1169,7 +1169,9 @@ def _local_trainable_sft_token_count_tensor(
     micro_inputs: list[dict[str, torch.Tensor]],
     device: torch.device,
 ) -> torch.Tensor:
-    local_token_total = sum(_count_sft_trainable_tokens(micro) for micro in micro_inputs)
+    local_token_total = sum(
+        _count_sft_trainable_tokens(micro) for micro in micro_inputs
+    )
     return torch.tensor([local_token_total], device=device, dtype=torch.float32)
 
 
