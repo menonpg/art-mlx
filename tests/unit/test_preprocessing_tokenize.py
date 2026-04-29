@@ -4,7 +4,6 @@ from typing import cast
 
 from openai.types.chat.chat_completion import Choice
 import pytest
-from transformers.tokenization_utils_base import BatchEncoding
 
 import art
 from art.preprocessing.tokenize import tokenize_sft_batch, tokenize_trajectory
@@ -36,14 +35,8 @@ class _FakeTokenizer:
         if not tokenize:
             return rendered
         token_ids = self.encode(rendered, add_special_tokens=False)
-        if return_dict is False:
-            return token_ids
-        return BatchEncoding(
-            {
-                "input_ids": token_ids,
-                "attention_mask": [1] * len(token_ids),
-            }
-        )
+        assert return_dict is False
+        return token_ids
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
@@ -94,7 +87,7 @@ class _Qwen3_5FakeTokenizer(_FakeTokenizer):
         )
 
 
-def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> None:
+def test_tokenize_trajectory_requests_list_chat_template_output() -> None:
     tokenizer = _FakeTokenizer()
     messages = cast(
         MessagesAndChoices,
@@ -124,7 +117,7 @@ def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> Non
     assert assistant_ids == tokenizer.encode("OK", add_special_tokens=False)
 
 
-def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(
+def test_tokenize_sft_batch_requests_list_chat_template_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tokenizer = _FakeTokenizer()

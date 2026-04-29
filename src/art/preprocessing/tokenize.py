@@ -11,7 +11,7 @@ from openai.types.chat.chat_completion import Choice
 from PIL import Image
 import torch
 from transformers.image_processing_utils import BaseImageProcessor
-from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 
@@ -130,23 +130,6 @@ class SFTBatch:
     num_trajectories: int
     num_tokens: int
     num_trainable_tokens: int
-
-
-def _apply_chat_template_token_ids(
-    tokenizer: PreTrainedTokenizerBase,
-    messages: list[dict[str, Any]],
-    **kwargs: Any,
-) -> list[int]:
-    output = tokenizer.apply_chat_template(messages, **kwargs)
-    if isinstance(output, BatchEncoding):
-        output = output["input_ids"]
-    if isinstance(output, torch.Tensor):
-        output = output.tolist()
-    assert isinstance(output, list)
-    if output and isinstance(output[0], list):
-        assert len(output) == 1
-        output = output[0]
-    return cast(list[int], output)
 
 
 def tokenize_trajectory_groups(
@@ -274,11 +257,14 @@ def tokenize_trajectory(
             tokenize=False,
         ),
     )
-    original_token_ids = _apply_chat_template_token_ids(
-        tokenizer,
-        messages,
-        tools=tools,
-        continue_final_message=True,
+    original_token_ids = cast(
+        list[int],
+        tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            continue_final_message=True,
+            return_dict=False,
+        ),
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinel_token = tokenizer.decode(sentinel_token_id)
@@ -305,11 +291,14 @@ def tokenize_trajectory(
             )
         else:
             token_template_messages.append(cast(dict[str, Any], message))
-    token_ids = _apply_chat_template_token_ids(
-        tokenizer,
-        token_template_messages,
-        tools=tools,
-        continue_final_message=True,
+    token_ids = cast(
+        list[int],
+        tokenizer.apply_chat_template(
+            token_template_messages,
+            tools=tools,
+            continue_final_message=True,
+            return_dict=False,
+        ),
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
@@ -498,12 +487,15 @@ def tokenize_sft_batch(
         tools = trajectory.tools
 
         # Single-step tokenization: apply_chat_template with tokenize=True
-        input_ids = _apply_chat_template_token_ids(
-            tokenizer,
-            cast(Any, messages),
-            tools=cast(Any, tools),
-            tokenize=True,
-            add_generation_prompt=False,
+        input_ids = cast(
+            list[int],
+            tokenizer.apply_chat_template(
+                cast(Any, messages),
+                tools=cast(Any, tools),
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=False,
+            ),
         )
 
         attention_mask = [1] * len(input_ids)

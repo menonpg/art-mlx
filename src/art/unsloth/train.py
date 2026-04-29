@@ -350,7 +350,7 @@ async def train(
 ) -> None:
     _compute_loss = trainer.compute_loss
     _log = trainer.log
-    trainer.compute_loss = get_compute_loss_fn(trainer)
+    trainer.compute_loss = get_compute_loss_fn(trainer)  # ty:ignore[invalid-assignment]
     trainer.log = get_log_fn(trainer, results_queue)  # ty:ignore[invalid-assignment]
     # Ensure we have a metrics container in the expected format
     try:
