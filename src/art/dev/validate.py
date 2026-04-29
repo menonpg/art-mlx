@@ -20,11 +20,6 @@ def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
     raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
 
 
-def _is_qwen3_5_moe_model(config: InternalModelConfig) -> bool:
-    model_name = config.get("engine_args", {}).get("model")
-    return model_name in QWEN3_5_MOE_MODELS
-
-
 def validate_dedicated_config(config: InternalModelConfig) -> None:
     """Validate dedicated mode GPU configuration.
 
@@ -88,10 +83,4 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         raise ValueError(
             "enable_sleep_mode is incompatible with dedicated mode "
             "(dedicated mode runs vLLM on a separate GPU, sleep/wake is not needed)"
-        )
-
-    if _is_qwen3_5_moe_model(config) and rollout_weights_mode == "lora":
-        raise ValueError(
-            "Qwen3.5-MoE models require rollout_weights_mode='merged' with the "
-            "current vLLM version because direct LoRA inference is currently broken"
         )

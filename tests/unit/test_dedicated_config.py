@@ -252,18 +252,18 @@ def test_merged_rollout_weights_requires_dedicated_mode():
         validate_dedicated_config(InternalModelConfig(rollout_weights_mode="merged"))
 
 
-def test_qwen3_5_moe_requires_merged_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
-            )
+@pytest.mark.parametrize(
+    "base_model",
+    ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B"],
+)
+def test_qwen3_5_moe_allows_default_lora_rollout_weights(base_model: str):
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            engine_args={"model": base_model},  # type: ignore[typeddict-item]
         )
+    )
 
 
 def test_qwen3_5_moe_allows_merged_rollout_weights():
@@ -275,17 +275,3 @@ def test_qwen3_5_moe_allows_merged_rollout_weights():
             engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
         )
     )
-
-
-def test_other_qwen3_5_moe_requires_merged_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                engine_args={"model": "Qwen/Qwen3.5-397B-A17B"},  # type: ignore[typeddict-item]
-            )
-        )

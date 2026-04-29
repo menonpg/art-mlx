@@ -90,7 +90,6 @@ env = [
     f"LEARNING_RATE={args.learning_rate}",
     f"TRAINER_GPU_IDS={_format_int_list(args.trainer_gpu_ids)}",
     f"INFERENCE_GPU_IDS={_format_int_list(args.inference_gpu_ids)}",
-    "ROLLOUT_WEIGHTS_MODE=merged",
 ]
 env_block = " \\\n    ".join(env)
 
