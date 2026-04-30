@@ -1966,7 +1966,7 @@ def _scatter_bucket_recurrent_output(
     output[
         bucket.row_indices.transpose(0, 1)[output_mask],
         bucket.position_indices.transpose(0, 1)[output_mask],
-    ] = bucket_output.squeeze(0)[flat_output_mask]
+    ] = bucket_output.squeeze(0)[flat_output_mask].to(dtype=output.dtype)
 
 
 def _bucket_output_mask(bucket: GdnSegmentBucketPlan) -> Tensor:
