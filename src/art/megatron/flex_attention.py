@@ -24,6 +24,8 @@ class SharedPrefixAttentionState(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     block_mask: BlockMask
+    group_ids: Tensor
+    parent_ids: Tensor
 
 
 class FlexAttentionWrapper(torch.nn.Module):
@@ -58,6 +60,7 @@ class FlexAttentionWrapper(torch.nn.Module):
                 enable_gqa=enable_gqa,
             ),
         )
+
 
 _compiled_create_block_mask = torch.compile(create_block_mask, backend="aot_eager")
 
@@ -97,7 +100,11 @@ def create_shared_prefix_attention_state(
         group_ids.shape[1],
         device=group_ids.device,
     )
-    return SharedPrefixAttentionState(block_mask=block_mask)
+    return SharedPrefixAttentionState(
+        block_mask=block_mask,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    )
 
 
 class FlexDotProductAttention(torch.nn.Module):

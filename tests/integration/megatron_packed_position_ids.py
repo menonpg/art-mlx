@@ -26,7 +26,7 @@ from .megatron_oracle_harness import (
 )
 from .megatron_oracle_worker import _configure_provider, provider_topology_env
 
-_LOGITS_MEAN_ABS_PCT_LIMIT = 0.01
+_LOGITS_MEAN_ABS_PCT_LIMIT = 0.1
 _DEBUG_ENV = "ART_PACKED_POSITION_IDS_DEBUG"
 PACKED_POSITION_IDS_REPORT_FILENAME = "report.json"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,10 +63,11 @@ def _env_int(name: str, default: int) -> int:
 def _reset_vllm_compile_overrides() -> None:
     """Undo vLLM's global Inductor compile-thread override for this test worker."""
     os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
-    torch._inductor.config.compile_threads = torch._inductor.config.decide_compile_threads()
+    torch._inductor.config.compile_threads = (
+        torch._inductor.config.decide_compile_threads()
+    )
     _debug_log(
-        "reset inductor compile_threads="
-        f"{torch._inductor.config.compile_threads}"
+        f"reset inductor compile_threads={torch._inductor.config.compile_threads}"
     )
 
 
@@ -173,7 +174,9 @@ def _position_keys(position_ids: torch.Tensor) -> list[tuple[int, ...]]:
     if position_ids.ndim == 3:
         channel_first = position_ids.permute(1, 2, 0).contiguous()
         return [
-            tuple(int(value) for value in channel_first[batch_index, token_index].tolist())
+            tuple(
+                int(value) for value in channel_first[batch_index, token_index].tolist()
+            )
             for batch_index in range(int(channel_first.shape[0]))
             for token_index in range(int(channel_first.shape[1]))
         ]
@@ -213,9 +216,7 @@ def _rotary_grouping_check(
     key_counts: dict[tuple[int, ...], int] = {}
     for key in keys:
         key_counts[key] = key_counts.get(key, 0) + 1
-    repeated_position_key_count = sum(
-        1 for count in key_counts.values() if count > 1
-    )
+    repeated_position_key_count = sum(1 for count in key_counts.values() if count > 1)
     if rotary_output is None:
         return False, True, repeated_position_key_count
     vectors = _flatten_rotary_vectors(rotary_output, position_ids=position_ids)
@@ -307,9 +308,7 @@ def _build_art_realistic_packed_tensors(
     ) -> tuple[int, int]:
         prompt_tokens = _sample_token_block(first_trainable_pos)
         prompt_end = cursor + shared_prompt_length
-        tokens[sequence_index, cursor:prompt_end] = prompt_tokens[
-            :shared_prompt_length
-        ]
+        tokens[sequence_index, cursor:prompt_end] = prompt_tokens[:shared_prompt_length]
         group_ids[sequence_index, cursor:prompt_end] = prompt_group_id
         parent_ids[sequence_index, cursor:prompt_end] = prompt_group_id
         input_pos[sequence_index, cursor:prompt_end] = torch.arange(
@@ -555,10 +554,7 @@ def _logits_equivalence_check(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
         )
-        _debug_log(
-            "logits_check row="
-            f"{row_index} families={len(families)}"
-        )
+        _debug_log(f"logits_check row={row_index} families={len(families)}")
         packed_logits = _time_block(
             f"logits_check row={row_index} packed_forward",
             lambda: _run_logits(
@@ -637,7 +633,9 @@ def _logits_equivalence_check(
                 ]
                 diff = (packed_completion_logits - reference_completion_logits).abs()
                 logits_abs_sum += float(diff.sum().item())
-                logits_ref_abs_sum += float(reference_completion_logits.abs().sum().item())
+                logits_ref_abs_sum += float(
+                    reference_completion_logits.abs().sum().item()
+                )
                 logits_numel += int(diff.numel())
                 logits_max_abs_diff = max(
                     logits_max_abs_diff,

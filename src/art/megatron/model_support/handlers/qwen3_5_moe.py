@@ -40,6 +40,13 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         return tuple(dict.fromkeys(suffixes))
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        from art.megatron.gdn.operator import (
+            install_gdn_island_hooks,
+            install_shared_prefix_gdn_hooks,
+        )
+
+        install_shared_prefix_gdn_hooks(model_chunks)
+        install_gdn_island_hooks(model_chunks)
         for chunk in cast(ModelChunks, list(model_chunks)):
             module: Any = chunk
             while hasattr(module, "module"):
@@ -337,6 +344,7 @@ def supported_qwen_moe_bridge_types() -> tuple[type[Any], ...]:
         return bridge_types
     return bridge_types + (Qwen35VLMoEBridge,)
 
+
 def _is_qwen35_vl_provider(provider: object) -> bool:
     qwen35_provider_type = _optional_qwen35_provider_type()
     return qwen35_provider_type is not None and isinstance(
@@ -416,6 +424,8 @@ def _text_only_qwen35_mapping(mapping: Any) -> Any:
 try:
     from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
         ExpertMLPDownProjMapping as _BridgeExpertMLPDownProjMapping,
+    )
+    from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
         ExpertMLPGateUpProjMapping as _BridgeExpertMLPGateUpProjMapping,
     )
 except ImportError:
