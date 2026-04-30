@@ -57,7 +57,9 @@ async def main():
     backend = MegatronBackend()
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3.6-35B-A3B")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", f"yes-no-maybe-megatron-{uuid.uuid4().hex[:8]}"),
+        name=os.environ.get(
+            "MODEL_NAME", f"yes-no-maybe-megatron-{uuid.uuid4().hex[:8]}"
+        ),
         project="yes-no-maybe-megatron",
         base_model=base_model,
         _internal_config=art.dev.InternalModelConfig(

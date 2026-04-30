@@ -9,8 +9,11 @@ Must be imported/run as a standalone process — not imported into the main trai
 
 import argparse
 import asyncio
+from collections.abc import Callable
+import inspect
 import json
 import os
+from typing import Any, cast
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -46,17 +49,20 @@ def _patch_art_dedicated_routes() -> None:
     if getattr(api_server, "_art_dedicated_routes_patched", False):
         return
 
-    original_build_app = api_server.build_app
+    original_build_app = cast("Callable[..., FastAPI]", api_server.build_app)
+    original_build_app_supports_model_config = (
+        len(inspect.signature(api_server.build_app).parameters) >= 3
+    )
 
     def art_build_app(
         args: argparse.Namespace,
-        supported_tasks: object | None = None,
-        model_config: object | None = None,
+        supported_tasks: Any = None,
+        model_config: Any = None,
     ) -> FastAPI:
-        if model_config is None:
-            app = original_build_app(args, supported_tasks)
-        else:
+        if model_config is not None and original_build_app_supports_model_config:
             app = original_build_app(args, supported_tasks, model_config)
+        else:
+            app = original_build_app(args, supported_tasks)
         router = APIRouter()
 
         @router.post("/art/set_served_model_name")

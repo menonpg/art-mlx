@@ -532,9 +532,7 @@ class MegatronService:
         if random_state is not None:
             launch_env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
         peft_args = self.config.get("peft_args", {})
-        launch_env["ART_MEGATRON_LORA_RANK"] = str(
-            int(peft_args.get("r", LORA_RANK))
-        )
+        launch_env["ART_MEGATRON_LORA_RANK"] = str(int(peft_args.get("r", LORA_RANK)))
         launch_env["ART_MEGATRON_LORA_ALPHA"] = str(
             int(peft_args.get("lora_alpha", LORA_ALPHA))
         )

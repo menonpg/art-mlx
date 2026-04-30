@@ -356,8 +356,8 @@ class LocalBackend(Backend):
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = (
-            internal_config.get("init_args", {}).get("max_seq_length", 32_768)
+        model_max_sequence_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         if packed_sequence_length is None:
             assert not self._requires_explicit_packed_sequence_length, (
@@ -965,8 +965,8 @@ class LocalBackend(Backend):
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
-        max_seq_length = (
-            internal_config.get("init_args", {}).get("max_seq_length", 32_768)
+        max_seq_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         max_seq_length = int(max_seq_length) if max_seq_length is not None else None
 
