@@ -38,6 +38,7 @@ def packed_tensors_from_tokenized_results(
     truncate_long_results: bool = True,
     advantage_balance: float = 0.0,
     verbosity: Verbosity = 1,
+    pack_results: bool = True,
 ) -> PackedTensors:
     # TODO: This function could potentially be optimized with vectorized operations
     token_ids: list[list[int]] = [[]]
@@ -61,8 +62,9 @@ def packed_tensors_from_tokenized_results(
             if verbosity > 1:
                 print("Result has no unique completion tokens, skipping")
             continue
-        if (
-            len(token_ids[-1])
+        if token_ids[-1] and (
+            not pack_results
+            or len(token_ids[-1])
             + (
                 len(result_without_prompt.token_ids)
                 if result.prompt_id in group_ids[-1]

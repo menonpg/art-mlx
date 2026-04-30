@@ -645,52 +645,49 @@ def run_megatron_sft_job(
             batch_dir = os.path.join(job.sft_data_dir, f"batch_{batch_idx:06d}")
             batch_metadata, trajectory_tensors = load_sft_batch_from_disk(batch_dir)
             num_trajectories = int(batch_metadata["num_trajectories"])
-            if not trajectory_tensors:
-                raise RuntimeError(f"SFT batch {batch_idx} is empty")
+            num_dropped_trajectories = int(
+                batch_metadata.get("num_dropped_trajectories", 0)
+            )
             if num_trajectories != len(trajectory_tensors):
                 raise RuntimeError(
                     "SFT batch metadata does not match trajectory count: "
                     f"{num_trajectories} != {len(trajectory_tensors)}"
                 )
 
-            global_tokens = max(
-                int(batch_metadata.get("num_tokens", 0)),
-                1,
+            global_tokens = sum(
+                _sft_actual_len(inputs) for inputs in trajectory_tensors
             )
-            if "num_tokens" not in batch_metadata:
-                global_tokens = max(
-                    sum(
-                        int(inputs["attention_mask"].sum().item())
-                        for inputs in trajectory_tensors
-                    ),
-                    1,
+            global_trainable_tokens = sum(
+                _count_sft_trainable_tokens(inputs) for inputs in trajectory_tensors
+            )
+            if trajectory_tensors:
+                template = _clone_sft_tensors(trajectory_tensors[0])
+                zero_template = _zero_contribution_sft_inputs(template)
+                micro_indices = build_micro_sample_indices(
+                    step_index=0,
+                    num_sequences=num_trajectories,
+                    global_grad_accumulation_sequences=grad_accumulation_sequences,
                 )
-            global_trainable_tokens = max(
-                int(batch_metadata["num_trainable_tokens"]),
-                1,
-            )
-            template = _clone_sft_tensors(trajectory_tensors[0])
-            zero_template = _zero_contribution_sft_inputs(template)
-            micro_indices = build_micro_sample_indices(
-                step_index=0,
-                num_sequences=num_trajectories,
-                global_grad_accumulation_sequences=grad_accumulation_sequences,
-            )
-            micro_inputs = select_sft_micro_inputs(
-                trajectory_tensors,
-                micro_indices,
-                zero_template,
-            )
-            step_result = run_megatron_sft_step(
-                model_chunks=runtime.model,
-                optimizer=runtime.optimizer,
-                learning_rate=job.learning_rates[batch_idx],
-                inputs=micro_inputs,
-                step_index=batch_idx,
-                sample_index=micro_indices,
-                global_grad_accumulation_sequences=grad_accumulation_sequences,
-                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
-            )
+                micro_inputs = select_sft_micro_inputs(
+                    trajectory_tensors,
+                    micro_indices,
+                    zero_template,
+                )
+                step_result = run_megatron_sft_step(
+                    model_chunks=runtime.model,
+                    optimizer=runtime.optimizer,
+                    learning_rate=job.learning_rates[batch_idx],
+                    inputs=micro_inputs,
+                    step_index=batch_idx,
+                    sample_index=micro_indices,
+                    global_grad_accumulation_sequences=grad_accumulation_sequences,
+                    moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                )
+                loss = step_result.reduced_loss.item()
+                grad_norm = float(step_result.grad_norm)
+            else:
+                loss = 0.0
+                grad_norm = 0.0
             batch_time = time.perf_counter() - batch_start_time
             tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
             completed_batches = batch_idx + 1
@@ -712,12 +709,13 @@ def run_megatron_sft_job(
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
                     log_msg = json.dumps(
                         {
-                            "loss": step_result.reduced_loss.item(),
+                            "loss": loss,
                             "learning_rate": job.learning_rates[batch_idx],
-                            "grad_norm": float(step_result.grad_norm),
+                            "grad_norm": grad_norm,
                             "num_trajectories": float(num_trajectories),
                             "num_tokens": float(global_tokens),
                             "num_trainable_tokens": float(global_trainable_tokens),
+                            "num_dropped_trajectories": float(num_dropped_trajectories),
                             "tokens_per_second": tokens_per_second,
                         }
                     )
@@ -1183,9 +1181,13 @@ def _local_trainable_token_count_tensor(
     return torch.tensor([local_token_total], device=device, dtype=torch.float32)
 
 
-def _count_sft_trainable_tokens(inputs: dict[str, torch.Tensor]) -> float:
+def _sft_actual_len(inputs: dict[str, torch.Tensor]) -> int:
     attention_mask = inputs["attention_mask"].reshape(-1)
-    actual_len = int(attention_mask.sum().item())
+    return max(int(attention_mask.sum().item()), 1)
+
+
+def _count_sft_trainable_tokens(inputs: dict[str, torch.Tensor]) -> float:
+    actual_len = _sft_actual_len(inputs)
     labels = inputs["labels"].reshape(-1)[:actual_len].unsqueeze(0)
     shifted_labels = shift_tensor(labels, -100)
     return float((shifted_labels != -100).sum().item())
@@ -1205,8 +1207,7 @@ def _prepare_sft_micro_inputs(
     inputs: dict[str, torch.Tensor],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    attention_mask = inputs["attention_mask"].reshape(-1)
-    actual_len = max(int(attention_mask.sum().item()), 1)
+    actual_len = _sft_actual_len(inputs)
     input_ids = inputs["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
     labels = inputs["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
     position_ids = torch.arange(actual_len, device=device).unsqueeze(0)
@@ -1241,6 +1242,8 @@ def run_megatron_sft_step(
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
 
+    device = next(model_chunks[0].parameters()).device
+
     if moe_routing_replay_controller is not None:
         resolved_global_grad_accumulation_sequences = (
             resolve_global_grad_accumulation_sequences(
@@ -1252,8 +1255,6 @@ def run_megatron_sft_step(
             sample_index=micro_sample_indices,
             global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
         )
-
-    device = next(model_chunks[0].parameters()).device
 
     for chunk in model_chunks:
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]

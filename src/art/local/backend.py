@@ -109,6 +109,7 @@ class LocalBackend(Backend):
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
+        self._supports_result_packing = False
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -417,6 +418,7 @@ class LocalBackend(Backend):
             pad_token_id=tokenizer.eos_token_id,
             truncate_long_results=False,
             advantage_balance=advantage_balance,
+            pack_results=self._supports_result_packing,
         )
         if (
             not allow_training_without_logprobs
@@ -967,6 +969,13 @@ class LocalBackend(Backend):
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
+        max_seq_length = (
+            (model._internal_config or dev.InternalModelConfig())
+            .get("init_args", {})
+            .get("max_seq_length", 32_768)
+        )
+        max_seq_length = int(max_seq_length) if max_seq_length is not None else None
+
         import itertools
         from typing import Iterator
 
@@ -990,6 +999,7 @@ class LocalBackend(Backend):
                     instruction_part=instruction_part,
                     response_part=response_part,
                     chat_template_kwargs=chat_template_kwargs,
+                    max_seq_length=max_seq_length,
                 )
             )
 
@@ -999,11 +1009,19 @@ class LocalBackend(Backend):
         pbar = tqdm.tqdm(total=len(batches), desc="sft train")
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
+        total_dropped_trajectories = sum(
+            batch.num_dropped_trajectories for batch in batches
+        )
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
             pbar.update(1)
-            pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
+            postfix: dict[str, str | int] = {
+                "loss": f"{result.get('loss/train', 0):.4f}"
+            }
+            if total_dropped_trajectories:
+                postfix["dropped"] = total_dropped_trajectories
+            pbar.set_postfix(postfix)
             batch_count += 1
             yield {
                 **result,

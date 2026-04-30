@@ -11,7 +11,7 @@ from openai.types.chat.chat_completion import Choice
 from PIL import Image
 import torch
 from transformers.image_processing_utils import BaseImageProcessor
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 
@@ -123,6 +123,7 @@ class SFTBatch:
         num_trajectories: Number of trajectories in this batch.
         num_tokens: Total number of non-padding tokens (attention_mask != 0).
         num_trainable_tokens: Total number of tokens being trained on (labels != -100).
+        num_dropped_trajectories: Number of overlength trajectories dropped while tokenizing.
     """
 
     trajectory_tensors: list[dict[str, torch.Tensor]]
@@ -130,6 +131,31 @@ class SFTBatch:
     num_trajectories: int
     num_tokens: int
     num_trainable_tokens: int
+    num_dropped_trajectories: int = 0
+
+
+def _validate_max_seq_length(max_seq_length: int | None) -> None:
+    if max_seq_length is None:
+        return
+    if max_seq_length < 1:
+        raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
+
+
+def _apply_chat_template_token_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> list[int]:
+    output = tokenizer.apply_chat_template(messages, **kwargs)
+    if isinstance(output, BatchEncoding):
+        output = output["input_ids"]
+    if isinstance(output, torch.Tensor):
+        output = output.tolist()
+    assert isinstance(output, list)
+    if output and isinstance(output[0], list):
+        assert len(output) == 1
+        output = output[0]
+    return cast(list[int], output)
 
 
 def tokenize_trajectory_groups(
@@ -465,6 +491,7 @@ def tokenize_sft_batch(
     instruction_part: str,
     response_part: str,
     chat_template_kwargs: dict[str, Any] | None = None,
+    max_seq_length: int | None = None,
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -474,10 +501,14 @@ def tokenize_sft_batch(
         tokenizer: Tokenizer to use for encoding
         instruction_part: Instruction template part (e.g., "<|im_start|>user")
         response_part: Response template part (e.g., "<|im_start|>assistant")
+        max_seq_length: Optional maximum tokenized trajectory length. Trajectories
+            longer than this limit are dropped before tensors are created.
 
     Returns:
         SFTBatch object for this batch
     """
+    _validate_max_seq_length(max_seq_length)
+
     import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
     from unsloth_zoo.dataset_utils import train_on_responses_only
 
@@ -493,22 +524,23 @@ def tokenize_sft_batch(
     trajectory_tensors = []
     num_tokens = 0
     num_trainable_tokens = 0
+    num_dropped_trajectories = 0
     for trajectory in trajectory_batch:
         messages = trajectory.messages_and_choices
         tools = trajectory.tools
 
-        # Single-step tokenization: apply_chat_template with tokenize=True
-        input_ids = cast(
-            list[int],
-            tokenizer.apply_chat_template(
-                cast(Any, messages),
-                tools=cast(Any, tools),
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=False,
-                **(chat_template_kwargs or {}),
-            ),
+        input_ids = _apply_chat_template_token_ids(
+            tokenizer,
+            cast(Any, messages),
+            tools=cast(Any, tools),
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=False,
+            **(chat_template_kwargs or {}),
         )
+        if max_seq_length is not None and len(input_ids) > max_seq_length:
+            num_dropped_trajectories += 1
+            continue
 
         attention_mask = [1] * len(input_ids)
 
@@ -524,10 +556,18 @@ def tokenize_sft_batch(
         num_tokens += sum(attention_mask)
         num_trainable_tokens += sum(1 for l in labels if l != -100)
 
+    if num_dropped_trajectories:
+        print(
+            "WARNING: Dropped "
+            f"{num_dropped_trajectories}/{len(trajectory_batch)} SFT trajectories "
+            f"because they exceed max_seq_length={max_seq_length}."
+        )
+
     return SFTBatch(
         trajectory_tensors=trajectory_tensors,
         learning_rate=learning_rate,
         num_trajectories=len(trajectory_tensors),
         num_tokens=num_tokens,
         num_trainable_tokens=num_trainable_tokens,
+        num_dropped_trajectories=num_dropped_trajectories,
     )

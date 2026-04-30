@@ -899,28 +899,31 @@ async def run_unsloth_sft_training(
             device=device,
         )
 
-        for trajectory_tensor in batch.trajectory_tensors:
-            input_ids = trajectory_tensor["input_ids"].to(device)
-            attention_mask = trajectory_tensor["attention_mask"].to(device)
-            labels = trajectory_tensor["labels"].to(device)
+        if batch.trajectory_tensors:
+            for trajectory_tensor in batch.trajectory_tensors:
+                input_ids = trajectory_tensor["input_ids"].to(device)
+                attention_mask = trajectory_tensor["attention_mask"].to(device)
+                labels = trajectory_tensor["labels"].to(device)
 
-            outputs = ctx.peft_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                num_items_in_batch=num_trainable_tokens,
-            )
-            loss = outputs.loss
-            loss.backward()
-            batch_loss += loss.item()
+                outputs = ctx.peft_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    num_items_in_batch=num_trainable_tokens,
+                )
+                loss = outputs.loss
+                loss.backward()
+                batch_loss += loss.item()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            ctx.peft_model.parameters(),
-            max_grad_norm,
-        ).item()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                ctx.peft_model.parameters(),
+                max_grad_norm,
+            ).item()
 
-        optimizer.step()
-        optimizer.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
+        else:
+            grad_norm = 0.0
 
         batch_time = time.perf_counter() - batch_start_time
         tokens_per_second = batch.num_tokens / batch_time if batch_time > 0 else 0.0
@@ -938,5 +941,6 @@ async def run_unsloth_sft_training(
             "num_trajectories": float(batch.num_trajectories),
             "num_tokens": float(batch.num_tokens),
             "num_trainable_tokens": float(batch.num_trainable_tokens),
+            "num_dropped_trajectories": float(batch.num_dropped_trajectories),
             "tokens_per_second": tokens_per_second,
         }
