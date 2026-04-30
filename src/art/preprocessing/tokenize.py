@@ -251,12 +251,16 @@ def tokenize_trajectory(
     # mapping here instead of the OpenAI JSON string.
     messages = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
     tools = _normalize_tools_for_chat_template(history.tools)
+    # These real-completion renders are only used for debug text and sentinel
+    # selection. Use a closed final message here because some chat templates
+    # normalize generated <think> blocks, which can make Transformers reject
+    # continue_final_message before we reach the trainable sentinel render below.
     chat = cast(
         str,
         tokenizer.apply_chat_template(
             messages,
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=False,
             tokenize=False,
             **(chat_template_kwargs or {}),
         ),
@@ -266,7 +270,7 @@ def tokenize_trajectory(
         tokenizer.apply_chat_template(
             messages,
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=False,
             return_dict=False,
             **(chat_template_kwargs or {}),
         ),

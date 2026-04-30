@@ -27,9 +27,6 @@ from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
-from ..utils.convert_megatron_moe_lora import (
-    convert_checkpoint_to_megatron_moe_lora_if_needed,
-)
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -59,10 +56,9 @@ def create_identity_lora(
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
-    PEFT saves MoE expert LoRA for target_parameters in a fused format, while
-    ART's Megatron loader currently expects per-expert gate/up/down LoRA keys.
-    Long term, we can teach Megatron's LoRA loader to accept PEFT fused
-    target_parameters directly, then delete convert_megatron_moe_lora.py entirely.
+    PEFT saves MoE expert LoRA for target_parameters in the fused format that
+    vLLM expects. ART's Megatron runtime converts that format in memory before
+    loading adapters into Megatron.
 
     Args:
         base_model: HuggingFace model identifier.
@@ -135,16 +131,6 @@ def create_identity_lora(
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)
-    convert_checkpoint_to_megatron_moe_lora_if_needed(lora_path)
-
-    # Write final adapter_config with per-expert target_modules
-    LoraConfig(
-        base_model_name_or_path=base_model,
-        r=rank,
-        lora_alpha=lora_alpha,
-        target_modules=default_target_modules(base_model),
-        bias="none",
-    ).save_pretrained(lora_path)
 
     del peft_model, model
     if torch.cuda.is_available():
@@ -224,10 +210,11 @@ class MegatronService:
         return optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
+        peft_args = self.config.get("peft_args", {})
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=LORA_RANK,
-            lora_alpha=LORA_ALPHA,
+            r=int(peft_args.get("r", LORA_RANK)),
+            lora_alpha=int(peft_args.get("lora_alpha", LORA_ALPHA)),
             target_modules=default_target_modules(self.base_model),
             bias="none",
         )
@@ -247,9 +234,12 @@ class MegatronService:
         return False
 
     def _create_identity_lora(self, lora_path: str) -> None:
+        peft_args = self.config.get("peft_args", {})
         create_identity_lora(
             self.base_model,
             lora_path,
+            rank=int(peft_args.get("r", LORA_RANK)),
+            lora_alpha=int(peft_args.get("lora_alpha", LORA_ALPHA)),
             random_state=self._megatron_random_state(),
         )
 
@@ -541,6 +531,13 @@ class MegatronService:
         random_state = self._megatron_random_state()
         if random_state is not None:
             launch_env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
+        peft_args = self.config.get("peft_args", {})
+        launch_env["ART_MEGATRON_LORA_RANK"] = str(
+            int(peft_args.get("r", LORA_RANK))
+        )
+        launch_env["ART_MEGATRON_LORA_ALPHA"] = str(
+            int(peft_args.get("lora_alpha", LORA_ALPHA))
+        )
 
         command = (
             f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "

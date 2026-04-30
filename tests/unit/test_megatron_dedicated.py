@@ -215,11 +215,6 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
             seen.setdefault("lora_config", lora_config) or FakePeftModel()
         ),
     )
-    monkeypatch.setattr(
-        "art.megatron.service.convert_checkpoint_to_megatron_moe_lora_if_needed",
-        lambda _path: None,
-    )
-
     create_identity_lora("Qwen/Qwen3.5-35B-A3B", str(tmp_path))
 
     assert seen["config"] is top_level_config.text_config
@@ -384,6 +379,11 @@ async def test_megatron_service_start_openai_server_shared_lora_bootstraps_step_
         "art.megatron.service.dev.get_openai_server_config",
         lambda **_kwargs: {"server_args": {"port": 8123}, "engine_args": {}},
     )
+
+    async def fake_get_llm(_args: Any) -> object:
+        return object()
+
+    monkeypatch.setattr("art.megatron.service.get_llm", fake_get_llm)
     monkeypatch.setattr(
         "art.megatron.service.openai_server_task",
         lambda **_kwargs: asyncio.sleep(0),

@@ -38,7 +38,7 @@ async def rollout(
     elif content == "maybe":
         reward = 1.0
     else:
-        reward = random.random()
+        reward = 0.0
     return art.Trajectory(messages_and_choices=[*messages, choice], reward=reward)
 
 

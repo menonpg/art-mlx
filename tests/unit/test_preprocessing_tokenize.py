@@ -91,6 +91,31 @@ class _Qwen3_5FakeTokenizer(_FakeTokenizer):
         )
 
 
+class _ContinueFinalMessageRejectingTokenizer(_FakeTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=True,
+        return_dict=None,
+        **kwargs,
+    ):
+        if kwargs.get("continue_final_message") is True and messages[-1].get(
+            "content", ""
+        ).startswith("<think>"):
+            raise ValueError(
+                "continue_final_message is set but the final message does not appear "
+                "in the chat after applying the chat template!"
+            )
+        return super().apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=tokenize,
+            return_dict=return_dict,
+            **kwargs,
+        )
+
+
 def test_tokenize_trajectory_requests_list_chat_template_output() -> None:
     tokenizer = _FakeTokenizer()
     messages = cast(
@@ -152,6 +177,78 @@ def test_tokenize_trajectory_passes_chat_template_kwargs() -> None:
         call.get("enable_thinking") is False and call.get("preserve_thinking") is True
         for call in tokenizer.apply_chat_template_kwargs
     )
+
+
+def test_tokenize_trajectory_does_not_continue_real_completion_with_thinking() -> None:
+    tokenizer = _ContinueFinalMessageRejectingTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:79",
+                        "bytes": [79],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    },
+                    {
+                        "token": "token_id:75",
+                        "bytes": [75],
+                        "logprob": -0.2,
+                        "top_logprobs": [],
+                    },
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "<think>\n reasoning \n</think>\n\nOK",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": None,
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            choice,
+        ],
+    )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
+
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=history,
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=trajectory,
+        chat_template_kwargs={
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
+    )
+
+    assert result is not None
+    assistant_ids = [
+        token_id
+        for token_id, mask in zip(result.token_ids, result.assistant_mask)
+        if mask
+    ]
+    assert assistant_ids == [79, 75]
+    continue_values = [
+        call.get("continue_final_message")
+        for call in tokenizer.apply_chat_template_kwargs
+    ]
+    assert continue_values[:2] == [False, False]
+    assert continue_values[-1] is True
 
 
 def test_tokenize_sft_batch_requests_list_chat_template_output(

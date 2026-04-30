@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import math
+import os
 from typing import Any, Literal, cast
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -13,8 +14,10 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -25,8 +28,8 @@ import torch
 
 from .cute_grouped_lora_quack import quack_grouped_lora, quack_grouped_lora_dual
 
-LORA_RANK = 1
-LORA_ALPHA = 32
+LORA_RANK = int(os.environ.get("ART_MEGATRON_LORA_RANK", "1"))
+LORA_ALPHA = int(os.environ.get("ART_MEGATRON_LORA_ALPHA", "32"))
 
 ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
@@ -96,6 +99,45 @@ def _normalize_axis(axis: int, ndim: int) -> int:
     if axis < 0 or axis >= ndim:
         raise ValueError(f"Invalid shard axis {axis} for tensor ndim={ndim}")
     return axis
+
+
+def _match_sequence_parallel_output_shape(
+    adapter_out: torch.Tensor,
+    base_out: torch.Tensor,
+    *,
+    adapter_model_prefix: str,
+) -> torch.Tensor:
+    if adapter_out.shape == base_out.shape:
+        return adapter_out
+
+    tp_size = _get_shard_world_size("tp")
+    if (
+        tp_size > 1
+        and adapter_out.ndim == base_out.ndim
+        and adapter_out.shape[0] == base_out.shape[0] * tp_size
+        and adapter_out.shape[1:] == base_out.shape[1:]
+    ):
+        adapter_out = scatter_to_sequence_parallel_region(adapter_out)
+        if adapter_out.shape == base_out.shape:
+            return adapter_out
+
+    if (
+        tp_size > 1
+        and adapter_out.ndim == base_out.ndim
+        and adapter_out.shape[0] * tp_size == base_out.shape[0]
+        and adapter_out.shape[1:] == base_out.shape[1:]
+    ):
+        adapter_out = gather_from_sequence_parallel_region(
+            adapter_out,
+            tensor_parallel_output_grad=True,
+        )
+        if adapter_out.shape == base_out.shape:
+            return adapter_out
+
+    raise RuntimeError(
+        f"{adapter_model_prefix}: LoRA adapter output shape {tuple(adapter_out.shape)} "
+        f"does not match base output shape {tuple(base_out.shape)}"
+    )
 
 
 def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
@@ -725,6 +767,10 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             alpha=alpha,
             num_local_experts=num_local_experts,
         )
+        # PEFT target-parameter MoE LoRA stores one A matrix for the fused
+        # gate/up projection. Keep Megatron's gate/up A tied so checkpoints can
+        # round-trip through the PEFT/vLLM fused format without losing state.
+        self.up_lora.A_T = self.gate_lora.A_T
         self.uses_direct_quack_grouped_lora_dual = True
 
     @staticmethod
@@ -855,6 +901,11 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         adapter_out = torch.cat(
             [self.gate_lora(x), self.up_lora(x)],
             dim=-1,
+        )
+        adapter_out = _match_sequence_parallel_output_shape(
+            adapter_out,
+            base_out,
+            adapter_model_prefix=self.gate_lora.adapter_model_prefix.rsplit(".", 1)[0],
         )
         return base_out + adapter_out, bias_out
 

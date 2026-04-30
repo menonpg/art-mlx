@@ -5,6 +5,10 @@ from typing import Any
 
 import torch
 
+from art.utils.convert_megatron_moe_lora import (
+    convert_megatron_moe_lora_to_peft_target_parameter,
+)
+
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
@@ -124,6 +128,7 @@ def merge_lora_adapter(lora_path: str) -> None:
         return
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
+    adapter_model = convert_megatron_moe_lora_to_peft_target_parameter(adapter_model)
     save_file(adapter_model, adapter_model_path)
     for filename in shard_filenames:
         filename.unlink()

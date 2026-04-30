@@ -1,4 +1,4 @@
-"""Convert PEFT target-parameter MoE LoRA to ART Megatron per-expert LoRA.
+"""Convert between PEFT target-parameter and ART Megatron MoE LoRA tensors.
 
 PEFT saves LoRA for fused MoE expert parameters as tensors under:
   mlp.experts.base_layer.lora_*  (gate_up_proj)
@@ -9,16 +9,17 @@ ART's Megatron LoRA loader currently consumes per-expert module keys:
   mlp.experts.0.up_proj.lora_A.weight
   mlp.experts.0.down_proj.lora_A.weight
 
+Checkpoints stay in the PEFT fused format on disk because vLLM expects that
+layout. Megatron converts to per-expert keys in memory while loading, then the
+Megatron shard merger converts trained tensors back before writing the final
+adapter_model.safetensors.
+
 TODO: Teach Megatron's LoRA loader to accept PEFT fused target_parameters
 directly, then delete this converter entirely.
 """
 
-import json
-import os
 import re
-from typing import Any
 
-import safetensors.torch
 import torch
 
 _FUSED_EXPERT_PATTERN = re.compile(
@@ -26,18 +27,12 @@ _FUSED_EXPERT_PATTERN = re.compile(
     r"(?P<base_layer>base_layer\.)?"
     r"(?P<lora>lora_[AB])\.weight$"
 )
-
-
-def _has_peft_target_parameter_moe_lora(tensors: dict[str, torch.Tensor]) -> bool:
-    """Check whether the adapter contains PEFT fused target-parameter MoE LoRA."""
-    return any(_FUSED_EXPERT_PATTERN.search(key) for key in tensors)
-
-
-def _rank_from_adapter_config(adapter_config: dict[str, Any]) -> int:
-    rank = adapter_config.get("r", adapter_config.get("lora_rank", 8))
-    if not isinstance(rank, int) or rank <= 0:
-        raise ValueError(f"Invalid LoRA rank in adapter_config: {rank!r}")
-    return rank
+_MEGATRON_EXPERT_PATTERN = re.compile(
+    r"(?P<prefix>.*\.mlp\.experts)\."
+    r"(?P<expert>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\."
+    r"(?P<lora>lora_[AB])\.weight$"
+)
 
 
 def _reshape_expert_a(
@@ -74,7 +69,7 @@ def _reshape_expert_b(
             f"{key}: second dimension {num_experts_times_rank} does not match "
             f"num_experts * rank ({expected})"
         )
-    return tensor.reshape(out_features, num_experts, rank).permute(1, 0, 2)
+    return tensor.reshape(out_features, rank, num_experts).permute(2, 0, 1)
 
 
 def _convert_gate_up_lora(
@@ -199,35 +194,127 @@ def convert_peft_target_parameter_moe_lora_to_megatron(
     return converted
 
 
-def convert_checkpoint_to_megatron_moe_lora_if_needed(checkpoint_dir: str) -> None:
-    """Convert a PEFT MoE target-parameter adapter to Megatron format if needed."""
-    adapter_path = os.path.join(checkpoint_dir, "adapter_model.safetensors")
-    config_path = os.path.join(checkpoint_dir, "adapter_config.json")
+def _stack_expert_tensors(
+    prefix: str,
+    projection_tensors: dict[int, torch.Tensor],
+    *,
+    projection: str,
+    lora: str,
+) -> torch.Tensor:
+    expert_ids = sorted(projection_tensors)
+    if expert_ids != list(range(len(expert_ids))):
+        raise ValueError(
+            f"{prefix}.{projection}.{lora}: expected contiguous expert ids, got "
+            f"{expert_ids}"
+        )
+    tensors = [projection_tensors[expert_id] for expert_id in expert_ids]
+    first_shape = tensors[0].shape
+    for expert_id, tensor in zip(expert_ids, tensors):
+        if tensor.shape != first_shape:
+            raise ValueError(
+                f"{prefix}.{expert_id}.{projection}.{lora}: expected shape "
+                f"{first_shape}, got {tensor.shape}"
+            )
+    return torch.stack(tensors)
 
-    if not os.path.exists(adapter_path) or not os.path.exists(config_path):
-        return
 
-    tensors = safetensors.torch.load_file(adapter_path)
-    if not _has_peft_target_parameter_moe_lora(tensors):
-        return
+def _flatten_expert_a(per_expert_a: torch.Tensor) -> torch.Tensor:
+    num_experts, rank, in_features = per_expert_a.shape
+    return per_expert_a.reshape(num_experts * rank, in_features).contiguous()
 
-    with open(config_path) as f:
-        adapter_config = json.load(f)
 
-    rank = _rank_from_adapter_config(adapter_config)
-    converted = convert_peft_target_parameter_moe_lora_to_megatron(
-        tensors,
-        rank=rank,
+def _flatten_expert_b(per_expert_b: torch.Tensor) -> torch.Tensor:
+    num_experts, out_features, rank = per_expert_b.shape
+    return (
+        per_expert_b.permute(1, 2, 0)
+        .reshape(out_features, num_experts * rank)
+        .contiguous()
     )
 
-    safetensors.torch.save_file(converted, adapter_path)
 
-    adapter_config["target_modules"] = [
-        module
-        for module in adapter_config.get("target_modules", [])
-        if "experts" not in module
-    ] + ["gate_proj", "up_proj", "down_proj"]
-    adapter_config.pop("target_parameters", None)
+def convert_megatron_moe_lora_to_peft_target_parameter(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Convert ART Megatron per-expert MoE LoRA tensors to PEFT fused keys."""
+    converted: dict[str, torch.Tensor] = {}
+    grouped: dict[
+        str,
+        dict[str, dict[str, dict[int, torch.Tensor]]],
+    ] = {}
 
-    with open(config_path, "w") as f:
-        json.dump(adapter_config, f, indent=2)
+    for key, tensor in tensors.items():
+        match = _MEGATRON_EXPERT_PATTERN.match(key)
+        if match is None:
+            converted[key] = tensor
+            continue
+        prefix = match.group("prefix")
+        projection = match.group("projection")
+        lora = match.group("lora")
+        expert_id = int(match.group("expert"))
+        grouped.setdefault(prefix, {}).setdefault(projection, {}).setdefault(lora, {})[
+            expert_id
+        ] = tensor
+
+    for prefix, projections in grouped.items():
+        required = {
+            "gate_proj": {"lora_A", "lora_B"},
+            "up_proj": {"lora_A", "lora_B"},
+            "down_proj": {"lora_A", "lora_B"},
+        }
+        for projection, loras in required.items():
+            missing_loras = loras - set(projections.get(projection, {}))
+            if missing_loras:
+                raise ValueError(
+                    f"{prefix}.{projection}: missing {sorted(missing_loras)}"
+                )
+
+        gate_a = _stack_expert_tensors(
+            prefix,
+            projections["gate_proj"]["lora_A"],
+            projection="gate_proj",
+            lora="lora_A",
+        )
+        up_a = _stack_expert_tensors(
+            prefix,
+            projections["up_proj"]["lora_A"],
+            projection="up_proj",
+            lora="lora_A",
+        )
+        if not torch.equal(gate_a, up_a):
+            raise ValueError(
+                f"{prefix}: cannot convert Megatron gate/up LoRA to PEFT "
+                "target_parameters because gate_proj.lora_A and up_proj.lora_A differ"
+            )
+        gate_b = _stack_expert_tensors(
+            prefix,
+            projections["gate_proj"]["lora_B"],
+            projection="gate_proj",
+            lora="lora_B",
+        )
+        up_b = _stack_expert_tensors(
+            prefix,
+            projections["up_proj"]["lora_B"],
+            projection="up_proj",
+            lora="lora_B",
+        )
+        down_a = _stack_expert_tensors(
+            prefix,
+            projections["down_proj"]["lora_A"],
+            projection="down_proj",
+            lora="lora_A",
+        )
+        down_b = _stack_expert_tensors(
+            prefix,
+            projections["down_proj"]["lora_B"],
+            projection="down_proj",
+            lora="lora_B",
+        )
+
+        converted[f"{prefix}.base_layer.lora_A.weight"] = _flatten_expert_a(gate_a)
+        converted[f"{prefix}.base_layer.lora_B.weight"] = _flatten_expert_b(
+            torch.cat([gate_b, up_b], dim=1)
+        )
+        converted[f"{prefix}.lora_A.weight"] = _flatten_expert_a(down_a)
+        converted[f"{prefix}.lora_B.weight"] = _flatten_expert_b(down_b)
+
+    return converted

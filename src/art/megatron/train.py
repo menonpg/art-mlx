@@ -80,6 +80,9 @@ from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
 )
+from art.utils.convert_megatron_moe_lora import (
+    convert_peft_target_parameter_moe_lora_to_megatron,
+)
 
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
@@ -774,7 +777,7 @@ def _load_lora_and_optimizer(
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
     print0(runtime.rank, "Loading adapter model from", lora_path)
-    adapter_model = load_lora_adapter_state_dict(lora_path)
+    adapter_model = _load_megatron_adapter_state_dict(lora_path)
     load_adapter_into_model(runtime.model, adapter_model)
     runtime.optimizer = _build_optimizer(
         runtime.model,
@@ -798,6 +801,26 @@ def _load_lora_and_optimizer(
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
     return adapter_model
+
+
+def _load_lora_rank(lora_path: str) -> int:
+    config_path = os.path.join(lora_path, "adapter_config.json")
+    if not os.path.exists(config_path):
+        return 1
+    with open(config_path) as f:
+        adapter_config = json.load(f)
+    rank = adapter_config.get("r", 1)
+    if not isinstance(rank, int) or rank <= 0:
+        raise ValueError(f"Invalid LoRA rank in {config_path}: {rank!r}")
+    return rank
+
+
+def _load_megatron_adapter_state_dict(lora_path: str) -> dict[str, torch.Tensor]:
+    adapter_model = load_lora_adapter_state_dict(lora_path)
+    return convert_peft_target_parameter_moe_lora_to_megatron(
+        adapter_model,
+        rank=_load_lora_rank(lora_path),
+    )
 
 
 def _save_lora_and_optimizer(
@@ -932,10 +955,15 @@ def maybe_load_adapter_into_model(
         print0(rank, "No adapter model found at", adapter_model_path)
         return {}
     print0(rank, "Loading adapter model from", adapter_model_path)
+    lora_path = os.path.dirname(adapter_model_path)
     with safe_open(adapter_model_path, framework="pt") as adapter_file:
         adapter_model = {
             key: adapter_file.get_tensor(key) for key in adapter_file.keys()
         }
+    adapter_model = convert_peft_target_parameter_moe_lora_to_megatron(
+        adapter_model,
+        rank=_load_lora_rank(lora_path),
+    )
     load_adapter_into_model(model_chunks, adapter_model, optimizer)
     return adapter_model
 

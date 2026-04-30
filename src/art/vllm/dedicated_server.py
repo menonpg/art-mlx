@@ -42,7 +42,6 @@ def _patch_art_dedicated_routes() -> None:
     from fastapi import APIRouter, FastAPI, Request
     from fastapi.responses import JSONResponse
     from vllm.entrypoints.openai import api_server
-    from vllm.tasks import SupportedTask
 
     if getattr(api_server, "_art_dedicated_routes_patched", False):
         return
@@ -51,9 +50,13 @@ def _patch_art_dedicated_routes() -> None:
 
     def art_build_app(
         args: argparse.Namespace,
-        supported_tasks: tuple[SupportedTask, ...] | None = None,
+        supported_tasks: object | None = None,
+        model_config: object | None = None,
     ) -> FastAPI:
-        app = original_build_app(args, supported_tasks)
+        if model_config is None:
+            app = original_build_app(args, supported_tasks)
+        else:
+            app = original_build_app(args, supported_tasks, model_config)
         router = APIRouter()
 
         @router.post("/art/set_served_model_name")
