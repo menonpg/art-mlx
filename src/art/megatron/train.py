@@ -37,7 +37,7 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 from torch.distributed import all_reduce
 
 from art import dev, types
-from art.dev.validate import QWEN3_5_DELTANET_MODELS
+from art.dev.validate import QWEN_DELTANET_MODELS
 from art.loss import loss_fn, shift_tensor
 from art.megatron.bridge_adapter_compat import build_adapter_weights_by_base
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
@@ -204,7 +204,7 @@ def _compile_enabled(model_identifier: str) -> bool:
     disabled = _env_flag("ART_DISABLE_MEGATRON_COMPILE")
     if disabled is not None:
         return disabled is not True
-    return model_identifier not in QWEN3_5_DELTANET_MODELS
+    return model_identifier not in QWEN_DELTANET_MODELS
 
 
 def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
@@ -389,12 +389,12 @@ def build_training_runtime(
     elif (
         rank == 0
         and _env_flag("ART_DISABLE_MEGATRON_COMPILE") is None
-        and resolved_model_identifier in QWEN3_5_DELTANET_MODELS
+        and resolved_model_identifier in QWEN_DELTANET_MODELS
     ):
         print(
             "Disabling torch.compile for",
             resolved_model_identifier,
-            "because Qwen3.5-family Gated DeltaNet currently fails under torch.compile.",
+            "because Qwen Gated DeltaNet currently fails under torch.compile.",
         )
 
     optimizer_config = optimizer_config or _default_optimizer_config()

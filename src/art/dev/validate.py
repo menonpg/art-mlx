@@ -2,10 +2,10 @@
 
 from .model import InternalModelConfig, RolloutWeightsMode
 
-# Dense and MoE Qwen3.5-family models with Gated DeltaNet linear-attention
+# Dense and MoE Qwen 3.5/3.6 models with Gated DeltaNet linear-attention
 # layers. These need LoRA coverage for linear_attn projections, and Megatron
 # compile should stay disabled until the DeltaNet torch.compile failure is fixed.
-QWEN3_5_DELTANET_MODELS = {
+QWEN_DELTANET_MODELS = {
     "Qwen/Qwen3.5-4B",
     "Qwen/Qwen3.5-27B",
     "Qwen/Qwen3.5-35B-A3B",

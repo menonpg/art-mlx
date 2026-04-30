@@ -1,10 +1,10 @@
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
-from .validate import QWEN3_5_DELTANET_MODELS, is_dedicated_mode
+from .validate import QWEN_DELTANET_MODELS, is_dedicated_mode
 
 
 def default_target_modules(base_model: str) -> list[str]:
-    if base_model in QWEN3_5_DELTANET_MODELS:
+    if base_model in QWEN_DELTANET_MODELS:
         return [
             "q_proj",
             "k_proj",
