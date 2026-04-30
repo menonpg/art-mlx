@@ -18,6 +18,8 @@ import art
 from art import dev
 from art.local import LocalBackend
 from art.megatron.backend import MegatronBackend
+from art.megatron.model_support.registry import get_model_support_spec
+from art.megatron.model_support.spec import RolloutWeightsMode
 
 from ..megatron_oracle_harness import ORACLE_TOPOLOGY, Topology
 from ..megatron_oracle_worker import provider_topology_env
@@ -129,7 +131,9 @@ def _resolve_dedicated_gpu_ids() -> tuple[list[int], list[int]]:
             )
         return trainer_gpu_ids, inference_gpu_ids
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        raise RuntimeError("Need at least 2 visible CUDA GPUs for dedicated trainability")
+        raise RuntimeError(
+            "Need at least 2 visible CUDA GPUs for dedicated trainability"
+        )
     return [0], [1]
 
 
@@ -298,7 +302,9 @@ def _wandb_disabled() -> Iterator[None]:
 
 
 def _artifact_dir(base_model: str, variant_name: _VARIANT_NAME) -> Path:
-    path = _TRAINABILITY_ROOT / _slugify(base_model) / variant_name / uuid.uuid4().hex[:8]
+    path = (
+        _TRAINABILITY_ROOT / _slugify(base_model) / variant_name / uuid.uuid4().hex[:8]
+    )
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -344,9 +350,7 @@ def _variant_train_kwargs(variant: _TrainabilityVariant) -> dict[str, object]:
 
 
 def _variant_init_args(variant: _TrainabilityVariant) -> dict[str, object]:
-    return {
-        "max_seq_length": _variant_packed_sequence_length(variant)
-    }
+    return {"max_seq_length": _variant_packed_sequence_length(variant)}
 
 
 def _variant_max_steps(variant: _TrainabilityVariant) -> int:
@@ -359,25 +363,39 @@ def _variant_rollouts_per_prompt(variant: _TrainabilityVariant) -> int:
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_ROLLOUTS_PER_PROMPT", default)
 
 
-def _build_internal_config(variant: _TrainabilityVariant) -> dev.InternalModelConfig:
+def _rollout_weights_mode(base_model: str) -> RolloutWeightsMode:
+    return get_model_support_spec(base_model).default_rollout_weights_mode
+
+
+def _default_variant_name(base_model: str) -> _VARIANT_NAME:
+    if _rollout_weights_mode(base_model) == "merged":
+        return "megatron_dedicated"
+    return "megatron_shared"
+
+
+def _build_internal_config(
+    variant: _TrainabilityVariant, *, base_model: str
+) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = (
         variant.inference_gpu_ids if not shared else _resolve_shared_gpu_ids()
     )
+    engine_args = _engine_args_for_yes_no_trainability(
+        inference_gpu_ids=inference_gpu_ids,
+        tensor_parallel_size=len(inference_gpu_ids) if shared else 1,
+        enable_expert_parallel=shared and variant.backend_name == "megatron",
+        enable_sleep_mode=True if shared else None,
+    )
+    engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
-        rollout_weights_mode="lora",
-        engine_args=_engine_args_for_yes_no_trainability(
-            inference_gpu_ids=inference_gpu_ids,
-            tensor_parallel_size=len(inference_gpu_ids) if shared else 1,
-            enable_expert_parallel=shared and variant.backend_name == "megatron",
-            enable_sleep_mode=True if shared else None,
-        ),
+        rollout_weights_mode=_rollout_weights_mode(base_model),
+        engine_args=engine_args,
         init_args=_variant_init_args(variant),
     )
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids
         internal_config["inference_gpu_ids"] = variant.inference_gpu_ids
-        dev.validate_dedicated_config(internal_config)
+    dev.validate_dedicated_config(internal_config)
     return internal_config
 
 
@@ -464,9 +482,7 @@ async def _evaluate_groups(
 
 def _mean_group_reward(groups: list[art.TrajectoryGroup]) -> float:
     rewards = [
-        trajectory.reward
-        for group in groups
-        for trajectory in group.trajectories
+        trajectory.reward for group in groups for trajectory in group.trajectories
     ]
     return sum(rewards) / max(1, len(rewards))
 
@@ -590,11 +606,13 @@ async def run_yes_no_trainability_async(
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
     eval_prompts = prompts[:eval_prompt_count]
+    internal_config = _build_internal_config(variant, base_model=base_model)
+    rollout_weights_mode = internal_config["rollout_weights_mode"]
     model = art.TrainableModel(
         name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
         project="model-support-validation",
         base_model=base_model,
-        _internal_config=_build_internal_config(variant),
+        _internal_config=internal_config,
         report_metrics=[],
     )
     train_kwargs = _variant_train_kwargs(variant)
@@ -621,7 +639,7 @@ async def run_yes_no_trainability_async(
             output_dir=str(output_dir),
             trainer_gpu_ids=variant.trainer_gpu_ids,
             inference_gpu_ids=variant.inference_gpu_ids,
-            rollout_weights_mode="lora",
+            rollout_weights_mode=rollout_weights_mode,
             reward_threshold=reward_threshold,
             max_steps=max_steps,
             prompt_count=len(prompts),
@@ -705,7 +723,7 @@ def run_yes_no_trainability(base_model: str) -> YesNoTrainabilityReport:
     return asyncio.run(
         run_yes_no_trainability_async(
             base_model=base_model,
-            variant_name="megatron_shared",
+            variant_name=_default_variant_name(base_model),
         )
     )
 
