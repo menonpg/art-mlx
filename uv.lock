@@ -29,7 +29,6 @@ overrides = [
     { name = "quack-kernels", specifier = ">=0.2.7" },
     { name = "transformer-engine", specifier = "==2.11.0" },
     { name = "transformers", specifier = "==5.6.2" },
-    { name = "trl", specifier = "==1.3.0" },
 ]
 excludes = [
     "emerging-optimizers",
@@ -5666,7 +5665,7 @@ backend = [
     { name = "torchao" },
     { name = "transformers" },
     { name = "trl" },
-    { name = "unsloth" },
+    { name = "unsloth", extra = ["colab-no-deps", "huggingface"] },
     { name = "unsloth-zoo" },
     { name = "vllm", marker = "sys_platform == 'linux'" },
     { name = "wandb" },
@@ -5787,8 +5786,8 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'tinker'", specifier = "==5.6.2" },
     { name = "trl", marker = "extra == 'backend'", specifier = "==1.3.0" },
     { name = "typer", specifier = ">=0.15.2" },
-    { name = "unsloth", marker = "extra == 'backend'", specifier = "==2026.4.8" },
-    { name = "unsloth-zoo", marker = "extra == 'backend'", specifier = "==2026.4.9" },
+    { name = "unsloth", extras = ["colab-no-deps", "huggingface"], marker = "extra == 'backend'", git = "https://github.com/Kovbo/unsloth.git?rev=140026a39cfce9ee8702c46140d4c2d4846d1eb6" },
+    { name = "unsloth-zoo", marker = "extra == 'backend'", git = "https://github.com/Kovbo/unsloth-zoo.git?rev=68677b9814e90ccb647cbda91062e0d4001798bd" },
     { name = "uvicorn", marker = "extra == 'tinker'", specifier = ">=0.35.0" },
     { name = "vllm", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "==0.19.1" },
     { name = "wandb", marker = "extra == 'backend'", specifier = "==0.25.0" },
@@ -8342,6 +8341,25 @@ wheels = [
 ]
 
 [[package]]
+name = "sentence-transformers"
+version = "5.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4d/68/7f98c221940ce783b492ad6140384daf2e2918cd7175009d6a362c22b9ee/sentence_transformers-5.4.1.tar.gz", hash = "sha256:436bcb1182a0ff42a8fb2b1c43498a70d0a75b688d182f2cd0d1dd115af61ddc", size = 428910, upload-time = "2026-04-14T13:34:59.006Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/d9/3a9b6f2ccdedc9dc00fe37b2fc58f58f8efbff44565cf4bf39d8568bb13a/sentence_transformers-5.4.1-py3-none-any.whl", hash = "sha256:a6d640fc363849b63affb8e140e9d328feabab86f83d58ac3e16b1c28140b790", size = 571311, upload-time = "2026-04-14T13:34:57.731Z" },
+]
+
+[[package]]
 name = "sentencepiece"
 version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -9662,45 +9680,51 @@ wheels = [
 [[package]]
 name = "unsloth"
 version = "2026.4.8"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/Kovbo/unsloth.git?rev=140026a39cfce9ee8702c46140d4c2d4846d1eb6#140026a39cfce9ee8702c46140d4c2d4846d1eb6" }
 dependencies = [
+    { name = "nest-asyncio" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "typer" },
+]
+
+[package.optional-dependencies]
+colab-no-deps = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
+    { name = "peft" },
+    { name = "protobuf" },
+    { name = "trl" },
+    { name = "xformers", marker = "(platform_machine == 'AMD64' and 'linux' in sys_platform) or (platform_machine == 'x86_64' and 'linux' in sys_platform) or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
+]
+huggingface = [
+    { name = "accelerate" },
     { name = "datasets" },
     { name = "diffusers" },
     { name = "hf-transfer" },
     { name = "huggingface-hub" },
-    { name = "nest-asyncio" },
     { name = "numpy" },
     { name = "packaging" },
     { name = "peft" },
     { name = "protobuf" },
     { name = "psutil" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
+    { name = "sentence-transformers" },
     { name = "sentencepiece" },
-    { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
     { name = "triton", marker = "'linux' in sys_platform" },
     { name = "triton-windows", marker = "(platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
     { name = "trl" },
-    { name = "typer" },
     { name = "tyro" },
     { name = "unsloth-zoo" },
     { name = "wheel" },
-    { name = "xformers", marker = "(platform_machine == 'AMD64' and 'linux' in sys_platform) or (platform_machine == 'x86_64' and 'linux' in sys_platform) or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1f/c1/0331327cc0537da282a11eee4ed2b98fd1a527772a1d7b87336b0fd0d709/unsloth-2026.4.8.tar.gz", hash = "sha256:57f1278d117b5fedc38eaf6f59aab6578c30a2c47e2f34e9049a366aa1a2cb28", size = 71199823, upload-time = "2026-04-23T14:05:14.602Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f7/9d/00445c8134207de8be674efd219f11944af37d10a2544f5c044a143e7583/unsloth-2026.4.8-py3-none-any.whl", hash = "sha256:f1992e0be0c79a702fc7dbe7b0f2b48e427602fa101754bd56320ad55571aba0", size = 67048222, upload-time = "2026-04-23T14:05:08.981Z" },
 ]
 
 [[package]]
 name = "unsloth-zoo"
 version = "2026.4.9"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/Kovbo/unsloth-zoo.git?rev=68677b9814e90ccb647cbda91062e0d4001798bd#68677b9814e90ccb647cbda91062e0d4001798bd" }
 dependencies = [
     { name = "accelerate" },
     { name = "cut-cross-entropy" },
@@ -9726,10 +9750,6 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "tyro" },
     { name = "wheel" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/17/47/837e40c08542466f4aa3489bdf303f6abeec10fe5ace430102b36fdceb16/unsloth_zoo-2026.4.9.tar.gz", hash = "sha256:074e3b84bffa61c08ba1292822fd34ee243ac83f54732dce37b877fa34eb3109", size = 389589, upload-time = "2026-04-22T16:17:21.186Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/2e/5528072e1eefeddd16adc0173e1a41e72585a4770507ab7f52313bbc3435/unsloth_zoo-2026.4.9-py3-none-any.whl", hash = "sha256:782bad1d34db3fc5686b33c0073708fbc3477eca1f427412bc299f48fbdf44e3", size = 421927, upload-time = "2026-04-22T16:17:18.726Z" },
 ]
 
 [[package]]
