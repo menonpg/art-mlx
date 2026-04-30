@@ -281,6 +281,7 @@ def tokenize_trajectory(
     # selection. Use a closed final message here because some chat templates
     # normalize generated <think> blocks, which can make Transformers reject
     # continue_final_message before we reach the trainable sentinel render below.
+    template_kwargs = chat_template_kwargs or {}
     chat = cast(
         str,
         tokenizer.apply_chat_template(
@@ -288,18 +289,16 @@ def tokenize_trajectory(
             tools=tools,
             continue_final_message=False,
             tokenize=False,
-            **(chat_template_kwargs or {}),
+            **template_kwargs,
         ),
     )
-    original_token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            messages,
-            tools=tools,
-            continue_final_message=False,
-            return_dict=False,
-            **(chat_template_kwargs or {}),
-        ),
+    original_token_ids = _apply_chat_template_token_ids(
+        tokenizer,
+        messages,
+        tools=tools,
+        continue_final_message=False,
+        return_dict=False,
+        **template_kwargs,
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinel_token = tokenizer.decode(sentinel_token_id)
@@ -326,15 +325,13 @@ def tokenize_trajectory(
             )
         else:
             token_template_messages.append(cast(dict[str, Any], message))
-    token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            token_template_messages,
-            tools=tools,
-            continue_final_message=True,
-            return_dict=False,
-            **(chat_template_kwargs or {}),
-        ),
+    token_ids = _apply_chat_template_token_ids(
+        tokenizer,
+        token_template_messages,
+        tools=tools,
+        continue_final_message=True,
+        return_dict=False,
+        **template_kwargs,
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)

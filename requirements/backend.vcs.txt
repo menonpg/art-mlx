@@ -7,5 +7,5 @@
 # Torchtune pinned to known-good commit
  torchtune @ git+https://github.com/pytorch/torchtune.git@2344509cf83bd886538fe3e8263e5145d1afb5c2
 
-# Unsloth Zoo pinned to known-good commit
- unsloth-zoo @ git+https://github.com/bradhilton/unsloth-zoo@f536ee6f554c11dea3ae142e05ab487c206c5c70
+# Unsloth Zoo fork pinned to known-good Transformers 5 commit
+ unsloth-zoo @ git+https://github.com/Kovbo/unsloth-zoo.git@68677b9814e90ccb647cbda91062e0d4001798bd
