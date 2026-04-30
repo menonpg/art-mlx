@@ -1552,6 +1552,7 @@ def _project_gdn_inputs(
     gdn: Any, hidden_states: Tensor
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     seq_len, batch_size, _ = hidden_states.shape
+    seq_len *= int(getattr(gdn, "sp_size", 1))
     qkvzba, _ = _in_proj(gdn, hidden_states)
     qkvzba = qkvzba.transpose(0, 1)
     qkv, gate, beta, alpha = torch.split(
@@ -1666,8 +1667,7 @@ def _project_gdn_output(
             out, out_bias = _out_proj_cp_full_shape(gdn, norm_out, plan)
         else:
             out, out_bias = _out_proj(gdn, norm_out)
-    real_mask = plan.real_token_mask.transpose(0, 1).unsqueeze(-1)
-    return out.masked_fill(~real_mask, 0), out_bias
+    return _mask_gdn_output(gdn, out, plan), out_bias
 
 
 def _select_bucket_outputs(
@@ -1719,8 +1719,35 @@ def _project_compact_local_dag_output(
             out, out_bias = _out_proj_cp_full_shape(gdn, norm_out, plan)
         else:
             out, out_bias = _out_proj(gdn, norm_out)
+    return _mask_gdn_output(gdn, out, plan), out_bias
+
+
+def _mask_gdn_output(gdn: Any, out: Tensor, plan: GdnRankExecutionPlan) -> Tensor:
     real_mask = plan.real_token_mask.transpose(0, 1).unsqueeze(-1)
-    return out.masked_fill(~real_mask, 0), out_bias
+    if tuple(real_mask.shape[:2]) == tuple(out.shape[:2]):
+        return out.masked_fill(~real_mask, 0)
+    full_batch = int(plan.packed_batch_size or plan.batch_size)
+    full_seq = int(plan.packed_sequence_length or plan.sequence_length)
+    full_count = full_batch * full_seq
+    local_indices = torch.tensor(
+        plan.gdn_token_indices, device=out.device, dtype=torch.long
+    )
+    full_flat = torch.zeros(full_count, device=out.device, dtype=torch.bool)
+    if int(local_indices.numel()):
+        full_flat = full_flat.index_fill(0, local_indices, True)
+    full_mask = full_flat.reshape(full_batch, full_seq).transpose(0, 1).unsqueeze(-1)
+    if tuple(full_mask.shape[:2]) == tuple(out.shape[:2]):
+        return out.masked_fill(~full_mask, 0)
+    rank = _tp_rank(getattr(gdn.out_proj, "linear_proj", gdn.out_proj))
+    start = rank * int(out.shape[0])
+    end = start + int(out.shape[0])
+    if end <= int(full_mask.shape[0]) and int(full_mask.shape[1]) == int(out.shape[1]):
+        return out.masked_fill(~full_mask[start:end], 0)
+    raise ValueError(
+        "GDN output mask shape must match projected output, got "
+        f"mask={tuple(real_mask.shape)} full_mask={tuple(full_mask.shape)} "
+        f"out={tuple(out.shape)}"
+    )
 
 
 def _out_proj_cp_full_shape(
@@ -1887,6 +1914,20 @@ def _tp_world_size(projection: Any) -> int:
     if group is not None and dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
         return int(dist.get_world_size(group))  # ty: ignore[possibly-missing-attribute]
     return int(getattr(projection, "tp_size", 1))
+
+
+def _tp_rank(projection: Any) -> int:
+    try:
+        from megatron.core import parallel_state as ps
+
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            return int(ps.get_tensor_model_parallel_rank())
+    except Exception:
+        pass
+    group = _tp_group(projection)
+    if group is not None and dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return int(dist.get_rank(group))  # ty: ignore[possibly-missing-attribute]
+    return int(getattr(projection, "tp_rank", 0))
 
 
 def _tp_group(projection: Any) -> Any | None:
