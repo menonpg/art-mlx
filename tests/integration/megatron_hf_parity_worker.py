@@ -56,6 +56,10 @@ _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
 _GATE_WEIGHT_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.gate\.weight$"
 )
+_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?P<expert>\d+)\.(?:down_proj|gate_proj|up_proj)\.weight$"
+)
 
 
 def _hf_moe_router_key(module_name: str) -> str | None:
@@ -357,14 +361,58 @@ def _active_router_rows_by_layer(
     return active_rows
 
 
+def _loss_active_last_layer_experts(
+    replay_bundle: MoeRoutingReplayBundle | None,
+    micro_inputs: list[dict[str, torch.Tensor]],
+    sample_indices: list[int | None],
+    *,
+    layer_index: int,
+) -> set[int]:
+    if replay_bundle is None:
+        return set()
+    experts: set[int] = set()
+    step_routes = replay_bundle.steps.get(0)
+    if step_routes is None:
+        return experts
+    for router_key, router_routes in step_routes.routers.items():
+        match = _REPLAY_ROUTER_LAYER_PATTERN.match(router_key)
+        if match is None or int(match.group("layer")) != layer_index:
+            continue
+        for route in router_routes.calls.values():
+            micro_index = (
+                sample_indices.index(route.sample_index)
+                if route.sample_index is not None
+                else route.micro_slot
+            )
+            if micro_index is None:
+                continue
+            micro = micro_inputs[micro_index]
+            actual_len = max(int(micro["attention_mask"].reshape(-1).sum().item()), 1)
+            shifted_labels = megatron_train.shift_tensor(
+                micro["labels"].reshape(-1)[:actual_len].unsqueeze(0), -100
+            ).reshape(-1)
+            loss_mask = (shifted_labels != -100).cpu()
+            selected = route.expert_indices[loss_mask][route.expert_mask[loss_mask]]
+            experts.update(int(expert) for expert in selected.reshape(-1).tolist())
+    return experts
+
+
 def _focus_derivative_tensor_map(
     tensor_map: dict[str, torch.Tensor],
     *,
     active_embedding_rows: torch.Tensor,
     active_router_rows: dict[int, torch.Tensor],
+    last_layer_index: int,
+    loss_active_last_layer_experts: set[int],
 ) -> dict[str, torch.Tensor]:
     focused: dict[str, torch.Tensor] = {}
     for key, value in tensor_map.items():
+        if match := _EXPERT_WEIGHT_PATTERN.match(key):
+            if (
+                int(match.group("layer")) == last_layer_index
+                and int(match.group("expert")) not in loss_active_last_layer_experts
+            ):
+                continue
         focused_value = value
         if (
             key == "model.language_model.embed_tokens.weight"
@@ -731,7 +779,9 @@ def _worker_run(request: HfParityRunRequest) -> None:
     device = torch.device("cuda", 0)
     try:
         _debug("starting HF parity worker")
-        model_support_handler = get_model_support_handler(request.case_config.base_model)
+        model_support_handler = get_model_support_handler(
+            request.case_config.base_model
+        )
         hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
             base_model=request.case_config.base_model,
             num_layers=request.case_config.num_layers,
@@ -755,15 +805,26 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
         active_embedding_rows = _active_embedding_token_rows(micro_inputs)
         active_router_rows = _active_router_rows_by_layer(moe_routing_replay_bundle)
+        last_layer_index = request.case_config.num_layers - 1
+        loss_active_last_layer_experts = _loss_active_last_layer_experts(
+            moe_routing_replay_bundle,
+            micro_inputs,
+            sample_indices,
+            layer_index=last_layer_index,
+        )
         normalized_hf_grads = _focus_derivative_tensor_map(
             normalized_hf_grads,
             active_embedding_rows=active_embedding_rows,
             active_router_rows=active_router_rows,
+            last_layer_index=last_layer_index,
+            loss_active_last_layer_experts=loss_active_last_layer_experts,
         )
         megatron_grads = _focus_derivative_tensor_map(
             megatron_grads,
             active_embedding_rows=active_embedding_rows,
             active_router_rows=active_router_rows,
+            last_layer_index=last_layer_index,
+            loss_active_last_layer_experts=loss_active_last_layer_experts,
         )
         outputs_summary = summarize_tensor_pair(hf_outputs, megatron_outputs)
         loss_summary = summarize_tensor_pair(hf_loss, megatron_loss)
