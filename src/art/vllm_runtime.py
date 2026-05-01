@@ -1,14 +1,24 @@
 import asyncio
-import httpx
+from contextlib import contextmanager
+import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
-from typing import Literal
+import tempfile
+from typing import Any, Literal
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
+
+RUNTIME_SERVER = "art-vllm-runtime-server"
+RUNTIME_PACKAGE = "art-vllm-runtime"
+RUNTIME_PROTOCOL_VERSION = 1
+RUNTIME_INSTALL_MARKER = "openpipe-art-vllm-runtime"
 
 
 class VllmRuntimeLaunchConfig(BaseModel):
@@ -25,6 +35,35 @@ class VllmRuntimeLaunchConfig(BaseModel):
     server_args: dict[str, object] = Field(default_factory=dict)
 
 
+class VllmRuntimeManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    art_package: str = "openpipe-art"
+    art_version: str
+    runtime_package: str = RUNTIME_PACKAGE
+    runtime_version: str
+    protocol_version: int = RUNTIME_PROTOCOL_VERSION
+    python: str
+    runtime_wheel: str
+    runtime_wheel_sha256: str
+    pyproject: str = "pyproject.toml"
+    pyproject_sha256: str
+    lockfile: str = "uv.lock"
+    lockfile_sha256: str
+
+
+class VllmRuntimeInstallMarker(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    managed_by: str = RUNTIME_INSTALL_MARKER
+    runtime_package: str = RUNTIME_PACKAGE
+    runtime_version: str
+    protocol_version: int = RUNTIME_PROTOCOL_VERSION
+    manifest_hash: str
+    runtime_wheel_sha256: str
+    cache_root: str
+
+
 def get_vllm_runtime_project_root() -> Path:
     override = os.environ.get("ART_VLLM_RUNTIME_PROJECT_ROOT")
     if override:
@@ -32,19 +71,301 @@ def get_vllm_runtime_project_root() -> Path:
     return Path(__file__).resolve().parents[2] / "vllm_runtime"
 
 
+def get_vllm_runtime_working_dir() -> Path:
+    runtime_root = get_vllm_runtime_project_root()
+    if runtime_root.exists():
+        return runtime_root
+    return Path.cwd()
+
+
+def get_vllm_runtime_cache_root() -> Path:
+    override = os.environ.get("ART_VLLM_RUNTIME_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".cache" / "art" / "vllm_runtime"
+
+
+def _bundled_runtime_dir() -> Path:
+    return Path(__file__).resolve().parent / "_vllm_runtime"
+
+
+def _source_runtime_bin() -> Path:
+    return get_vllm_runtime_project_root() / ".venv" / "bin" / RUNTIME_SERVER
+
+
+def _runtime_bin(runtime_dir: Path) -> Path:
+    return runtime_dir / ".venv" / "bin" / RUNTIME_SERVER
+
+
+def _runtime_python(runtime_dir: Path) -> Path:
+    return runtime_dir / ".venv" / "bin" / "python"
+
+
+def _is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_hash(manifest: VllmRuntimeManifest) -> str:
+    payload = json.dumps(manifest.model_dump(), sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _load_bundled_manifest(bundle_dir: Path | None = None) -> VllmRuntimeManifest:
+    bundle_dir = bundle_dir or _bundled_runtime_dir()
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(
+            "ART vLLM runtime bundle is missing. Reinstall openpipe-art from a "
+            "wheel built with scripts/build_package.py or set ART_VLLM_RUNTIME_BIN."
+        )
+    return VllmRuntimeManifest.model_validate_json(manifest_path.read_text())
+
+
+def _run_install_command(command: list[str], *, cwd: Path | None = None) -> None:
+    try:
+        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "uv is required to install ART's managed vLLM runtime. Install uv or "
+            "set ART_VLLM_RUNTIME_BIN to an existing runtime server."
+        ) from exc
+    if result.returncode == 0:
+        return
+    output = (result.stdout + result.stderr)[-4000:]
+    raise RuntimeError(
+        "Failed to install ART's managed vLLM runtime with command "
+        f"{shlex.join(command)}.\n{output}"
+    )
+
+
+@contextmanager
+def _runtime_install_lock(cache_root: Path):
+    cache_root.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_root / ".install.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _install_marker_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "install.json"
+
+
+def _read_install_marker(runtime_dir: Path) -> VllmRuntimeInstallMarker | None:
+    marker_path = _install_marker_path(runtime_dir)
+    if not marker_path.exists():
+        return None
+    try:
+        return VllmRuntimeInstallMarker.model_validate_json(marker_path.read_text())
+    except ValueError:
+        return None
+
+
+def _is_managed_runtime_dir(
+    runtime_dir: Path,
+    *,
+    cache_root: Path,
+    expected_hash: str | None = None,
+) -> bool:
+    if not runtime_dir.is_dir():
+        return False
+    if runtime_dir.resolve().parent != cache_root.resolve():
+        return False
+    if len(runtime_dir.name) != 64 or any(
+        c not in "0123456789abcdef" for c in runtime_dir.name
+    ):
+        return False
+    if expected_hash is not None and runtime_dir.name != expected_hash:
+        return False
+    marker = _read_install_marker(runtime_dir)
+    if marker is None:
+        return False
+    if marker.managed_by != RUNTIME_INSTALL_MARKER:
+        return False
+    if marker.runtime_package != RUNTIME_PACKAGE:
+        return False
+    if marker.manifest_hash != runtime_dir.name:
+        return False
+    if marker.cache_root != str(cache_root.resolve()):
+        return False
+    if not (runtime_dir / ".venv" / "pyvenv.cfg").exists():
+        return False
+    return True
+
+
+def _validate_managed_runtime(
+    runtime_dir: Path,
+    *,
+    cache_root: Path,
+    manifest: VllmRuntimeManifest,
+    manifest_hash: str,
+) -> Path | None:
+    if not _is_managed_runtime_dir(
+        runtime_dir, cache_root=cache_root, expected_hash=manifest_hash
+    ):
+        return None
+    marker = _read_install_marker(runtime_dir)
+    if marker is None:
+        return None
+    if marker.runtime_version != manifest.runtime_version:
+        return None
+    if marker.protocol_version != manifest.protocol_version:
+        return None
+    if marker.runtime_wheel_sha256 != manifest.runtime_wheel_sha256:
+        return None
+    runtime_bin = _runtime_bin(runtime_dir)
+    if not _is_executable_file(runtime_bin):
+        return None
+    return runtime_bin
+
+
+def _cleanup_old_managed_runtimes(cache_root: Path, *, keep_hash: str) -> None:
+    if os.environ.get("ART_VLLM_RUNTIME_KEEP_OLD"):
+        return
+    if not cache_root.exists():
+        return
+    for child in cache_root.iterdir():
+        if child.name == keep_hash:
+            continue
+        if not _is_managed_runtime_dir(child, cache_root=cache_root):
+            continue
+        shutil.rmtree(child)
+
+
+def _install_managed_runtime(
+    *,
+    bundle_dir: Path,
+    cache_root: Path,
+    manifest: VllmRuntimeManifest,
+    manifest_hash: str,
+) -> Path:
+    runtime_wheel = bundle_dir / manifest.runtime_wheel
+    if _sha256_file(runtime_wheel) != manifest.runtime_wheel_sha256:
+        raise RuntimeError(f"Bundled vLLM runtime wheel hash mismatch: {runtime_wheel}")
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{manifest_hash}.tmp-", dir=str(cache_root.resolve()))
+    )
+    runtime_dir = cache_root / manifest_hash
+    promoted = False
+    try:
+        shutil.copy2(bundle_dir / manifest.pyproject, stage / "pyproject.toml")
+        shutil.copy2(bundle_dir / manifest.lockfile, stage / "uv.lock")
+        _run_install_command(
+            [
+                "uv",
+                "sync",
+                "--project",
+                str(stage),
+                "--frozen",
+                "--no-install-project",
+                "--no-dev",
+            ]
+        )
+        if runtime_dir.exists():
+            existing = _validate_managed_runtime(
+                runtime_dir,
+                cache_root=cache_root,
+                manifest=manifest,
+                manifest_hash=manifest_hash,
+            )
+            if existing is not None:
+                shutil.rmtree(stage)
+                return existing
+            raise RuntimeError(
+                f"Refusing to replace invalid vLLM runtime cache directory: {runtime_dir}"
+            )
+        stage.rename(runtime_dir)
+        promoted = True
+        runtime_python = _runtime_python(runtime_dir)
+        _run_install_command(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--no-deps",
+                "--python",
+                str(runtime_python),
+                str(runtime_wheel),
+            ]
+        )
+        runtime_bin = _runtime_bin(runtime_dir)
+        if not _is_executable_file(runtime_bin):
+            raise RuntimeError(f"vLLM runtime server was not installed: {runtime_bin}")
+
+        marker = VllmRuntimeInstallMarker(
+            runtime_version=manifest.runtime_version,
+            protocol_version=manifest.protocol_version,
+            manifest_hash=manifest_hash,
+            runtime_wheel_sha256=manifest.runtime_wheel_sha256,
+            cache_root=str(cache_root.resolve()),
+        )
+        _install_marker_path(runtime_dir).write_text(
+            json.dumps(marker.model_dump(), indent=2, sort_keys=True) + "\n"
+        )
+        _cleanup_old_managed_runtimes(cache_root, keep_hash=manifest_hash)
+        return runtime_bin
+    except Exception:
+        shutil.rmtree(runtime_dir if promoted else stage, ignore_errors=True)
+        raise
+
+
+def ensure_vllm_runtime() -> Path:
+    bundle_dir = _bundled_runtime_dir()
+    manifest = _load_bundled_manifest(bundle_dir)
+    manifest_hash = _manifest_hash(manifest)
+    cache_root = get_vllm_runtime_cache_root()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_root = cache_root.resolve()
+    runtime_dir = cache_root / manifest_hash
+
+    with _runtime_install_lock(cache_root):
+        existing = _validate_managed_runtime(
+            runtime_dir,
+            cache_root=cache_root,
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+        )
+        if existing is not None:
+            _cleanup_old_managed_runtimes(cache_root, keep_hash=manifest_hash)
+            return existing
+        return _install_managed_runtime(
+            bundle_dir=bundle_dir,
+            cache_root=cache_root,
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+        )
+
+
 def _runtime_command_prefix() -> list[str]:
     override = os.environ.get("ART_VLLM_RUNTIME_BIN")
     if override:
         return shlex.split(override)
-    runtime_bin = (
-        get_vllm_runtime_project_root() / ".venv" / "bin" / "art-vllm-runtime-server"
-    )
-    if not runtime_bin.exists():
+    runtime_bin = _source_runtime_bin()
+    if runtime_bin.exists():
+        return [str(runtime_bin)]
+    runtime_root = get_vllm_runtime_project_root()
+    if (
+        runtime_root.exists()
+        and not (_bundled_runtime_dir() / "manifest.json").exists()
+    ):
         raise RuntimeError(
             "vLLM runtime env is not built. Run `uv sync` in "
-            f"{get_vllm_runtime_project_root()} or set ART_VLLM_RUNTIME_BIN."
+            f"{runtime_root} or set ART_VLLM_RUNTIME_BIN."
         )
-    return [str(runtime_bin)]
+    return [str(ensure_vllm_runtime())]
 
 
 def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
@@ -64,7 +385,7 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
 
 async def wait_for_vllm_runtime(
     *,
-    process: subprocess.Popen[object],
+    process: subprocess.Popen[Any],
     host: str,
     port: int,
     timeout: float,

@@ -27,7 +27,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build wheel
-        run: uv build --wheel --out-dir dist
+        run: python scripts/build_package.py --wheel
 
       - name: Smoke test uv add + sync for backend extra
         run: |

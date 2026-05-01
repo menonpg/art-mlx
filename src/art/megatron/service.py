@@ -27,7 +27,7 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
-    get_vllm_runtime_project_root,
+    get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
 from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
@@ -403,7 +403,7 @@ class MegatronService:
         )
         self._vllm_process = subprocess.Popen(
             cmd,
-            cwd=str(get_vllm_runtime_project_root()),
+            cwd=str(get_vllm_runtime_working_dir()),
             env=os.environ.copy(),
             stdout=self._vllm_log_file,
             stderr=subprocess.STDOUT,

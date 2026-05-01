@@ -24,7 +24,7 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
-    get_vllm_runtime_project_root,
+    get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
 from ..weight_transfer import (
@@ -145,7 +145,9 @@ class UnslothService:
             return visible
         return ",".join(str(index) for index in range(torch.cuda.device_count()))
 
-    def _runtime_engine_args(self, config: dev.OpenAIServerConfig | None) -> dict[str, object]:
+    def _runtime_engine_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
         engine_args = dict(self.config.get("engine_args", {}))
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
@@ -161,7 +163,9 @@ class UnslothService:
             engine_args.pop(key, None)
         return engine_args
 
-    def _runtime_server_args(self, config: dev.OpenAIServerConfig | None) -> dict[str, object]:
+    def _runtime_server_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
         server_args: dict[str, object] = {
             "return_tokens_as_token_ids": True,
             "enable_auto_tool_choice": True,
@@ -216,7 +220,7 @@ class UnslothService:
 
         self._vllm_process = subprocess.Popen(
             cmd,
-            cwd=str(get_vllm_runtime_project_root()),
+            cwd=str(get_vllm_runtime_working_dir()),
             stdout=self._vllm_log_file,
             stderr=subprocess.STDOUT,
             bufsize=1,

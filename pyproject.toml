@@ -94,17 +94,30 @@ packages = ["src/art", "src/mp_actors"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
+sources = []
+only-include = [
+    ".agents/skills",
+    "LICENSE",
+    "README.md",
+    "THIRD-PARTY-NOTICES",
+    "pyproject.toml",
+    "src",
+]
 exclude = [
     "/dev",
     "/wandb",
     "/.art",
+    "/.local",
     "/.ruff_cache",
     "/.venv",
     "/dist",
+    "/scratch",
+    "/unsloth_compiled_cache",
     "/.git",
     "/.github",
     "/examples/*/data",
     "/examples/*/wandb",
+    "/tests/unsloth_compiled_cache",
     "**/__pycache__",
     "**/*.pyc",
 ]
