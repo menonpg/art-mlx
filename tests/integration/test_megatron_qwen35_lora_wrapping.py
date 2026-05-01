@@ -250,6 +250,8 @@ def test_apply_lora_adapters_accepts_layernorm_column_fc1_dense_path() -> None:
 
         assert isinstance(target_layer.mlp.linear_fc1, SharedExpertsLinearFC1LoRA)
         assert isinstance(target_layer.mlp.linear_fc2, SharedExpertsLinearFC2LoRA)
+        assert dense_fc1.return_layernorm_output is True
+        assert dense_fc1.return_layernorm_output_gathered is True
 
 
 @pytest.mark.skipif(
