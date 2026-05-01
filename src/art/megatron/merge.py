@@ -6,13 +6,25 @@ from typing import Any
 import torch
 
 from art.utils.convert_megatron_moe_lora import (
+    add_language_model_prefix_for_vllm,
     convert_megatron_moe_lora_to_peft_target_parameter,
+    uses_qwen_language_model_prefix,
 )
 
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
 save_file = safetensors_torch.save_file
+
+
+def _uses_qwen_language_model_prefix(lora_path: Path) -> bool:
+    config_path = lora_path / "adapter_config.json"
+    if not config_path.exists():
+        return False
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        adapter_config = json.load(config_file)
+    base_model = adapter_config.get("base_model_name_or_path")
+    return isinstance(base_model, str) and uses_qwen_language_model_prefix(base_model)
 
 
 def _load_adapter_shards(
@@ -129,6 +141,8 @@ def merge_lora_adapter(lora_path: str) -> None:
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
     adapter_model = convert_megatron_moe_lora_to_peft_target_parameter(adapter_model)
+    if _uses_qwen_language_model_prefix(base_dir):
+        adapter_model = add_language_model_prefix_for_vllm(adapter_model)
     save_file(adapter_model, adapter_model_path)
     for filename in shard_filenames:
         filename.unlink()

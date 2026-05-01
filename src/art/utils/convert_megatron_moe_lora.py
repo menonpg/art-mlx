@@ -33,6 +33,32 @@ _MEGATRON_EXPERT_PATTERN = re.compile(
     r"(?P<projection>gate_proj|up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
 )
+_TEXT_LAYER_PREFIX = "base_model.model.model.layers."
+_LANGUAGE_MODEL_LAYER_PREFIX = "base_model.model.model.language_model.layers."
+
+
+def uses_qwen_language_model_prefix(base_model: str) -> bool:
+    return base_model.startswith(("Qwen/Qwen3.5", "Qwen/Qwen3.6"))
+
+
+def add_language_model_prefix_for_vllm(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Rewrite Megatron text-model LoRA keys to vLLM's Qwen3.5/3.6 wrapper path."""
+    return {
+        key.replace(_TEXT_LAYER_PREFIX, _LANGUAGE_MODEL_LAYER_PREFIX, 1): tensor
+        for key, tensor in tensors.items()
+    }
+
+
+def strip_language_model_prefix_for_megatron(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Rewrite vLLM/HF Qwen3.5/3.6 wrapper LoRA keys to Megatron text-model keys."""
+    return {
+        key.replace(_LANGUAGE_MODEL_LAYER_PREFIX, _TEXT_LAYER_PREFIX, 1): tensor
+        for key, tensor in tensors.items()
+    }
 
 
 def _reshape_expert_a(

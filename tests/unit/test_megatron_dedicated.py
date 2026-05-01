@@ -14,6 +14,7 @@ import torch
 pytest.importorskip("vllm")
 
 from art import TrainableModel, types
+from art.dev.get_model_config import default_target_modules
 from art.dev.model import InternalModelConfig
 from art.dev.validate import QWEN_DELTANET_MODELS
 from art.megatron.backend import MegatronBackend
@@ -218,10 +219,13 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
     create_identity_lora("Qwen/Qwen3.5-35B-A3B", str(tmp_path))
 
     assert seen["config"] is top_level_config.text_config
-    assert (
-        "model.layers.0.linear_attn.in_proj_qkv.weight"
-        in seen["lora_config"].target_parameters
-    )
+    assert seen["lora_config"].target_modules == set(default_target_modules(
+        "Qwen/Qwen3.5-35B-A3B"
+    ))
+    assert seen["lora_config"].target_parameters == [
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    ]
 
 
 @pytest.mark.asyncio

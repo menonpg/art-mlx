@@ -82,6 +82,7 @@ from art.preprocessing.pack import (
 )
 from art.utils.convert_megatron_moe_lora import (
     convert_peft_target_parameter_moe_lora_to_megatron,
+    strip_language_model_prefix_for_megatron,
 )
 
 safetensors = importlib.import_module("safetensors")
@@ -815,6 +816,7 @@ def _load_lora_rank(lora_path: str) -> int:
 
 def _load_megatron_adapter_state_dict(lora_path: str) -> dict[str, torch.Tensor]:
     adapter_model = load_lora_adapter_state_dict(lora_path)
+    adapter_model = strip_language_model_prefix_for_megatron(adapter_model)
     return convert_peft_target_parameter_moe_lora_to_megatron(
         adapter_model,
         rank=_load_lora_rank(lora_path),
@@ -958,6 +960,7 @@ def maybe_load_adapter_into_model(
         adapter_model = {
             key: adapter_file.get_tensor(key) for key in adapter_file.keys()
         }
+    adapter_model = strip_language_model_prefix_for_megatron(adapter_model)
     adapter_model = convert_peft_target_parameter_moe_lora_to_megatron(
         adapter_model,
         rank=_load_lora_rank(lora_path),
