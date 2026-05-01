@@ -174,7 +174,7 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     top_level_config = SimpleNamespace(
-        text_config=SimpleNamespace(vocab_size=128),
+        text_config=SimpleNamespace(vocab_size=128, num_experts=256),
     )
     seen: dict[str, Any] = {}
 
@@ -226,6 +226,47 @@ def test_create_identity_lora_uses_nested_text_config_when_top_level_lacks_vocab
         "mlp.experts.gate_up_proj",
         "mlp.experts.down_proj",
     ]
+
+
+def test_create_identity_lora_uses_dense_qwen_target_modules_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    top_level_config = SimpleNamespace(
+        text_config=SimpleNamespace(vocab_size=128),
+    )
+    seen: dict[str, Any] = {}
+
+    class FakeModel:
+        name_or_path = ""
+
+    class FakePeftModel:
+        def save_pretrained(self, lora_path: str) -> None:
+            Path(lora_path).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: top_level_config,
+    )
+    monkeypatch.setattr(
+        "transformers.AutoModelForCausalLM.from_config",
+        lambda config, **_kwargs: seen.setdefault("config", config) or FakeModel(),
+    )
+    monkeypatch.setattr("accelerate.init_empty_weights", nullcontext)
+    monkeypatch.setattr(
+        "peft.get_peft_model",
+        lambda _model, lora_config, **_kwargs: (
+            seen.setdefault("lora_config", lora_config) or FakePeftModel()
+        ),
+    )
+
+    create_identity_lora("Qwen/Qwen3.6-27B", str(tmp_path))
+
+    assert seen["config"] is top_level_config.text_config
+    assert seen["lora_config"].target_modules == set(
+        default_target_modules("Qwen/Qwen3.6-27B")
+    )
+    assert seen["lora_config"].target_parameters == []
 
 
 @pytest.mark.asyncio

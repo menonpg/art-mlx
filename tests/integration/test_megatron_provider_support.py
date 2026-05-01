@@ -10,7 +10,10 @@ pytest.importorskip("megatron.bridge.models.qwen.qwen3_moe_bridge")
 pytest.importorskip("megatron.bridge.models.qwen_vl.qwen35_vl_bridge")
 
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
-from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+    Qwen35VLBridge,
+    Qwen35VLMoEBridge,
+)
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.flex_attention import FlexDotProductAttention
@@ -21,6 +24,14 @@ class _FakeProvider:
     def __init__(self) -> None:
         self.transformer_layer_spec = self._base_layer_spec
         self.finalized = False
+        self.overlap_moe_expert_parallel_comm = False
+        self.delay_wgrad_compute = False
+        self.ep_overlap_early_attn_memory_release = False
+        self.moe_apply_probs_on_input = False
+        self.bias_activation_fusion = True
+        self.fine_grained_activation_offloading = False
+        self.offload_modules = []
+        self.recompute_modules = None
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
@@ -67,12 +78,28 @@ class _FakeBridge:
         return self._provider
 
 
-@pytest.mark.parametrize("bridge_type", [Qwen3MoEBridge, Qwen35VLMoEBridge])
-def test_get_provider_accepts_supported_qwen_moe_bridges(
+@pytest.mark.parametrize(
+    (
+        "bridge_type",
+        "num_moe_experts",
+        "expected_expert_model_parallel_size",
+        "expected_moe_shared_expert_overlap",
+    ),
+    [
+        (Qwen3MoEBridge, 8, 2, False),
+        (Qwen35VLBridge, 0, 1, False),
+        (Qwen35VLMoEBridge, 8, 2, False),
+    ],
+)
+def test_get_provider_accepts_supported_qwen_bridges(
     monkeypatch: pytest.MonkeyPatch,
     bridge_type: type[object],
+    num_moe_experts: int,
+    expected_expert_model_parallel_size: int,
+    expected_moe_shared_expert_overlap: bool,
 ) -> None:
     provider = _FakeProvider()
+    provider.num_moe_experts = num_moe_experts
     fake_bridge = _FakeBridge(
         model_bridge=object.__new__(bridge_type),
         provider=provider,
@@ -95,12 +122,15 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     assert resolved.tensor_model_parallel_size == 2
     assert resolved.context_parallel_size == 1
     assert resolved.pipeline_model_parallel_size == 1
-    assert resolved.expert_model_parallel_size == 2
+    assert (
+        resolved.expert_model_parallel_size == expected_expert_model_parallel_size
+    )
     assert resolved.expert_tensor_parallel_size == 1
     assert resolved.sequence_parallel is True
-    assert resolved.moe_shared_expert_overlap is True
-    assert resolved.moe_router_dtype == "fp32"
-    assert resolved.moe_aux_loss_coeff == 0.0
+    assert resolved.moe_shared_expert_overlap is expected_moe_shared_expert_overlap
+    if num_moe_experts:
+        assert resolved.moe_router_dtype == "fp32"
+        assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
 
     layer_spec = provider_module._resolve_layer_spec(
@@ -127,7 +157,7 @@ def test_get_provider_rejects_unsupported_bridge(
 
     with pytest.raises(
         AssertionError,
-        match="Only Qwen3 and Qwen3.5 MoE models are supported",
+        match="Only Qwen3 MoE and Qwen3.5/3.6 dense or MoE models are supported",
     ):
         provider_module.get_provider("unsupported-model")
 

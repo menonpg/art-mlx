@@ -69,6 +69,13 @@ def _rewrite_identity_lora_for_vllm(base_model: str, lora_path: str) -> None:
         )
 
 
+def _is_moe_model_config(config: Any) -> bool:
+    text_config = getattr(config, "text_config", None)
+    return int(
+        getattr(text_config, "num_experts", getattr(config, "num_experts", 0)) or 0
+    ) > 0
+
+
 def create_identity_lora(
     base_model: str,
     lora_path: str,
@@ -111,10 +118,14 @@ def create_identity_lora(
 
     if uses_qwen_language_model_prefix(base_model):
         target_modules = default_target_modules(base_model)
-        target_parameters = [
-            "mlp.experts.gate_up_proj",
-            "mlp.experts.down_proj",
-        ]
+        target_parameters = (
+            [
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+            ]
+            if _is_moe_model_config(base_config)
+            else []
+        )
         task_type = "CAUSAL_LM"
     else:
         target_modules = []
