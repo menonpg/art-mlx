@@ -18,6 +18,24 @@ from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 
 
+def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
+    chat_template = tokenizer.chat_template
+    return isinstance(chat_template, str) and "enable_thinking" in chat_template
+
+
+def _chat_template_kwargs(
+    tokenizer: PreTrainedTokenizerBase,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    kwargs = (
+        {"enable_thinking": False}
+        if _chat_template_disables_thinking(tokenizer)
+        else {}
+    )
+    kwargs.update(chat_template_kwargs or {})
+    return kwargs
+
+
 def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | None:
     if tools is None:
         return None
@@ -281,7 +299,7 @@ def tokenize_trajectory(
     # selection. Use a closed final message here because some chat templates
     # normalize generated <think> blocks, which can make Transformers reject
     # continue_final_message before we reach the trainable sentinel render below.
-    template_kwargs = chat_template_kwargs or {}
+    template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
     chat = cast(
         str,
         tokenizer.apply_chat_template(
@@ -390,7 +408,7 @@ def tokenize_trajectory(
                     for token_logprob in token_logprobs
                 )
             except (IndexError, ValueError):
-                token_ids[start:end] = [
+                token_ids[start:end] = [  # type: ignore[assignment]
                     token_id if token_id is not None else tokenizer.eos_token_id
                     for token_id in cast(
                         list[int],
@@ -398,7 +416,7 @@ def tokenize_trajectory(
                             [
                                 token_logprob.token or tokenizer.eos_token
                                 for token_logprob in token_logprobs
-                            ]
+                            ]  # type: ignore[arg-type]
                         ),
                     )
                 ]
