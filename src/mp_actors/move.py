@@ -125,17 +125,28 @@ class Proxy:
             ),
         )
         self._process.start()
+        startup_timeout = float(os.environ.get("ART_MP_ACTOR_START_TIMEOUT", 300.0))
+        deadline = time.monotonic() + startup_timeout
         try:
-            ready_status, ready_payload = ready.get(
-                timeout=float(os.environ.get("ART_MP_ACTOR_START_TIMEOUT", 30.0))
-            )
-        except queue.Empty as exc:
+            while True:
+                try:
+                    ready_status, ready_payload = ready.get(timeout=0.1)
+                    break
+                except queue.Empty as exc:
+                    if not self._process.is_alive():
+                        self._process.join(timeout=1)
+                        raise self._process_error() from exc
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"Child process did not enter its process group within {startup_timeout:.1f}s"
+                        ) from exc
+        except BaseException:
             self._process.terminate()
             self._process.join(timeout=1)
             if self._process.is_alive():
                 self._process.kill()
                 self._process.join(timeout=1)
-            raise RuntimeError("Child process did not enter its process group") from exc
+            raise
         if ready_status != "ok":
             self._process.terminate()
             self._process.join(timeout=1)
