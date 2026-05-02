@@ -1,5 +1,4 @@
 from pathlib import Path
-import shlex
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -17,7 +16,9 @@ class _AsyncOkResponse:
 
 
 class _RecordingAsyncClient:
-    def __init__(self, posts: list[tuple[str, dict[str, object] | None, float]]) -> None:
+    def __init__(
+        self, posts: list[tuple[str, dict[str, object] | None, float]]
+    ) -> None:
         self._posts = posts
 
     async def __aenter__(self):
@@ -79,7 +80,9 @@ async def test_unsloth_shared_start_requires_runtime_sleep_mode(
         trainer=SimpleNamespace(save_model=lambda path: None),
         offload_to_cpu=lambda: None,
     )
-    monkeypatch.setattr("art.unsloth.service.get_last_checkpoint_dir", lambda _output_dir: "/tmp/lora")
+    monkeypatch.setattr(
+        "art.unsloth.service.get_last_checkpoint_dir", lambda _output_dir: "/tmp/lora"
+    )
     monkeypatch.setattr("art.unsloth.service.get_step_from_dir", lambda _output_dir: 0)
     monkeypatch.setattr(service, "_start_vllm_subprocess", AsyncMock())
 
@@ -186,16 +189,15 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     )
     recorded: dict[str, object] = {}
 
-    async def _fake_create_subprocess_shell(
-        command: str,
-        *,
+    async def _fake_create_subprocess_exec(
+        *command: str,
         cwd: str,
         env: dict[str, str],
         stdout,
         stderr,
         start_new_session: bool,
     ) -> SimpleNamespace:
-        recorded["command"] = command
+        recorded["command"] = list(command)
         recorded["cwd"] = cwd
         recorded["env"] = env
         recorded["stdout"] = stdout
@@ -204,16 +206,23 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
         return SimpleNamespace(returncode=None)
 
     monkeypatch.setattr(
-        "art.megatron.service.asyncio.create_subprocess_shell",
-        _fake_create_subprocess_shell,
+        "art.megatron.service.asyncio.create_subprocess_exec",
+        _fake_create_subprocess_exec,
     )
     monkeypatch.setattr(service, "_install_parent_signal_cleanup", lambda: None)
     monkeypatch.setattr(service, "_allocate_master_port", lambda: 12345)
 
     await service._ensure_megatron_running()
-    assert recorded["command"].startswith(
-        f"{shlex.quote(sys.executable)} -m torch.distributed.run "
-    )
-    assert "uv run" not in recorded["command"]
+    command = recorded["command"]
+    assert isinstance(command, list)
+    assert command[0] == sys.executable
+    assert command[1].endswith("managed_process.py")
+    separator = command.index("--")
+    assert command[separator + 1 : separator + 4] == [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+    ]
+    assert "uv run" not in command
     assert recorded["cwd"] == str(Path(__file__).resolve().parents[3])
     service._megatron_log_file.close()

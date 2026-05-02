@@ -156,12 +156,18 @@ class OpenAICompatibleTinkerServer:
         return host, port
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await self._task
-            self._task = None
-        for worker in self._workers:
-            close_proxy(worker)
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                self._task = None
+        finally:
+            for worker in self._workers:
+                close_proxy(worker)
+            self._workers.clear()
 
     def _get_request_tenant(
         self, request: Request

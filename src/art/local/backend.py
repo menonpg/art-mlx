@@ -6,7 +6,6 @@ import math
 import os
 import shutil
 import socket
-import subprocess
 import time
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
@@ -322,8 +321,6 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
             if not dedicated and not self._in_process:
-                # Kill all "model-service" processes to free up GPU memory
-                subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="tinker-service" if is_tinker else "model-service",
@@ -497,6 +494,9 @@ class LocalBackend(Backend):
         def done_callback(_: asyncio.Task[None]) -> None:
             service = self._services.pop(model.name, None)
             if service is not None:
+                close = getattr(service, "close", None)
+                if close is not None:
+                    close()
                 close_proxy(service)
 
         if os.environ.get("ART_DISABLE_SERVER_MONITOR", "").lower() not in {

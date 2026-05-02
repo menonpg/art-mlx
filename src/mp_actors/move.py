@@ -7,8 +7,10 @@ import itertools as it
 import multiprocessing as mp
 import os
 import queue
+import signal
 import sys
 import threading
+import time
 from typing import Any, AsyncGenerator, TypeVar, cast
 import weakref
 
@@ -109,11 +111,40 @@ class Proxy:
         self._process_name = process_name
         self._requests = mp.Queue()
         self._responses = mp.Queue()
+        ready = mp.Queue()
         self._process = mp.Process(
             target=_target,
-            args=(obj, self._requests, self._responses, log_file, process_name),
+            args=(
+                obj,
+                self._requests,
+                self._responses,
+                ready,
+                os.getpid(),
+                log_file,
+                process_name,
+            ),
         )
         self._process.start()
+        try:
+            ready_status, ready_payload = ready.get(
+                timeout=float(os.environ.get("ART_MP_ACTOR_START_TIMEOUT", 30.0))
+            )
+        except queue.Empty as exc:
+            self._process.terminate()
+            self._process.join(timeout=1)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=1)
+            raise RuntimeError("Child process did not enter its process group") from exc
+        if ready_status != "ok":
+            self._process.terminate()
+            self._process.join(timeout=1)
+            raise RuntimeError(
+                f"Child process failed to enter process group: {ready_payload}"
+            )
+        self._process_group_id = int(ready_payload)
+        ready.close()
+        ready.cancel_join_thread()
         self._futures: dict[int, Future] = {}
         self._futures_lock = threading.Lock()
         self._dead_process_error: RuntimeError | None = None
@@ -257,11 +288,17 @@ class Proxy:
         self._closing = True
         self._fail_pending(RuntimeError("Proxy is closing"))
 
-        # terminate child process and force kill if needed
-        self._process.terminate()
+        # terminate child process group and force kill if needed
+        try:
+            os.killpg(self._process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         self._process.join(timeout=1)
         if self._process.is_alive():
-            self._process.kill()
+            try:
+                os.killpg(self._process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             self._process.join(timeout=1)
 
         # close and cancel queue feeder threads
@@ -276,9 +313,26 @@ def _target(
     obj: object,
     requests: mp.Queue,
     responses: mp.Queue,
+    ready: mp.Queue,
+    parent_pid: int,
     log_file: str | None = None,
     process_name: str | None = None,
 ) -> None:
+    try:
+        if hasattr(os, "setsid") and os.getpgrp() != os.getpid():
+            os.setsid()
+        ready.put_nowait(("ok", os.getpgrp()))
+    except BaseException as exc:
+        ready.put_nowait(("error", repr(exc)))
+        raise
+
+    def monitor_parent() -> None:
+        while True:
+            if os.getppid() != parent_pid:
+                os._exit(1)
+            time.sleep(0.5)
+
+    threading.Thread(target=monitor_parent, daemon=True).start()
     if process_name:
         setproctitle.setproctitle(process_name)
     if log_file:

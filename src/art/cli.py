@@ -230,6 +230,8 @@ def migrate(
 def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     """Run the ART CLI."""
 
+    from contextlib import asynccontextmanager
+
     from fastapi import Body, FastAPI, Request
     from fastapi.responses import JSONResponse, StreamingResponse
     import pydantic
@@ -264,7 +266,15 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     TrajectoryGroup.__init__ = __init__  # ty:ignore[invalid-assignment]
 
     backend = LocalBackend()
-    app = FastAPI()
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            await backend.close()
+
+    app = FastAPI(lifespan=lifespan)
 
     # Add exception handler for ARTError
     @app.exception_handler(ARTError)

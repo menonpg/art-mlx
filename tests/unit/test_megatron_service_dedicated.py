@@ -176,9 +176,9 @@ def test_stop_megatron_process_kills_process_group(
         returncode = None
 
     seen: dict[str, int] = {}
-    monkeypatch.setattr("art.megatron.service.os.getpgid", lambda pid: pid + 1)
+    monkeypatch.setattr("art.utils.lifecycle.os.getpgid", lambda pid: pid + 1)
     monkeypatch.setattr(
-        "art.megatron.service.os.killpg",
+        "art.utils.lifecycle.os.killpg",
         lambda pgid, sig: seen.update({"pgid": pgid, "sig": int(sig)}),
     )
     service._megatron_process = cast(Any, _Process())
@@ -208,13 +208,13 @@ def test_stop_megatron_process_ignores_missing_process(
         pid = 4321
         returncode = None
 
-    monkeypatch.setattr("art.megatron.service.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("art.utils.lifecycle.os.getpgid", lambda pid: pid)
 
     def _raise_process_lookup(pgid: int, sig: int) -> None:
         del pgid, sig
         raise ProcessLookupError
 
-    monkeypatch.setattr("art.megatron.service.os.killpg", _raise_process_lookup)
+    monkeypatch.setattr("art.utils.lifecycle.os.killpg", _raise_process_lookup)
     service._megatron_process = cast(Any, _Process())
 
     service._stop_megatron_process()

@@ -3,9 +3,7 @@ from dataclasses import dataclass, field
 import importlib
 import os
 from pathlib import Path
-import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -23,6 +21,12 @@ from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.lifecycle import (
+    ServiceLifecycle,
+    managed_process_cmd,
+    terminate_asyncio_process_group,
+    terminate_popen_process_group,
+)
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
@@ -146,8 +150,8 @@ class MegatronService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
-    _previous_signal_handlers: dict[int, Any] = field(
-        default_factory=dict,
+    _lifecycle: ServiceLifecycle = field(
+        default_factory=ServiceLifecycle,
         init=False,
         repr=False,
     )
@@ -185,41 +189,21 @@ class MegatronService:
             str(runtime_dir / "vllm_waking.lock"),
         )
 
+    def _clear_wake_lock(self) -> None:
+        _, _, wake_lock_path = self._megatron_runtime_paths()
+        if os.path.exists(wake_lock_path):
+            os.remove(wake_lock_path)
+
     def _allocate_master_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("", 0))
             return int(sock.getsockname()[1])
 
     def _install_parent_signal_cleanup(self) -> None:
-        if self._previous_signal_handlers:
-            return
-
-        def _default_signal_exit(signum: int) -> None:
-            if signum == signal.SIGINT:
-                raise KeyboardInterrupt
-            raise SystemExit(128 + signum)
-
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous = signal.getsignal(signum)
-            self._previous_signal_handlers[signum] = previous
-
-            def _handler(received_signum, frame, *, _previous=previous):
-                self.close()
-                if callable(_previous):
-                    _previous(received_signum, frame)
-                    return
-                if _previous == signal.SIG_IGN:
-                    return
-                _default_signal_exit(received_signum)
-
-            signal.signal(signum, _handler)
+        self._lifecycle.install_parent_cleanup(self.close)
 
     def _restore_parent_signal_cleanup(self) -> None:
-        if not self._previous_signal_handlers:
-            return
-        for signum, previous in self._previous_signal_handlers.items():
-            signal.signal(signum, previous)
-        self._previous_signal_handlers.clear()
+        self._lifecycle.restore_parent_cleanup()
 
     def _runtime_cuda_visible_devices(self) -> str:
         if self.is_dedicated:
@@ -376,8 +360,6 @@ class MegatronService:
         port: int,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, int]:
-        import atexit
-
         import httpx
 
         cmd = build_vllm_runtime_server_cmd(
@@ -402,7 +384,7 @@ class MegatronService:
             buffering=1,
         )
         self._vllm_process = subprocess.Popen(
-            cmd,
+            managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
             env=os.environ.copy(),
             stdout=self._vllm_log_file,
@@ -447,8 +429,6 @@ class MegatronService:
                     "vLLM passed /health but /v1/models was not reachable. "
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
-
-        atexit.register(self.close)
         return self._vllm_host, self._vllm_port
 
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
@@ -522,13 +502,7 @@ class MegatronService:
             await self._reload_adapter(checkpoint_dir, step)
         self._latest_step = step
 
-    async def _ensure_megatron_running(self) -> None:
-        """Lazily start Megatron training process if not running."""
-        if self._megatron_process is not None:
-            if self._megatron_process.returncode is None:
-                return
-            self._megatron_process = None
-
+    def _validate_megatron_dependencies(self) -> None:
         try:
             import megatron.bridge  # type: ignore
         except ImportError as exc:
@@ -537,6 +511,15 @@ class MegatronService:
                 "Build the project venv with `uv sync --extra backend --extra megatron` "
                 "before starting Megatron training."
             ) from exc
+
+    async def _ensure_megatron_running(self) -> None:
+        """Lazily start Megatron training process if not running."""
+        if self._megatron_process is not None:
+            if self._megatron_process.returncode is None:
+                return
+            self._megatron_process = None
+
+        self._validate_megatron_dependencies()
 
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
@@ -561,12 +544,18 @@ class MegatronService:
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
 
-        command = (
-            f"{shlex.quote(sys.executable)} -m torch.distributed.run "
-            f"--master-addr {shlex.quote(master_addr)} "
-            f"--master-port {shlex.quote(master_port)} "
-            f"--nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
-        )
+        command = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--master-addr",
+            master_addr,
+            "--master-port",
+            master_port,
+            "--nproc_per_node",
+            str(num_gpus),
+            str(train_script),
+        ]
         log_dir = Path(self.output_dir) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self._megatron_log_path = str(log_dir / "megatron-runtime.log")
@@ -575,8 +564,8 @@ class MegatronService:
             "w",
             buffering=1,
         )
-        self._megatron_process = await asyncio.create_subprocess_shell(
-            command,
+        self._megatron_process = await asyncio.create_subprocess_exec(
+            *managed_process_cmd(command),
             cwd=str(project_root),
             env=env,
             stdout=self._megatron_log_file,
@@ -609,6 +598,7 @@ class MegatronService:
         return lora_path
 
     async def _prepare_for_training(self) -> str:
+        self._validate_megatron_dependencies()
         await self._sleep_runtime()
         gc_and_empty_cuda_cache()
 
@@ -655,11 +645,15 @@ class MegatronService:
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
         location = await self._start_vllm_subprocess(lora_path, port, config)
-        if self.rollout_weights_mode == "merged":
-            await self._sync_dedicated_merged_weights(
-                lora_path=lora_path,
-                step=self._latest_step,
-            )
+        try:
+            if self.rollout_weights_mode == "merged":
+                await self._sync_dedicated_merged_weights(
+                    lora_path=lora_path,
+                    step=self._latest_step,
+                )
+        except BaseException:
+            await self.aclose()
+            raise
         return location
 
     async def vllm_engine_is_sleeping(self) -> bool:
@@ -672,21 +666,42 @@ class MegatronService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        if _config.get("moe_routing_replay_bundle") is not None:
-            raise RuntimeError(
-                "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
-                "MegatronService subprocess jobs must use moe_routing_replay_path."
-            )
-        if self.is_dedicated:
-            await self._ensure_megatron_running()
-            lora_path = self._resolve_active_lora_path()
-            self._clear_pending_jobs()
-            next_step = self._latest_step + 1
-            job_path, log_path = self._create_megatron_job_paths()
-            if self.rollout_weights_mode == "merged":
-                await self._init_merged_weight_transfer()
-                job: MegatronTrainingJob | MegatronMergedTrainingJob = (
-                    MegatronMergedTrainingJob(
+        try:
+            if _config.get("moe_routing_replay_bundle") is not None:
+                raise RuntimeError(
+                    "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
+                    "MegatronService subprocess jobs must use moe_routing_replay_path."
+                )
+            if self.is_dedicated:
+                await self._ensure_megatron_running()
+                lora_path = self._resolve_active_lora_path()
+                self._clear_pending_jobs()
+                next_step = self._latest_step + 1
+                job_path, log_path = self._create_megatron_job_paths()
+                if self.rollout_weights_mode == "merged":
+                    await self._init_merged_weight_transfer()
+                    job: MegatronTrainingJob | MegatronMergedTrainingJob = (
+                        MegatronMergedTrainingJob(
+                            lora_path=lora_path,
+                            optimizer_state_path=self._get_optimizer_state_path("rl"),
+                            disk_packed_tensors=disk_packed_tensors,
+                            config=config,
+                            experimental_config=cast(dict[str, Any], _config),
+                            moe_routing_replay_path=_config.get(
+                                "moe_routing_replay_path"
+                            ),
+                            moe_routing_replay_strict=_config.get(
+                                "moe_routing_replay_strict",
+                                True,
+                            ),
+                            merged_weight_transfer=self._build_merged_weight_transfer_spec(
+                                next_step
+                            ),
+                            log_path=log_path,
+                        )
+                    )
+                else:
+                    job = MegatronTrainingJob(
                         lora_path=lora_path,
                         optimizer_state_path=self._get_optimizer_state_path("rl"),
                         disk_packed_tensors=disk_packed_tensors,
@@ -697,27 +712,48 @@ class MegatronService:
                             "moe_routing_replay_strict",
                             True,
                         ),
-                        merged_weight_transfer=self._build_merged_weight_transfer_spec(
-                            next_step
-                        ),
                         log_path=log_path,
                     )
+                write_megatron_job(job, job_path=job_path)
+                async for result in stream_megatron_job(
+                    job,
+                    job_path=job_path,
+                    process=self._megatron_process,
+                    process_log_path=self._megatron_log_path,
+                ):
+                    yield {key: float(value) for key, value in result.items()}
+
+                new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
+                os.makedirs(new_checkpoint_dir, exist_ok=True)
+                shutil.copy(
+                    f"{lora_path}/adapter_model.safetensors",
+                    f"{new_checkpoint_dir}/adapter_model.safetensors",
                 )
-            else:
-                job = MegatronTrainingJob(
-                    lora_path=lora_path,
-                    optimizer_state_path=self._get_optimizer_state_path("rl"),
-                    disk_packed_tensors=disk_packed_tensors,
-                    config=config,
-                    experimental_config=cast(dict[str, Any], _config),
-                    moe_routing_replay_path=_config.get("moe_routing_replay_path"),
-                    moe_routing_replay_strict=_config.get(
-                        "moe_routing_replay_strict",
-                        True,
-                    ),
-                    log_path=log_path,
+                self._ensure_lora_adapter_config(
+                    new_checkpoint_dir, source_path=lora_path
                 )
+                if self.rollout_weights_mode == "merged":
+                    self._latest_step = next_step
+                else:
+                    await self._reload_adapter(new_checkpoint_dir, next_step)
+                return
+
+            lora_path = await self._prepare_for_training()
+            job_path, log_path = self._create_megatron_job_paths()
+            job = MegatronTrainingJob(
+                lora_path=lora_path,
+                optimizer_state_path=self._get_optimizer_state_path("rl"),
+                disk_packed_tensors=disk_packed_tensors,
+                config=config,
+                experimental_config=cast(dict[str, Any], _config),
+                moe_routing_replay_path=_config.get("moe_routing_replay_path"),
+                moe_routing_replay_strict=_config.get(
+                    "moe_routing_replay_strict", True
+                ),
+                log_path=log_path,
+            )
             write_megatron_job(job, job_path=job_path)
+
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
@@ -726,42 +762,10 @@ class MegatronService:
             ):
                 yield {key: float(value) for key, value in result.items()}
 
-            new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
-            os.makedirs(new_checkpoint_dir, exist_ok=True)
-            shutil.copy(
-                f"{lora_path}/adapter_model.safetensors",
-                f"{new_checkpoint_dir}/adapter_model.safetensors",
-            )
-            self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
-            if self.rollout_weights_mode == "merged":
-                self._latest_step = next_step
-            else:
-                await self._reload_adapter(new_checkpoint_dir, next_step)
-            return
-
-        lora_path = await self._prepare_for_training()
-        job_path, log_path = self._create_megatron_job_paths()
-        job = MegatronTrainingJob(
-            lora_path=lora_path,
-            optimizer_state_path=self._get_optimizer_state_path("rl"),
-            disk_packed_tensors=disk_packed_tensors,
-            config=config,
-            experimental_config=cast(dict[str, Any], _config),
-            moe_routing_replay_path=_config.get("moe_routing_replay_path"),
-            moe_routing_replay_strict=_config.get("moe_routing_replay_strict", True),
-            log_path=log_path,
-        )
-        write_megatron_job(job, job_path=job_path)
-
-        async for result in stream_megatron_job(
-            job,
-            job_path=job_path,
-            process=self._megatron_process,
-            process_log_path=self._megatron_log_path,
-        ):
-            yield {key: float(value) for key, value in result.items()}
-
-        await self._publish_training_checkpoint(lora_path=lora_path)
+            await self._publish_training_checkpoint(lora_path=lora_path)
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def train_sft(
         self,
@@ -769,65 +773,51 @@ class MegatronService:
         config: types.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        if self.is_dedicated:
-            raise NotImplementedError(
-                "train_sft is not yet supported in dedicated mode"
+        try:
+            if self.is_dedicated:
+                raise NotImplementedError(
+                    "train_sft is not yet supported in dedicated mode"
+                )
+            lora_path = await self._prepare_for_training()
+            serialized_batches = materialize_sft_batches(batches)
+            job_path, log_path = self._create_megatron_job_paths()
+            grad_accumulation_sequences = (
+                config.batch_size if isinstance(config.batch_size, int) else None
             )
-        lora_path = await self._prepare_for_training()
-        serialized_batches = materialize_sft_batches(batches)
-        job_path, log_path = self._create_megatron_job_paths()
-        grad_accumulation_sequences = (
-            config.batch_size if isinstance(config.batch_size, int) else None
-        )
-        job = MegatronSFTTrainingJob(
-            lora_path=lora_path,
-            optimizer_state_path=self._get_optimizer_state_path("sft"),
-            sft_data_dir=serialized_batches.sft_data_dir,
-            num_batches=serialized_batches.num_batches,
-            learning_rates=serialized_batches.learning_rates,
-            grad_accumulation_sequences=grad_accumulation_sequences,
-            log_path=log_path,
-        )
-        write_megatron_job(job, job_path=job_path)
+            job = MegatronSFTTrainingJob(
+                lora_path=lora_path,
+                optimizer_state_path=self._get_optimizer_state_path("sft"),
+                sft_data_dir=serialized_batches.sft_data_dir,
+                num_batches=serialized_batches.num_batches,
+                learning_rates=serialized_batches.learning_rates,
+                grad_accumulation_sequences=grad_accumulation_sequences,
+                log_path=log_path,
+            )
+            write_megatron_job(job, job_path=job_path)
 
-        async for result in stream_megatron_job(
-            job,
-            job_path=job_path,
-            process=self._megatron_process,
-            process_log_path=self._megatron_log_path,
-        ):
-            yield {
-                "loss/train": float(result["loss"]),
-                "loss/learning_rate": float(result["learning_rate"]),
-                "loss/grad_norm": float(result["grad_norm"]),
-            }
+            async for result in stream_megatron_job(
+                job,
+                job_path=job_path,
+                process=self._megatron_process,
+                process_log_path=self._megatron_log_path,
+            ):
+                yield {
+                    "loss/train": float(result["loss"]),
+                    "loss/learning_rate": float(result["learning_rate"]),
+                    "loss/grad_norm": float(result["grad_norm"]),
+                }
 
-        await self._publish_training_checkpoint(lora_path=lora_path)
+            await self._publish_training_checkpoint(lora_path=lora_path)
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def aclose(self) -> None:
         self.close()
 
     def _stop_vllm_subprocess(self) -> None:
         if self._vllm_process is not None:
-            if self._vllm_process.poll() is None:
-                try:
-                    os.killpg(
-                        os.getpgid(self._vllm_process.pid),
-                        signal.SIGTERM,
-                    )
-                except ProcessLookupError:
-                    pass
-            try:
-                self._vllm_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(
-                        os.getpgid(self._vllm_process.pid),
-                        signal.SIGKILL,
-                    )
-                except ProcessLookupError:
-                    pass
-                self._vllm_process.wait()
+            terminate_popen_process_group(self._vllm_process)
             self._vllm_process = None
         if self._vllm_log_file is not None:
             self._vllm_log_file.close()
@@ -841,14 +831,7 @@ class MegatronService:
                 self._megatron_log_file = None
             self._megatron_log_path = None
             return
-        if self._megatron_process.returncode is None:
-            try:
-                os.killpg(
-                    os.getpgid(self._megatron_process.pid),
-                    signal.SIGTERM,
-                )
-            except ProcessLookupError:
-                pass
+        terminate_asyncio_process_group(self._megatron_process)
         self._megatron_process = None
         if self._megatron_log_file is not None:
             self._megatron_log_file.close()
@@ -856,6 +839,11 @@ class MegatronService:
         self._megatron_log_path = None
 
     def close(self) -> None:
-        self._stop_vllm_subprocess()
-        self._stop_megatron_process()
-        self._restore_parent_signal_cleanup()
+        if not self._lifecycle.begin_close():
+            return
+        try:
+            self._stop_vllm_subprocess()
+            self._stop_megatron_process()
+            self._clear_wake_lock()
+        finally:
+            self._restore_parent_signal_cleanup()

@@ -20,6 +20,11 @@ from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.lifecycle import (
+    ServiceLifecycle,
+    managed_process_cmd,
+    terminate_popen_process_group,
+)
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
@@ -123,6 +128,11 @@ class UnslothService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
+    _lifecycle: ServiceLifecycle = field(
+        default_factory=ServiceLifecycle,
+        init=False,
+        repr=False,
+    )
 
     @property
     def is_dedicated(self) -> bool:
@@ -196,8 +206,6 @@ class UnslothService:
         port: int,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, int]:
-        import atexit
-
         cmd = build_vllm_runtime_server_cmd(
             VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
@@ -211,6 +219,7 @@ class UnslothService:
                 server_args=self._runtime_server_args(config),
             )
         )
+        self._lifecycle.install_parent_cleanup(self.close)
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -219,11 +228,13 @@ class UnslothService:
         )
 
         self._vllm_process = subprocess.Popen(
-            cmd,
+            managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
+            env=os.environ.copy(),
             stdout=self._vllm_log_file,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            start_new_session=True,
         )
         self._vllm_port = port
 
@@ -263,7 +274,6 @@ class UnslothService:
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
 
-        atexit.register(self.close)
         logger.info(
             "vLLM runtime ready on port %d (GPUs: %s)",
             port,
@@ -486,19 +496,18 @@ class UnslothService:
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
-        self._weight_transfer_group = None
-        if self._vllm_process is None:
+        if not self._lifecycle.begin_close():
             return
-        self._vllm_process.terminate()
+        self._weight_transfer_group = None
         try:
-            self._vllm_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._vllm_process.kill()
-            self._vllm_process.wait()
-        self._vllm_process = None
-        if self._vllm_log_file is not None:
-            self._vllm_log_file.close()
-            self._vllm_log_file = None
+            if self._vllm_process is not None:
+                terminate_popen_process_group(self._vllm_process)
+                self._vllm_process = None
+            if self._vllm_log_file is not None:
+                self._vllm_log_file.close()
+                self._vllm_log_file = None
+        finally:
+            self._lifecycle.restore_parent_cleanup()
 
     # =========================================================================
     # start_openai_server
@@ -531,10 +540,14 @@ class UnslothService:
             port,
             config=config,
         )
-        if self.rollout_weights_mode == "merged":
-            _ = self._state
-            await self._init_merged_weight_transfer()
-            await self._sync_merged_weights(self._latest_step, False)
+        try:
+            if self.rollout_weights_mode == "merged":
+                _ = self._state
+                await self._init_merged_weight_transfer()
+                await self._sync_merged_weights(self._latest_step, False)
+        except BaseException:
+            await self.aclose()
+            raise
         return vllm_location
 
     async def vllm_engine_is_sleeping(self) -> bool:
@@ -577,17 +590,21 @@ class UnslothService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        if self.is_dedicated:
-            async for result in self._train_dedicated(
+        try:
+            if self.is_dedicated:
+                async for result in self._train_dedicated(
+                    disk_packed_tensors, config, _config, verbose
+                ):
+                    yield result
+                return
+
+            async for result in self._train_shared(
                 disk_packed_tensors, config, _config, verbose
             ):
                 yield result
-            return
-
-        async for result in self._train_shared(
-            disk_packed_tensors, config, _config, verbose
-        ):
-            yield result
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def _train_dedicated(
         self,
@@ -688,45 +705,49 @@ class UnslothService:
         Yields:
             Dictionary containing training metrics for each batch.
         """
-        if self.is_dedicated:
-            async for result in self._train_sft_dedicated(batches, config, verbose):
-                yield result
-            return
+        try:
+            if self.is_dedicated:
+                async for result in self._train_sft_dedicated(batches, config, verbose):
+                    yield result
+                return
 
-        await self._sleep_runtime()
-        gc_and_empty_cuda_cache()
-        self._state.reload_to_gpu()
-        if verbose:
-            print("SFT training started")
+            await self._sleep_runtime()
+            gc_and_empty_cuda_cache()
+            self._state.reload_to_gpu()
+            if verbose:
+                print("SFT training started")
 
-        async for result in run_unsloth_sft_training(
-            self._state,
-            batches,
-            verbose=verbose,
-            max_grad_norm=1.0,
-        ):
-            yield {
-                "loss/train": result["loss"],
-                "loss/learning_rate": result["learning_rate"],
-                "loss/grad_norm": result["grad_norm"],
-            }
+            async for result in run_unsloth_sft_training(
+                self._state,
+                batches,
+                verbose=verbose,
+                max_grad_norm=1.0,
+            ):
+                yield {
+                    "loss/train": result["loss"],
+                    "loss/learning_rate": result["learning_rate"],
+                    "loss/grad_norm": result["grad_norm"],
+                }
 
-        checkpoint_dir = save_checkpoint(
-            trainer=self._state.trainer,
-            output_dir=self.output_dir,
-            verbose=verbose,
-        )
+            checkpoint_dir = save_checkpoint(
+                trainer=self._state.trainer,
+                output_dir=self.output_dir,
+                verbose=verbose,
+            )
 
-        self._state.offload_to_cpu()
-        gc_and_empty_cuda_cache()
-        await asyncio.sleep(0.5)
-        await self._wake_runtime()
-        new_step = int(os.path.basename(checkpoint_dir))
-        await self._reload_adapter(checkpoint_dir, new_step)
-        self._latest_step = new_step
+            self._state.offload_to_cpu()
+            gc_and_empty_cuda_cache()
+            await asyncio.sleep(0.5)
+            await self._wake_runtime()
+            new_step = int(os.path.basename(checkpoint_dir))
+            await self._reload_adapter(checkpoint_dir, new_step)
+            self._latest_step = new_step
 
-        if verbose:
-            print("SFT training finished")
+            if verbose:
+                print("SFT training finished")
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def _train_sft_dedicated(
         self,
