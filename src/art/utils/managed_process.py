@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import signal
 import subprocess
@@ -18,6 +19,17 @@ def parse_args() -> argparse.Namespace:
     if not args.command:
         parser.error("missing command")
     return args
+
+
+def set_parent_death_signal(parent_pid: int, sig: signal.Signals) -> None:
+    if sys.platform != "linux":
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, int(sig), 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    if os.getppid() != parent_pid:
+        os._exit(1)
 
 
 def main() -> None:
@@ -65,7 +77,12 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    process = subprocess.Popen(args.command, start_new_session=True)
+    wrapper_pid = os.getpid()
+    process = subprocess.Popen(
+        args.command,
+        start_new_session=True,
+        preexec_fn=lambda: set_parent_death_signal(wrapper_pid, signal.SIGTERM),
+    )
     child_pgid = process.pid
 
     while True:
