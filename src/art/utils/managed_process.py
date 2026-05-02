@@ -5,7 +5,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 
 
@@ -29,6 +28,7 @@ def main() -> None:
     process: subprocess.Popen[bytes] | None = None
     child_pgid: int | None = None
     shutting_down = False
+    requested_shutdown: tuple[signal.Signals, int] | None = None
 
     def signal_child_group(sig: signal.Signals) -> None:
         if child_pgid is None:
@@ -59,7 +59,8 @@ def main() -> None:
         os._exit(exit_code)
 
     def handle_signal(signum: int, _frame: object | None) -> None:
-        shutdown(signal.Signals(signum), 128 + signum)
+        nonlocal requested_shutdown
+        requested_shutdown = (signal.Signals(signum), 128 + signum)
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -67,16 +68,16 @@ def main() -> None:
     process = subprocess.Popen(args.command, start_new_session=True)
     child_pgid = process.pid
 
-    def monitor_parent() -> None:
-        while process is not None and process.poll() is None:
-            if os.getppid() != args.parent_pid:
-                shutdown(signal.SIGTERM, 1)
-            time.sleep(0.5)
-
-    threading.Thread(target=monitor_parent, daemon=True).start()
-    return_code = process.wait()
-    sweep_child_group()
-    sys.exit(return_code)
+    while True:
+        if requested_shutdown is not None:
+            shutdown(*requested_shutdown)
+        if os.getppid() != args.parent_pid:
+            shutdown(signal.SIGTERM, 1)
+        return_code = process.poll()
+        if return_code is not None:
+            sweep_child_group()
+            sys.exit(return_code)
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
