@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Tiny ART-owned vLLM runtime package"
 requires-python = ">=3.11"
 dependencies = [
-    "transformers==5.2.0",
-    "vllm @ https://github.com/vivekkalyan/vllm/releases/download/v0.17.0-art1/vllm-0.17.0%2Bart1-cp38-abi3-manylinux_2_31_x86_64.whl ; sys_platform == 'linux'",
+    "transformers==5.6.2",
+    "vllm==0.19.1 ; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -17,9 +17,6 @@ art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/art_vllm_runtime"]
@@ -33,5 +30,5 @@ override-dependencies = [
     "flashinfer-python==0.6.1",
     "numpy<2",
     "torch==2.10.0",
-    "transformers==5.2.0",
+    "transformers==5.6.2",
 ]
