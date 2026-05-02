@@ -48,9 +48,13 @@ class TinkerService:
             host=config.get("host") if config else None,
             port=config.get("port") if config else None,
         )
-        self._server.models = state.models
-        with log_timing("Starting OpenAI-compatible Tinker server"):
-            return await self._server.start()
+        try:
+            self._server.models = state.models
+            with log_timing("Starting OpenAI-compatible Tinker server"):
+                return await self._server.start()
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def vllm_engine_is_sleeping(self) -> bool:
         return False

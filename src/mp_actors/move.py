@@ -329,6 +329,25 @@ def _target(
     def monitor_parent() -> None:
         while True:
             if os.getppid() != parent_pid:
+
+                def force_exit() -> None:
+                    time.sleep(5)
+                    try:
+                        os.killpg(os.getpgrp(), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+                threading.Thread(target=force_exit, daemon=True).start()
+                try:
+                    close = getattr(obj, "close", None)
+                    if callable(close):
+                        close()
+                except BaseException:
+                    pass
+                try:
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 os._exit(1)
             time.sleep(0.5)
 

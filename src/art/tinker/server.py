@@ -132,28 +132,33 @@ class OpenAICompatibleTinkerServer:
     async def start(self) -> tuple[str, int]:
         host = self.host or "0.0.0.0"
         port = self.port or get_free_port(host)
-        self._workers = [
-            move_to_child_process(
-                OpenAICompatibleTinkerServerWorker(),
-                process_name=f"openai-compatible-tinker-server-worker-{i}",
-            )
-            for i in range(self.num_workers or self._default_num_workers())
-        ]
-        self._task = asyncio.create_task(self._run(host, port))
-        client = AsyncOpenAI(api_key="default", base_url=f"http://{host}:{port}/v1")
-        start = time.time()
-        while True:
-            timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
-            if time.time() - start > timeout:
-                raise TimeoutError(
-                    f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+        try:
+            self._workers = []
+            for i in range(self.num_workers or self._default_num_workers()):
+                self._workers.append(
+                    move_to_child_process(
+                        OpenAICompatibleTinkerServerWorker(),
+                        process_name=f"openai-compatible-tinker-server-worker-{i}",
+                    )
                 )
-            try:
-                await client.completions.create(model="", prompt="")
-                break  # Server is ready
-            except Exception:
-                await asyncio.sleep(0.1)
-        return host, port
+            self._task = asyncio.create_task(self._run(host, port))
+            client = AsyncOpenAI(api_key="default", base_url=f"http://{host}:{port}/v1")
+            start = time.time()
+            while True:
+                timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
+                if time.time() - start > timeout:
+                    raise TimeoutError(
+                        f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+                    )
+                try:
+                    await client.completions.create(model="", prompt="")
+                    break  # Server is ready
+                except Exception:
+                    await asyncio.sleep(0.1)
+            return host, port
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
         try:
@@ -161,7 +166,7 @@ class OpenAICompatibleTinkerServer:
                 self._task.cancel()
                 try:
                     await self._task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
                 self._task = None
         finally:

@@ -27,26 +27,35 @@ def main() -> None:
         os.setsid()
 
     process: subprocess.Popen[bytes] | None = None
+    child_pgid: int | None = None
     shutting_down = False
+
+    def signal_child_group(sig: signal.Signals) -> None:
+        if child_pgid is None:
+            return
+        try:
+            os.killpg(child_pgid, sig)
+        except ProcessLookupError:
+            pass
+
+    def sweep_child_group() -> None:
+        signal_child_group(signal.SIGTERM)
+        time.sleep(float(os.environ.get("ART_MANAGED_PROCESS_SWEEP_GRACE", 0.5)))
+        signal_child_group(signal.SIGKILL)
 
     def shutdown(sig: signal.Signals, exit_code: int) -> None:
         nonlocal shutting_down
         if shutting_down:
             return
         shutting_down = True
-        try:
-            os.killpg(os.getpgrp(), sig)
-        except ProcessLookupError:
-            pass
+        signal_child_group(sig)
         if process is not None:
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgrp(), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_child_group(signal.SIGKILL)
                 process.wait()
+        sweep_child_group()
         os._exit(exit_code)
 
     def handle_signal(signum: int, _frame: object | None) -> None:
@@ -55,7 +64,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    process = subprocess.Popen(args.command)
+    process = subprocess.Popen(args.command, start_new_session=True)
+    child_pgid = process.pid
 
     def monitor_parent() -> None:
         while process is not None and process.poll() is None:
@@ -64,7 +74,9 @@ def main() -> None:
             time.sleep(0.5)
 
     threading.Thread(target=monitor_parent, daemon=True).start()
-    sys.exit(process.wait())
+    return_code = process.wait()
+    sweep_child_group()
+    sys.exit(return_code)
 
 
 if __name__ == "__main__":
