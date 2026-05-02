@@ -415,7 +415,7 @@ async def _backend_context(
             if variant.backend_name == "megatron":
                 async with MegatronBackend(
                     path=str(backend_root),
-                    in_process=True,
+                    in_process=False,
                 ) as backend:
                     yield backend
                 return
