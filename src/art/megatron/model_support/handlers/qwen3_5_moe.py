@@ -86,7 +86,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         standard_attention_layer_index = (
             linear_attention_pattern.index(0) if 0 in linear_attention_pattern else 0
         )
-        return [
+        layer_families = [
             LayerFamilyInstance(
                 key="standard_attention",
                 layer_index=standard_attention_layer_index,
@@ -95,9 +95,16 @@ class Qwen35MoeHandler(DefaultDenseHandler):
                 key="gated_delta_net_attention",
                 layer_index=gated_delta_net_layer_index,
             ),
-            LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
-            LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
         ]
+        if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+            layer_families.append(LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0))
+        else:
+            layer_families.append(LayerFamilyInstance(key="dense_mlp", layer_index=0))
+        if int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0) > 0:
+            layer_families.append(
+                LayerFamilyInstance(key="shared_experts_mlp", layer_index=0)
+            )
+        return layer_families
 
     def patch_bridge(self, bridge: Any) -> None:
         del bridge
@@ -109,11 +116,21 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             return
         (
             qwen3_vl_self_attention,
-            qwen35_provider_type,
+            qwen35_provider_types,
             patch_standard_attention_specs,
             transformer_block_spec_factory,
         ) = _require_qwen35_provider_symbols()
         from art.megatron.flex_attention import FlexDotProductAttention
+        matched_provider_type = next(
+            (
+                provider_type
+                for provider_type in qwen35_provider_types
+                if isinstance(provider, provider_type)
+            ),
+            None,
+        )
+        if matched_provider_type is None:
+            return
 
         def _patch_qwen35_block_spec(block_spec: object) -> None:
             patch_standard_attention_specs(block_spec, qwen3_vl_self_attention)
@@ -131,18 +148,17 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             post_process: bool | None = None,
             vp_stage: int | None = None,
         ) -> Any:
-            return qwen35_provider_type.provide_language_model(
+            return matched_provider_type.provide_language_model(
                 self,
                 pre_process=pre_process,
                 post_process=post_process,
                 vp_stage=vp_stage,
             )
 
-        if isinstance(provider, qwen35_provider_type):
-            provider.scatter_embedding_sequence_parallel = True
-            provider.transformer_layer_spec = _qwen35_layer_spec
-            provider.provide = MethodType(_provide_qwen35_with_flex_attention, provider)
-            setattr(provider, "_art_text_only_language_model", True)
+        provider.scatter_embedding_sequence_parallel = True
+        provider.transformer_layer_spec = _qwen35_layer_spec
+        provider.provide = MethodType(_provide_qwen35_with_flex_attention, provider)
+        setattr(provider, "_art_text_only_language_model", True)
 
     def apply_lora_adapters(
         self,
@@ -336,24 +352,30 @@ def _ensure_bridge_qwen35_adapter_name_map() -> None:
 
 def supported_qwen_moe_bridge_types() -> tuple[type[Any], ...]:
     from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
-    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
+    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+        Qwen35VLBridge,
+        Qwen35VLMoEBridge,
+    )
 
-    return (Qwen3MoEBridge, Qwen35VLMoEBridge)
+    return (Qwen3MoEBridge, Qwen35VLBridge, Qwen35VLMoEBridge)
 
 
 def _is_qwen35_vl_provider(provider: object) -> bool:
-    qwen35_provider_type = _optional_qwen35_provider_type()
-    return qwen35_provider_type is not None and isinstance(
-        provider, qwen35_provider_type
-    )
+    return isinstance(provider, _optional_qwen35_provider_types())
 
 
-def _optional_qwen35_provider_type() -> type[Any] | None:
+def _optional_qwen35_provider_types() -> tuple[type[Any], ...]:
     from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+        Qwen35VLModelProvider,
         Qwen35VLMoEModelProvider,
     )
 
-    return Qwen35VLMoEModelProvider
+    return (Qwen35VLModelProvider, Qwen35VLMoEModelProvider)
+
+
+def _optional_qwen35_provider_type() -> type[Any] | None:
+    provider_types = _optional_qwen35_provider_types()
+    return provider_types[0] if provider_types else None
 
 
 def _require_qwen35_provider_symbols() -> tuple[Any, ...]:
@@ -361,6 +383,7 @@ def _require_qwen35_provider_symbols() -> tuple[Any, ...]:
         Qwen3VLSelfAttention,
     )
     from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+        Qwen35VLModelProvider,
         Qwen35VLMoEModelProvider,
         _patch_standard_attention_specs,
     )
@@ -370,7 +393,7 @@ def _require_qwen35_provider_symbols() -> tuple[Any, ...]:
 
     return (
         Qwen3VLSelfAttention,
-        Qwen35VLMoEModelProvider,
+        (Qwen35VLModelProvider, Qwen35VLMoEModelProvider),
         _patch_standard_attention_specs,
         get_transformer_block_with_experimental_attention_variant_spec,
     )
@@ -538,10 +561,26 @@ def _ensure_qwen35_text_only_bridge_registered() -> None:
 
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+    _QWEN3_5_DENSE_HF_CLASS_NAME,
     _QWEN3_5_MOE_HF_CLASS_NAME,
+    Qwen35VLBridge,
     Qwen35VLMoEBridge,
 )
-from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLMoEModelProvider
+from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+    Qwen35VLModelProvider,
+    Qwen35VLMoEModelProvider,
+)
+
+
+@MegatronModelBridge.register_bridge(
+    source=_QWEN3_5_DENSE_HF_CLASS_NAME,
+    target=GPTModel,
+    provider=Qwen35VLModelProvider,
+    model_type="qwen3_5_moe",
+)
+class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
+    def mapping_registry(self) -> Any:
+        return _qwen35_text_only_mapping_registry()
 
 
 @MegatronModelBridge.register_bridge(

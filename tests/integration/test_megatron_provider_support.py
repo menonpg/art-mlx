@@ -71,6 +71,7 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _FakeProvider()
+    provider.num_moe_experts = 8
     fake_bridge = _FakeBridge(
         model_bridge=object.__new__(Qwen3MoEBridge),
         provider=provider,
@@ -96,7 +97,7 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     assert resolved.expert_model_parallel_size == 2
     assert resolved.expert_tensor_parallel_size == 1
     assert resolved.sequence_parallel is True
-    assert resolved.moe_shared_expert_overlap is True
+    assert resolved.moe_shared_expert_overlap is False
     assert resolved.moe_router_dtype == "fp32"
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
@@ -126,15 +127,15 @@ def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
     monkeypatch.setattr(
         qwen35_handler_module,
-        "_optional_qwen35_provider_type",
-        lambda: _FakeProvider,
+        "_optional_qwen35_provider_types",
+        lambda: (_FakeProvider,),
     )
     monkeypatch.setattr(
         qwen35_handler_module,
         "_require_qwen35_provider_symbols",
         lambda: (
             object(),
-            _FakeProvider,
+            (_FakeProvider,),
             lambda block_spec, attention_module: None,
             provider._base_layer_spec,
         ),
@@ -158,7 +159,7 @@ def test_get_provider_rejects_unsupported_bridge(
 
     with pytest.raises(
         AssertionError,
-        match="Only Qwen3 and Qwen3.5 MoE models are supported",
+        match="Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported",
     ):
         provider_module.get_provider("unsupported-model")
 

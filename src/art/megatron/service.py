@@ -21,6 +21,7 @@ from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.lora_checkpoint import normalize_runtime_lora_checkpoint
 from ..utils.lifecycle import (
     ServiceLifecycle,
     managed_process_cmd,
@@ -127,6 +128,7 @@ def create_identity_lora(
         target_modules=target_modules,
         bias="none",
     ).save_pretrained(lora_path)
+    normalize_runtime_lora_checkpoint(lora_path, base_model=base_model)
 
     del peft_model, model
     if torch.cuda.is_available():

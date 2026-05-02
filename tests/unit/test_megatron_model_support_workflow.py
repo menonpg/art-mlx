@@ -15,6 +15,7 @@ from art.megatron.model_support.workflow import (
     run_correctness_sensitivity_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
+    run_native_vllm_lora_stage,
     run_packed_position_ids_stage,
     run_yes_no_trainability_stage,
 )
@@ -23,6 +24,10 @@ from art.megatron.model_support.workflow import (
 def test_build_validation_stage_names_has_fixed_order() -> None:
     assert build_validation_stage_names() == list(MANDATORY_VALIDATION_STAGES)
     assert build_validation_stage_names(include_native_vllm_lora=True) == [
+        *MANDATORY_VALIDATION_STAGES,
+        NATIVE_VLLM_LORA_STAGE,
+    ]
+    assert build_validation_stage_names(native_vllm_lora_status="wip") == [
         *MANDATORY_VALIDATION_STAGES,
         NATIVE_VLLM_LORA_STAGE,
     ]
@@ -107,6 +112,16 @@ def test_build_validation_report_populates_architecture_stage(
                     "final_eval_reward": 0.97,
                 },
                 artifact_dir="/tmp/trainability",
+            ),
+            "native_vllm_lora": ValidationStageResult(
+                name="native_vllm_lora",
+                passed=True,
+                metrics={
+                    "rollout_weights_mode": "lora",
+                    "latest_step": 2,
+                    "final_eval_reward": 0.97,
+                },
+                artifact_dir="/tmp/native-vllm-lora",
             ),
         }[stage_name],
     )
@@ -198,6 +213,16 @@ def test_build_validation_report_populates_architecture_stage(
         "final_eval_reward": 0.97,
     }
     assert trainability_stage.artifact_dir == "/tmp/trainability"
+    native_vllm_lora_stage = next(
+        stage for stage in report.stages if stage.name == "native_vllm_lora"
+    )
+    assert native_vllm_lora_stage.passed is True
+    assert native_vllm_lora_stage.metrics == {
+        "rollout_weights_mode": "lora",
+        "latest_step": 2,
+        "final_eval_reward": 0.97,
+    }
+    assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
 
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:
@@ -381,6 +406,44 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 
     assert result.passed is True
     assert result.artifact_dir == "/tmp/trainability"
+
+
+def test_run_native_vllm_lora_stage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(
+            run_native_vllm_lora=lambda *, base_model: SimpleNamespace(
+                rollout_weights_mode="lora",
+                latest_step=2,
+                initial_eval_reward=0.4,
+                final_eval_reward=0.95,
+                reward_threshold=0.95,
+                saturated_step=2,
+                output_dir="/tmp/native-vllm-lora",
+                model_dump=lambda mode="json": {
+                    "rollout_weights_mode": "lora",
+                    "latest_step": 2,
+                    "initial_eval_reward": 0.4,
+                    "final_eval_reward": 0.95,
+                    "reward_threshold": 0.95,
+                    "saturated_step": 2,
+                },
+            )
+        ),
+    )
+
+    result = run_native_vllm_lora_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+        ),
+    )
+
+    assert result.name == "native_vllm_lora"
+    assert result.passed is True
+    assert result.artifact_dir == "/tmp/native-vllm-lora"
 
 
 def test_run_packed_position_ids_stage(monkeypatch) -> None:

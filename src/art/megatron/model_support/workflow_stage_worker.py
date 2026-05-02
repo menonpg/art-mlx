@@ -8,6 +8,7 @@ from art.megatron.model_support.workflow import (
     run_hf_parity_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
+    run_native_vllm_lora_stage,
     run_packed_position_ids_stage,
     run_yes_no_trainability_stage,
 )
@@ -20,6 +21,7 @@ _STAGE_RUNNERS = {
     "chat_template_rollout": run_chat_template_rollout_stage,
     "packed_position_ids": run_packed_position_ids_stage,
     "yes_no_trainability": run_yes_no_trainability_stage,
+    "native_vllm_lora": run_native_vllm_lora_stage,
 }
 
 

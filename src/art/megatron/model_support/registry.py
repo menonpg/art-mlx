@@ -48,8 +48,12 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
     key="qwen3_5_moe",
     handler_key=QWEN3_5_MOE_HANDLER.key,
     model_names=(
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
     ),
     default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
     default_rollout_weights_mode="merged",

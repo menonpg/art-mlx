@@ -20,6 +20,7 @@ from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.lora_checkpoint import normalize_runtime_lora_checkpoint
 from ..utils.lifecycle import (
     ServiceLifecycle,
     managed_process_cmd,
@@ -89,6 +90,7 @@ def save_checkpoint(
     os.makedirs(checkpoint_dir, exist_ok=True)
     trainer.save_model(checkpoint_dir)
     convert_checkpoint_if_needed(checkpoint_dir)
+    normalize_runtime_lora_checkpoint(checkpoint_dir)
 
     gc_and_empty_cuda_cache()
     return checkpoint_dir
@@ -545,6 +547,7 @@ class UnslothService:
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self._state.trainer.save_model(lora_path)
             convert_checkpoint_if_needed(lora_path)
+            normalize_runtime_lora_checkpoint(lora_path)
             self._latest_step = 0
         else:
             self._latest_step = get_step_from_dir(self.output_dir)

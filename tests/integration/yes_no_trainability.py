@@ -374,7 +374,10 @@ def _default_variant_name(base_model: str) -> _VARIANT_NAME:
 
 
 def _build_internal_config(
-    variant: _TrainabilityVariant, *, base_model: str
+    variant: _TrainabilityVariant,
+    *,
+    base_model: str,
+    rollout_weights_mode: RolloutWeightsMode | None = None,
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = (
@@ -388,7 +391,7 @@ def _build_internal_config(
     )
     engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
-        rollout_weights_mode=_rollout_weights_mode(base_model),
+        rollout_weights_mode=rollout_weights_mode or _rollout_weights_mode(base_model),
         engine_args=engine_args,
         init_args=_variant_init_args(variant),
     )
@@ -596,6 +599,7 @@ async def run_yes_no_trainability_async(
     base_model: str,
     variant_name: _VARIANT_NAME = "megatron_shared",
     artifact_root: Path | None = None,
+    rollout_weights_mode: RolloutWeightsMode | None = None,
 ) -> YesNoTrainabilityReport:
     variant = _build_variant(variant_name)
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
@@ -606,7 +610,11 @@ async def run_yes_no_trainability_async(
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
     eval_prompts = prompts[:eval_prompt_count]
-    internal_config = _build_internal_config(variant, base_model=base_model)
+    internal_config = _build_internal_config(
+        variant,
+        base_model=base_model,
+        rollout_weights_mode=rollout_weights_mode,
+    )
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     model = art.TrainableModel(
         name=f"{variant.name}-{uuid.uuid4().hex[:8]}",
@@ -730,11 +738,14 @@ def run_yes_no_trainability(base_model: str) -> YesNoTrainabilityReport:
 
 def run_megatron_dedicated_yes_no_trainability(
     base_model: str,
+    *,
+    rollout_weights_mode: RolloutWeightsMode | None = None,
 ) -> YesNoTrainabilityReport:
     return asyncio.run(
         run_yes_no_trainability_async(
             base_model=base_model,
             variant_name="megatron_dedicated",
+            rollout_weights_mode=rollout_weights_mode,
         )
     )
 

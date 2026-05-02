@@ -157,7 +157,14 @@ def test_get_model_config_shared_mode():
 
 @pytest.mark.parametrize(
     "base_model",
-    ["Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-397B-A17B"],
+    [
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+    ],
 )
 def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
     from art.dev.get_model_config import get_model_config
@@ -252,21 +259,17 @@ def test_merged_rollout_weights_requires_dedicated_mode():
         validate_dedicated_config(InternalModelConfig(rollout_weights_mode="merged"))
 
 
-def test_qwen3_5_moe_requires_merged_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
-            )
+def test_qwen3_5_allows_lora_rollout_weights():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
         )
+    )
 
 
-def test_qwen3_5_moe_allows_merged_rollout_weights():
+def test_qwen3_5_allows_merged_rollout_weights():
     validate_dedicated_config(
         InternalModelConfig(
             trainer_gpu_ids=[0],
@@ -275,17 +278,3 @@ def test_qwen3_5_moe_allows_merged_rollout_weights():
             engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
         )
     )
-
-
-def test_other_qwen3_5_moe_requires_merged_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                engine_args={"model": "Qwen/Qwen3.5-397B-A17B"},  # type: ignore[typeddict-item]
-            )
-        )

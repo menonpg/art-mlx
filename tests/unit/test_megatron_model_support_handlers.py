@@ -77,7 +77,16 @@ def test_default_dense_handler_collects_moe_layer_families() -> None:
 
 
 def test_qwen_handler_collects_expected_layer_families() -> None:
-    provider = type("Provider", (), {"linear_attention_freq": 4, "num_layers": 8})()
+    provider = type(
+        "Provider",
+        (),
+        {
+            "linear_attention_freq": 4,
+            "num_layers": 8,
+            "num_moe_experts": 8,
+            "moe_shared_expert_intermediate_size": 4096,
+        },
+    )()
 
     assert QWEN3_5_MOE_HANDLER.collect_layer_families(provider) == [
         LayerFamilyInstance(key="standard_attention", layer_index=3),
@@ -132,6 +141,7 @@ def test_qwen3_handler_uses_qwen3_compile_workaround_pair() -> None:
         "flags": (
             "alltoall_dtoh",
             "alltoall_dispatch_preprocess",
+            "deepep_permute_restore",
         ),
         "shared_expert_state": "none",
         "disable_compile": False,
@@ -211,14 +221,14 @@ def test_qwen35_handler_rebinds_provider_to_language_only_runtime(
         return SimpleNamespace(layer_specs=[gdn_layer, attention_layer])
 
     monkeypatch.setattr(
-        "art.megatron.model_support.handlers.qwen3_5_moe._optional_qwen35_provider_type",
-        lambda: _FakeQwen35Provider,
+        "art.megatron.model_support.handlers.qwen3_5_moe._optional_qwen35_provider_types",
+        lambda: (_FakeQwen35Provider,),
     )
     monkeypatch.setattr(
         "art.megatron.model_support.handlers.qwen3_5_moe._require_qwen35_provider_symbols",
         lambda: (
             object(),
-            _FakeQwen35Provider,
+            (_FakeQwen35Provider,),
             _patch_standard_attention_specs,
             _transformer_block_spec_factory,
         ),

@@ -13,6 +13,7 @@ from art.megatron.model_support.registry import get_model_support_spec
 from art.megatron.model_support.spec import (
     ArchitectureReport,
     MinimalLayerCoverageReport,
+    NativeVllmLoraStatus,
     ValidationReport,
     ValidationStageResult,
 )
@@ -46,6 +47,7 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "chat_template_rollout",
         "packed_position_ids",
         "yes_no_trainability",
+        NATIVE_VLLM_LORA_STAGE,
     }
 )
 
@@ -53,9 +55,10 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
 def build_validation_stage_names(
     *,
     include_native_vllm_lora: bool = False,
+    native_vllm_lora_status: NativeVllmLoraStatus | None = None,
 ) -> list[str]:
     stages = list(MANDATORY_VALIDATION_STAGES)
-    if include_native_vllm_lora:
+    if include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}:
         stages.append(NATIVE_VLLM_LORA_STAGE)
     return stages
 
@@ -83,7 +86,8 @@ def initialize_validation_report(
         stages=[
             ValidationStageResult(name=stage_name)
             for stage_name in build_validation_stage_names(
-                include_native_vllm_lora=include_native_vllm_lora
+                include_native_vllm_lora=include_native_vllm_lora,
+                native_vllm_lora_status=spec.native_vllm_lora_status,
             )
         ],
     )
@@ -388,6 +392,31 @@ def run_yes_no_trainability_stage(
     )
 
 
+def run_native_vllm_lora_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+) -> ValidationStageResult:
+    del architecture
+    native_vllm_lora = _import_integration_module("integration.megatron_native_vllm_lora")
+    report = native_vllm_lora.run_native_vllm_lora(base_model=base_model)
+    passed = (
+        report.rollout_weights_mode == "lora"
+        and report.saturated_step is not None
+        and report.saturated_step > 0
+        and report.initial_eval_reward < report.reward_threshold
+        and report.final_eval_reward is not None
+        and report.final_eval_reward >= report.reward_threshold
+        and report.final_eval_reward > report.initial_eval_reward
+    )
+    return ValidationStageResult(
+        name=NATIVE_VLLM_LORA_STAGE,
+        passed=passed,
+        metrics=report.model_dump(mode="json"),
+        artifact_dir=report.output_dir,
+    )
+
+
 def run_packed_position_ids_stage(
     *,
     base_model: str,
@@ -431,6 +460,7 @@ def build_validation_report(
         "chat_template_rollout": run_chat_template_rollout_stage,
         "packed_position_ids": run_packed_position_ids_stage,
         "yes_no_trainability": run_yes_no_trainability_stage,
+        NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
     stage_results: dict[str, ValidationStageResult] = {}
     for stage_name, stage_runner in stage_runners.items():

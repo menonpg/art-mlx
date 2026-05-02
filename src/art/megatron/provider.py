@@ -98,7 +98,9 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.tensor_model_parallel_size = visible_gpu_count
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
-    provider.expert_model_parallel_size = visible_gpu_count
+    provider.expert_model_parallel_size = (
+        visible_gpu_count if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else 1
+    )
     provider.expert_tensor_parallel_size = 1
 
 
@@ -252,7 +254,7 @@ def _build_provider_bundle(
         trust_remote_code=True,
     )
     assert isinstance(bridge._model_bridge, supported_qwen_moe_bridge_types()), (
-        "Only Qwen3 and Qwen3.5 MoE models are supported"
+        "Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported"
     )
     handler.patch_bridge(bridge)
     return ProviderBundle(
