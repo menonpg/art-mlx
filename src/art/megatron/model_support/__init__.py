@@ -14,6 +14,7 @@ from art.megatron.model_support.registry import (
     is_model_support_registered,
     list_model_support_specs,
     model_requires_merged_rollout,
+    native_vllm_lora_status_for_model,
 )
 from art.megatron.model_support.spec import (
     ArchitectureReport,
@@ -67,5 +68,6 @@ __all__ = [
     "is_model_support_registered",
     "list_model_support_specs",
     "model_requires_merged_rollout",
+    "native_vllm_lora_status_for_model",
     "summarize_layer_families",
 ]

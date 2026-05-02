@@ -36,12 +36,14 @@ DEFAULT_DENSE_SPEC = ModelSupportSpec(
     key="default_dense",
     handler_key=DEFAULT_DENSE_HANDLER.key,
     default_target_modules=_DENSE_TARGET_MODULES,
+    native_vllm_lora_status=DEFAULT_DENSE_HANDLER.native_vllm_lora_status,
 )
 
 QWEN3_MOE_SPEC = ModelSupportSpec(
     key="qwen3_moe",
     handler_key=QWEN3_MOE_HANDLER.key,
     default_target_modules=_DENSE_TARGET_MODULES,
+    native_vllm_lora_status=QWEN3_MOE_HANDLER.native_vllm_lora_status,
 )
 
 QWEN3_5_MOE_SPEC = ModelSupportSpec(
@@ -57,7 +59,7 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
     ),
     default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
     default_rollout_weights_mode="merged",
-    native_vllm_lora_status="wip",
+    native_vllm_lora_status=QWEN3_5_MOE_HANDLER.native_vllm_lora_status,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     ),
@@ -98,6 +100,10 @@ def get_model_support_handler_for_spec(
 
 def default_target_modules_for_model(base_model: str) -> list[str]:
     return list(get_model_support_spec(base_model).default_target_modules)
+
+
+def native_vllm_lora_status_for_model(base_model: str) -> str:
+    return get_model_support_handler(base_model).native_vllm_lora_status
 
 
 def model_requires_merged_rollout(base_model: str) -> bool:

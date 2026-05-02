@@ -12,6 +12,7 @@ from art.megatron.model_support.spec import (
 
 class DefaultDenseHandler:
     key = "default_dense"
+    native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config

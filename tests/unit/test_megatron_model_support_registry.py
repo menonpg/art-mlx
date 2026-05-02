@@ -5,6 +5,7 @@ from art.megatron.model_support import (
     get_model_support_spec,
     list_model_support_specs,
     model_requires_merged_rollout,
+    native_vllm_lora_status_for_model,
 )
 
 
@@ -28,7 +29,7 @@ def test_qwen3_5_model_support_spec():
     assert spec.key == "qwen3_5_moe"
     assert spec.handler_key == "qwen3_5_moe"
     assert spec.default_rollout_weights_mode == "merged"
-    assert spec.native_vllm_lora_status == "wip"
+    assert native_vllm_lora_status_for_model("Qwen/Qwen3.5-35B-A3B") == "wip"
     assert spec.dependency_floor.megatron_bridge == (
         "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d"
     )

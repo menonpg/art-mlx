@@ -9,7 +9,10 @@ import tempfile
 from typing import Any
 
 from art.megatron.model_support.discovery import inspect_architecture
-from art.megatron.model_support.registry import get_model_support_spec
+from art.megatron.model_support.registry import (
+    get_model_support_handler_for_spec,
+    get_model_support_spec,
+)
 from art.megatron.model_support.spec import (
     ArchitectureReport,
     MinimalLayerCoverageReport,
@@ -79,6 +82,7 @@ def initialize_validation_report(
     include_native_vllm_lora: bool = False,
 ) -> ValidationReport:
     spec = get_model_support_spec(base_model)
+    handler = get_model_support_handler_for_spec(spec)
     return ValidationReport(
         base_model=base_model,
         model_key=spec.key,
@@ -87,7 +91,7 @@ def initialize_validation_report(
             ValidationStageResult(name=stage_name)
             for stage_name in build_validation_stage_names(
                 include_native_vllm_lora=include_native_vllm_lora,
-                native_vllm_lora_status=spec.native_vllm_lora_status,
+                native_vllm_lora_status=handler.native_vllm_lora_status,
             )
         ],
     )

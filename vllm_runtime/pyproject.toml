@@ -27,7 +27,7 @@ sources = ["src"]
 [tool.uv]
 required-version = ">=0.6.15"
 override-dependencies = [
-    "flashinfer-python==0.6.1",
+    "flashinfer-python==0.6.6",
     "numpy<2",
     "torch==2.10.0",
     "transformers==5.6.2",

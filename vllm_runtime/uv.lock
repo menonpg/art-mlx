@@ -10,7 +10,7 @@ resolution-markers = [
 
 [manifest]
 overrides = [
-    { name = "flashinfer-python", specifier = "==0.6.1" },
+    { name = "flashinfer-python", specifier = "==0.6.6" },
     { name = "numpy", specifier = "<2" },
     { name = "torch", specifier = "==2.10.0" },
     { name = "transformers", specifier = "==5.6.2" },
@@ -811,7 +811,7 @@ wheels = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.1"
+version = "0.6.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -828,9 +828,9 @@ dependencies = [
     { name = "torch" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/81/5a84e14df7358d2c2903b18c6f2779bd4b4a6739076d01a847d4c18fb102/flashinfer_python-0.6.1.tar.gz", hash = "sha256:8dc2fc5dc187fc70151d5f39ef560fde8a38117a4f6cf40dce0ddb09cbd4f0bf", size = 5141191, upload-time = "2026-01-14T05:40:27.825Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/70/c5a235297351021f5d3d3233523a85f5a6468495587489ad2f257e8eafe2/flashinfer_python-0.6.6.tar.gz", hash = "sha256:0730ba7c7aad332961933bcebc5119762797161ede57d955f6fd199818ed1d92", size = 5344156, upload-time = "2026-03-11T01:36:21.434Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/76/d5/bca632bb5781689415186421bbee2ad39ae8a39b0996d579c76901e5c66f/flashinfer_python-0.6.1-py3-none-any.whl", hash = "sha256:610dd4ac15e7a0874b79e7577d027cb35133e8dc31dc3137c2f2d6497fe46f18", size = 7580432, upload-time = "2026-01-14T05:40:25.636Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/61/385d06755f3ab66333018285657adf0daf8a90a129448231fd09e315bd2e/flashinfer_python-0.6.6-py3-none-any.whl", hash = "sha256:078f158636969eec1a0d3dea19c3ca90b426b66df89bbf7b7b8276ce2ec08148", size = 7817047, upload-time = "2026-03-11T01:36:19.198Z" },
 ]
 
 [[package]]
