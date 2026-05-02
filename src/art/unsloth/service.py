@@ -707,9 +707,9 @@ class UnslothService:
         """
         try:
             if self.is_dedicated:
-                async for result in self._train_sft_dedicated(batches, config, verbose):
-                    yield result
-                return
+                raise NotImplementedError(
+                    "train_sft is not yet supported in dedicated mode"
+                )
 
             await self._sleep_runtime()
             gc_and_empty_cuda_cache()
@@ -748,36 +748,6 @@ class UnslothService:
         except BaseException:
             await self.aclose()
             raise
-
-    async def _train_sft_dedicated(
-        self,
-        batches: list[SFTBatch],
-        config: types.TrainSFTConfig,
-        verbose: bool,
-    ) -> AsyncIterator[dict[str, float]]:
-        async for result in run_unsloth_sft_training(
-            self._state,
-            batches,
-            verbose=verbose,
-            max_grad_norm=1.0,
-        ):
-            yield {
-                "loss/train": result["loss"],
-                "loss/learning_rate": result["learning_rate"],
-                "loss/grad_norm": result["grad_norm"],
-            }
-
-        checkpoint_dir = save_checkpoint(
-            trainer=self._state.trainer,
-            output_dir=self.output_dir,
-            verbose=verbose,
-        )
-        new_step = int(os.path.basename(checkpoint_dir))
-        if self.rollout_weights_mode == "merged":
-            await self._sync_merged_weights(new_step, True)
-        else:
-            await self._reload_adapter(checkpoint_dir, new_step)
-        self._latest_step = new_step
 
     @cached_property
     def _state(self) -> UnslothTrainContext:
