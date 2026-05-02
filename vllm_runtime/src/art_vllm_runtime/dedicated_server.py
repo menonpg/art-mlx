@@ -38,18 +38,14 @@ def _patch_art_runtime_routes() -> None:
     from fastapi import APIRouter, FastAPI, Query, Request
     from fastapi.responses import JSONResponse
     from vllm.entrypoints.openai import api_server
-    from vllm.tasks import SupportedTask
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
         return
 
     original_build_app = api_server.build_app
 
-    def art_build_app(
-        args: argparse.Namespace,
-        supported_tasks: tuple[SupportedTask, ...] | None = None,
-    ) -> FastAPI:
-        app = original_build_app(args, supported_tasks)
+    def art_build_app(*build_args: object, **build_kwargs: object) -> FastAPI:
+        app = original_build_app(*build_args, **build_kwargs)
         router = APIRouter()
 
         def engine(request: Request):
