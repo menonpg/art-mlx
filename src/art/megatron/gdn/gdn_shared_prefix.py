@@ -6,16 +6,7 @@ from typing import Any, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
-try:
-    from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-except ModuleNotFoundError:
-
-    class TokenLayoutIndex(BaseModel):
-        model_config = ConfigDict(frozen=True)
-
-        ownership_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...]
-        token_counts_by_rank: tuple[int, ...]
-
+from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 
 GdnSegmentKind = Literal["prefix", "completion"]
 # FLA's public chunk_gated_delta_rule hard-codes 64-token WY chunks.

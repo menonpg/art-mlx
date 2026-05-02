@@ -35,13 +35,11 @@ if "expandable_segments:True" in conf:
     conf.remove("expandable_segments:True")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
 
-# Import unsloth before transformers, peft, and trl to maximize Unsloth
-# optimizations. Unsloth is an ART backend dependency, so the standard
-# `import art` path should activate this ordering automatically.
-from .utils.optional_import_guards import disable_broken_mamba_ssm
-
-disable_broken_mamba_ssm()
-import unsloth  # noqa: F401
+# Import unsloth before transformers, peft, and trl only in backend processes that
+# explicitly request it. Unsloth is an optional backend dependency, not a base ART
+# import dependency.
+if os.environ.get("IMPORT_UNSLOTH", "0") == "1":
+    import unsloth  # noqa: F401
 
 try:
     import transformers

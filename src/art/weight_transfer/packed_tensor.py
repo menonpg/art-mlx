@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Packed tensor utilities for efficient trainer-side weight transfer."""
 
-import math
 from collections.abc import Callable, Iterator
+import math
 from typing import Any
 
 import torch
@@ -58,6 +58,8 @@ def packed_broadcast_producer(
                     )
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
+    for stream in streams:
+        stream.synchronize()
 
 
 def packed_broadcast_consumer(

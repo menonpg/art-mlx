@@ -676,9 +676,6 @@ def create_unsloth_train_context(
     trainer_args: dict[str, Any],
     use_fast_model: bool = False,
 ) -> UnslothTrainContext:
-    from ..utils.optional_import_guards import disable_broken_mamba_ssm
-
-    disable_broken_mamba_ssm()
     import unsloth
 
     loader_cls = unsloth.FastModel if use_fast_model else unsloth.FastLanguageModel

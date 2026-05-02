@@ -13,12 +13,11 @@ import art
 from art import dev
 from art.megatron.backend import MegatronBackend
 from art.megatron.service import MegatronService
-
 from tests.integration.megatron_oracle_harness import ORACLE_TOPOLOGY, Topology
 from tests.integration.megatron_oracle_worker import provider_topology_env
 from tests.integration.vllm_separation.yes_no_trainability import (
-    _build_training_groups,
     _build_trainable_groups,
+    _build_training_groups,
     _engine_args_for_yes_no_trainability,
     _evaluate_model,
     _wandb_disabled,
@@ -195,7 +194,9 @@ async def _megatron_backend_context(
 ) -> AsyncIterator[MegatronBackend]:
     with _wandb_disabled():
         with provider_topology_env(topology):
-            async with MegatronBackend(path=str(backend_root), in_process=True) as backend:
+            async with MegatronBackend(
+                path=str(backend_root), in_process=False
+            ) as backend:
                 yield backend
 
 

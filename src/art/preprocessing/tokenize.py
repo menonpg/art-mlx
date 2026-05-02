@@ -484,9 +484,6 @@ def tokenize_sft_batch(
     Returns:
         SFTBatch object for this batch
     """
-    from ..utils.optional_import_guards import disable_broken_mamba_ssm
-
-    disable_broken_mamba_ssm()
     import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
     from unsloth_zoo.dataset_utils import train_on_responses_only
 

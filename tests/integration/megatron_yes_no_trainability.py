@@ -1,6 +1,6 @@
-from .vllm_separation.yes_no_trainability import (
-    YesNoTrainabilityReport,
+from .yes_no_trainability import (
     TrainabilityStepReport,
+    YesNoTrainabilityReport,
     _build_trainable_groups,
     _engine_args_for_yes_no_trainability,
     _evaluate_model,

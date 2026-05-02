@@ -127,6 +127,7 @@ class UnslothService:
     _vllm_log_file: Any = field(default=None, repr=False)
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _vllm_api_key: str | None = None
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
@@ -183,9 +184,18 @@ class UnslothService:
         }
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
-        for key in ("port", "host", "lora_modules", "api_key"):
+        for key in ("port", "host", "lora_modules"):
             server_args.pop(key, None)
         return server_args
+
+    def _runtime_headers(self) -> dict[str, str]:
+        if self._vllm_api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self._vllm_api_key}"}
+
+    def _runtime_request_kwargs(self) -> dict[str, dict[str, str]]:
+        headers = self._runtime_headers()
+        return {"headers": headers} if headers else {}
 
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
@@ -206,6 +216,9 @@ class UnslothService:
         port: int,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, int]:
+        server_args = self._runtime_server_args(config)
+        api_key = server_args.get("api_key")
+        self._vllm_api_key = api_key if isinstance(api_key, str) else None
         cmd = build_vllm_runtime_server_cmd(
             VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
@@ -216,7 +229,7 @@ class UnslothService:
                 served_model_name=f"{self.model_name}@{self._latest_step}",
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
-                server_args=self._runtime_server_args(config),
+                server_args=server_args,
             )
         )
         self._lifecycle.install_parent_cleanup(self.close)
@@ -256,14 +269,17 @@ class UnslothService:
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
             except RuntimeError as exc:
+                returncode = self._vllm_process.returncode
+                self.close()
                 raise RuntimeError(
-                    f"vLLM subprocess exited with code {self._vllm_process.returncode}. "
+                    f"vLLM subprocess exited with code {returncode}. "
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
 
             try:
                 resp = await client.get(
                     f"http://{self._vllm_host}:{self._vllm_port}/v1/models",
+                    **self._runtime_request_kwargs(),
                     timeout=5.0,
                 )
                 resp.raise_for_status()
@@ -289,6 +305,7 @@ class UnslothService:
             response = await client.post(
                 f"{self._vllm_base_url}/art/set_served_model_name",
                 json={"name": served_model_name},
+                **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             response.raise_for_status()
@@ -306,6 +323,7 @@ class UnslothService:
         async with httpx.AsyncClient() as client:
             world_size_response = await client.get(
                 f"{self._vllm_base_url}/get_world_size",
+                **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             try:
@@ -329,6 +347,7 @@ class UnslothService:
                 client.post(
                     f"{self._vllm_base_url}/init_weight_transfer_engine",
                     json={"init_info": init_info},
+                    **self._runtime_request_kwargs(),
                     timeout=300.0,
                 )
             )
@@ -395,6 +414,7 @@ class UnslothService:
                     response = await client.post(
                         f"{self._vllm_base_url}/pause",
                         params={"mode": "wait"},
+                        **self._runtime_request_kwargs(),
                         timeout=300.0,
                     )
                     response.raise_for_status()
@@ -431,6 +451,7 @@ class UnslothService:
                     client.post(
                         f"{self._vllm_base_url}/update_weights",
                         json={"update_info": update_info},
+                        **self._runtime_request_kwargs(),
                         timeout=600.0,
                     ),
                 )
@@ -454,6 +475,7 @@ class UnslothService:
                     try:
                         response = await client.post(
                             f"{self._vllm_base_url}/resume",
+                            **self._runtime_request_kwargs(),
                             timeout=30.0,
                         )
                         response.raise_for_status()
@@ -486,6 +508,7 @@ class UnslothService:
                     "lora_path": checkpoint_path,
                     "load_inplace": True,
                 },
+                **self._runtime_request_kwargs(),
                 timeout=60.0,
             )
             response.raise_for_status()
@@ -560,6 +583,7 @@ class UnslothService:
             response = await client.post(
                 f"{self._vllm_base_url}/sleep",
                 params={"level": 1, "mode": "wait"},
+                **self._runtime_request_kwargs(),
                 timeout=300.0,
             )
             response.raise_for_status()
@@ -571,6 +595,7 @@ class UnslothService:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/wake_up",
+                **self._runtime_request_kwargs(),
                 timeout=300.0,
             )
             response.raise_for_status()

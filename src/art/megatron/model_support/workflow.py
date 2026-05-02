@@ -370,9 +370,7 @@ def run_yes_no_trainability_stage(
     architecture: ArchitectureReport,
 ) -> ValidationStageResult:
     del architecture
-    yes_no_trainability = _import_integration_module(
-        "integration.vllm_separation.yes_no_trainability"
-    )
+    yes_no_trainability = _import_integration_module("integration.yes_no_trainability")
     report = yes_no_trainability.run_yes_no_trainability(base_model=base_model)
     passed = (
         report.saturated_step is not None

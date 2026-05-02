@@ -336,13 +336,9 @@ def _ensure_bridge_qwen35_adapter_name_map() -> None:
 
 def supported_qwen_moe_bridge_types() -> tuple[type[Any], ...]:
     from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
+    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
 
-    bridge_types: tuple[type[Any], ...] = (Qwen3MoEBridge,)
-    try:
-        from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
-    except ImportError:
-        return bridge_types
-    return bridge_types + (Qwen35VLMoEBridge,)
+    return (Qwen3MoEBridge, Qwen35VLMoEBridge)
 
 
 def _is_qwen35_vl_provider(provider: object) -> bool:
@@ -353,12 +349,10 @@ def _is_qwen35_vl_provider(provider: object) -> bool:
 
 
 def _optional_qwen35_provider_type() -> type[Any] | None:
-    try:
-        from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
-            Qwen35VLMoEModelProvider,
-        )
-    except ImportError:
-        return None
+    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+        Qwen35VLMoEModelProvider,
+    )
+
     return Qwen35VLMoEModelProvider
 
 
@@ -421,22 +415,12 @@ def _text_only_qwen35_mapping(mapping: Any) -> Any:
     return cloned
 
 
-try:
-    from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-        ExpertMLPDownProjMapping as _BridgeExpertMLPDownProjMapping,
-    )
-    from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-        ExpertMLPGateUpProjMapping as _BridgeExpertMLPGateUpProjMapping,
-    )
-except ImportError:
-
-    class _UnavailableQwen35BridgeMapping:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
-            raise ImportError("Qwen3.5 bridge mappings are unavailable")
-
-    _BridgeExpertMLPDownProjMapping = _UnavailableQwen35BridgeMapping
-    _BridgeExpertMLPGateUpProjMapping = _UnavailableQwen35BridgeMapping
+from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
+    ExpertMLPDownProjMapping as _BridgeExpertMLPDownProjMapping,
+)
+from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
+    ExpertMLPGateUpProjMapping as _BridgeExpertMLPGateUpProjMapping,
+)
 
 
 class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
@@ -552,48 +536,34 @@ def _ensure_qwen35_text_only_bridge_registered() -> None:
     return None
 
 
-try:
-    from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
-        _QWEN3_5_MOE_HF_CLASS_NAME,
-        Qwen35VLMoEBridge,
-    )
-    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
-        Qwen35VLMoEModelProvider,
-    )
-except ImportError:
-    _ArtQwen35TextOnlyBridge = None
-else:
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+    _QWEN3_5_MOE_HF_CLASS_NAME,
+    Qwen35VLMoEBridge,
+)
+from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLMoEModelProvider
 
-    @MegatronModelBridge.register_bridge(
-        source=_QWEN3_5_MOE_HF_CLASS_NAME,
-        target=GPTModel,
-        provider=Qwen35VLMoEModelProvider,
-        model_type="qwen3_5_moe",
-    )
-    class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
-        def mapping_registry(self) -> Any:
-            return _qwen35_text_only_mapping_registry()
+
+@MegatronModelBridge.register_bridge(
+    source=_QWEN3_5_MOE_HF_CLASS_NAME,
+    target=GPTModel,
+    provider=Qwen35VLMoEModelProvider,
+    model_type="qwen3_5_moe",
+)
+class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
+    def mapping_registry(self) -> Any:
+        return _qwen35_text_only_mapping_registry()
 
 
 def _optional_gated_delta_net_type() -> type[Any] | None:
-    try:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-    except ImportError:
-        return None
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
     return GatedDeltaNet
 
 
 def _linear_attention_pattern(provider: Any) -> list[int]:
-    try:
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-            get_linear_attention_pattern,
-        )
-    except ImportError:
-        frequency = int(getattr(provider, "linear_attention_freq", 1) or 1)
-        layer_count = int(getattr(provider, "num_layers", 1) or 1)
-        return [
-            0 if frequency > 0 and (layer_index + 1) % frequency == 0 else 1
-            for layer_index in range(layer_count)
-        ]
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_linear_attention_pattern,
+    )
+
     return list(get_linear_attention_pattern(provider))

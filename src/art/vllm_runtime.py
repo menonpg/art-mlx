@@ -400,7 +400,7 @@ async def wait_for_vllm_runtime(
                 )
             try:
                 response = await client.get(url, timeout=5.0)
-                if response.status_code < 500:
+                if response.status_code == 200:
                     return
             except httpx.HTTPError:
                 pass

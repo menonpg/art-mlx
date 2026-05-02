@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
+import time
 from typing import Any, Iterator, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -196,6 +197,62 @@ def _maybe_distributed_barrier(world_size: int) -> None:
     torch.distributed.barrier()
 
 
+def _runtime_headers(spec: MergedWeightTransferSpec) -> dict[str, str]:
+    if spec.api_key is None:
+        return {}
+    return {"Authorization": f"Bearer {spec.api_key}"}
+
+
+def _post_with_retry(
+    post: Any,
+    url: str,
+    *,
+    phase: str,
+    retry_seconds: float = 10.0,
+    **kwargs: Any,
+) -> Any:
+    if kwargs.get("headers") == {}:
+        kwargs = {key: value for key, value in kwargs.items() if key != "headers"}
+    deadline = time.monotonic() + retry_seconds
+    while True:
+        try:
+            response = post(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"{phase} failed after retrying for {retry_seconds:g}s"
+                ) from exc
+            time.sleep(0.5)
+
+
+def _sync_rank_zero_status(
+    *,
+    rank: int,
+    world_size: int,
+    phase: str,
+    error: BaseException | None,
+) -> None:
+    if world_size <= 1 or not (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    ):
+        if error is not None:
+            raise RuntimeError(f"{phase} failed on rank 0") from error
+        return
+    payload = [
+        f"{type(error).__name__}: {error}"
+        if _is_sender_rank(rank) and error is not None
+        else None
+    ]
+    torch.distributed.broadcast_object_list(payload, src=0)
+    if payload[0] is None:
+        return
+    if _is_sender_rank(rank):
+        raise RuntimeError(f"{phase} failed on rank 0: {payload[0]}") from error
+    raise RuntimeError(f"{phase} failed on rank 0: {payload[0]}")
+
+
 def _drain_merged_vllm_weights(
     weight_export: MergedWeightExport,
     *,
@@ -229,22 +286,35 @@ def ensure_merged_weight_transfer_group(
 
     import httpx
 
+    error: BaseException | None = None
     if _is_sender_rank(rank):
         init_kwargs = {
             "master_address": spec.init_info.master_address,
             "master_port": spec.init_info.master_port,
             "world_size": spec.init_info.world_size,
         }
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
             trainer_future = executor.submit(trainer_init, init_kwargs)
-            response = httpx.post(
+            _post_with_retry(
+                httpx.post,
                 f"{spec.vllm_base_url}/init_weight_transfer_engine",
+                phase="initialize merged weight transfer",
                 json={"init_info": spec.init_info.model_dump()},
+                headers=_runtime_headers(spec),
                 timeout=300.0,
             )
-            response.raise_for_status()
             merged_weight_transfer_group = trainer_future.result()
-    _maybe_distributed_barrier(world_size)
+        except BaseException as exc:
+            error = exc
+        finally:
+            executor.shutdown(wait=error is None, cancel_futures=error is not None)
+    _sync_rank_zero_status(
+        rank=rank,
+        world_size=world_size,
+        phase="initialize merged weight transfer",
+        error=error,
+    )
     return merged_weight_transfer_group, spec.init_info
 
 
@@ -302,56 +372,108 @@ def sync_merged_weights_to_vllm(
     )
     _maybe_distributed_barrier(world_size)
 
-    if not _is_sender_rank(rank):
-        _maybe_distributed_barrier(world_size)
-        _drain_merged_vllm_weights(weight_export)
-        _maybe_distributed_barrier(world_size)
-        return merged_weight_transfer_group, merged_weight_transfer_init_info
+    pause_error: BaseException | None = None
+    update_error: BaseException | None = None
+    resume_error: BaseException | None = None
 
-    with httpx.Client() as client:
-        if pause_generation:
-            response = client.post(
-                f"{spec.vllm_base_url}/pause",
-                params={"mode": "wait"},
-                timeout=300.0,
-            )
-            response.raise_for_status()
-        _maybe_distributed_barrier(world_size)
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                send_future = executor.submit(_send_weights)
-                response = client.post(
-                    f"{spec.vllm_base_url}/update_weights",
-                    json={
-                        "update_info": {
-                            "names": names,
-                            "dtype_names": dtype_names,
-                            "shapes": shapes,
-                            "is_checkpoint_format": True,
-                            "packed": True,
-                            "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-                            "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
-                        }
-                    },
-                    timeout=600.0,
-                )
-                response.raise_for_status()
-                send_future.result()
-            response = client.post(
-                f"{spec.vllm_base_url}/art/set_served_model_name",
-                json={"name": spec.served_model_name},
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            torch.cuda.synchronize()
-        finally:
-            _maybe_distributed_barrier(world_size)
+    if _is_sender_rank(rank):
+        with httpx.Client() as client:
             if pause_generation:
-                response = client.post(
-                    f"{spec.vllm_base_url}/resume",
+                try:
+                    _post_with_retry(
+                        client.post,
+                        f"{spec.vllm_base_url}/pause",
+                        phase="pause generation",
+                        params={"mode": "wait"},
+                        headers=_runtime_headers(spec),
+                        timeout=300.0,
+                    )
+                except BaseException as exc:
+                    pause_error = exc
+
+            _sync_rank_zero_status(
+                rank=rank,
+                world_size=world_size,
+                phase="pause generation",
+                error=pause_error,
+            )
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    send_future = executor.submit(_send_weights)
+                    _post_with_retry(
+                        client.post,
+                        f"{spec.vllm_base_url}/update_weights",
+                        phase="update merged weights",
+                        json={
+                            "update_info": {
+                                "names": names,
+                                "dtype_names": dtype_names,
+                                "shapes": shapes,
+                                "is_checkpoint_format": True,
+                                "packed": True,
+                                "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                                "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+                            }
+                        },
+                        headers=_runtime_headers(spec),
+                        timeout=600.0,
+                    )
+                    send_future.result()
+                _post_with_retry(
+                    client.post,
+                    f"{spec.vllm_base_url}/art/set_served_model_name",
+                    phase="set served model name",
+                    json={"name": spec.served_model_name},
+                    headers=_runtime_headers(spec),
                     timeout=30.0,
                 )
-                response.raise_for_status()
+                torch.cuda.synchronize()
+            except BaseException as exc:
+                update_error = exc
+            finally:
+                if pause_generation:
+                    try:
+                        _post_with_retry(
+                            client.post,
+                            f"{spec.vllm_base_url}/resume",
+                            phase="resume generation",
+                            headers=_runtime_headers(spec),
+                            timeout=30.0,
+                        )
+                    except BaseException as exc:
+                        resume_error = exc
+                _sync_rank_zero_status(
+                    rank=rank,
+                    world_size=world_size,
+                    phase="update merged weights",
+                    error=update_error,
+                )
+                _sync_rank_zero_status(
+                    rank=rank,
+                    world_size=world_size,
+                    phase="resume generation",
+                    error=resume_error,
+                )
+    else:
+        _sync_rank_zero_status(
+            rank=rank,
+            world_size=world_size,
+            phase="pause generation",
+            error=None,
+        )
+        _drain_merged_vllm_weights(weight_export)
+        _sync_rank_zero_status(
+            rank=rank,
+            world_size=world_size,
+            phase="update merged weights",
+            error=None,
+        )
+        _sync_rank_zero_status(
+            rank=rank,
+            world_size=world_size,
+            phase="resume generation",
+            error=None,
+        )
     return merged_weight_transfer_group, merged_weight_transfer_init_info
 
 

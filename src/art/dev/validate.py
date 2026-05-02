@@ -42,7 +42,7 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
             "(set both trainer_gpu_ids and inference_gpu_ids)"
         )
 
-    if config.get("init_args", {}).get("fast_inference"):
+    if "fast_inference" in config.get("init_args", {}):
         raise ValueError(
             "fast_inference is no longer supported; ART always uses an external "
             "vLLM runtime"

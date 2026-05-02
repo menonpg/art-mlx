@@ -33,6 +33,10 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
+from art.megatron.bridge_runtime import install_art_bridge_runtime_patches
+
+install_art_bridge_runtime_patches()
+
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state

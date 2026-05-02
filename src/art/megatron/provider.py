@@ -9,7 +9,6 @@ from megatron.bridge.training.flex_dispatcher_backend import (
 from megatron.core.transformer.enums import AttnBackend
 import torch
 
-from art.megatron.bridge_runtime import install_art_bridge_runtime_patches
 from art.megatron.flex_attention import FlexDotProductAttention
 from art.megatron.model_support.handlers.qwen3_5_moe import (
     supported_qwen_moe_bridge_types,
@@ -23,8 +22,6 @@ from art.megatron.provider_common import (
     patch_layer_spec_tree,
     resolve_layer_spec,
 )
-
-install_art_bridge_runtime_patches()
 
 
 def _env_flag(name: str) -> bool | None:

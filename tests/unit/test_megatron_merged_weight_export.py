@@ -144,27 +144,11 @@ def test_sync_merged_weights_to_vllm_posts_update_payload(
     httpx_module = ModuleType("httpx")
     setattr(httpx_module, "Client", FakeClient)
 
-    class FakeEngine:
-        @staticmethod
-        def trainer_send_weights(iterator, options) -> None:
-            del options
-            sent_weights.append(list(iterator))
-
-    nccl_module = ModuleType("vllm.distributed.weight_transfer.nccl_engine")
-    setattr(nccl_module, "NCCLWeightTransferEngine", FakeEngine)
-
     monkeypatch.setitem(sys.modules, "httpx", httpx_module)
-    monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
-    monkeypatch.setitem(sys.modules, "vllm.distributed", ModuleType("vllm.distributed"))
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.distributed.weight_transfer",
-        ModuleType("vllm.distributed.weight_transfer"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.distributed.weight_transfer.nccl_engine",
-        nccl_module,
+    monkeypatch.setattr(
+        merged_weight_export,
+        "trainer_send_weights",
+        lambda iterator, options: sent_weights.append(list(iterator)),
     )
     monkeypatch.setattr(
         merged_weight_export,
@@ -229,6 +213,9 @@ def test_sync_merged_weights_to_vllm_posts_update_payload(
                     "dtype_names": ["float32", "bfloat16"],
                     "shapes": [[2], [1]],
                     "is_checkpoint_format": True,
+                    "packed": True,
+                    "packed_buffer_size_bytes": merged_weight_export.DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                    "packed_num_buffers": merged_weight_export.DEFAULT_PACKED_NUM_BUFFERS,
                 }
             },
             None,

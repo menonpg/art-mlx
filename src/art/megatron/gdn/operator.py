@@ -8,7 +8,6 @@ from typing import Any, Callable, Iterator, Literal, Sequence, cast
 from pydantic import BaseModel, ConfigDict
 import torch
 from torch import Tensor
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from .conv_gelu import gdn_varlen_causal_conv_gelu
@@ -1910,28 +1909,24 @@ def _uses_sequence_parallel(projection: Any) -> bool:
 
 
 def _tp_world_size(projection: Any) -> int:
-    group = _tp_group(projection)
-    if group is not None and dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
-        return int(dist.get_world_size(group))  # ty: ignore[possibly-missing-attribute]
-    return int(getattr(projection, "tp_size", 1))
+    del projection
+    from megatron.core import parallel_state as ps
+
+    return int(ps.get_tensor_model_parallel_world_size())
 
 
 def _tp_rank(projection: Any) -> int:
-    try:
-        from megatron.core import parallel_state as ps
+    del projection
+    from megatron.core import parallel_state as ps
 
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            return int(ps.get_tensor_model_parallel_rank())
-    except Exception:
-        pass
-    group = _tp_group(projection)
-    if group is not None and dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
-        return int(dist.get_rank(group))  # ty: ignore[possibly-missing-attribute]
-    return int(getattr(projection, "tp_rank", 0))
+    return int(ps.get_tensor_model_parallel_rank())
 
 
 def _tp_group(projection: Any) -> Any | None:
-    return getattr(projection, "_tp_group", getattr(projection, "tp_group", None))
+    del projection
+    from megatron.core import parallel_state as ps
+
+    return ps.get_tensor_model_parallel_group()
 
 
 def _linear_bias(projection: Any) -> Tensor | None:
@@ -2736,33 +2731,17 @@ def _zero_recurrent_state(
 
 
 def _default_cp_rank(cp_size: int) -> int:
-    if cp_size == 1:
-        return 0
-    try:
-        from megatron.core import parallel_state as ps
+    del cp_size
+    from megatron.core import parallel_state as ps
 
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            return int(ps.get_context_parallel_rank())
-    except Exception:
-        pass
-    if torch.distributed.is_available() and torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
-        return int(torch.distributed.get_rank())  # ty: ignore[possibly-missing-attribute]
-    return 0
+    return int(ps.get_context_parallel_rank())
 
 
 def _default_cp_group(cp_size: int) -> Any:
-    if cp_size == 1:
-        return None
-    try:
-        from megatron.core import parallel_state as ps
+    del cp_size
+    from megatron.core import parallel_state as ps
 
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            return ps.get_context_parallel_group()
-    except Exception:
-        pass
-    if torch.distributed.is_available() and torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
-        return torch.distributed.group.WORLD  # ty: ignore[possibly-missing-attribute]
-    raise RuntimeError("CP GDN execution requires torch.distributed initialization")
+    return ps.get_context_parallel_group()
 
 
 def _l2norm(x: Tensor) -> Tensor:

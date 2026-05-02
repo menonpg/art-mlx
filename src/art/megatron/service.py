@@ -149,12 +149,16 @@ class MegatronService:
     _vllm_log_file: Any = None
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _vllm_api_key: str | None = None
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
         init=False,
         repr=False,
     )
+
+    def __post_init__(self) -> None:
+        self._validate_megatron_dependencies()
 
     @property
     def is_dedicated(self) -> bool:
@@ -240,9 +244,18 @@ class MegatronService:
         }
         if config and "server_args" in config:
             server_args.update(dict(config["server_args"]))
-        for key in ("port", "host", "lora_modules", "api_key"):
+        for key in ("port", "host", "lora_modules"):
             server_args.pop(key, None)
         return server_args
+
+    def _runtime_headers(self) -> dict[str, str]:
+        if self._vllm_api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self._vllm_api_key}"}
+
+    def _runtime_request_kwargs(self) -> dict[str, dict[str, str]]:
+        headers = self._runtime_headers()
+        return {"headers": headers} if headers else {}
 
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
@@ -263,19 +276,17 @@ class MegatronService:
             bias="none",
         )
 
-    def _adapter_has_weights(self, lora_path: str) -> bool:
+    def _adapter_exists_and_loads(self, lora_path: str) -> bool:
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             return False
-        try:
-            with safe_open(adapter_path, framework="pt") as adapter_file:
-                for key in adapter_file.keys():
-                    tensor = adapter_file.get_tensor(key)
-                    if torch.any(tensor != 0):
-                        return True
-        except Exception:
-            return False
-        return False
+        with safe_open(adapter_path, framework="pt") as adapter_file:
+            keys = list(adapter_file.keys())
+            if not keys:
+                raise RuntimeError(f"LoRA adapter contains no tensors: {adapter_path}")
+            for key in keys:
+                adapter_file.get_tensor(key)
+        return True
 
     def _create_identity_lora(self, lora_path: str) -> None:
         create_identity_lora(
@@ -285,7 +296,7 @@ class MegatronService:
         )
 
     def _ensure_identity_lora(self, lora_path: str) -> None:
-        if self._adapter_has_weights(lora_path):
+        if self._adapter_exists_and_loads(lora_path):
             return
         self._create_identity_lora(lora_path)
 
@@ -310,6 +321,7 @@ class MegatronService:
             init_info=init_info,
             vllm_base_url=self._vllm_base_url,
             served_model_name=f"{self.model_name}@{step}",
+            api_key=self._vllm_api_key,
         )
 
     def _resolve_active_lora_path(self) -> str:
@@ -330,6 +342,7 @@ class MegatronService:
             response = await client.post(
                 f"{self._vllm_base_url}/art/set_served_model_name",
                 json={"name": f"{self.model_name}@{step}"},
+                **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             response.raise_for_status()
@@ -343,6 +356,7 @@ class MegatronService:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{self._vllm_base_url}/get_world_size",
+                **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             response.raise_for_status()
@@ -362,6 +376,9 @@ class MegatronService:
     ) -> tuple[str, int]:
         import httpx
 
+        server_args = self._runtime_server_args(config)
+        api_key = server_args.get("api_key")
+        self._vllm_api_key = api_key if isinstance(api_key, str) else None
         cmd = build_vllm_runtime_server_cmd(
             VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
@@ -372,7 +389,7 @@ class MegatronService:
                 served_model_name=f"{self.model_name}@{self._latest_step}",
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
-                server_args=self._runtime_server_args(config),
+                server_args=server_args,
             )
         )
 
@@ -411,15 +428,17 @@ class MegatronService:
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
             except RuntimeError as exc:
+                returncode = self._vllm_process.returncode
+                self._stop_vllm_subprocess()
                 raise RuntimeError(
-                    "vLLM subprocess exited with code "
-                    f"{self._vllm_process.returncode}. "
+                    f"vLLM subprocess exited with code {returncode}. "
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
 
             try:
                 response = await client.get(
                     f"{self._vllm_base_url}/v1/models",
+                    **self._runtime_request_kwargs(),
                     timeout=5.0,
                 )
                 response.raise_for_status()
@@ -442,6 +461,7 @@ class MegatronService:
                     "lora_path": checkpoint_path,
                     "load_inplace": True,
                 },
+                **self._runtime_request_kwargs(),
                 timeout=60.0,
             )
             response.raise_for_status()
@@ -479,6 +499,7 @@ class MegatronService:
             response = await client.post(
                 f"{self._vllm_base_url}/sleep",
                 params={"level": 1, "mode": "wait"},
+                **self._runtime_request_kwargs(),
                 timeout=300.0,
             )
             response.raise_for_status()
@@ -490,6 +511,7 @@ class MegatronService:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/wake_up",
+                **self._runtime_request_kwargs(),
                 timeout=300.0,
             )
             response.raise_for_status()
@@ -508,8 +530,9 @@ class MegatronService:
         except ImportError as exc:
             raise RuntimeError(
                 "Megatron dependencies are not available in the active ART environment. "
-                "Build the project venv with `uv sync --extra backend --extra megatron` "
-                "before starting Megatron training."
+                "Run `setup.sh` for this worktree and build the project venv with "
+                "`uv sync --extra backend --extra megatron` before starting Megatron "
+                "training."
             ) from exc
 
     async def _ensure_megatron_running(self) -> None:
@@ -599,10 +622,10 @@ class MegatronService:
 
     async def _prepare_for_training(self) -> str:
         self._validate_megatron_dependencies()
+        await self._ensure_megatron_running()
         await self._sleep_runtime()
         gc_and_empty_cuda_cache()
 
-        await self._ensure_megatron_running()
         lora_path = self._resolve_training_lora_path()
         self._clear_pending_jobs()
         return lora_path

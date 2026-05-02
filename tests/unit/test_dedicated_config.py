@@ -97,9 +97,9 @@ def test_trainer_not_contiguous():
         )
 
 
-def test_dedicated_rejects_fast_inference():
+def test_rejects_fast_inference():
     with pytest.raises(
-        ValueError, match="fast_inference is incompatible with dedicated"
+        ValueError, match="fast_inference is no longer supported"
     ):
         validate_dedicated_config(
             InternalModelConfig(
@@ -123,15 +123,15 @@ def test_dedicated_rejects_enable_sleep_mode():
         )
 
 
-def test_dedicated_allows_fast_inference_false():
-    """fast_inference=False is fine in dedicated mode (it's the intended state)."""
-    validate_dedicated_config(
-        InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            init_args={"fast_inference": False},  # type: ignore[typeddict-item]
+def test_rejects_fast_inference_false():
+    with pytest.raises(ValueError, match="fast_inference is no longer supported"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1],
+                init_args={"fast_inference": False},  # type: ignore[typeddict-item]
+            )
         )
-    )
 
 
 def test_get_model_config_shared_mode():
@@ -142,7 +142,7 @@ def test_get_model_config_shared_mode():
         assert "trainer_gpu_ids" not in result
         assert "inference_gpu_ids" not in result
         assert result["engine_args"]["enable_sleep_mode"] is True
-        assert result["init_args"].get("fast_inference") is False
+        assert "fast_inference" not in result["init_args"]
         assert result["rollout_weights_mode"] == "lora"
         assert result["peft_args"]["target_modules"] == [
             "q_proj",

@@ -21,6 +21,7 @@ class MergedWeightTransferSpec(BaseModel):
     init_info: MergedWeightTransferInitInfo
     vllm_base_url: str
     served_model_name: str
+    api_key: str | None = None
 
 
 class _MegatronTrainingJobBase(BaseModel):

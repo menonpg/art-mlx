@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import logging
 from pathlib import Path
 import re
 import types
@@ -26,6 +27,7 @@ TRACE_UID_SPAN_ATTR = "_art_trace_uid_span"
 
 _ROUTER_LAYER_PATTERN = re.compile(r"decoder\.layers\.(?P<layer>\d+)\.mlp\.router$")
 _TRACE_CHUNK_PREFIX_PATTERN = re.compile(r"^chunk(?P<chunk>\d+)\.(?P<name>.+)$")
+logger = logging.getLogger(__name__)
 
 
 def _to_tensor_cpu_contiguous(
@@ -1018,9 +1020,11 @@ class MoeRoutingReplayController:
         bundle: MoeRoutingReplayBundle,
         strict: bool,
         local_token_indexer: LocalTokenIndexer | None = None,
+        allow_recompute_reuse: bool = True,
     ) -> None:
         self.bundle = bundle
         self.strict = strict
+        self.allow_recompute_reuse = allow_recompute_reuse
         self.local_token_indexer = (
             local_token_indexer or TopologyAwareLocalTokenIndexer()
         )
@@ -1032,6 +1036,7 @@ class MoeRoutingReplayController:
         self._router_call_sequences: dict[str, list[int]] = {}
         self._router_last_call_indices: dict[str, int] = {}
         self._router_last_call_keys: dict[str, tuple[str, int] | None] = {}
+        self._router_reuse_counts: dict[str, int] = {}
         self._global_uid_to_row_index: dict[int, int] = {}
         self._local_router_keys: set[str] = set()
         self._active_micro_order: int | None = None
@@ -1167,6 +1172,7 @@ class MoeRoutingReplayController:
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
+        self._router_reuse_counts = {}
         local_call_keys = self._build_local_call_keys(
             sample_index=sample_index,
         )
@@ -1336,6 +1342,12 @@ class MoeRoutingReplayController:
                     f"step={self._active_step_index}, router='{router_key}', "
                     f"consumed={consumed}, expected={len(call_sequence)}"
                 )
+        if self._router_reuse_counts:
+            logger.info(
+                "Routing replay reused routes for recompute: step=%s counts=%s",
+                self._active_step_index,
+                dict(sorted(self._router_reuse_counts.items())),
+            )
         self._active_step_index = None
         self._active_sample_index = None
         self._active_step_routes = None
@@ -1343,6 +1355,7 @@ class MoeRoutingReplayController:
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
+        self._router_reuse_counts = {}
         self._global_uid_to_row_index = {}
         self._active_micro_order = None
         if _ACTIVE_ROUTING_REPLAY_CONTROLLER is self:
@@ -1382,7 +1395,16 @@ class MoeRoutingReplayController:
             and last_call_key == active_call_key
             and next_call_key != active_call_key
         ):
+            if not self.allow_recompute_reuse:
+                raise RuntimeError(
+                    "Routing replay recompute reuse is disabled: "
+                    f"step={self._active_step_index}, router='{router_key}', "
+                    f"call_key={active_call_key}"
+                )
             route = router_calls[last_call_index]
+            self._router_reuse_counts[router_key] = (
+                self._router_reuse_counts.get(router_key, 0) + 1
+            )
         else:
             if call_cursor >= len(call_sequence):
                 raise RuntimeError(

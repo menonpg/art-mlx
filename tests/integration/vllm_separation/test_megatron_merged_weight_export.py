@@ -99,7 +99,7 @@ def test_ensure_merged_weight_transfer_group_non_sender_skips_runtime_init(
 
     assert group is None
     assert init_info == spec.init_info
-    assert barriers == [2]
+    assert barriers == []
 
 
 def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
@@ -150,7 +150,7 @@ def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
     assert group is None
     assert init_info == spec.init_info
     assert iter_passes == [1, 2]
-    assert barrier_calls == [2, 2, 2]
+    assert barrier_calls == [2]
 
 
 def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
@@ -242,4 +242,4 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
         ),
         ("http://runtime.test/resume", None, None, 30.0),
     ]
-    assert barrier_calls == [2, 2, 2]
+    assert barrier_calls == [2]
