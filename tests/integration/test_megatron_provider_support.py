@@ -115,7 +115,7 @@ def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
 
     provider = _FakeProvider()
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     monkeypatch.setattr(
@@ -199,7 +199,7 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     provider = _FakeProvider()
     setattr(provider, "num_moe_experts", 8)
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     dispatcher_calls: list[tuple[int, int, str]] = []
@@ -242,7 +242,7 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
 ) -> None:
     provider = _FakeProvider()
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     monkeypatch.setattr(
@@ -280,7 +280,7 @@ def test_get_provider_bundle_disables_recompute_from_env(
 ) -> None:
     provider = _FakeProvider()
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     monkeypatch.setattr(
@@ -307,7 +307,7 @@ def test_get_provider_bundle_honors_expert_parallel_env_overrides(
 ) -> None:
     provider = _FakeProvider()
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     monkeypatch.setattr(
