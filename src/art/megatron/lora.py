@@ -16,7 +16,6 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-    scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -98,45 +97,6 @@ def _normalize_axis(axis: int, ndim: int) -> int:
     if axis < 0 or axis >= ndim:
         raise ValueError(f"Invalid shard axis {axis} for tensor ndim={ndim}")
     return axis
-
-
-def _match_sequence_parallel_output_shape(
-    adapter_out: torch.Tensor,
-    base_out: torch.Tensor,
-    *,
-    adapter_model_prefix: str,
-) -> torch.Tensor:
-    if adapter_out.shape == base_out.shape:
-        return adapter_out
-
-    tp_size = _get_shard_world_size("tp")
-    if (
-        tp_size > 1
-        and adapter_out.ndim == base_out.ndim
-        and adapter_out.shape[0] == base_out.shape[0] * tp_size
-        and adapter_out.shape[1:] == base_out.shape[1:]
-    ):
-        adapter_out = scatter_to_sequence_parallel_region(adapter_out)
-        if adapter_out.shape == base_out.shape:
-            return adapter_out
-
-    if (
-        tp_size > 1
-        and adapter_out.ndim == base_out.ndim
-        and adapter_out.shape[0] * tp_size == base_out.shape[0]
-        and adapter_out.shape[1:] == base_out.shape[1:]
-    ):
-        adapter_out = gather_from_sequence_parallel_region(
-            adapter_out,
-            tensor_parallel_output_grad=True,
-        )
-        if adapter_out.shape == base_out.shape:
-            return adapter_out
-
-    raise RuntimeError(
-        f"{adapter_model_prefix}: LoRA adapter output shape {tuple(adapter_out.shape)} "
-        f"does not match base output shape {tuple(base_out.shape)}"
-    )
 
 
 def _shard_weight_by_components(
@@ -1078,11 +1038,13 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             [self.gate_lora(lora_input), self.up_lora(lora_input)],
             dim=-1,
         )
-        adapter_out = _match_sequence_parallel_output_shape(
-            adapter_out,
-            base_out,
-            adapter_model_prefix=self.gate_lora.adapter_model_prefix.rsplit(".", 1)[0],
-        )
+        if adapter_out.shape != base_out.shape:
+            adapter_model_prefix = self.gate_lora.adapter_model_prefix.rsplit(".", 1)[0]
+            raise RuntimeError(
+                f"{adapter_model_prefix}: LoRA adapter output shape "
+                f"{tuple(adapter_out.shape)} does not match base output shape "
+                f"{tuple(base_out.shape)}"
+            )
         return base_out + adapter_out, bias_out
 
 
