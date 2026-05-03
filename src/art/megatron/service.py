@@ -21,7 +21,10 @@ from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
-from ..utils.lora_checkpoint import normalize_runtime_lora_checkpoint
+from ..utils.lora_checkpoint import (
+    normalize_runtime_lora_checkpoint,
+    prepare_runtime_lora_checkpoint,
+)
 from ..utils.lifecycle import (
     ServiceLifecycle,
     managed_process_cmd,
@@ -326,6 +329,17 @@ class MegatronService:
             api_key=self._vllm_api_key,
         )
 
+    def _runtime_lora_checkpoint_dir(self, checkpoint_path: str) -> str:
+        checkpoint_name = Path(checkpoint_path).name
+        return str(Path(self.output_dir) / "runtime_lora" / checkpoint_name)
+
+    def _prepare_runtime_lora_path(self, checkpoint_path: str) -> str:
+        return prepare_runtime_lora_checkpoint(
+            checkpoint_path,
+            runtime_checkpoint_dir=self._runtime_lora_checkpoint_dir(checkpoint_path),
+            base_model=self.base_model,
+        )
+
     def _resolve_active_lora_path(self) -> str:
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
@@ -455,12 +469,13 @@ class MegatronService:
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         import httpx
 
+        runtime_checkpoint_path = self._prepare_runtime_lora_path(checkpoint_path)
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": f"{self.model_name}@{step}",
-                    "lora_path": checkpoint_path,
+                    "lora_path": runtime_checkpoint_path,
                     "load_inplace": True,
                 },
                 **self._runtime_request_kwargs(),
@@ -661,6 +676,11 @@ class MegatronService:
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
         lora_path = self._resolve_active_lora_path()
+        runtime_lora_path = (
+            self._prepare_runtime_lora_path(lora_path)
+            if self.rollout_weights_mode == "lora"
+            else lora_path
+        )
 
         if not self.is_dedicated and not self._sleep_mode_enabled():
             raise ValueError(
@@ -669,7 +689,7 @@ class MegatronService:
             )
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
-        location = await self._start_vllm_subprocess(lora_path, port, config)
+        location = await self._start_vllm_subprocess(runtime_lora_path, port, config)
         try:
             if self.rollout_weights_mode == "merged":
                 await self._sync_dedicated_merged_weights(
