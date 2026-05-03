@@ -4,6 +4,7 @@ from art.megatron.model_support.discovery import (
 )
 from art.megatron.model_support.registry import (
     DEFAULT_DENSE_SPEC,
+    PROBE_ONLY_MODEL_SUPPORT_SPECS,
     QWEN3_5_DENSE_MODELS,
     QWEN3_5_DENSE_SPEC,
     QWEN3_5_MODELS,
@@ -11,6 +12,7 @@ from art.megatron.model_support.registry import (
     QWEN3_5_MOE_SPEC,
     QWEN3_MOE_MODELS,
     QWEN3_MOE_SPEC,
+    VALIDATED_MODEL_SUPPORT_SPECS,
     UnsupportedModelArchitectureError,
     default_target_modules_for_model,
     get_model_support_handler,
@@ -62,10 +64,12 @@ __all__ = [
     "QWEN3_MOE_MODELS",
     "QWEN3_MOE_SPEC",
     "QWEN3_5_MOE_SPEC",
+    "PROBE_ONLY_MODEL_SUPPORT_SPECS",
     "RolloutWeightsMode",
     "ValidationReport",
     "ValidationStageResult",
     "UnsupportedModelArchitectureError",
+    "VALIDATED_MODEL_SUPPORT_SPECS",
     "assess_minimal_layer_coverage",
     "build_validation_report",
     "build_validation_stage_names",

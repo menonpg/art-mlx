@@ -10,9 +10,6 @@ from megatron.core.transformer.enums import AttnBackend
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
-from art.megatron.model_support.handlers.qwen3_5 import (
-    supported_qwen35_bridge_types,
-)
 from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
     get_model_support_spec,
@@ -259,10 +256,6 @@ def _build_provider_bundle(
         dtype=torch_dtype,
         trust_remote_code=True,
     )
-    if not allow_unsupported_arch:
-        assert isinstance(bridge._model_bridge, supported_qwen35_bridge_types()), (
-            "Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported"
-        )
     handler.patch_bridge(bridge)
     return ProviderBundle(
         provider=bridge.to_megatron_provider(),

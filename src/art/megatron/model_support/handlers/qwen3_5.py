@@ -725,16 +725,6 @@ def _ensure_bridge_qwen35_adapter_name_map() -> None:
         peft_bridge.ADAPTER_KEY_TO_SUFFIX.setdefault(adapter_key, suffix)
 
 
-def supported_qwen35_bridge_types() -> tuple[type[Any], ...]:
-    from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
-    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
-        Qwen35VLBridge,
-        Qwen35VLMoEBridge,
-    )
-
-    return (Qwen3MoEBridge, Qwen35VLBridge, Qwen35VLMoEBridge)
-
-
 def _is_qwen35_vl_provider(provider: object) -> bool:
     return isinstance(provider, _optional_qwen35_provider_types())
 

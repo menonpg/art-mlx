@@ -6,12 +6,11 @@ from typing import Any, cast
 import pytest
 
 pytest.importorskip("megatron.bridge")
-pytest.importorskip("megatron.bridge.models.qwen.qwen3_moe_bridge")
 
-from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.flex_attention import FlexDotProductAttention
+from art.megatron.model_support.registry import UnsupportedModelArchitectureError
 import art.megatron.provider as provider_module
 
 
@@ -67,13 +66,13 @@ class _FakeBridge:
         return self._provider
 
 
-def test_get_provider_accepts_supported_qwen_moe_bridges(
+def test_get_provider_accepts_registry_supported_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _FakeProvider()
     provider.num_moe_experts = 8
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     monkeypatch.setattr(
@@ -147,21 +146,21 @@ def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
     assert resolved.scatter_embedding_sequence_parallel is True
 
 
-def test_get_provider_rejects_unsupported_bridge(
+def test_get_provider_rejects_unregistered_model_before_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_bridge = _FakeBridge(model_bridge=object(), provider=_FakeProvider())
+    def from_hf_pretrained(*args: object, **kwargs: object) -> object:
+        raise AssertionError("AutoBridge should not be called for unsupported models")
+
     monkeypatch.setattr(
-        provider_module.AutoBridge,
-        "from_hf_pretrained",
-        lambda *args, **kwargs: fake_bridge,
+        provider_module.AutoBridge, "from_hf_pretrained", from_hf_pretrained
     )
 
     with pytest.raises(
-        AssertionError,
-        match="Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported",
+        UnsupportedModelArchitectureError,
+        match="has not passed the Megatron model-support workflow",
     ):
-        provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
+        provider_module.get_provider("unsupported/model")
 
 
 def test_get_provider_preserves_hybrid_layer_specs(
@@ -169,7 +168,7 @@ def test_get_provider_preserves_hybrid_layer_specs(
 ) -> None:
     provider = _FakeHybridProvider()
     fake_bridge = _FakeBridge(
-        model_bridge=object.__new__(Qwen3MoEBridge),
+        model_bridge=object(),
         provider=provider,
     )
     monkeypatch.setattr(

@@ -106,19 +106,29 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
     ),
 )
 
-_SPECS_BY_KEY = {
-    DEFAULT_DENSE_SPEC.key: DEFAULT_DENSE_SPEC,
-    QWEN3_MOE_SPEC.key: QWEN3_MOE_SPEC,
-    QWEN3_5_DENSE_SPEC.key: QWEN3_5_DENSE_SPEC,
-    QWEN3_5_MOE_SPEC.key: QWEN3_5_MOE_SPEC,
-}
+VALIDATED_MODEL_SUPPORT_SPECS = (
+    QWEN3_MOE_SPEC,
+    QWEN3_5_MOE_SPEC,
+)
+PROBE_ONLY_MODEL_SUPPORT_SPECS = (
+    QWEN3_DENSE_SPEC,
+    QWEN3_5_DENSE_SPEC,
+)
+_ALL_MODEL_SUPPORT_SPECS = (
+    DEFAULT_DENSE_SPEC,
+    *VALIDATED_MODEL_SUPPORT_SPECS,
+    *PROBE_ONLY_MODEL_SUPPORT_SPECS,
+)
+_SPECS_BY_KEY = {spec.key: spec for spec in _ALL_MODEL_SUPPORT_SPECS}
 _SPECS_BY_MODEL = {
-    **{model_name: QWEN3_MOE_SPEC for model_name in QWEN3_MOE_SPEC.model_names},
-    **{model_name: QWEN3_5_MOE_SPEC for model_name in QWEN3_5_MOE_SPEC.model_names},
+    model_name: spec
+    for spec in VALIDATED_MODEL_SUPPORT_SPECS
+    for model_name in spec.model_names
 }
 _UNSUPPORTED_ARCH_SPECS_BY_MODEL = {
-    **{model_name: QWEN3_DENSE_SPEC for model_name in QWEN3_DENSE_SPEC.model_names},
-    **{model_name: QWEN3_5_DENSE_SPEC for model_name in QWEN3_5_DENSE_SPEC.model_names},
+    model_name: spec
+    for spec in PROBE_ONLY_MODEL_SUPPORT_SPECS
+    for model_name in spec.model_names
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
     DEFAULT_DENSE_HANDLER.key: DEFAULT_DENSE_HANDLER,
@@ -230,4 +240,4 @@ def is_model_support_registered(base_model: str) -> bool:
 
 
 def list_model_support_specs() -> list[ModelSupportSpec]:
-    return list(_SPECS_BY_KEY.values())
+    return list(VALIDATED_MODEL_SUPPORT_SPECS)

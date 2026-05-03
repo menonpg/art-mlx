@@ -148,8 +148,6 @@ def test_qwen3_dense_uses_default_dense_only_in_unsupported_probe_mode():
 def test_model_support_specs_list_is_stable():
     specs = list_model_support_specs()
     assert [spec.key for spec in specs] == [
-        "default_dense",
         "qwen3_moe",
-        "qwen3_5_dense",
         "qwen3_5_moe",
     ]
