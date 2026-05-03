@@ -120,15 +120,18 @@ def create_identity_lora(
     peft_model.save_pretrained(lora_path)
     convert_checkpoint_if_needed(lora_path)
 
-    # Write final adapter_config in ART's vLLM-canonical disk format.
-    LoraConfig(
+    final_config = LoraConfig(
         base_model_name_or_path=base_model,
         r=rank,
         lora_alpha=lora_alpha,
         target_modules=target_modules,
         bias="none",
-    ).save_pretrained(lora_path)
-    normalize_lora_checkpoint_to_vllm(lora_path, handler=handler)
+    ).to_dict()
+    normalize_lora_checkpoint_to_vllm(
+        lora_path,
+        handler=handler,
+        adapter_config=final_config,
+    )
     del peft_model, model
     if torch.cuda.is_available():
         torch.cuda.synchronize()
