@@ -21,7 +21,7 @@ _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
 
 class Qwen35MoeHandler(DefaultDenseHandler):
     key = "qwen3_5_moe"
-    native_vllm_lora_status = "wip"
+    native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
