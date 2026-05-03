@@ -4,6 +4,7 @@ from art.megatron.model_support import (
     get_model_support_handler,
     get_model_support_spec,
     list_model_support_specs,
+    model_uses_expert_parallel,
     model_requires_merged_rollout,
     native_vllm_lora_status_for_model,
 )
@@ -57,6 +58,8 @@ def test_qwen3_5_registry_exports():
         "down_proj",
     ]
     assert model_requires_merged_rollout("Qwen/Qwen3.6-35B-A3B") is False
+    assert model_uses_expert_parallel("Qwen/Qwen3.6-35B-A3B") is True
+    assert model_uses_expert_parallel("Qwen/Qwen3.6-27B") is False
     assert get_model_support_handler("Qwen/Qwen3.6-35B-A3B").key == "qwen3_5_moe"
 
 

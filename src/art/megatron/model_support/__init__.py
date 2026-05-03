@@ -13,6 +13,7 @@ from art.megatron.model_support.registry import (
     get_model_support_spec,
     is_model_support_registered,
     list_model_support_specs,
+    model_uses_expert_parallel,
     model_requires_merged_rollout,
     native_vllm_lora_status_for_model,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "inspect_architecture",
     "is_model_support_registered",
     "list_model_support_specs",
+    "model_uses_expert_parallel",
     "model_requires_merged_rollout",
     "native_vllm_lora_status_for_model",
     "summarize_layer_families",

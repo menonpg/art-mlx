@@ -109,6 +109,15 @@ def model_requires_merged_rollout(base_model: str) -> bool:
     return get_model_support_spec(base_model).default_rollout_weights_mode == "merged"
 
 
+def model_uses_expert_parallel(base_model: str) -> bool:
+    spec = get_model_support_spec(base_model)
+    if spec.key == QWEN3_MOE_SPEC.key:
+        return True
+    if spec.key == QWEN3_5_MOE_SPEC.key:
+        return "-A" in base_model
+    return False
+
+
 def is_model_support_registered(base_model: str) -> bool:
     return base_model in _SPECS_BY_MODEL
 

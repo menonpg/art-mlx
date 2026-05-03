@@ -85,3 +85,4 @@ def test_qwen3_5_shared_variant_allows_default_rollout(monkeypatch) -> None:
 
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
+    assert "enable_expert_parallel" not in config["engine_args"]

@@ -18,7 +18,10 @@ import art
 from art import dev
 from art.local import LocalBackend
 from art.megatron.backend import MegatronBackend
-from art.megatron.model_support.registry import get_model_support_spec
+from art.megatron.model_support.registry import (
+    get_model_support_spec,
+    model_uses_expert_parallel,
+)
 from art.megatron.model_support.spec import RolloutWeightsMode
 
 from .megatron_oracle_harness import ORACLE_TOPOLOGY, Topology
@@ -386,7 +389,11 @@ def _build_internal_config(
     engine_args = _engine_args_for_yes_no_trainability(
         inference_gpu_ids=inference_gpu_ids,
         tensor_parallel_size=len(inference_gpu_ids) if shared else 1,
-        enable_expert_parallel=shared and variant.backend_name == "megatron",
+        enable_expert_parallel=(
+            shared
+            and variant.backend_name == "megatron"
+            and model_uses_expert_parallel(base_model)
+        ),
         enable_sleep_mode=True if shared else None,
     )
     engine_args["model"] = base_model
