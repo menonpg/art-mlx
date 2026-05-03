@@ -26,7 +26,6 @@ REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 EXTENDED_TOPOLOGIES_ENV = "ART_ENABLE_EXTENDED_TOPOLOGIES"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
-MAX_WORLD_SIZE_ENV = "ART_ORACLE_MAX_WORLD_SIZE"
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
@@ -222,7 +221,7 @@ def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
     topologies = list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
     if extended_topologies_enabled():
         topologies.extend(EXTENDED_TOPOLOGIES if is_moe else DENSE_EXTENDED_TOPOLOGIES)
-    return _filter_topologies_by_max_world_size(topologies)
+    return topologies
 
 
 class PackedTensorConfig(BaseModel):
@@ -596,6 +595,7 @@ def selected_sensitivity_mutations_for_objective(
     mutations: list[SensitivityMutation],
     *,
     is_moe: bool = True,
+    max_world_size: int | None = None,
 ) -> list[SensitivityMutation]:
     return [
         mutation
@@ -604,6 +604,14 @@ def selected_sensitivity_mutations_for_objective(
             objective,
             mutation,
             is_moe=is_moe,
+        )
+        and (
+            max_world_size is None
+            or sensitivity_topology_for_mutation(
+                mutation,
+                is_moe=is_moe,
+            ).world_size()
+            <= max_world_size
         )
     ]
 
@@ -637,29 +645,6 @@ def sensitivity_required_world_size(
         sensitivity_topology_for_mutation(mutation, is_moe=is_moe).world_size()
         for mutation in mutations
     )
-
-
-def max_world_size_limit() -> int | None:
-    """Parses an optional hard cap for exploratory oracle topology scheduling."""
-    raw = os.environ.get(MAX_WORLD_SIZE_ENV)
-    if raw is None or raw.strip() == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{MAX_WORLD_SIZE_ENV} must be a positive integer") from exc
-    if value < 1:
-        raise ValueError(f"{MAX_WORLD_SIZE_ENV} must be a positive integer")
-    return value
-
-
-def _filter_topologies_by_max_world_size(topologies: list[Topology]) -> list[Topology]:
-    max_world_size = max_world_size_limit()
-    if max_world_size is None:
-        return topologies
-    return [
-        topology for topology in topologies if topology.world_size() <= max_world_size
-    ]
 
 
 def extended_topologies_enabled() -> bool:
@@ -1712,11 +1697,14 @@ def _suite_variants(
     objective: OracleObjective,
     *,
     is_moe: bool,
+    max_world_size: int | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
     variants: list[VariantSpec] = []
     for topology in selected_suite_topologies(is_moe=is_moe)[1:]:
+        if max_world_size is not None and topology.world_size() > max_world_size:
+            continue
         variants.append(
             VariantSpec(
                 name=f"{objective}_topology_{topology.slug()}",
@@ -1731,13 +1719,20 @@ def _suite_variants(
 def run_suite(
     *,
     case_config: OracleCaseConfig,
+    max_world_size: int | None = None,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
     for objective in selected_oracle_objectives():
         runner = VariantRunner(objective=objective, case_config=case_config)
         reports.extend(
-            runner.run_suite(_suite_variants(objective, is_moe=case_config.is_moe))
+            runner.run_suite(
+                _suite_variants(
+                    objective,
+                    is_moe=case_config.is_moe,
+                    max_world_size=max_world_size,
+                )
+            )
         )
     return reports
 
@@ -1746,17 +1741,28 @@ def run_sensitivity_suite(
     *,
     case_config: OracleCaseConfig,
     mutations: list[SensitivityMutation],
+    max_world_size: int | None = None,
 ) -> list[VariantReport]:
     """Runs a list of sensitivity mutations and expects each to fail."""
     phase_pass = _default_phase_pass_fns()
     reports: list[VariantReport] = []
     ran_any_variants = False
+    matched_any_objective = False
     for objective in selected_oracle_objectives():
         runner = VariantRunner(objective=objective, case_config=case_config)
+        objective_supported_mutations = selected_sensitivity_mutations_for_objective(
+            objective,
+            mutations,
+            is_moe=case_config.is_moe,
+        )
+        matched_any_objective = matched_any_objective or bool(
+            objective_supported_mutations
+        )
         objective_mutations = selected_sensitivity_mutations_for_objective(
             objective,
             mutations,
             is_moe=case_config.is_moe,
+            max_world_size=max_world_size,
         )
         if not objective_mutations:
             continue
@@ -1776,7 +1782,7 @@ def run_sensitivity_suite(
         ]
         ran_any_variants = True
         reports.extend(runner.run_suite(variants))
-    if ran_any_variants:
+    if ran_any_variants or (max_world_size is not None and matched_any_objective):
         return reports
     requested = ", ".join(mutations)
     supported_by_objective = []

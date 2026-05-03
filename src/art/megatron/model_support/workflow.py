@@ -305,11 +305,30 @@ def run_correctness_sensitivity_stage(
     suite_topologies = list(
         oracle_harness.selected_suite_topologies(is_moe=handler.is_moe)
     )
-    suite_world_size = max(topology.world_size() for topology in suite_topologies)
     objectives = list(oracle_harness.selected_oracle_objectives())
     skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
+    available_gpu_count = oracle_harness.available_gpu_count()
+    max_world_size = available_gpu_count
+    oracle_world_size = oracle_harness.oracle_topology(
+        is_moe=handler.is_moe
+    ).world_size()
+    if available_gpu_count < oracle_world_size:
+        raise RuntimeError(
+            "Need "
+            f"{oracle_world_size} GPUs for oracle topology, found {available_gpu_count}"
+        )
+    selected_suite_topologies = [
+        topology
+        for topology in suite_topologies
+        if topology.world_size() <= max_world_size
+    ]
+    excluded_suite_topologies = [
+        topology
+        for topology in suite_topologies
+        if topology.world_size() > max_world_size
+    ]
     mutations: list[str] = []
-    sensitivity_world_size = 0
+    excluded_sensitivity_mutations: list[str] = []
     if not skip_sensitivity:
         for objective in objectives:
             for (
@@ -320,22 +339,28 @@ def run_correctness_sensitivity_stage(
             ):
                 if mutation not in mutations:
                     mutations.append(mutation)
-        sensitivity_world_size = oracle_harness.sensitivity_required_world_size(
-            mutations,
-            is_moe=handler.is_moe,
-        )
-    available_gpu_count = oracle_harness.available_gpu_count()
-    required_gpu_count = max(suite_world_size, sensitivity_world_size)
-    if available_gpu_count < required_gpu_count:
-        raise RuntimeError(
-            "Need "
-            f"{required_gpu_count} GPUs for correctness/sensitivity, found {available_gpu_count}"
-        )
+        excluded_sensitivity_mutations = [
+            mutation
+            for mutation in mutations
+            if oracle_harness.sensitivity_topology_for_mutation(
+                mutation,
+                is_moe=handler.is_moe,
+            ).world_size()
+            > max_world_size
+        ]
+        mutations = [
+            mutation
+            for mutation in mutations
+            if mutation not in excluded_sensitivity_mutations
+        ]
     LIVE_TRAINING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     LIVE_TRAINING_LOG_PATH.write_text("", encoding="utf-8")
     with _temporary_env(**{ORACLE_LIVE_TRAINING_LOG_ENV: str(LIVE_TRAINING_LOG_PATH)}):
         with _redirect_output(CORRECTNESS_LOG_PATH):
-            suite_reports = oracle_harness.run_suite(case_config=case_config)
+            suite_reports = oracle_harness.run_suite(
+                case_config=case_config,
+                max_world_size=max_world_size,
+            )
         sensitivity_reports = []
         if skip_sensitivity:
             SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -346,11 +371,21 @@ def run_correctness_sensitivity_stage(
                 ),
                 encoding="utf-8",
             )
+        elif not mutations:
+            SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SENSITIVITY_LOG_PATH.write_text(
+                (
+                    "Sensitivity suite skipped. "
+                    f"No sensitivity mutations fit max_world_size={max_world_size}.\n"
+                ),
+                encoding="utf-8",
+            )
         else:
             with _redirect_output(SENSITIVITY_LOG_PATH):
                 sensitivity_reports = oracle_harness.run_sensitivity_suite(
                     case_config=case_config,
                     mutations=mutations,
+                    max_world_size=max_world_size,
                 )
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     return ValidationStageResult(
@@ -362,8 +397,18 @@ def run_correctness_sensitivity_stage(
             "allow_unsupported_arch": allow_unsupported_arch,
             "objectives": objectives,
             "sensitivity_mutations": mutations,
-            "required_gpu_count": required_gpu_count,
+            "excluded_sensitivity_mutations": excluded_sensitivity_mutations,
+            "available_gpu_count": available_gpu_count,
+            "max_world_size": max_world_size,
+            "required_gpu_count": oracle_world_size,
             "correctness_variant_count": len(suite_reports),
+            "correctness_excluded_topology_count": len(excluded_suite_topologies),
+            "correctness_excluded_topologies": [
+                topology.slug() for topology in excluded_suite_topologies
+            ],
+            "correctness_selected_topologies": [
+                topology.slug() for topology in selected_suite_topologies
+            ],
             "correctness_variants": [
                 {
                     "variant": report.variant,

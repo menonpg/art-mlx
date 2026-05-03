@@ -5,17 +5,14 @@ from typing import Callable
 import pytest
 
 from .megatron_oracle_harness import (
-    EXTENDED_TOPOLOGIES,
+    ORACLE_TOPOLOGY,
     SENSITIVITY_MUTATION_ENV,
-    TOPOLOGIES,
     available_gpu_count,
     case_config,
-    extended_topologies_enabled,
     run_sensitivity_suite,
     run_suite,
     sensitivity_enabled,
     sensitivity_mutations,
-    sensitivity_required_world_size,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,34 +48,27 @@ def _require_gpus_for(topology_world_size: int) -> None:
         )
 
 
-def _suite_world_size() -> int:
-    suite_topologies = list(TOPOLOGIES)
-    if extended_topologies_enabled():
-        suite_topologies.extend(EXTENDED_TOPOLOGIES)
-    return max(topology.world_size() for topology in suite_topologies)
-
-
 def test_megatron_lora_topology_suite(capsys: pytest.CaptureFixture[str]) -> None:
     """
     Runs the suite of topologies and expects each to pass (numerical differences within our thresholds)
     """
     _announce_report_log(log_path=CORRECTNESS_LOG_PATH, capsys=capsys)
-    suite_world_size = _suite_world_size()
     gpu_count = available_gpu_count()
-    if gpu_count < suite_world_size:
+    if gpu_count < ORACLE_TOPOLOGY.world_size():
         CORRECTNESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CORRECTNESS_LOG_PATH.write_text(
             (
                 "Topology suite skipped. "
-                f"Need {suite_world_size} GPUs, found {gpu_count}.\n"
+                f"Need {ORACLE_TOPOLOGY.world_size()} GPUs, found {gpu_count}.\n"
             ),
             encoding="utf-8",
         )
-    _require_gpus_for(suite_world_size)
+    _require_gpus_for(ORACLE_TOPOLOGY.world_size())
     _run_suite_with_log(
         log_path=CORRECTNESS_LOG_PATH,
         run=lambda: run_suite(
             case_config=case_config(),
+            max_world_size=gpu_count,
         ),
     )
 
@@ -105,22 +95,22 @@ def test_megatron_lora_diff_sensitivity(capsys: pytest.CaptureFixture[str]) -> N
         )
     mutations = sensitivity_mutations()
     assert mutations
-    sensitivity_world_size = sensitivity_required_world_size(mutations)
     gpu_count = available_gpu_count()
-    if gpu_count < sensitivity_world_size:
+    if gpu_count < ORACLE_TOPOLOGY.world_size():
         SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         SENSITIVITY_LOG_PATH.write_text(
             (
                 "Sensitivity suite skipped. "
-                f"Need {sensitivity_world_size} GPUs, found {gpu_count}.\n"
+                f"Need {ORACLE_TOPOLOGY.world_size()} GPUs, found {gpu_count}.\n"
             ),
             encoding="utf-8",
         )
-    _require_gpus_for(sensitivity_world_size)
+    _require_gpus_for(ORACLE_TOPOLOGY.world_size())
     _run_suite_with_log(
         log_path=SENSITIVITY_LOG_PATH,
         run=lambda: run_sensitivity_suite(
             case_config=case_config(),
             mutations=mutations,
+            max_world_size=gpu_count,
         ),
     )

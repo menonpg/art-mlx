@@ -2,13 +2,12 @@ import torch
 
 from .megatron_oracle_harness import (
     DENSE_ORACLE_TOPOLOGY,
-    MAX_WORLD_SIZE_ENV,
     ORACLE_TOPOLOGY,
     DiffAccumulator,
     MetricThresholdRule,
     _default_phase_pass_fns,
     _suite_variants,
-    selected_suite_topologies,
+    selected_sensitivity_mutations_for_objective,
 )
 
 
@@ -71,11 +70,22 @@ def test_dense_suite_variants_include_tp2_dp2_without_oracle_duplicate() -> None
     )
 
 
-def test_max_world_size_env_filters_dense_topologies(monkeypatch) -> None:
-    monkeypatch.setenv(MAX_WORLD_SIZE_ENV, "2")
+def test_max_world_size_arg_filters_dense_variants() -> None:
+    variants = _suite_variants("rl", is_moe=False, max_world_size=2)
 
-    topologies = selected_suite_topologies(is_moe=False)
+    assert variants
+    assert all(variant.topology.world_size() <= 2 for variant in variants)
+    assert not any(
+        variant.topology.tp == 2 and variant.topology.dp == 2 for variant in variants
+    )
 
-    assert topologies
-    assert all(topology.world_size() <= 2 for topology in topologies)
-    assert not any(topology.tp == 2 and topology.dp == 2 for topology in topologies)
+
+def test_max_world_size_arg_filters_sensitivity_mutations() -> None:
+    mutations = selected_sensitivity_mutations_for_objective(
+        "rl",
+        ["skip_finalize", "dp_local_token_normalization"],
+        is_moe=True,
+        max_world_size=1,
+    )
+
+    assert mutations == []
