@@ -24,6 +24,16 @@ MODELS = (
     "Qwen/Qwen3.6-35B-A3B",
 )
 
+CANONICAL_KEYS = (
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+    "base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight",
+    "base_model.model.model.layers.0.linear_attn.in_proj_qkv.lora_A.weight",
+    "base_model.model.model.layers.0.linear_attn.in_proj_z.lora_A.weight",
+    "base_model.model.model.layers.0.linear_attn.out_proj.lora_A.weight",
+    "base_model.model.model.layers.0.mlp.gate_proj.lora_A.weight",
+    "base_model.model.model.layers.0.mlp.down_proj.lora_A.weight",
+)
+
 
 def _parse(key: str) -> str:
     return parse_fine_tuned_lora_name(
@@ -60,6 +70,14 @@ def _load_modules(tensors: dict[str, torch.Tensor]) -> tuple[str, list[str]]:
         return "ok", sorted(lora.loras)
 
 
+def _to_qwen_wrapper_key(key: str) -> str:
+    return key.replace(
+        "base_model.model.model.layers.",
+        "base_model.model.model.language_model.layers.",
+        1,
+    )
+
+
 def main() -> None:
     print("hf_architectures")
     for model in MODELS:
@@ -70,13 +88,14 @@ def main() -> None:
             getattr(config, "model_type", None),
         )
 
-    canonical_dense = "base_model.model.model.layers.0.mlp.down_proj.lora_A.weight"
-    qwen_wrapper_dense = (
-        "base_model.model.model.language_model.layers.0.mlp.down_proj.lora_A.weight"
-    )
-    print("dense_key_parse")
-    print("canonical", canonical_dense, "->", _parse(canonical_dense))
-    print("qwen_wrapper", qwen_wrapper_dense, "->", _parse(qwen_wrapper_dense))
+    print("canonical_key_parse")
+    for key in CANONICAL_KEYS:
+        print(key, "->", _parse(key))
+
+    print("qwen_wrapper_key_parse")
+    for key in CANONICAL_KEYS:
+        wrapper_key = _to_qwen_wrapper_key(key)
+        print(wrapper_key, "->", _parse(wrapper_key))
 
     canonical_moe = {
         "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight": torch.zeros(
@@ -112,8 +131,17 @@ def main() -> None:
             4, 4
         ),
     }
+    fused_canonical_moe = {
+        key.replace(
+            "base_model.model.model.language_model.layers.",
+            "base_model.model.model.layers.",
+            1,
+        ): tensor
+        for key, tensor in fused_runtime_moe.items()
+    }
     print("moe_checkpoint_load")
     print("canonical_per_expert", _load_modules(canonical_moe))
+    print("fused_canonical", _load_modules(fused_canonical_moe))
     print("fused_runtime", _load_modules(fused_runtime_moe))
 
 
