@@ -289,6 +289,23 @@ class MetricThresholdRule(BaseModel):
         return len(self.failure_reasons(summary)) == 0
 
 
+class LossThresholdRule(MetricThresholdRule):
+    """Scalar loss rule with an absolute floor for near-zero losses."""
+
+    mean_abs_diff_floor: float = 1e-7
+
+    def failure_reasons(self, summary: MetricSummary) -> list[str]:
+        reasons = super().failure_reasons(summary)
+        if not reasons:
+            return []
+        mean_abs_diff = summary.get("mean_abs_diff")
+        if isinstance(mean_abs_diff, (int, float)) and (
+            float(mean_abs_diff) <= self.mean_abs_diff_floor
+        ):
+            return []
+        return reasons
+
+
 class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
@@ -1667,9 +1684,7 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out_loss = MetricThresholdRule(
-        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0}
-    )
+    fwd_out_loss = LossThresholdRule(limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0})
     fwd_out = MetricThresholdRule(
         limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
         minimums=non_zero_scales,

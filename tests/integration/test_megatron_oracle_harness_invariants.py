@@ -5,6 +5,7 @@ from .megatron_oracle_harness import (
     DENSE_ORACLE_TOPOLOGY,
     ORACLE_TOPOLOGY,
     DiffAccumulator,
+    LossThresholdRule,
     MetricThresholdRule,
     _default_phase_pass_fns,
     _suite_variants,
@@ -19,6 +20,25 @@ def test_metric_threshold_rule_can_require_strictly_positive_values() -> None:
 
     assert not rule(summary)
     assert rule.failure_reasons(summary) == ["candidate_abs_scale=0<=0"]
+
+
+def test_loss_threshold_rule_allows_tiny_absolute_loss_drift() -> None:
+    rule = LossThresholdRule(limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0})
+
+    assert rule(
+        {
+            "relative_l2": 0.016,
+            "mean_abs_pct": 1.6,
+            "mean_abs_diff": 1e-8,
+        }
+    )
+    assert not rule(
+        {
+            "relative_l2": 0.016,
+            "mean_abs_pct": 1.6,
+            "mean_abs_diff": 1e-6,
+        }
+    )
 
 
 def test_diff_accumulator_summary_tracks_candidate_abs_scale() -> None:
