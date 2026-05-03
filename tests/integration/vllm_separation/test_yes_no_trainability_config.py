@@ -1,3 +1,7 @@
+import pytest
+
+from art.megatron.model_support import UnsupportedModelArchitectureError
+
 from .yes_no_trainability import (
     _build_internal_config,
     _default_variant_name,
@@ -71,7 +75,9 @@ def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
     assert "inference_gpu_ids" not in config
 
 
-def test_qwen3_5_shared_variant_allows_default_rollout(monkeypatch) -> None:
+def test_unvalidated_dense_model_is_not_default_megatron_trainability_model(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
     variant = _TrainabilityVariant(
         name="megatron_shared",
@@ -81,8 +87,14 @@ def test_qwen3_5_shared_variant_allows_default_rollout(monkeypatch) -> None:
         inference_gpu_ids=[0, 1],
     )
 
-    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
+    with pytest.raises(UnsupportedModelArchitectureError):
+        _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
 
+    config = _build_internal_config(
+        variant,
+        base_model="Qwen/Qwen3.5-4B",
+        allow_unsupported_arch=True,
+    )
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
     assert "enable_expert_parallel" not in config["engine_args"]

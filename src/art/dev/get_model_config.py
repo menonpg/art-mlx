@@ -5,7 +5,7 @@ from .validate import is_dedicated_mode
 
 
 def default_target_modules(base_model: str) -> list[str]:
-    return default_target_modules_for_model(base_model)
+    return default_target_modules_for_model(base_model, allow_unsupported_arch=True)
 
 
 def get_model_config(

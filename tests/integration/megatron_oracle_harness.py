@@ -26,6 +26,7 @@ REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 EXTENDED_TOPOLOGIES_ENV = "ART_ENABLE_EXTENDED_TOPOLOGIES"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
+MAX_WORLD_SIZE_ENV = "ART_ORACLE_MAX_WORLD_SIZE"
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
@@ -221,7 +222,7 @@ def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
     topologies = list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
     if extended_topologies_enabled():
         topologies.extend(EXTENDED_TOPOLOGIES if is_moe else DENSE_EXTENDED_TOPOLOGIES)
-    return topologies
+    return _filter_topologies_by_max_world_size(topologies)
 
 
 class PackedTensorConfig(BaseModel):
@@ -304,6 +305,7 @@ class OracleCaseConfig(BaseModel):
     loss_scale: float = 1
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
+    allow_unsupported_arch: bool = False
 
 
 class DiskPackedTensorsSpec(BaseModel):
@@ -629,10 +631,35 @@ def sensitivity_required_world_size(
     is_moe: bool = True,
 ) -> int:
     """Returns the max world-size required by a selected mutation set."""
+    if not mutations:
+        return 0
     return max(
         sensitivity_topology_for_mutation(mutation, is_moe=is_moe).world_size()
         for mutation in mutations
     )
+
+
+def max_world_size_limit() -> int | None:
+    """Parses an optional hard cap for exploratory oracle topology scheduling."""
+    raw = os.environ.get(MAX_WORLD_SIZE_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{MAX_WORLD_SIZE_ENV} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{MAX_WORLD_SIZE_ENV} must be a positive integer")
+    return value
+
+
+def _filter_topologies_by_max_world_size(topologies: list[Topology]) -> list[Topology]:
+    max_world_size = max_world_size_limit()
+    if max_world_size is None:
+        return topologies
+    return [
+        topology for topology in topologies if topology.world_size() <= max_world_size
+    ]
 
 
 def extended_topologies_enabled() -> bool:

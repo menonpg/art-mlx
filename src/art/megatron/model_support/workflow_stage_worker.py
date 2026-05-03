@@ -31,6 +31,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--architecture-json", required=True)
     parser.add_argument("--output-json", required=True)
+    parser.add_argument("--allow-unsupported-arch", action="store_true")
     return parser.parse_args()
 
 
@@ -43,6 +44,7 @@ def main() -> None:
     result = stage_runner(
         base_model=args.base_model,
         architecture=architecture,
+        allow_unsupported_arch=args.allow_unsupported_arch,
     )
     Path(args.output_json).write_text(
         result.model_dump_json(indent=2),

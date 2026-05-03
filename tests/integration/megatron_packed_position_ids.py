@@ -146,6 +146,7 @@ class PackedPositionIdsRunRequest(BaseModel):
     base_model: str
     num_layers: int
     output_dir: str
+    allow_unsupported_arch: bool = False
 
 
 def _prompt_family_count(group_ids: torch.Tensor, parent_ids: torch.Tensor) -> int:
@@ -712,6 +713,7 @@ def _run_packed_position_ids_worker(
     base_model: str,
     num_layers: int,
     output_dir: Path,
+    allow_unsupported_arch: bool = False,
 ) -> PackedPositionIdsReport:
     _debug_log(f"run start base_model={base_model} num_layers={num_layers}")
     _reset_vllm_compile_overrides()
@@ -770,6 +772,7 @@ def _run_packed_position_ids_worker(
         base_model=base_model,
         precision="fp32",
         num_layers=num_layers,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     runtime: megatron_train.TrainingRuntime | None = None
     try:
@@ -787,6 +790,7 @@ def _run_packed_position_ids_worker(
                     print_env=False,
                     build_optimizer=False,
                     trainable_parameter_mode="base_model",
+                    allow_unsupported_arch=allow_unsupported_arch,
                 ),
             )
         model_chunks = cast(list[Any], runtime.model)
@@ -908,6 +912,7 @@ def run_packed_position_ids(
     *,
     base_model: str,
     num_layers: int | None = None,
+    allow_unsupported_arch: bool = False,
 ) -> PackedPositionIdsReport:
     _debug_log(f"run start base_model={base_model} requested_num_layers={num_layers}")
     resolved_num_layers = (
@@ -916,6 +921,7 @@ def run_packed_position_ids(
             inspect_architecture(
                 base_model,
                 torch_dtype=torch.float32,
+                allow_unsupported_arch=allow_unsupported_arch,
             ).recommended_min_layers,
         )
         if num_layers is None
@@ -930,6 +936,7 @@ def run_packed_position_ids(
         base_model=base_model,
         num_layers=resolved_num_layers,
         output_dir=str(output_dir),
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     with provider_topology_env(ORACLE_TOPOLOGY):
         _run_packed_position_ids_subprocess(request, output_dir)
@@ -942,6 +949,7 @@ def run_worker_cli(run_request_path: Path) -> None:
         base_model=request.base_model,
         num_layers=request.num_layers,
         output_dir=Path(request.output_dir),
+        allow_unsupported_arch=request.allow_unsupported_arch,
     )
 
 

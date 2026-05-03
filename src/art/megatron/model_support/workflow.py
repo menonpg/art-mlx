@@ -81,8 +81,12 @@ def initialize_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationReport:
-    spec = get_model_support_spec(base_model)
+    spec = get_model_support_spec(
+        base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     handler = get_model_support_handler_for_spec(spec)
     return ValidationReport(
         base_model=base_model,
@@ -148,6 +152,7 @@ def _run_stage_in_subprocess(
     stage_name: str,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     with tempfile.TemporaryDirectory(prefix=f"model_support_{stage_name}_") as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -171,6 +176,8 @@ def _run_stage_in_subprocess(
             "--output-json",
             str(output_json),
         ]
+        if allow_unsupported_arch:
+            cmd.append("--allow-unsupported-arch")
         with log_path.open("w", encoding="utf-8") as log_file:
             completed = subprocess.run(
                 cmd,
@@ -208,10 +215,14 @@ def run_hf_parity_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     hf_parity = _import_integration_module("integration.megatron_hf_parity")
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
-    spec = get_model_support_spec(base_model)
+    spec = get_model_support_spec(
+        base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
@@ -219,6 +230,7 @@ def run_hf_parity_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     report = hf_parity.run_hf_parity(case_config=case_config)
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
@@ -244,10 +256,14 @@ def run_lora_coverage_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     lora_coverage = _import_integration_module("integration.megatron_lora_coverage")
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
-    spec = get_model_support_spec(base_model)
+    spec = get_model_support_spec(
+        base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
@@ -255,6 +271,7 @@ def run_lora_coverage_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     report = lora_coverage.run_lora_coverage(case_config)
     return ValidationStageResult(
@@ -269,9 +286,13 @@ def run_correctness_sensitivity_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
-    spec = get_model_support_spec(base_model)
+    spec = get_model_support_spec(
+        base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
@@ -279,6 +300,7 @@ def run_correctness_sensitivity_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     suite_topologies = list(
         oracle_harness.selected_suite_topologies(is_moe=handler.is_moe)
@@ -337,6 +359,7 @@ def run_correctness_sensitivity_stage(
         metrics={
             "requested_num_layers": case_config.num_layers,
             "is_moe": handler.is_moe,
+            "allow_unsupported_arch": allow_unsupported_arch,
             "objectives": objectives,
             "sensitivity_mutations": mutations,
             "required_gpu_count": required_gpu_count,
@@ -374,12 +397,16 @@ def run_merged_vllm_serving_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     merged_vllm_serving = _import_integration_module(
         "integration.megatron_merged_vllm_serving"
     )
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
-    spec = get_model_support_spec(base_model)
+    spec = get_model_support_spec(
+        base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
@@ -387,6 +414,7 @@ def run_merged_vllm_serving_stage(
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     report = merged_vllm_serving.run_merged_vllm_serving(case_config)
     return ValidationStageResult(
@@ -401,8 +429,10 @@ def run_chat_template_rollout_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     del architecture
+    del allow_unsupported_arch
     chat_template_rollout = _import_integration_module(
         "integration.megatron_chat_template_rollout"
     )
@@ -419,10 +449,14 @@ def run_yes_no_trainability_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     del architecture
     yes_no_trainability = _import_integration_module("integration.yes_no_trainability")
-    report = yes_no_trainability.run_yes_no_trainability(base_model=base_model)
+    report = yes_no_trainability.run_yes_no_trainability(
+        base_model=base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     passed = (
         report.saturated_step is not None
         and report.saturated_step > 0
@@ -443,8 +477,10 @@ def run_native_vllm_lora_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     del architecture
+    del allow_unsupported_arch
     native_vllm_lora = _import_integration_module(
         "integration.megatron_native_vllm_lora"
     )
@@ -470,6 +506,7 @@ def run_packed_position_ids_stage(
     *,
     base_model: str,
     architecture: ArchitectureReport,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationStageResult:
     packed_position_ids = _import_integration_module(
         "integration.megatron_packed_position_ids"
@@ -477,6 +514,7 @@ def run_packed_position_ids_stage(
     report = packed_position_ids.run_packed_position_ids(
         base_model=base_model,
         num_layers=max(1, architecture.recommended_min_layers),
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     metrics = report.model_dump(mode="json")
     passed = bool(metrics["scenarios"]) and all(
@@ -495,12 +533,18 @@ def build_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
+    allow_unsupported_arch: bool = False,
 ) -> ValidationReport:
     report = initialize_validation_report(
         base_model=base_model,
         include_native_vllm_lora=include_native_vllm_lora,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
-    architecture = inspect_architecture(base_model)
+    architecture = (
+        inspect_architecture(base_model, allow_unsupported_arch=True)
+        if allow_unsupported_arch
+        else inspect_architecture(base_model)
+    )
     stage_runners = {
         "hf_parity": run_hf_parity_stage,
         "lora_coverage": run_lora_coverage_stage,
@@ -518,12 +562,14 @@ def build_validation_report(
                 stage_name=stage_name,
                 base_model=base_model,
                 architecture=architecture,
+                allow_unsupported_arch=allow_unsupported_arch,
             )
             continue
         try:
             stage_results[stage_name] = stage_runner(
                 base_model=base_model,
                 architecture=architecture,
+                allow_unsupported_arch=allow_unsupported_arch,
             )
         except Exception as exc:
             stage_results[stage_name] = ValidationStageResult(
@@ -559,8 +605,13 @@ def assess_minimal_layer_coverage(
     base_model: str,
     num_layers: int,
     architecture: ArchitectureReport | None = None,
+    allow_unsupported_arch: bool = False,
 ) -> MinimalLayerCoverageReport:
-    architecture_report = architecture or inspect_architecture(base_model)
+    architecture_report = architecture or (
+        inspect_architecture(base_model, allow_unsupported_arch=True)
+        if allow_unsupported_arch
+        else inspect_architecture(base_model)
+    )
     missing_layer_families = [
         family.key
         for family in architecture_report.layer_families

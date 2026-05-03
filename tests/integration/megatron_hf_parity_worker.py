@@ -508,6 +508,7 @@ def _build_megatron_runtime(
         optimizer_config=_build_optimizer_config(request.case_config),
         print_env=False,
         trainable_parameter_mode="base_model",
+        allow_unsupported_arch=request.case_config.allow_unsupported_arch,
     )
 
 
@@ -780,7 +781,8 @@ def _worker_run(request: HfParityRunRequest) -> None:
     try:
         _debug("starting HF parity worker")
         model_support_handler = get_model_support_handler(
-            request.case_config.base_model
+            request.case_config.base_model,
+            allow_unsupported_arch=request.case_config.allow_unsupported_arch,
         )
         hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
             base_model=request.case_config.base_model,

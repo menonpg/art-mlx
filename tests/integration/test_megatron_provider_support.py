@@ -83,7 +83,7 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
 
-    resolved = provider_module.get_provider("unused-model")
+    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     assert resolved is provider
     assert provider.finalized is True
@@ -161,7 +161,7 @@ def test_get_provider_rejects_unsupported_bridge(
         AssertionError,
         match="Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported",
     ):
-        provider_module.get_provider("unsupported-model")
+        provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 
 def test_get_provider_preserves_hybrid_layer_specs(
@@ -179,7 +179,10 @@ def test_get_provider_preserves_hybrid_layer_specs(
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
 
-    resolved = provider_module.get_provider("unused-qwen")
+    resolved = provider_module.get_provider(
+        "unused-qwen",
+        allow_unsupported_arch=True,
+    )
     layer_spec = cast(Any, resolved).transformer_layer_spec(resolved, vp_stage=0)
 
     assert hasattr(layer_spec, "layer_specs")
@@ -219,7 +222,7 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
         ),
     )
 
-    bundle = provider_module.prepare_provider_bundle("unused-model")
+    bundle = provider_module.prepare_provider_bundle("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     assert provider.finalized is False
     assert getattr(provider, "tensor_model_parallel_size") == 2
@@ -253,7 +256,7 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
     monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
     monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "1")
 
-    bundle = provider_module.get_provider_bundle("unused-model")
+    bundle = provider_module.get_provider_bundle("Qwen/Qwen3-30B-A3B-Instruct-2507")
     resolved = bundle.provider
 
     assert resolved.tensor_model_parallel_size == 1
@@ -318,7 +321,7 @@ def test_get_provider_bundle_honors_expert_parallel_env_overrides(
     monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
     monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "2")
 
-    resolved = provider_module.get_provider("unused-model")
+    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     assert resolved.tensor_model_parallel_size == 2
     assert resolved.expert_model_parallel_size == 1

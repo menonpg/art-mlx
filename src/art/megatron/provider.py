@@ -14,7 +14,7 @@ from art.megatron.model_support.handlers.qwen3_5 import (
     supported_qwen35_bridge_types,
 )
 from art.megatron.model_support.registry import (
-    get_model_support_handler,
+    get_model_support_handler_for_spec,
     get_model_support_spec,
 )
 from art.megatron.provider_common import (
@@ -247,17 +247,22 @@ def _build_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype,
+    allow_unsupported_arch: bool = False,
 ) -> ProviderBundle:
-    spec = get_model_support_spec(model)
-    handler = get_model_support_handler(model)
+    spec = get_model_support_spec(
+        model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
+    handler = get_model_support_handler_for_spec(spec)
     bridge = AutoBridge.from_hf_pretrained(
         model,
         dtype=torch_dtype,
         trust_remote_code=True,
     )
-    assert isinstance(bridge._model_bridge, supported_qwen35_bridge_types()), (
-        "Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported"
-    )
+    if not allow_unsupported_arch:
+        assert isinstance(bridge._model_bridge, supported_qwen35_bridge_types()), (
+            "Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported"
+        )
     handler.patch_bridge(bridge)
     return ProviderBundle(
         provider=bridge.to_megatron_provider(),
@@ -271,10 +276,12 @@ def prepare_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    allow_unsupported_arch: bool = False,
 ) -> ProviderBundle:
     bundle = _build_provider_bundle(
         model,
         torch_dtype=torch_dtype,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     provider = bundle.provider
     setattr(provider, "_art_model_support_handler", bundle.handler)
@@ -307,11 +314,13 @@ def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    allow_unsupported_arch: bool = False,
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
             torch_dtype=torch_dtype,
+            allow_unsupported_arch=allow_unsupported_arch,
         )
     )
 
@@ -320,5 +329,10 @@ def get_provider(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    allow_unsupported_arch: bool = False,
 ) -> GPTModelProvider:
-    return get_provider_bundle(model, torch_dtype=torch_dtype).provider
+    return get_provider_bundle(
+        model,
+        torch_dtype=torch_dtype,
+        allow_unsupported_arch=allow_unsupported_arch,
+    ).provider

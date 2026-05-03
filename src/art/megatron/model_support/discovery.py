@@ -42,8 +42,13 @@ def inspect_architecture(
     base_model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    allow_unsupported_arch: bool = False,
 ) -> ArchitectureReport:
-    provider_bundle = get_provider_bundle(base_model, torch_dtype=torch_dtype)
+    provider_bundle = get_provider_bundle(
+        base_model,
+        torch_dtype=torch_dtype,
+        allow_unsupported_arch=allow_unsupported_arch,
+    )
     discovered = provider_bundle.handler.collect_layer_families(
         provider_bundle.provider
     )

@@ -53,7 +53,7 @@ def test_build_validation_report_populates_architecture_stage(
     )
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._run_stage_in_subprocess",
-        lambda *, stage_name, base_model, architecture: {
+        lambda *, stage_name, base_model, architecture, allow_unsupported_arch=False: {
             "hf_parity": ValidationStageResult(
                 name="hf_parity",
                 passed=True,
@@ -244,7 +244,7 @@ def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None
 
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._run_stage_in_subprocess",
-        lambda *, stage_name, base_model, architecture: (
+        lambda *, stage_name, base_model, architecture, allow_unsupported_arch=False: (
             ValidationStageResult(
                 name="hf_parity",
                 passed=False,
@@ -286,7 +286,7 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
     )
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._run_stage_in_subprocess",
-        lambda *, stage_name, base_model, architecture: (
+        lambda *, stage_name, base_model, architecture, allow_unsupported_arch=False: (
             ValidationStageResult(
                 name="lora_coverage",
                 passed=False,
@@ -422,6 +422,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
 
     result = run_correctness_sensitivity_stage(
         base_model="Qwen/Qwen3.5-4B",
+        allow_unsupported_arch=True,
         architecture=ArchitectureReport(
             base_model="Qwen/Qwen3.5-4B",
             model_key="qwen3_5_dense",
@@ -447,20 +448,24 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_yes_no_trainability=lambda *, base_model: SimpleNamespace(
-                latest_step=2,
-                initial_eval_reward=0.4,
-                final_eval_reward=0.95,
-                reward_threshold=0.95,
-                saturated_step=2,
-                output_dir="/tmp/trainability",
-                model_dump=lambda mode="json": {
-                    "latest_step": 2,
-                    "initial_eval_reward": 0.4,
-                    "final_eval_reward": 0.95,
-                    "reward_threshold": 0.95,
-                    "saturated_step": 2,
-                },
+            run_yes_no_trainability=lambda *,
+            base_model,
+            allow_unsupported_arch=False: (
+                SimpleNamespace(
+                    latest_step=2,
+                    initial_eval_reward=0.4,
+                    final_eval_reward=0.95,
+                    reward_threshold=0.95,
+                    saturated_step=2,
+                    output_dir="/tmp/trainability",
+                    model_dump=lambda mode="json": {
+                        "latest_step": 2,
+                        "initial_eval_reward": 0.4,
+                        "final_eval_reward": 0.95,
+                        "reward_threshold": 0.95,
+                        "saturated_step": 2,
+                    },
+                )
             )
         ),
     )
@@ -520,24 +525,29 @@ def test_run_packed_position_ids_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_packed_position_ids=lambda *, base_model, num_layers: SimpleNamespace(
-                output_dir="/tmp/packed-position-ids",
-                model_dump=lambda mode="json": {
-                    "base_model": base_model,
-                    "num_layers": num_layers,
-                    "scenarios": [
-                        {
-                            "name": "stop_early",
-                            "matched": True,
-                            "checked_token_count": 40,
-                        },
-                        {
-                            "name": "truncate",
-                            "matched": True,
-                            "checked_token_count": 44,
-                        },
-                    ],
-                },
+            run_packed_position_ids=lambda *,
+            base_model,
+            num_layers,
+            allow_unsupported_arch=False: (
+                SimpleNamespace(
+                    output_dir="/tmp/packed-position-ids",
+                    model_dump=lambda mode="json": {
+                        "base_model": base_model,
+                        "num_layers": num_layers,
+                        "scenarios": [
+                            {
+                                "name": "stop_early",
+                                "matched": True,
+                                "checked_token_count": 40,
+                            },
+                            {
+                                "name": "truncate",
+                                "matched": True,
+                                "checked_token_count": 44,
+                            },
+                        ],
+                    },
+                )
             )
         ),
     )

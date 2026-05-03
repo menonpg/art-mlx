@@ -2,11 +2,13 @@ import torch
 
 from .megatron_oracle_harness import (
     DENSE_ORACLE_TOPOLOGY,
+    MAX_WORLD_SIZE_ENV,
     ORACLE_TOPOLOGY,
     DiffAccumulator,
     MetricThresholdRule,
     _default_phase_pass_fns,
     _suite_variants,
+    selected_suite_topologies,
 )
 
 
@@ -67,3 +69,13 @@ def test_dense_suite_variants_include_tp2_dp2_without_oracle_duplicate() -> None
     assert any(
         variant.topology.tp == 2 and variant.topology.dp == 2 for variant in variants
     )
+
+
+def test_max_world_size_env_filters_dense_topologies(monkeypatch) -> None:
+    monkeypatch.setenv(MAX_WORLD_SIZE_ENV, "2")
+
+    topologies = selected_suite_topologies(is_moe=False)
+
+    assert topologies
+    assert all(topology.world_size() <= 2 for topology in topologies)
+    assert not any(topology.tp == 2 and topology.dp == 2 for topology in topologies)

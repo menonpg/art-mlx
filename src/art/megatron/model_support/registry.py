@@ -43,6 +43,12 @@ DEFAULT_DENSE_SPEC = ModelSupportSpec(
 QWEN3_MOE_SPEC = ModelSupportSpec(
     key="qwen3_moe",
     handler_key=QWEN3_MOE_HANDLER.key,
+    model_names=(
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-30B-A3B-Base",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    ),
     default_target_modules=_DENSE_TARGET_MODULES,
     native_vllm_lora_status=QWEN3_MOE_HANDLER.native_vllm_lora_status,
 )
@@ -84,8 +90,11 @@ _SPECS_BY_KEY = {
     QWEN3_5_MOE_SPEC.key: QWEN3_5_MOE_SPEC,
 }
 _SPECS_BY_MODEL = {
-    **{model_name: QWEN3_5_DENSE_SPEC for model_name in QWEN3_5_DENSE_SPEC.model_names},
+    **{model_name: QWEN3_MOE_SPEC for model_name in QWEN3_MOE_SPEC.model_names},
     **{model_name: QWEN3_5_MOE_SPEC for model_name in QWEN3_5_MOE_SPEC.model_names},
+}
+_UNSUPPORTED_ARCH_SPECS_BY_MODEL = {
+    **{model_name: QWEN3_5_DENSE_SPEC for model_name in QWEN3_5_DENSE_SPEC.model_names},
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
     DEFAULT_DENSE_HANDLER.key: DEFAULT_DENSE_HANDLER,
@@ -94,21 +103,44 @@ _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
     QWEN3_5_MOE_HANDLER.key: QWEN3_5_MOE_HANDLER,
 }
 
+QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
 QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
 QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)
-QWEN3_5_MODELS = frozenset(
-    QWEN3_5_DENSE_SPEC.model_names + QWEN3_5_MOE_SPEC.model_names
-)
+QWEN3_5_MODELS = QWEN3_5_MOE_MODELS
 
 
-def get_model_support_spec(base_model: str) -> ModelSupportSpec:
-    if _is_qwen3_moe_model(base_model):
-        return QWEN3_MOE_SPEC
-    return _SPECS_BY_MODEL.get(base_model, DEFAULT_DENSE_SPEC)
+class UnsupportedModelArchitectureError(ValueError):
+    """Raised when a model has not passed the Megatron support workflow."""
 
 
-def get_model_support_handler(base_model: str) -> ModelSupportHandler:
-    return get_model_support_handler_for_spec(get_model_support_spec(base_model))
+def get_model_support_spec(
+    base_model: str,
+    *,
+    allow_unsupported_arch: bool = False,
+) -> ModelSupportSpec:
+    if spec := _SPECS_BY_MODEL.get(base_model):
+        return spec
+    if allow_unsupported_arch:
+        return _UNSUPPORTED_ARCH_SPECS_BY_MODEL.get(base_model, DEFAULT_DENSE_SPEC)
+    supported = ", ".join(sorted(_SPECS_BY_MODEL))
+    raise UnsupportedModelArchitectureError(
+        f"{base_model!r} has not passed the Megatron model-support workflow. "
+        "Pass allow_unsupported_arch=True only for explicit validation/probing. "
+        f"Supported models: {supported}."
+    )
+
+
+def get_model_support_handler(
+    base_model: str,
+    *,
+    allow_unsupported_arch: bool = False,
+) -> ModelSupportHandler:
+    return get_model_support_handler_for_spec(
+        get_model_support_spec(
+            base_model,
+            allow_unsupported_arch=allow_unsupported_arch,
+        )
+    )
 
 
 def get_model_support_handler_for_spec(
@@ -117,20 +149,55 @@ def get_model_support_handler_for_spec(
     return _HANDLERS_BY_KEY[spec.handler_key]
 
 
-def default_target_modules_for_model(base_model: str) -> list[str]:
-    return list(get_model_support_spec(base_model).default_target_modules)
+def default_target_modules_for_model(
+    base_model: str,
+    *,
+    allow_unsupported_arch: bool = False,
+) -> list[str]:
+    return list(
+        get_model_support_spec(
+            base_model,
+            allow_unsupported_arch=allow_unsupported_arch,
+        ).default_target_modules
+    )
 
 
-def native_vllm_lora_status_for_model(base_model: str) -> str:
-    return get_model_support_handler(base_model).native_vllm_lora_status
+def native_vllm_lora_status_for_model(
+    base_model: str,
+    *,
+    allow_unsupported_arch: bool = False,
+) -> str:
+    return get_model_support_handler(
+        base_model,
+        allow_unsupported_arch=allow_unsupported_arch,
+    ).native_vllm_lora_status
 
 
-def model_requires_merged_rollout(base_model: str) -> bool:
-    return get_model_support_spec(base_model).default_rollout_weights_mode == "merged"
+def model_requires_merged_rollout(
+    base_model: str,
+    *,
+    allow_unsupported_arch: bool = False,
+) -> bool:
+    return (
+        get_model_support_spec(
+            base_model,
+            allow_unsupported_arch=allow_unsupported_arch,
+        ).default_rollout_weights_mode
+        == "merged"
+    )
 
 
-def model_uses_expert_parallel(base_model: str) -> bool:
-    return bool(get_model_support_handler(base_model).is_moe)
+def model_uses_expert_parallel(
+    base_model: str,
+    *,
+    allow_unsupported_arch: bool = False,
+) -> bool:
+    return bool(
+        get_model_support_handler(
+            base_model,
+            allow_unsupported_arch=allow_unsupported_arch,
+        ).is_moe
+    )
 
 
 def is_model_support_registered(base_model: str) -> bool:
@@ -139,12 +206,3 @@ def is_model_support_registered(base_model: str) -> bool:
 
 def list_model_support_specs() -> list[ModelSupportSpec]:
     return list(_SPECS_BY_KEY.values())
-
-
-def _is_qwen3_moe_model(base_model: str) -> bool:
-    return (
-        base_model.startswith("Qwen/Qwen3-")
-        and "Qwen3.5" not in base_model
-        and "-VL-" not in base_model
-        and ("-A3B" in base_model or "-A22B" in base_model)
-    )

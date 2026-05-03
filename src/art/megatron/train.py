@@ -323,6 +323,7 @@ def build_training_runtime(
     print_env: bool = True,
     build_optimizer: bool = True,
     trainable_parameter_mode: Literal["lora", "base_model"] = "lora",
+    allow_unsupported_arch: bool = False,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -335,6 +336,7 @@ def build_training_runtime(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
+        allow_unsupported_arch=allow_unsupported_arch,
     )
     if provider_bundle_configure is not None:
         provider_bundle_configure(provider_bundle)
