@@ -164,9 +164,7 @@ def provider_topology_env_vars(topology: Topology) -> dict[str, str]:
 
 @contextmanager
 def provider_topology_env(topology: Topology):
-    previous = {
-        name: os.environ.get(name) for name in _TOPOLOGY_ENV_VARS.values()
-    }
+    previous = {name: os.environ.get(name) for name in _TOPOLOGY_ENV_VARS.values()}
     os.environ.update(provider_topology_env_vars(topology))
     try:
         yield
@@ -385,10 +383,11 @@ def _patch_finalize_provider_bundle_for_oracle(
     def _oracle_finalize_provider_bundle(provider_bundle: Any) -> Any:
         provider = provider_bundle.provider
         if case_config.precision == "fp32":
-            provider.moe_token_dispatcher_type = "alltoall"
-            provider.moe_flex_dispatcher_backend = None
-            provider.moe_shared_expert_overlap = True
-            provider.overlap_moe_expert_parallel_comm = False
+            if case_config.is_moe:
+                provider.moe_token_dispatcher_type = "alltoall"
+                provider.moe_flex_dispatcher_backend = None
+                provider.moe_shared_expert_overlap = True
+                provider.overlap_moe_expert_parallel_comm = False
             provider.delay_wgrad_compute = False
             provider.ep_overlap_early_attn_memory_release = False
             provider.finalize()
@@ -399,7 +398,9 @@ def _patch_finalize_provider_bundle_for_oracle(
     try:
         yield
     finally:
-        megatron_train_module.finalize_provider_bundle = original_finalize_provider_bundle
+        megatron_train_module.finalize_provider_bundle = (
+            original_finalize_provider_bundle
+        )
 
 
 def _build_optimizer_config(case_config: OracleCaseConfig):
@@ -517,6 +518,8 @@ def _matches_grad_sync_skip_mutation(
         return (
             ".mlp.experts.linear_fc1.gate_lora.A_T" in param_name
             or ".mlp.experts.linear_fc1.up_lora.A_T" in param_name
+            or ".mlp.linear_fc1.gate_lora.A_T" in param_name
+            or ".mlp.linear_fc1.up_lora.A_T" in param_name
         )
     return False
 
@@ -539,8 +542,8 @@ def _apply_grad_sync_skip_mutation(
         # this only passes lora params atm, so we assume lora params below
         if not _matches_grad_sync_skip_mutation(param_name, mutation):
             continue
-        if (
-            mutation == "bwd_skip_sync_fc1_a" and param.grad_sync_domain != "expert_tp"  # ty: ignore[unresolved-attribute]
+        if mutation == "bwd_skip_sync_fc1_a" and (
+            ".mlp.experts." in param_name and param.grad_sync_domain != "expert_tp"  # ty: ignore[unresolved-attribute]
         ):
             continue
 

@@ -10,7 +10,7 @@ from megatron.core.transformer.enums import AttnBackend
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
-from art.megatron.model_support.handlers.qwen3_5_moe import (
+from art.megatron.model_support.handlers.qwen3_5 import (
     supported_qwen35_bridge_types,
 )
 from art.megatron.model_support.registry import (
@@ -99,7 +99,9 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
     provider.expert_model_parallel_size = (
-        visible_gpu_count if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else 1
+        visible_gpu_count
+        if int(getattr(provider, "num_moe_experts", 0) or 0) > 0
+        else 1
     )
     provider.expert_tensor_parallel_size = 1
 

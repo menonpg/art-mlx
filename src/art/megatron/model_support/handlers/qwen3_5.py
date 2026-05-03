@@ -7,7 +7,11 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 import torch
 
 from art.megatron.model_chunks import ModelChunks
-from art.megatron.model_support.handlers.default_dense import DefaultDenseHandler
+from art.megatron.model_support.handlers.default_dense import (
+    DefaultDenseHandler,
+    _require_dense_mlp,
+    _require_moe_experts,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     LayerFamilyInstance,
@@ -30,8 +34,8 @@ _VLLM_MOE_KEY_RE = re.compile(
 )
 
 
-class Qwen35MoeHandler(DefaultDenseHandler):
-    key = "qwen3_5_moe"
+class Qwen35BaseHandler(DefaultDenseHandler):
+    key = "qwen3_5_base"
     native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
@@ -57,7 +61,12 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+        if _group_art_moe_tensors(tensors):
+            raise TypeError("Dense Qwen3.5 handler received MoE LoRA tensors")
+        return (
+            {_to_vllm_key(key): tensor for key, tensor in tensors.items()},
+            adapter_config,
+        )
 
     def from_vllm_lora_tensors(
         self,
@@ -65,7 +74,10 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
-        return _from_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+        del adapter_config
+        if any(_VLLM_MOE_KEY_RE.match(key) for key in tensors):
+            raise TypeError("Dense Qwen3.5 handler received MoE vLLM LoRA tensors")
+        return {_from_vllm_key(key): tensor for key, tensor in tensors.items()}
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from art.megatron.gdn.operator import (
@@ -103,10 +115,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
 
             gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
 
-    def configure_provider_for_runtime(self, provider: Any) -> None:
-        provider.moe_shared_expert_overlap = False
-
-    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+    def _attention_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         linear_attention_pattern = _linear_attention_pattern(provider)
         gated_delta_net_layer_index = (
             linear_attention_pattern.index(1) if 1 in linear_attention_pattern else 0
@@ -124,17 +133,15 @@ class Qwen35MoeHandler(DefaultDenseHandler):
                 layer_index=gated_delta_net_layer_index,
             ),
         ]
-        if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
-            layer_families.append(
-                LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)
-            )
-        else:
-            layer_families.append(LayerFamilyInstance(key="dense_mlp", layer_index=0))
-        if int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0) > 0:
-            layer_families.append(
-                LayerFamilyInstance(key="shared_experts_mlp", layer_index=0)
-            )
         return layer_families
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+            raise TypeError("Dense Qwen3.5 handler received a MoE provider")
+        return [
+            *self._attention_layer_families(provider),
+            LayerFamilyInstance(key="dense_mlp", layer_index=0),
+        ]
 
     def patch_bridge(self, bridge: Any) -> None:
         del bridge
@@ -206,10 +213,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         from art.megatron.lora import (
             _adapter_model_prefix,
             _is_language_transformer_layer_name,
-            wrap_dense_mlp,
             wrap_gated_delta_net_attention,
-            wrap_grouped_moe_experts,
-            wrap_shared_experts_mlp,
             wrap_standard_self_attention,
         )
 
@@ -247,34 +251,14 @@ class Qwen35MoeHandler(DefaultDenseHandler):
                         "Unsupported self_attention module type for Megatron LoRA: "
                         f"{type(module.self_attention)}"
                     )
-                experts = getattr(module.mlp, "experts", None)
-                if experts is not None:
-                    wrap_grouped_moe_experts(
-                        experts,
-                        adapter_model_prefix=adapter_model_prefix,
-                        target_modules=target_set,
-                        rank=rank,
-                        alpha=alpha,
-                    )
-                else:
-                    wrap_dense_mlp(
-                        module.mlp,
-                        adapter_model_prefix=adapter_model_prefix,
-                        provider=provider,
-                        target_modules=target_set,
-                        rank=rank,
-                        alpha=alpha,
-                    )
-                shared_experts = getattr(module.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    wrap_shared_experts_mlp(
-                        shared_experts,
-                        adapter_model_prefix=adapter_model_prefix,
-                        provider=provider,
-                        target_modules=target_set,
-                        rank=rank,
-                        alpha=alpha,
-                    )
+                self._wrap_mlp_lora(
+                    module,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
 
     def build_adapter_weights_by_base(
         self,
@@ -284,10 +268,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         from art.megatron.adapter_export import (
-            add_dense_mlp_adapter_weights,
             add_gated_delta_net_adapter_weights,
-            add_grouped_moe_adapter_weights,
-            add_shared_experts_adapter_weights,
             add_standard_self_attention_adapter_weights,
             layer_base_prefix,
         )
@@ -317,27 +298,154 @@ class Qwen35MoeHandler(DefaultDenseHandler):
                         layer_prefix=layer_prefix,
                         self_attention=module.self_attention,
                     )
-                experts = getattr(module.mlp, "experts", None)
-                if experts is not None:
-                    add_grouped_moe_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        experts=experts,
-                    )
-                else:
-                    add_dense_mlp_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        mlp=module.mlp,
-                    )
-                shared_experts = getattr(module.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    add_shared_experts_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        shared_experts=shared_experts,
-                    )
+                self._add_mlp_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    module=module,
+                )
         return adapter_weights_by_base
+
+    def _wrap_mlp_lora(
+        self,
+        module: Any,
+        *,
+        adapter_model_prefix: str,
+        provider: Any,
+        target_modules: set[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from art.megatron.lora import wrap_dense_mlp
+
+        _require_dense_mlp(module)
+        wrap_dense_mlp(
+            module.mlp,
+            adapter_model_prefix=adapter_model_prefix,
+            provider=provider,
+            target_modules=target_modules,
+            rank=rank,
+            alpha=alpha,
+        )
+
+    def _add_mlp_adapter_weights(
+        self,
+        adapter_weights_by_base: dict[str, list[Any]],
+        *,
+        layer_prefix: str,
+        module: Any,
+    ) -> None:
+        from art.megatron.adapter_export import add_dense_mlp_adapter_weights
+
+        _require_dense_mlp(module)
+        add_dense_mlp_adapter_weights(
+            adapter_weights_by_base,
+            layer_prefix=layer_prefix,
+            mlp=module.mlp,
+        )
+
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        if type(unwrapped).__name__ == "Qwen3VLModel":
+            return {"extra_block_kwargs": {"extra_block_kwargs": kwargs}}
+        return {"extra_block_kwargs": kwargs}
+
+
+class Qwen35DenseHandler(Qwen35BaseHandler):
+    key = "qwen3_5_dense"
+
+
+class Qwen35MoeHandler(Qwen35BaseHandler):
+    key = "qwen3_5_moe"
+    is_moe = True
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _from_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+
+    def configure_provider_for_runtime(self, provider: Any) -> None:
+        provider.moe_shared_expert_overlap = False
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
+            raise TypeError("MoE Qwen3.5 handler received a dense provider")
+        layer_families = [
+            *self._attention_layer_families(provider),
+            LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
+        ]
+        if int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0) > 0:
+            layer_families.append(
+                LayerFamilyInstance(key="shared_experts_mlp", layer_index=0)
+            )
+        return layer_families
+
+    def _wrap_mlp_lora(
+        self,
+        module: Any,
+        *,
+        adapter_model_prefix: str,
+        provider: Any,
+        target_modules: set[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from art.megatron.lora import wrap_grouped_moe_experts, wrap_shared_experts_mlp
+
+        wrap_grouped_moe_experts(
+            _require_moe_experts(module),
+            adapter_model_prefix=adapter_model_prefix,
+            target_modules=target_modules,
+            rank=rank,
+            alpha=alpha,
+        )
+        shared_experts = getattr(module.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            wrap_shared_experts_mlp(
+                shared_experts,
+                adapter_model_prefix=adapter_model_prefix,
+                provider=provider,
+                target_modules=target_modules,
+                rank=rank,
+                alpha=alpha,
+            )
+
+    def _add_mlp_adapter_weights(
+        self,
+        adapter_weights_by_base: dict[str, list[Any]],
+        *,
+        layer_prefix: str,
+        module: Any,
+    ) -> None:
+        from art.megatron.adapter_export import (
+            add_grouped_moe_adapter_weights,
+            add_shared_experts_adapter_weights,
+        )
+
+        add_grouped_moe_adapter_weights(
+            adapter_weights_by_base,
+            layer_prefix=layer_prefix,
+            experts=_require_moe_experts(module),
+        )
+        shared_experts = getattr(module.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            add_shared_experts_adapter_weights(
+                adapter_weights_by_base,
+                layer_prefix=layer_prefix,
+                shared_experts=shared_experts,
+            )
 
     def compile_workaround_config(
         self,
@@ -355,15 +463,8 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             disable_compile=False,
         )
 
-    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
-        unwrapped = model
-        while hasattr(unwrapped, "module"):
-            unwrapped = unwrapped.module
-        if type(unwrapped).__name__ == "Qwen3VLModel":
-            return {"extra_block_kwargs": {"extra_block_kwargs": kwargs}}
-        return {"extra_block_kwargs": kwargs}
 
-
+QWEN3_5_DENSE_HANDLER = Qwen35DenseHandler()
 QWEN3_5_MOE_HANDLER = Qwen35MoeHandler()
 
 

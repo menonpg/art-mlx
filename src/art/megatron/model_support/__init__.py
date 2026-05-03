@@ -4,6 +4,9 @@ from art.megatron.model_support.discovery import (
 )
 from art.megatron.model_support.registry import (
     DEFAULT_DENSE_SPEC,
+    QWEN3_5_DENSE_MODELS,
+    QWEN3_5_DENSE_SPEC,
+    QWEN3_5_MODELS,
     QWEN3_5_MOE_MODELS,
     QWEN3_5_MOE_SPEC,
     QWEN3_MOE_SPEC,
@@ -13,8 +16,8 @@ from art.megatron.model_support.registry import (
     get_model_support_spec,
     is_model_support_registered,
     list_model_support_specs,
-    model_uses_expert_parallel,
     model_requires_merged_rollout,
+    model_uses_expert_parallel,
     native_vllm_lora_status_for_model,
 )
 from art.megatron.model_support.spec import (
@@ -50,6 +53,9 @@ __all__ = [
     "ModelSupportSpec",
     "NativeVllmLoraStatus",
     "NATIVE_VLLM_LORA_STAGE",
+    "QWEN3_5_DENSE_MODELS",
+    "QWEN3_5_DENSE_SPEC",
+    "QWEN3_5_MODELS",
     "QWEN3_5_MOE_MODELS",
     "QWEN3_MOE_SPEC",
     "QWEN3_5_MOE_SPEC",

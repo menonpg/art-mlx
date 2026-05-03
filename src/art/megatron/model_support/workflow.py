@@ -211,8 +211,11 @@ def run_hf_parity_stage(
 ) -> ValidationStageResult:
     hf_parity = _import_integration_module("integration.megatron_hf_parity")
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    spec = get_model_support_spec(base_model)
+    handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
+        is_moe=handler.is_moe,
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
@@ -244,8 +247,11 @@ def run_lora_coverage_stage(
 ) -> ValidationStageResult:
     lora_coverage = _import_integration_module("integration.megatron_lora_coverage")
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    spec = get_model_support_spec(base_model)
+    handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
+        is_moe=handler.is_moe,
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
@@ -264,27 +270,19 @@ def run_correctness_sensitivity_stage(
     base_model: str,
     architecture: ArchitectureReport,
 ) -> ValidationStageResult:
-    if not any(
-        family.key == "grouped_moe_mlp" for family in architecture.layer_families
-    ):
-        return ValidationStageResult(
-            name="correctness_sensitivity",
-            passed=True,
-            metrics={
-                "skipped": True,
-                "reason": "router-trace replay only applies to MoE routing models",
-            },
-        )
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    spec = get_model_support_spec(base_model)
+    handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
+        is_moe=handler.is_moe,
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
     )
-    suite_topologies = list(oracle_harness.TOPOLOGIES)
-    if oracle_harness.extended_topologies_enabled():
-        suite_topologies.extend(oracle_harness.EXTENDED_TOPOLOGIES)
+    suite_topologies = list(
+        oracle_harness.selected_suite_topologies(is_moe=handler.is_moe)
+    )
     suite_world_size = max(topology.world_size() for topology in suite_topologies)
     objectives = list(oracle_harness.selected_oracle_objectives())
     skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
@@ -292,12 +290,18 @@ def run_correctness_sensitivity_stage(
     sensitivity_world_size = 0
     if not skip_sensitivity:
         for objective in objectives:
-            for mutation in oracle_harness.supported_sensitivity_mutations_for_objective(
-                objective
+            for (
+                mutation
+            ) in oracle_harness.supported_sensitivity_mutations_for_objective(
+                objective,
+                is_moe=handler.is_moe,
             ):
                 if mutation not in mutations:
                     mutations.append(mutation)
-        sensitivity_world_size = oracle_harness.sensitivity_required_world_size(mutations)
+        sensitivity_world_size = oracle_harness.sensitivity_required_world_size(
+            mutations,
+            is_moe=handler.is_moe,
+        )
     available_gpu_count = oracle_harness.available_gpu_count()
     required_gpu_count = max(suite_world_size, sensitivity_world_size)
     if available_gpu_count < required_gpu_count:
@@ -332,6 +336,7 @@ def run_correctness_sensitivity_stage(
         passed=True,
         metrics={
             "requested_num_layers": case_config.num_layers,
+            "is_moe": handler.is_moe,
             "objectives": objectives,
             "sensitivity_mutations": mutations,
             "required_gpu_count": required_gpu_count,
@@ -347,9 +352,7 @@ def run_correctness_sensitivity_stage(
             ],
             "sensitivity_skipped": skip_sensitivity,
             "sensitivity_skip_reason": (
-                f"{SKIP_SENSITIVITY_ENV}=1"
-                if skip_sensitivity
-                else None
+                f"{SKIP_SENSITIVITY_ENV}=1" if skip_sensitivity else None
             ),
             "sensitivity_variant_count": len(sensitivity_reports),
             "sensitivity_variants": [
@@ -376,8 +379,11 @@ def run_merged_vllm_serving_stage(
         "integration.megatron_merged_vllm_serving"
     )
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    spec = get_model_support_spec(base_model)
+    handler = get_model_support_handler_for_spec(spec)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
+        is_moe=handler.is_moe,
         precision="fp32",
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
@@ -439,7 +445,9 @@ def run_native_vllm_lora_stage(
     architecture: ArchitectureReport,
 ) -> ValidationStageResult:
     del architecture
-    native_vllm_lora = _import_integration_module("integration.megatron_native_vllm_lora")
+    native_vllm_lora = _import_integration_module(
+        "integration.megatron_native_vllm_lora"
+    )
     report = native_vllm_lora.run_native_vllm_lora(base_model=base_model)
     passed = (
         report.rollout_weights_mode == "lora"

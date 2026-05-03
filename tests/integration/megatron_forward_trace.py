@@ -19,6 +19,12 @@ CAPTURE_NAME_TOKENS = (
     ".mlp.experts.linear_fc1.up_lora",
     ".mlp.experts.linear_fc2",
     ".mlp.experts.linear_fc2.lora",
+    ".mlp.linear_fc1",
+    ".mlp.linear_fc1.gate_lora",
+    ".mlp.linear_fc1.up_lora",
+    ".mlp.linear_fc2",
+    ".mlp.linear_fc2.row_parallel_lora",
+    ".mlp.linear_fc2.row_parallel_lora.lora",
 )
 ROUTER_NAME_TOKEN = ".mlp.router"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
@@ -332,6 +338,20 @@ class ForwardTraceCapture:
                 return {"op": "sum"}
             return {"op": "concat", "dim": 0}
 
+        if ".mlp.linear_fc1" in name and ".lora" not in name:
+            return {"op": "concat", "dim": -1}
+        if ".mlp.linear_fc2.row_parallel_lora" in name and ".lora" not in name:
+            if self._sequence_parallel_enabled(module):
+                return {"op": "concat", "dim": 0}
+            return None
+        if ".mlp.linear_fc2" in name and ".lora" not in name:
+            row_parallel_lora = getattr(module, "row_parallel_lora", None)
+            if row_parallel_lora is not None and self._sequence_parallel_enabled(
+                row_parallel_lora
+            ):
+                return {"op": "concat", "dim": 0}
+            return None
+
         gather_output = getattr(module, "gather_output", None)
         if isinstance(gather_output, bool) and not gather_output:
             return {"op": "concat", "dim": -1}
@@ -363,7 +383,9 @@ class ForwardTraceCapture:
         return hints
 
     @torch._dynamo.disable
-    def _record_module_hook(self, name: str, module: Any, inputs: Any, output: Any) -> None:
+    def _record_module_hook(
+        self, name: str, module: Any, inputs: Any, output: Any
+    ) -> None:
         if self.current_step_index is None:
             return
         micro_call_index = self.current_micro_module_call_counts.get(name, 0)

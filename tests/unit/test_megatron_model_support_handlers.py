@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -6,10 +7,12 @@ import torch
 from art.megatron.flex_attention import FlexDotProductAttention
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
+    QWEN3_5_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
+    DefaultMoeHandler,
 )
-from art.megatron.model_support.handlers.qwen3_5_moe import (
+from art.megatron.model_support.handlers.qwen3_5 import (
     _ensure_qwen35_text_only_bridge_registered,
     _qwen35_text_only_mapping_registry,
 )
@@ -29,6 +32,14 @@ def test_default_dense_handler_returns_standard_attention_kwargs() -> None:
         object(),
         attention_bias="bias",
     ) == {"extra_block_kwargs": {"attention_bias": "bias"}}
+
+
+def test_handlers_report_dense_or_moe_contract() -> None:
+    assert DEFAULT_DENSE_HANDLER.is_moe is False
+    assert QWEN3_5_DENSE_HANDLER.is_moe is False
+    assert DefaultMoeHandler().is_moe is True
+    assert QWEN3_MOE_HANDLER.is_moe is True
+    assert QWEN3_5_MOE_HANDLER.is_moe is True
 
 
 def test_qwen_handler_wraps_qwen3vl_forward_kwargs() -> None:
@@ -59,7 +70,7 @@ def test_default_dense_handler_collects_dense_layer_families() -> None:
     ]
 
 
-def test_default_dense_handler_collects_moe_layer_families() -> None:
+def test_default_moe_handler_collects_moe_layer_families() -> None:
     provider = type(
         "Provider",
         (),
@@ -69,7 +80,7 @@ def test_default_dense_handler_collects_moe_layer_families() -> None:
         },
     )()
 
-    assert DEFAULT_DENSE_HANDLER.collect_layer_families(provider) == [
+    assert DefaultMoeHandler().collect_layer_families(provider) == [
         LayerFamilyInstance(key="standard_attention", layer_index=0),
         LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
         LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
@@ -93,6 +104,24 @@ def test_qwen_handler_collects_expected_layer_families() -> None:
         LayerFamilyInstance(key="gated_delta_net_attention", layer_index=0),
         LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0),
         LayerFamilyInstance(key="shared_experts_mlp", layer_index=0),
+    ]
+
+
+def test_qwen35_dense_handler_collects_expected_layer_families() -> None:
+    provider = type(
+        "Provider",
+        (),
+        {
+            "linear_attention_freq": 4,
+            "num_layers": 8,
+            "num_moe_experts": 0,
+        },
+    )()
+
+    assert QWEN3_5_DENSE_HANDLER.collect_layer_families(provider) == [
+        LayerFamilyInstance(key="standard_attention", layer_index=3),
+        LayerFamilyInstance(key="gated_delta_net_attention", layer_index=0),
+        LayerFamilyInstance(key="dense_mlp", layer_index=0),
     ]
 
 
@@ -156,7 +185,9 @@ def test_qwen35_handler_disables_shared_expert_overlap_by_default() -> None:
     assert provider.moe_shared_expert_overlap is False
 
 
-def test_qwen35_handler_uses_shared_expert_workaround_pair_when_overlap_disabled() -> None:
+def test_qwen35_handler_uses_shared_expert_workaround_pair_when_overlap_disabled() -> (
+    None
+):
     provider = type("Provider", (), {"moe_shared_expert_overlap": False})()
 
     assert QWEN3_5_MOE_HANDLER.compile_workaround_config(provider).model_dump() == {
@@ -186,7 +217,9 @@ def test_qwen35_handler_rebinds_provider_to_language_only_runtime(
         def __init__(self) -> None:
             self.transformer_layer_spec = object()
             self.freeze_language_model = False
-            self.language_only_calls: list[tuple[bool | None, bool | None, int | None]] = []
+            self.language_only_calls: list[
+                tuple[bool | None, bool | None, int | None]
+            ] = []
 
         def provide_language_model(
             self,
@@ -197,7 +230,9 @@ def test_qwen35_handler_rebinds_provider_to_language_only_runtime(
             self.language_only_calls.append((pre_process, post_process, vp_stage))
             return SimpleNamespace(kind="language_only")
 
-    def _patch_standard_attention_specs(block_spec: object, attention_cls: object) -> None:
+    def _patch_standard_attention_specs(
+        block_spec: object, attention_cls: object
+    ) -> None:
         del attention_cls
         return None
 
@@ -221,11 +256,11 @@ def test_qwen35_handler_rebinds_provider_to_language_only_runtime(
         return SimpleNamespace(layer_specs=[gdn_layer, attention_layer])
 
     monkeypatch.setattr(
-        "art.megatron.model_support.handlers.qwen3_5_moe._optional_qwen35_provider_types",
+        "art.megatron.model_support.handlers.qwen3_5._optional_qwen35_provider_types",
         lambda: (_FakeQwen35Provider,),
     )
     monkeypatch.setattr(
-        "art.megatron.model_support.handlers.qwen3_5_moe._require_qwen35_provider_symbols",
+        "art.megatron.model_support.handlers.qwen3_5._require_qwen35_provider_symbols",
         lambda: (
             object(),
             (_FakeQwen35Provider,),
@@ -236,9 +271,10 @@ def test_qwen35_handler_rebinds_provider_to_language_only_runtime(
 
     provider = _FakeQwen35Provider()
     QWEN3_5_MOE_HANDLER.patch_provider(provider, bridge=object())
+    provider_any: Any = provider
 
-    model = provider.provide(pre_process=True, post_process=False, vp_stage=7)
-    layer_spec = provider.transformer_layer_spec(provider, vp_stage=7)
+    model = provider_any.provide(pre_process=True, post_process=False, vp_stage=7)
+    layer_spec = provider_any.transformer_layer_spec(provider, vp_stage=7)
 
     assert model.kind == "language_only"
     assert provider.language_only_calls == [(True, False, 7)]
@@ -255,7 +291,7 @@ def test_qwen35_handler_requests_text_only_bridge_registration(monkeypatch) -> N
     calls: list[None] = []
 
     monkeypatch.setattr(
-        "art.megatron.model_support.handlers.qwen3_5_moe._ensure_qwen35_text_only_bridge_registered",
+        "art.megatron.model_support.handlers.qwen3_5._ensure_qwen35_text_only_bridge_registered",
         lambda: calls.append(None),
     )
 
@@ -302,7 +338,9 @@ def test_qwen35_text_only_bridge_registry_matches_dense_or_moe_surface() -> None
     assert "decoder.layers.*.mlp.linear_fc1.weight" not in moe_names
 
 
-def test_default_dense_handler_identity_lora_targets_dense_shared_and_moe_params() -> None:
+def test_default_dense_handler_identity_lora_targets_dense_shared_and_moe_params() -> (
+    None
+):
     model = _FakeModel(
         [
             "model.layers.0.self_attn.q_proj.weight",
@@ -378,7 +416,9 @@ def test_qwen35_handler_identity_lora_targets_linear_attn_and_shared_experts() -
     ]
 
 
-def test_qwen3_handler_unfuses_hf_expert_tensor_map_for_expected_per_expert_keys() -> None:
+def test_qwen3_handler_unfuses_hf_expert_tensor_map_for_expected_per_expert_keys() -> (
+    None
+):
     gate_up = torch.arange(2 * 8 * 3, dtype=torch.float32).reshape(2, 8, 3)
     down = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
 
@@ -422,7 +462,9 @@ def test_qwen3_handler_unfuses_hf_expert_tensor_map_for_expected_per_expert_keys
     )
 
 
-def test_default_dense_handler_preserves_fused_hf_expert_tensors_without_per_expert_expectation() -> None:
+def test_default_dense_handler_preserves_fused_hf_expert_tensors_without_per_expert_expectation() -> (
+    None
+):
     gate_up = torch.arange(2 * 8 * 3, dtype=torch.float32).reshape(2, 8, 3)
     down = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
 

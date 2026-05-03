@@ -374,13 +374,58 @@ def test_run_chat_template_rollout_stage(monkeypatch) -> None:
     assert result.artifact_dir == "/tmp/chat-template"
 
 
-def test_run_correctness_sensitivity_stage_skips_dense_models() -> None:
+def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> None:
+    case_configs: list[SimpleNamespace] = []
+    oracle_module = SimpleNamespace(
+        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        selected_suite_topologies=lambda *, is_moe: [
+            SimpleNamespace(world_size=lambda: 1),
+            SimpleNamespace(world_size=lambda: 2),
+            SimpleNamespace(world_size=lambda: 2),
+            SimpleNamespace(world_size=lambda: 4),
+        ],
+        selected_oracle_objectives=lambda: ["sft"],
+        supported_sensitivity_mutations_for_objective=lambda objective, *, is_moe: (
+            ["skip_finalize"] if objective == "sft" and not is_moe else []
+        ),
+        sensitivity_required_world_size=lambda mutations, *, is_moe: 2,
+        available_gpu_count=lambda: 4,
+        run_suite=lambda case_config: (
+            case_configs.append(case_config)
+            or [
+                SimpleNamespace(
+                    variant="sft_topology_tp2_dp2",
+                    topology="tp2_dp2",
+                    signal="pass",
+                    fail_count=0,
+                )
+            ]
+        ),
+        run_sensitivity_suite=lambda case_config, mutations: [
+            SimpleNamespace(
+                variant="sft_sensitivity_skip_finalize",
+                topology="tp2",
+                signal="fail",
+                expected_signal="fail",
+                fail_count=1,
+            )
+        ],
+        ensure_case_artifacts=lambda case_config: SimpleNamespace(
+            case_dir="/tmp/oracle"
+        ),
+    )
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        lambda name: oracle_module,
+    )
+    monkeypatch.delenv(SKIP_SENSITIVITY_ENV, raising=False)
+
     result = run_correctness_sensitivity_stage(
         base_model="Qwen/Qwen3.5-4B",
         architecture=ArchitectureReport(
             base_model="Qwen/Qwen3.5-4B",
-            model_key="qwen3_5_moe",
-            handler_key="qwen3_5_moe",
+            model_key="qwen3_5_dense",
+            handler_key="qwen3_5_dense",
             layer_families=[
                 LayerFamilyInstance(key="dense_mlp", layer_index=0),
                 LayerFamilyInstance(key="gated_delta_net_attention", layer_index=0),
@@ -391,10 +436,11 @@ def test_run_correctness_sensitivity_stage_skips_dense_models() -> None:
     )
 
     assert result.passed is True
-    assert result.metrics == {
-        "skipped": True,
-        "reason": "router-trace replay only applies to MoE routing models",
-    }
+    assert result.metrics["is_moe"] is False
+    assert result.metrics["required_gpu_count"] == 4
+    assert result.metrics["correctness_variant_count"] == 1
+    assert result.metrics["sensitivity_mutations"] == ["skip_finalize"]
+    assert case_configs[0].is_moe is False
 
 
 def test_run_yes_no_trainability_stage(monkeypatch) -> None:
@@ -594,14 +640,15 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        TOPOLOGIES=[SimpleNamespace(world_size=lambda: 2)],
-        EXTENDED_TOPOLOGIES=[SimpleNamespace(world_size=lambda: 4)],
-        extended_topologies_enabled=lambda: False,
+        selected_suite_topologies=lambda *, is_moe: [
+            SimpleNamespace(world_size=lambda: 1),
+            SimpleNamespace(world_size=lambda: 2),
+        ],
         selected_oracle_objectives=lambda: ["sft"],
-        supported_sensitivity_mutations_for_objective=lambda objective: (
+        supported_sensitivity_mutations_for_objective=lambda objective, *, is_moe: (
             ["skip_finalize"] if objective == "sft" else []
         ),
-        sensitivity_required_world_size=lambda mutations: 2,
+        sensitivity_required_world_size=lambda mutations, *, is_moe: 2,
         available_gpu_count=lambda: 2,
         run_suite=lambda case_config: [
             SimpleNamespace(
@@ -637,6 +684,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.name == "correctness_sensitivity"
     assert stage.passed is True
     assert stage.metrics["requested_num_layers"] == 4
+    assert stage.metrics["is_moe"] is True
     assert stage.metrics["objectives"] == ["sft"]
     assert stage.metrics["sensitivity_mutations"] == ["skip_finalize"]
     assert stage.metrics["required_gpu_count"] == 2
@@ -659,14 +707,15 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     )
     oracle_module = SimpleNamespace(
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-        TOPOLOGIES=[SimpleNamespace(world_size=lambda: 2)],
-        EXTENDED_TOPOLOGIES=[SimpleNamespace(world_size=lambda: 4)],
-        extended_topologies_enabled=lambda: False,
+        selected_suite_topologies=lambda *, is_moe: [
+            SimpleNamespace(world_size=lambda: 1),
+            SimpleNamespace(world_size=lambda: 2),
+        ],
         selected_oracle_objectives=lambda: ["sft"],
-        supported_sensitivity_mutations_for_objective=lambda objective: (
+        supported_sensitivity_mutations_for_objective=lambda objective, *, is_moe: (
             ["skip_finalize"] if objective == "sft" else []
         ),
-        sensitivity_required_world_size=lambda mutations: 4,
+        sensitivity_required_world_size=lambda mutations, *, is_moe: 4,
         available_gpu_count=lambda: 2,
         run_suite=lambda case_config: [
             SimpleNamespace(

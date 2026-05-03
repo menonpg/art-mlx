@@ -4,7 +4,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 import torch
 
 from art.megatron.model_chunks import ModelChunks
-from art.megatron.model_support.handlers.default_dense import DefaultDenseHandler
+from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
 _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
@@ -14,7 +14,7 @@ _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
 )
 
 
-class Qwen3MoeHandler(DefaultDenseHandler):
+class Qwen3MoeHandler(DefaultMoeHandler):
     key = "qwen3_moe"
     native_vllm_lora_status = "disabled"
 

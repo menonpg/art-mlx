@@ -18,7 +18,7 @@ from torch.distributed import (
 from art.megatron import train as megatron_train
 from art.megatron.lora import LoRA
 
-from .megatron_oracle_harness import ORACLE_TOPOLOGY, OracleCaseConfig
+from .megatron_oracle_harness import OracleCaseConfig, oracle_topology
 from .megatron_oracle_worker import _configure_provider, provider_topology_env
 
 _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
@@ -127,13 +127,14 @@ def _covered_exported_target_modules(
 
 
 def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
+    topology = oracle_topology(is_moe=case_config.is_moe)
     with _single_rank_model_parallel():
-        with provider_topology_env(ORACLE_TOPOLOGY):
+        with provider_topology_env(topology):
             runtime = megatron_train.build_training_runtime(
                 model_identifier=case_config.base_model,
                 provider_torch_dtype=torch.float32,
                 provider_configure=lambda provider: _configure_provider(
-                    provider, ORACLE_TOPOLOGY, case_config
+                    provider, topology, case_config
                 ),
                 print_env=False,
                 build_optimizer=False,
@@ -145,9 +146,7 @@ def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
             if isinstance(module, LoRA)
         }
         adapter_weights_by_base = (
-            runtime.provider_bundle.handler.build_adapter_weights_by_base(
-                runtime.model
-            )
+            runtime.provider_bundle.handler.build_adapter_weights_by_base(runtime.model)
         )
 
     target_modules = list(runtime.provider_bundle.spec.default_target_modules)

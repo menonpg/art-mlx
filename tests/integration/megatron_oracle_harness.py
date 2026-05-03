@@ -96,15 +96,23 @@ def oracle_output_slug(
 
 def supported_sensitivity_mutations_for_objective(
     objective: OracleObjective,
+    *,
+    is_moe: bool = True,
 ) -> tuple[SensitivityMutation, ...]:
+    del is_moe
     return OBJECTIVE_SENSITIVITY_MUTATIONS[objective]
 
 
 def objective_supports_sensitivity_mutation(
     objective: OracleObjective,
     mutation: SensitivityMutation,
+    *,
+    is_moe: bool = True,
 ) -> bool:
-    return mutation in supported_sensitivity_mutations_for_objective(objective)
+    return mutation in supported_sensitivity_mutations_for_objective(
+        objective,
+        is_moe=is_moe,
+    )
 
 
 def selected_oracle_objectives() -> list[OracleObjective]:
@@ -172,13 +180,23 @@ TOPOLOGIES = [
     Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
     Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
 ]
+DENSE_TOPOLOGIES = [
+    Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
+    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
+]
 EXTENDED_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
     Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
     Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
 ]
+DENSE_EXTENDED_TOPOLOGIES: list[Topology] = []
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
+DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+DENSE_SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
+DENSE_DP_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=1, etp=1, dp=2, sp=False)
 SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
     mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
 }
@@ -193,6 +211,17 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
         "sft_local_token_normalization",
     ]
 }
+
+
+def oracle_topology(*, is_moe: bool = True) -> Topology:
+    return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
+
+
+def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
+    topologies = list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
+    if extended_topologies_enabled():
+        topologies.extend(EXTENDED_TOPOLOGIES if is_moe else DENSE_EXTENDED_TOPOLOGIES)
+    return topologies
 
 
 class PackedTensorConfig(BaseModel):
@@ -264,6 +293,7 @@ class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
     base_model: str
+    is_moe: bool = True
     precision: Literal["bf16", "fp32"] = "fp32"
     num_layers: int = 4
     seed: int = 20260304
@@ -562,23 +592,45 @@ def sensitivity_enabled() -> bool:
 def selected_sensitivity_mutations_for_objective(
     objective: OracleObjective,
     mutations: list[SensitivityMutation],
+    *,
+    is_moe: bool = True,
 ) -> list[SensitivityMutation]:
     return [
         mutation
         for mutation in mutations
-        if objective_supports_sensitivity_mutation(objective, mutation)
+        if objective_supports_sensitivity_mutation(
+            objective,
+            mutation,
+            is_moe=is_moe,
+        )
     ]
 
 
-def sensitivity_topology_for_mutation(mutation: SensitivityMutation) -> Topology:
+def sensitivity_topology_for_mutation(
+    mutation: SensitivityMutation,
+    *,
+    is_moe: bool = True,
+) -> Topology:
     """Returns the sensitivity topology required for one mutation."""
+    if not is_moe:
+        if mutation in {
+            "dp_grad_accumulation_seqs",
+            "dp_local_token_normalization",
+            "sft_local_token_normalization",
+        }:
+            return DENSE_DP_SENSITIVITY_TOPOLOGY
+        return DENSE_SENSITIVITY_TOPOLOGY
     return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
 
 
-def sensitivity_required_world_size(mutations: list[SensitivityMutation]) -> int:
+def sensitivity_required_world_size(
+    mutations: list[SensitivityMutation],
+    *,
+    is_moe: bool = True,
+) -> int:
     """Returns the max world-size required by a selected mutation set."""
     return max(
-        sensitivity_topology_for_mutation(mutation).world_size()
+        sensitivity_topology_for_mutation(mutation, is_moe=is_moe).world_size()
         for mutation in mutations
     )
 
@@ -1022,7 +1074,8 @@ class VariantRunner:
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
-        self.oracle_slug = oracle_output_slug(objective, ORACLE_TOPOLOGY)
+        self.oracle_topology = oracle_topology(is_moe=case_config.is_moe)
+        self.oracle_slug = oracle_output_slug(objective, self.oracle_topology)
         self.oracle_dir = self.case_dir / self.oracle_slug
         self.oracle_routing_bundle_dir = (
             self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
@@ -1087,20 +1140,26 @@ class VariantRunner:
         )
         run_oracle_topology = partial(
             self._run_topology,
-            topology=ORACLE_TOPOLOGY,
+            topology=self.oracle_topology,
             mutation=None,
             regenerate=True,
         )
-        if need_capture:
+        if self.case_config.is_moe and need_capture:
             run_oracle_topology(
                 output_slug=f"{self.oracle_slug}__oracle_capture",
                 replay_bundle_dir=None,
                 capture_bundle_dir=self.oracle_routing_bundle_dir,
             )
-        if regenerate or not oracle_manifest.exists():
+        if (
+            regenerate
+            or not oracle_manifest.exists()
+            or not self.shared_init_path.exists()
+        ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
-                replay_bundle_dir=self.oracle_routing_bundle_dir,
+                replay_bundle_dir=(
+                    self.oracle_routing_bundle_dir if self.case_config.is_moe else None
+                ),
                 capture_bundle_dir=None,
             )
         self._oracle_initialized = True
@@ -1120,7 +1179,9 @@ class VariantRunner:
             topology=variant.topology,
             output_slug=output_slug,
             mutation=variant.mutation,
-            replay_bundle_dir=self.oracle_routing_bundle_dir,
+            replay_bundle_dir=(
+                self.oracle_routing_bundle_dir if self.case_config.is_moe else None
+            ),
             capture_bundle_dir=None,
             regenerate=variant.force_regenerate,
         )
@@ -1620,13 +1681,15 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     }
 
 
-def _suite_variants(objective: OracleObjective) -> list[VariantSpec]:
+def _suite_variants(
+    objective: OracleObjective,
+    *,
+    is_moe: bool,
+) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
     variants: list[VariantSpec] = []
-    for topology in TOPOLOGIES[1:] + (
-        EXTENDED_TOPOLOGIES if extended_topologies_enabled() else []
-    ):
+    for topology in selected_suite_topologies(is_moe=is_moe)[1:]:
         variants.append(
             VariantSpec(
                 name=f"{objective}_topology_{topology.slug()}",
@@ -1646,7 +1709,9 @@ def run_suite(
     reports: list[VariantReport] = []
     for objective in selected_oracle_objectives():
         runner = VariantRunner(objective=objective, case_config=case_config)
-        reports.extend(runner.run_suite(_suite_variants(objective)))
+        reports.extend(
+            runner.run_suite(_suite_variants(objective, is_moe=case_config.is_moe))
+        )
     return reports
 
 
@@ -1664,6 +1729,7 @@ def run_sensitivity_suite(
         objective_mutations = selected_sensitivity_mutations_for_objective(
             objective,
             mutations,
+            is_moe=case_config.is_moe,
         )
         if not objective_mutations:
             continue
@@ -1671,7 +1737,10 @@ def run_sensitivity_suite(
             VariantSpec(
                 name=f"{objective}_sensitivity_{mutation}",
                 objective=objective,
-                topology=sensitivity_topology_for_mutation(mutation),
+                topology=sensitivity_topology_for_mutation(
+                    mutation,
+                    is_moe=case_config.is_moe,
+                ),
                 mutation=mutation,
                 expected_signal="fail",
                 pass_fn_by_phase=phase_pass,
@@ -1683,10 +1752,14 @@ def run_sensitivity_suite(
     if ran_any_variants:
         return reports
     requested = ", ".join(mutations)
-    supported = ", ".join(
-        f"{objective}: {', '.join(supported_sensitivity_mutations_for_objective(objective))}"
-        for objective in selected_oracle_objectives()
-    )
+    supported_by_objective = []
+    for objective in selected_oracle_objectives():
+        objective_supported = supported_sensitivity_mutations_for_objective(
+            objective,
+            is_moe=case_config.is_moe,
+        )
+        supported_by_objective.append(f"{objective}: {', '.join(objective_supported)}")
+    supported = ", ".join(supported_by_objective)
     raise ValueError(
         "No sensitivity variants matched the selected objectives. "
         f"Requested mutations: {requested}. Supported by objective: {supported}."

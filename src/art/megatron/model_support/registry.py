@@ -1,5 +1,6 @@
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
+    QWEN3_5_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
@@ -46,15 +47,27 @@ QWEN3_MOE_SPEC = ModelSupportSpec(
     native_vllm_lora_status=QWEN3_MOE_HANDLER.native_vllm_lora_status,
 )
 
+QWEN3_5_DENSE_SPEC = ModelSupportSpec(
+    key="qwen3_5_dense",
+    handler_key=QWEN3_5_DENSE_HANDLER.key,
+    model_names=(
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.6-27B",
+    ),
+    default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
+    native_vllm_lora_status=QWEN3_5_DENSE_HANDLER.native_vllm_lora_status,
+    dependency_floor=DependencyFloor(
+        megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
+    ),
+)
+
 QWEN3_5_MOE_SPEC = ModelSupportSpec(
     key="qwen3_5_moe",
     handler_key=QWEN3_5_MOE_HANDLER.key,
     model_names=(
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-397B-A17B",
-        "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
     ),
     default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
@@ -67,18 +80,25 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
 _SPECS_BY_KEY = {
     DEFAULT_DENSE_SPEC.key: DEFAULT_DENSE_SPEC,
     QWEN3_MOE_SPEC.key: QWEN3_MOE_SPEC,
+    QWEN3_5_DENSE_SPEC.key: QWEN3_5_DENSE_SPEC,
     QWEN3_5_MOE_SPEC.key: QWEN3_5_MOE_SPEC,
 }
 _SPECS_BY_MODEL = {
-    model_name: QWEN3_5_MOE_SPEC for model_name in QWEN3_5_MOE_SPEC.model_names
+    **{model_name: QWEN3_5_DENSE_SPEC for model_name in QWEN3_5_DENSE_SPEC.model_names},
+    **{model_name: QWEN3_5_MOE_SPEC for model_name in QWEN3_5_MOE_SPEC.model_names},
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
     DEFAULT_DENSE_HANDLER.key: DEFAULT_DENSE_HANDLER,
     QWEN3_MOE_HANDLER.key: QWEN3_MOE_HANDLER,
+    QWEN3_5_DENSE_HANDLER.key: QWEN3_5_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER.key: QWEN3_5_MOE_HANDLER,
 }
 
+QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
 QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)
+QWEN3_5_MODELS = frozenset(
+    QWEN3_5_DENSE_SPEC.model_names + QWEN3_5_MOE_SPEC.model_names
+)
 
 
 def get_model_support_spec(base_model: str) -> ModelSupportSpec:
@@ -110,12 +130,7 @@ def model_requires_merged_rollout(base_model: str) -> bool:
 
 
 def model_uses_expert_parallel(base_model: str) -> bool:
-    spec = get_model_support_spec(base_model)
-    if spec.key == QWEN3_MOE_SPEC.key:
-        return True
-    if spec.key == QWEN3_5_MOE_SPEC.key:
-        return "-A" in base_model
-    return False
+    return bool(get_model_support_handler(base_model).is_moe)
 
 
 def is_model_support_registered(base_model: str) -> bool:

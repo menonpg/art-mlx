@@ -112,7 +112,7 @@ def test_get_provider_accepts_supported_qwen_moe_bridges(
 def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from art.megatron.model_support.handlers import qwen3_5_moe as qwen35_handler_module
+    from art.megatron.model_support.handlers import qwen3_5 as qwen35_handler_module
 
     provider = _FakeProvider()
     fake_bridge = _FakeBridge(
@@ -233,6 +233,7 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     assert dispatcher_calls == []
     assert provider.finalized is True
     assert getattr(provider, "sequence_parallel") is False
+
 
 def test_get_provider_bundle_honors_single_gpu_env_topology(
     monkeypatch: pytest.MonkeyPatch,
