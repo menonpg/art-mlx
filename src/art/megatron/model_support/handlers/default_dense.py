@@ -91,15 +91,6 @@ class DefaultDenseHandler:
         del adapter_config
         return tensors
 
-    def to_vllm_lora_shard_tensors(
-        self,
-        tensors: dict[str, torch.Tensor],
-        manifest: dict[str, dict[str, Any]],
-        *,
-        adapter_config: dict[str, Any],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]], dict[str, Any]]:
-        return tensors, manifest, adapter_config
-
     def _shared_expert_compile_state(
         self,
         provider: Any,

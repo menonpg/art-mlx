@@ -6,7 +6,7 @@ import sys
 from safetensors.torch import save_file
 import torch
 
-from art.megatron.merge import merge_sharded_adapter_entries
+from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
@@ -159,7 +159,7 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
 
 
-def test_qwen35_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
+def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
     original = {
         "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(
             2,
@@ -170,30 +170,31 @@ def test_qwen35_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
             2,
         ),
     }
-    vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
-        original,
-        adapter_config=_config("Qwen/Qwen3.5-4B"),
-    )
-    assert set(vllm_tensors) == {
-        key.replace(
-            "base_model.model.model.layers.",
-            "base_model.model.model.language_model.layers.",
+    for base_model in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-4B"):
+        vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+            original,
+            adapter_config=_config(base_model),
         )
-        for key in original
-    }
-    roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
-        vllm_tensors,
-        adapter_config=vllm_config,
-    )
-    _assert_tensors_equal(roundtrip, original)
-    adapter_dir = tmp_path / "qwen35_dense"
-    _save_adapter(adapter_dir, vllm_tensors, vllm_config)
-    loaded_modules = _assert_stock_vllm_loads(
-        adapter_dir,
-        expected_modules={"q_proj"},
-        mapper="qwen35",
-    )
-    assert loaded_modules == ["language_model.model.layers.0.self_attn.q_proj"]
+        assert set(vllm_tensors) == {
+            key.replace(
+                "base_model.model.model.layers.",
+                "base_model.model.model.language_model.layers.",
+            )
+            for key in original
+        }
+        roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+            vllm_tensors,
+            adapter_config=vllm_config,
+        )
+        _assert_tensors_equal(roundtrip, original)
+        adapter_dir = tmp_path / base_model.replace("/", "_")
+        _save_adapter(adapter_dir, vllm_tensors, vllm_config)
+        loaded_modules = _assert_stock_vllm_loads(
+            adapter_dir,
+            expected_modules={"q_proj"},
+            mapper="qwen35",
+        )
+        assert loaded_modules == ["language_model.model.layers.0.self_attn.q_proj"]
 
 
 def test_qwen3_dense_and_moe_are_already_vllm_canonical(tmp_path: Path):
@@ -245,7 +246,9 @@ def test_qwen3_dense_and_moe_are_already_vllm_canonical(tmp_path: Path):
     ) == ["model.layers.0.mlp.experts.0.gate_proj"]
 
 
-def test_qwen35_vllm_shard_codec_merges_and_roundtrips():
+def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
+    tmp_path: Path,
+):
     prefix = "base_model.model.model.layers.0.mlp.experts.0"
     rank = 1
     hidden = 2
@@ -320,24 +323,37 @@ def test_qwen35_vllm_shard_codec_merges_and_roundtrips():
         f"{prefix}.up_proj.lora_B.weight": sharded(1, 0),
         f"{prefix}.down_proj.lora_A.weight": sharded(1, 1),
     }
-    config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)
-    vllm0, manifest0, config0 = QWEN3_5_MOE_HANDLER.to_vllm_lora_shard_tensors(
-        shard0,
-        manifest0,
-        adapter_config=config,
+    adapter_dir = tmp_path / "qwen35_megatron_shards"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(_config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)),
+        encoding="utf-8",
     )
-    vllm1, manifest1, _config1 = QWEN3_5_MOE_HANDLER.to_vllm_lora_shard_tensors(
-        shard1,
-        manifest1,
-        adapter_config=config,
+    save_file(shard0, adapter_dir / "adapter_model-01-of-02.safetensors")
+    save_file(shard1, adapter_dir / "adapter_model-02-of-02.safetensors")
+    (adapter_dir / "adapter_manifest-01-of-02.json").write_text(
+        json.dumps(manifest0),
+        encoding="utf-8",
     )
-    entries: dict[str, list[tuple[dict, torch.Tensor]]] = {}
-    for tensors, manifest in ((vllm0, manifest0), (vllm1, manifest1)):
-        for key, tensor in tensors.items():
-            entries.setdefault(key, []).append((manifest[key], tensor))
-    merged = merge_sharded_adapter_entries(entries)
-    roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
-        merged,
-        adapter_config=config0,
+    (adapter_dir / "adapter_manifest-02-of-02.json").write_text(
+        json.dumps(manifest1),
+        encoding="utf-8",
+    )
+
+    merge_lora_adapter(str(adapter_dir))
+
+    assert not list(adapter_dir.glob("adapter_model-*-of-*.safetensors"))
+    assert not list(adapter_dir.glob("adapter_manifest-*-of-*.json"))
+    roundtrip = load_lora_adapter_state_dict(
+        str(adapter_dir),
+        handler=QWEN3_5_MOE_HANDLER,
     )
     _assert_tensors_equal(roundtrip, full)
+    final_config = json.loads((adapter_dir / "adapter_config.json").read_text())
+    loaded_modules = _assert_stock_vllm_loads(
+        adapter_dir,
+        expected_modules=set(final_config["target_modules"]),
+        mapper="qwen35",
+    )
+    assert "language_model.model.layers.0.mlp.experts" in loaded_modules
+    assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules

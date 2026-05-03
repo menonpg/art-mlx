@@ -88,19 +88,3 @@ def load_lora_tensors_for_megatron(
         load_vllm_lora_tensors(lora_path),
         adapter_config=load_adapter_config(lora_path),
     )
-
-
-def convert_shard_to_vllm(
-    lora_path: str | Path,
-    tensors: dict[str, torch.Tensor],
-    manifest: dict[str, dict[str, Any]],
-    *,
-    handler: Any,
-) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]]]:
-    tensors, manifest, adapter_config = handler.to_vllm_lora_shard_tensors(
-        tensors,
-        manifest,
-        adapter_config=load_adapter_config(lora_path),
-    )
-    save_adapter_config(lora_path, adapter_config)
-    return tensors, manifest

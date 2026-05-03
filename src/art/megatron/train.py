@@ -62,7 +62,6 @@ from art.megatron.model_chunks import (
     as_megatron_api_chunks,
     validate_model_chunks,
 )
-from art.megatron.model_support.lora_disk import convert_shard_to_vllm
 from art.megatron.offload import (
     OffloadState,
     offload_to_cpu,
@@ -789,12 +788,6 @@ def _save_lora_and_optimizer(
     sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
         runtime.model,
         adapter_model,
-    )
-    sharded_state_dict, sharded_state_manifest = convert_shard_to_vllm(
-        lora_path,
-        sharded_state_dict,
-        sharded_state_manifest,
-        handler=runtime.model_support_handler,
     )
     shard_path = os.path.join(
         lora_path,

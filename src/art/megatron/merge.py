@@ -7,8 +7,7 @@ import torch
 
 from art.megatron.model_support.lora_disk import (
     load_lora_tensors_for_megatron,
-    load_vllm_lora_tensors,
-    resolve_lora_handler,
+    normalize_lora_checkpoint_to_vllm,
 )
 
 safetensors = importlib.import_module("safetensors")
@@ -53,49 +52,12 @@ def _merge_sharded_tensor(
     return torch.cat(ordered_shards, dim=axis).contiguous()
 
 
-def _merge_sum_slices(
-    key: str,
-    key_entries: list[tuple[dict[str, Any], torch.Tensor]],
-) -> torch.Tensor:
-    final_shape = list(key_entries[0][1].shape)
-    for manifest, tensor in key_entries:
-        slices = manifest.get("slices")
-        if not isinstance(slices, list) or not slices:
-            raise RuntimeError(f"Missing merge slices for key={key}")
-        for item in slices:
-            dim = int(item["dim"])
-            start = int(item["start"])
-            end = int(item["end"])
-            if end - start != tensor.shape[dim]:
-                raise RuntimeError(
-                    f"Slice shape mismatch for key={key} dim={dim}: "
-                    f"slice=({start}, {end}) tensor_shape={tuple(tensor.shape)}"
-                )
-            final_shape[dim] = max(final_shape[dim], end)
-    merged = key_entries[0][1].new_zeros(final_shape)
-    for manifest, tensor in key_entries:
-        index = [slice(None)] * tensor.ndim
-        for item in manifest["slices"]:
-            index[int(item["dim"])] = slice(int(item["start"]), int(item["end"]))
-        merged[tuple(index)] += tensor
-    return merged.contiguous()
-
-
 def merge_sharded_adapter_entries(
     entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]],
 ) -> dict[str, torch.Tensor]:
     adapter_model: dict[str, torch.Tensor] = {}
     for key, key_entries in entries_by_key.items():
         first_manifest = key_entries[0][0]
-        merge_strategy = first_manifest.get("merge_strategy")
-        if merge_strategy == "sum_slices":
-            if any(
-                entry_manifest.get("merge_strategy") != merge_strategy
-                for entry_manifest, _tensor in key_entries
-            ):
-                raise RuntimeError(f"Inconsistent merge strategy for key={key}")
-            adapter_model[key] = _merge_sum_slices(key, key_entries)
-            continue
         sharded = bool(first_manifest["sharded"])
         shard_world_size = int(first_manifest["shard_world_size"])
         for manifest_entry, _tensor in key_entries:
@@ -200,13 +162,7 @@ def load_lora_adapter_state_dict(
     adapter_model, _shard_filenames, _manifest_filenames = _load_adapter_shards(
         base_dir
     )
-    resolved_handler = resolve_lora_handler(lora_path, handler)
-    from art.megatron.model_support.lora_disk import load_adapter_config
-
-    return resolved_handler.from_vllm_lora_tensors(
-        adapter_model,
-        adapter_config=load_adapter_config(lora_path),
-    )
+    return adapter_model
 
 
 def merge_lora_adapter(lora_path: str) -> None:
@@ -220,6 +176,7 @@ def merge_lora_adapter(lora_path: str) -> None:
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
     save_file(adapter_model, adapter_model_path)
+    normalize_lora_checkpoint_to_vllm(base_dir)
     for filename in shard_filenames:
         filename.unlink()
     for filename in manifest_filenames:
