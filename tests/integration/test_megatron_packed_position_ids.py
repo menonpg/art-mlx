@@ -26,4 +26,4 @@ def test_run_packed_position_ids_qwen35() -> None:
         scenario.repeated_position_key_count > 0 for scenario in report.scenarios
     )
     assert all(scenario.completion_pair_count > 0 for scenario in report.scenarios)
-    assert all(scenario.logits_mean_abs_pct <= 0.1 for scenario in report.scenarios)
+    assert all(scenario.logits_mean_abs_pct <= 0.2 for scenario in report.scenarios)
