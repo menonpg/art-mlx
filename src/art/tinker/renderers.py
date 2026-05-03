@@ -1,7 +1,13 @@
+def is_qwen3_5_family_model(base_model: str) -> bool:
+    return base_model.startswith("Qwen/Qwen3.5-") or base_model.startswith(
+        "Qwen/Qwen3.6-"
+    )
+
+
 def get_renderer_name(base_model: str) -> str:
     if base_model.startswith("meta-llama/"):
         return "llama3"
-    elif base_model.startswith("Qwen/Qwen3.5-"):
+    elif is_qwen3_5_family_model(base_model):
         # print("Defaulting to Qwen3.5 renderer with thinking for", base_model)
         # print(renderer_name_message)
         return "qwen3_5_disable_thinking"

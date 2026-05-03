@@ -28,7 +28,7 @@ def test_qwen3_5_model_support_spec():
     spec = get_model_support_spec("Qwen/Qwen3.5-35B-A3B")
     assert spec.key == "qwen3_5_moe"
     assert spec.handler_key == "qwen3_5_moe"
-    assert spec.default_rollout_weights_mode == "merged"
+    assert spec.default_rollout_weights_mode == "lora"
     assert native_vllm_lora_status_for_model("Qwen/Qwen3.5-35B-A3B") == "validated"
     assert spec.dependency_floor.megatron_bridge == (
         "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d"
@@ -56,7 +56,7 @@ def test_qwen3_5_registry_exports():
         "up_proj",
         "down_proj",
     ]
-    assert model_requires_merged_rollout("Qwen/Qwen3.6-35B-A3B") is True
+    assert model_requires_merged_rollout("Qwen/Qwen3.6-35B-A3B") is False
     assert get_model_support_handler("Qwen/Qwen3.6-35B-A3B").key == "qwen3_5_moe"
 
 

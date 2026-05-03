@@ -1,5 +1,3 @@
-import pytest
-
 from .yes_no_trainability import (
     _build_internal_config,
     _default_variant_name,
@@ -56,24 +54,24 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
     assert _variant_max_steps(variant) == 12
 
 
-def test_qwen3_5_uses_dedicated_merged_rollout() -> None:
+def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
     variant = _TrainabilityVariant(
-        name="megatron_dedicated",
+        name="megatron_shared",
         backend_name="megatron",
-        placement_mode="dedicated",
-        trainer_gpu_ids=[0],
-        inference_gpu_ids=[1],
+        placement_mode="shared",
+        trainer_gpu_ids=[0, 1],
+        inference_gpu_ids=[0, 1],
     )
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
 
-    assert _default_variant_name("Qwen/Qwen3.5-35B-A3B") == "megatron_dedicated"
-    assert config["rollout_weights_mode"] == "merged"
-    assert config["trainer_gpu_ids"] == [0]
-    assert config["inference_gpu_ids"] == [1]
+    assert _default_variant_name("Qwen/Qwen3.5-35B-A3B") == "megatron_shared"
+    assert config["rollout_weights_mode"] == "lora"
+    assert "trainer_gpu_ids" not in config
+    assert "inference_gpu_ids" not in config
 
 
-def test_qwen3_5_shared_variant_rejects_merged_rollout(monkeypatch) -> None:
+def test_qwen3_5_shared_variant_allows_default_rollout(monkeypatch) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
     variant = _TrainabilityVariant(
         name="megatron_shared",
@@ -83,7 +81,7 @@ def test_qwen3_5_shared_variant_rejects_merged_rollout(monkeypatch) -> None:
         inference_gpu_ids=[0, 1],
     )
 
-    with pytest.raises(
-        ValueError, match="rollout_weights_mode='merged' requires dedicated mode"
-    ):
-        _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
+    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
+
+    assert config["rollout_weights_mode"] == "lora"
+    assert config["engine_args"]["enable_sleep_mode"] is True

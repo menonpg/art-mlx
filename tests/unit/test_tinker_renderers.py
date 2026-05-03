@@ -63,7 +63,11 @@ def _get_test_renderer(name: str, tokenizer: FakeTokenizer) -> renderers.Rendere
 
 
 def test_get_renderer_name_autodetects_qwen3_5() -> None:
-    assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5"
+    assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5_disable_thinking"
+
+
+def test_get_renderer_name_autodetects_qwen3_6() -> None:
+    assert get_renderer_name("Qwen/Qwen3.6-35B-A3B") == "qwen3_5_disable_thinking"
 
 
 def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:

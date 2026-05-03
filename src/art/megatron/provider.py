@@ -11,7 +11,7 @@ import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
 from art.megatron.model_support.handlers.qwen3_5_moe import (
-    supported_qwen_moe_bridge_types,
+    supported_qwen35_bridge_types,
 )
 from art.megatron.model_support.registry import (
     get_model_support_handler,
@@ -253,7 +253,7 @@ def _build_provider_bundle(
         dtype=torch_dtype,
         trust_remote_code=True,
     )
-    assert isinstance(bridge._model_bridge, supported_qwen_moe_bridge_types()), (
+    assert isinstance(bridge._model_bridge, supported_qwen35_bridge_types()), (
         "Only supported Qwen3 and Qwen3.5/3.6 DeltaNet models are supported"
     )
     handler.patch_bridge(bridge)

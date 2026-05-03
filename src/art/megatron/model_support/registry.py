@@ -58,7 +58,6 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3.6-35B-A3B",
     ),
     default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
-    default_rollout_weights_mode="merged",
     native_vllm_lora_status=QWEN3_5_MOE_HANDLER.native_vllm_lora_status,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",

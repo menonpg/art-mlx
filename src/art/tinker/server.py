@@ -34,7 +34,7 @@ import uvicorn
 from art.tinker.cookbook_v import renderers
 from art.tinker.cookbook_v.tokenizer_utils import get_tokenizer
 from art.tinker.prefix_cache import LRUTrieCache
-from art.tinker.renderers import get_renderer_name
+from art.tinker.renderers import get_renderer_name, is_qwen3_5_family_model
 from art.types import Message, Tools
 from mp_actors import close_proxy, move_to_child_process
 
@@ -67,7 +67,7 @@ def _normalize_qwen3_5_messages(
     base_model: str, messages: list[ChatCompletionMessageParam]
 ) -> list[dict[str, Any]]:
     normalized_messages = [cast(dict[str, Any], message) for message in messages]
-    if not base_model.startswith("Qwen/Qwen3.5"):
+    if not is_qwen3_5_family_model(base_model):
         return normalized_messages
     for i, message in enumerate(normalized_messages):
         tool_calls = message.get("tool_calls")

@@ -171,6 +171,7 @@ def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         result = get_model_config(base_model, tmpdir, None)
+        assert result["rollout_weights_mode"] == "lora"
         assert result["peft_args"]["target_modules"] == [
             "q_proj",
             "k_proj",
