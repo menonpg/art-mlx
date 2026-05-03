@@ -130,6 +130,28 @@ class ModelSupportHandler(Protocol):
         """
         ...
 
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, Any],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]: ...
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, Any],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def to_vllm_lora_shard_tensors(
+        self,
+        tensors: dict[str, Any],
+        manifest: dict[str, dict[str, Any]],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]: ...
+
     def compile_workaround_config(
         self,
         provider: Any,

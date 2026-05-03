@@ -1,4 +1,5 @@
 from copy import copy
+import re
 from types import MethodType
 from typing import Any, Callable, Sequence, cast
 
@@ -16,6 +17,16 @@ from art.megatron.provider_common import patch_layer_spec_tree
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
+)
+_ART_LAYER_PREFIX = "base_model.model.model.layers."
+_VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
+_ART_MOE_EXPERT_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
+    r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+)
+_VLLM_MOE_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\."
+    r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
 )
 
 
@@ -39,6 +50,35 @@ class Qwen35MoeHandler(DefaultDenseHandler):
         if "out_proj" in target_set:
             suffixes.append("linear_attn.out_proj.weight")
         return tuple(dict.fromkeys(suffixes))
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _from_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+
+    def to_vllm_lora_shard_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        manifest: dict[str, dict[str, Any]],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]], dict[str, Any]]:
+        return _to_vllm_lora_shard_tensors(
+            tensors,
+            manifest,
+            adapter_config=adapter_config,
+        )
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from art.megatron.gdn.operator import (
@@ -98,7 +138,9 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             ),
         ]
         if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
-            layer_families.append(LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0))
+            layer_families.append(
+                LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)
+            )
         else:
             layer_families.append(LayerFamilyInstance(key="dense_mlp", layer_index=0))
         if int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0) > 0:
@@ -122,6 +164,7 @@ class Qwen35MoeHandler(DefaultDenseHandler):
             transformer_block_spec_factory,
         ) = _require_qwen35_provider_symbols()
         from art.megatron.flex_attention import FlexDotProductAttention
+
         matched_provider_type = next(
             (
                 provider_type
@@ -335,6 +378,420 @@ class Qwen35MoeHandler(DefaultDenseHandler):
 
 
 QWEN3_5_MOE_HANDLER = Qwen35MoeHandler()
+
+
+def _to_vllm_key(key: str) -> str:
+    return (
+        key.replace(_ART_LAYER_PREFIX, _VLLM_LAYER_PREFIX, 1)
+        if key.startswith(_ART_LAYER_PREFIX)
+        else key
+    )
+
+
+def _from_vllm_key(key: str) -> str:
+    return (
+        key.replace(_VLLM_LAYER_PREFIX, _ART_LAYER_PREFIX, 1)
+        if key.startswith(_VLLM_LAYER_PREFIX)
+        else key
+    )
+
+
+def _is_lora_weight_key(key: str) -> bool:
+    return key.endswith((".lora_A.weight", ".lora_B.weight"))
+
+
+def _pad_a(tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    if tensor.shape[0] == rank:
+        return tensor
+    if tensor.shape[0] > rank:
+        return tensor[:rank, :].contiguous()
+    padded = tensor.new_zeros((rank, tensor.shape[1]))
+    padded[: tensor.shape[0], :] = tensor
+    return padded.contiguous()
+
+
+def _pad_b(tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    if tensor.shape[1] == rank:
+        return tensor
+    if tensor.shape[1] > rank:
+        return tensor[:, :rank].contiguous()
+    padded = tensor.new_zeros((tensor.shape[0], rank))
+    padded[:, : tensor.shape[1]] = tensor
+    return padded.contiguous()
+
+
+def _adapter_scale(adapter_config: dict[str, Any]) -> float:
+    rank = int(adapter_config.get("r", 1) or 1)
+    alpha = int(adapter_config.get("lora_alpha", rank) or rank)
+    return alpha / rank
+
+
+def _vllm_moe_config(adapter_config: dict[str, Any], rank: int) -> dict[str, Any]:
+    vllm_rank = 2 * rank
+    config = dict(adapter_config)
+    config["r"] = vllm_rank
+    config["lora_alpha"] = round(_adapter_scale(adapter_config) * vllm_rank)
+    target_modules = list(config.get("target_modules") or [])
+    if "experts" not in target_modules:
+        target_modules.append("experts")
+    config["target_modules"] = target_modules
+    return config
+
+
+def _group_art_moe_tensors(
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]]:
+    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, tensor in tensors.items():
+        match = _ART_MOE_EXPERT_KEY_RE.match(key)
+        if match is None:
+            continue
+        grouped.setdefault(match.group("prefix"), {}).setdefault(
+            int(match.group("expert")),
+            {},
+        ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+    return grouped
+
+
+def _rank_from_grouped_moe(
+    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]],
+) -> int:
+    for experts in grouped.values():
+        for modules in experts.values():
+            for loras in modules.values():
+                if "lora_A" in loras:
+                    return int(loras["lora_A"].shape[0])
+                if "lora_B" in loras:
+                    return int(loras["lora_B"].shape[1])
+    raise RuntimeError("Could not infer Qwen3.5 MoE LoRA rank")
+
+
+def _to_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    grouped = _group_art_moe_tensors(tensors)
+    if not grouped:
+        return {
+            _to_vllm_key(key): tensor for key, tensor in tensors.items()
+        }, adapter_config
+    rank = _rank_from_grouped_moe(grouped)
+    vllm_rank = 2 * rank
+    transformed: dict[str, torch.Tensor] = {}
+    used_keys: set[str] = set()
+    for prefix, experts in grouped.items():
+        vllm_prefix = _to_vllm_key(prefix)
+        gate_up_a: list[torch.Tensor] = []
+        gate_up_b: list[torch.Tensor] = []
+        down_a: list[torch.Tensor] = []
+        down_b: list[torch.Tensor] = []
+        for expert in sorted(experts):
+            modules = experts[expert]
+            try:
+                gate_a = modules["gate_proj"]["lora_A"]
+                gate_b = modules["gate_proj"]["lora_B"]
+                up_a = modules["up_proj"]["lora_A"]
+                up_b = modules["up_proj"]["lora_B"]
+                d_a = modules["down_proj"]["lora_A"]
+                d_b = modules["down_proj"]["lora_B"]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Incomplete Qwen3.5 MoE LoRA block for {prefix}.{expert}"
+                ) from exc
+            gate_up_a.append(torch.cat((gate_a, up_a), dim=0).contiguous())
+            block_b = gate_b.new_zeros((gate_b.shape[0] + up_b.shape[0], vllm_rank))
+            block_b[: gate_b.shape[0], :rank] = gate_b
+            block_b[gate_b.shape[0] :, rank:] = up_b
+            gate_up_b.append(block_b.contiguous())
+            down_a.append(_pad_a(d_a, vllm_rank))
+            down_b.append(_pad_b(d_b, vllm_rank))
+            for module_name in ("gate_proj", "up_proj", "down_proj"):
+                for lora_name in ("lora_A", "lora_B"):
+                    used_keys.add(f"{prefix}.{expert}.{module_name}.{lora_name}.weight")
+        transformed[f"{vllm_prefix}.base_layer.lora_A.weight"] = torch.cat(
+            gate_up_a,
+            dim=0,
+        ).contiguous()
+        transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = torch.cat(
+            gate_up_b,
+            dim=1,
+        ).contiguous()
+        transformed[f"{vllm_prefix}.lora_A.weight"] = torch.cat(
+            down_a,
+            dim=0,
+        ).contiguous()
+        transformed[f"{vllm_prefix}.lora_B.weight"] = torch.cat(
+            down_b,
+            dim=1,
+        ).contiguous()
+    for key, tensor in tensors.items():
+        if key in used_keys:
+            continue
+        vllm_key = _to_vllm_key(key)
+        if vllm_key.endswith(".lora_A.weight"):
+            tensor = _pad_a(tensor, vllm_rank)
+        elif vllm_key.endswith(".lora_B.weight"):
+            tensor = _pad_b(tensor, vllm_rank)
+        transformed[vllm_key] = tensor
+    return transformed, _vllm_moe_config(adapter_config, rank)
+
+
+def _from_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    for key, tensor in tensors.items():
+        match = _VLLM_MOE_KEY_RE.match(key)
+        if match is None:
+            continue
+        slot = (
+            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
+        )
+        grouped.setdefault(match.group("prefix"), {})[slot] = tensor
+    if not grouped:
+        return {_from_vllm_key(key): tensor for key, tensor in tensors.items()}
+
+    vllm_rank = int(adapter_config["r"])
+    if vllm_rank % 2 != 0:
+        raise RuntimeError(f"Qwen3.5 vLLM MoE LoRA rank must be even, got {vllm_rank}")
+    rank = vllm_rank // 2
+    transformed: dict[str, torch.Tensor] = {}
+    used_keys: set[str] = set()
+    for prefix, slots in grouped.items():
+        try:
+            gate_up_a = slots["base_layer.lora_A"]
+            gate_up_b = slots["base_layer.lora_B"]
+            down_a = slots["lora_A"]
+            down_b = slots["lora_B"]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Incomplete Qwen3.5 vLLM MoE LoRA block for {prefix}"
+            ) from exc
+        if gate_up_a.shape[0] % vllm_rank != 0:
+            raise RuntimeError(
+                f"{prefix}: gate/up lora_A shape {tuple(gate_up_a.shape)} "
+                f"is not divisible by rank {vllm_rank}"
+            )
+        num_experts = gate_up_a.shape[0] // vllm_rank
+        intermediate = gate_up_b.shape[0] // 2
+        art_prefix = _from_vllm_key(prefix)
+        for expert in range(num_experts):
+            row = expert * vllm_rank
+            col = expert * vllm_rank
+            gate_up_a_block = gate_up_a[row : row + vllm_rank]
+            gate_up_b_block = gate_up_b[:, col : col + vllm_rank]
+            down_a_block = down_a[row : row + vllm_rank]
+            down_b_block = down_b[:, col : col + vllm_rank]
+            transformed[f"{art_prefix}.{expert}.gate_proj.lora_A.weight"] = (
+                gate_up_a_block[:rank].contiguous()
+            )
+            transformed[f"{art_prefix}.{expert}.up_proj.lora_A.weight"] = (
+                gate_up_a_block[rank:].contiguous()
+            )
+            transformed[f"{art_prefix}.{expert}.gate_proj.lora_B.weight"] = (
+                gate_up_b_block[:intermediate, :rank].contiguous()
+            )
+            transformed[f"{art_prefix}.{expert}.up_proj.lora_B.weight"] = (
+                gate_up_b_block[intermediate:, rank:].contiguous()
+            )
+            transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = (
+                down_a_block[:rank].contiguous()
+            )
+            transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = (
+                down_b_block[:, :rank].contiguous()
+            )
+        used_keys.update(
+            {
+                f"{prefix}.base_layer.lora_A.weight",
+                f"{prefix}.base_layer.lora_B.weight",
+                f"{prefix}.lora_A.weight",
+                f"{prefix}.lora_B.weight",
+            }
+        )
+    for key, tensor in tensors.items():
+        if key in used_keys:
+            continue
+        art_key = _from_vllm_key(key)
+        if art_key.endswith(".lora_A.weight"):
+            tensor = _pad_a(tensor, rank)
+        elif art_key.endswith(".lora_B.weight"):
+            tensor = _pad_b(tensor, rank)
+        transformed[art_key] = tensor
+    return transformed
+
+
+def _shard_dim_info(
+    tensor: torch.Tensor,
+    manifest: dict[str, Any],
+    dim: int,
+) -> tuple[int, int, int]:
+    if (
+        bool(manifest.get("sharded"))
+        and int(manifest.get("export_shard_dim", -1)) == dim
+    ):
+        rank = int(manifest["shard_rank"])
+        world = int(manifest["shard_world_size"])
+        local = int(tensor.shape[dim])
+        return rank * local, (rank + 1) * local, world * local
+    size = int(tensor.shape[dim])
+    return 0, size, size
+
+
+def _sum_slice_manifest(*, dim: int, start: int, end: int) -> dict[str, Any]:
+    return {
+        "merge_strategy": "sum_slices",
+        "slices": [{"dim": dim, "start": start, "end": end}],
+    }
+
+
+def _contiguous_experts(experts: list[int]) -> tuple[int, int]:
+    ordered = sorted(experts)
+    if ordered != list(range(ordered[0], ordered[-1] + 1)):
+        raise RuntimeError(f"Qwen3.5 local expert ids are not contiguous: {ordered}")
+    return ordered[0], ordered[-1] + 1
+
+
+def _to_vllm_lora_shard_tensors(
+    tensors: dict[str, torch.Tensor],
+    manifest: dict[str, dict[str, Any]],
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]], dict[str, Any]]:
+    grouped = _group_art_moe_tensors(tensors)
+    if not grouped:
+        return (
+            {_to_vllm_key(key): tensor for key, tensor in tensors.items()},
+            {_to_vllm_key(key): value for key, value in manifest.items()},
+            adapter_config,
+        )
+    rank = _rank_from_grouped_moe(grouped)
+    vllm_rank = 2 * rank
+    transformed: dict[str, torch.Tensor] = {}
+    transformed_manifest: dict[str, dict[str, Any]] = {}
+    used_keys: set[str] = set()
+    for prefix, experts in grouped.items():
+        vllm_prefix = _to_vllm_key(prefix)
+        gate_up_a_blocks: list[torch.Tensor] = []
+        gate_up_a_experts: list[int] = []
+        base_b_blocks: list[torch.Tensor] = []
+        base_b_experts: list[int] = []
+        down_a_blocks: list[torch.Tensor] = []
+        down_a_experts: list[int] = []
+        down_b_blocks: list[torch.Tensor] = []
+        down_b_experts: list[int] = []
+        for expert in sorted(experts):
+            modules = experts[expert]
+            gate = modules.get("gate_proj", {})
+            up = modules.get("up_proj", {})
+            down = modules.get("down_proj", {})
+            if "lora_A" in gate and "lora_A" in up:
+                gate_up_a_blocks.append(
+                    torch.cat((gate["lora_A"], up["lora_A"]), dim=0)
+                )
+                gate_up_a_experts.append(expert)
+            if "lora_B" in gate and "lora_B" in up:
+                gate_key = f"{prefix}.{expert}.gate_proj.lora_B.weight"
+                up_key = f"{prefix}.{expert}.up_proj.lora_B.weight"
+                gate_b = gate["lora_B"]
+                up_b = up["lora_B"]
+                gate_start, gate_end, intermediate = _shard_dim_info(
+                    gate_b,
+                    manifest[gate_key],
+                    0,
+                )
+                up_start, up_end, up_intermediate = _shard_dim_info(
+                    up_b,
+                    manifest[up_key],
+                    0,
+                )
+                if up_intermediate != intermediate:
+                    raise RuntimeError(f"{prefix}.{expert}: gate/up shard sizes differ")
+                base_b = gate_b.new_zeros((2 * intermediate, vllm_rank))
+                base_b[gate_start:gate_end, :rank] = gate_b
+                base_b[intermediate + up_start : intermediate + up_end, rank:] = up_b
+                base_b_blocks.append(base_b)
+                base_b_experts.append(expert)
+            if "lora_A" in down:
+                down_a_key = f"{prefix}.{expert}.down_proj.lora_A.weight"
+                d_a = down["lora_A"]
+                down_col_start, down_col_end, down_intermediate = _shard_dim_info(
+                    d_a,
+                    manifest[down_a_key],
+                    1,
+                )
+                down_a = d_a.new_zeros((vllm_rank, down_intermediate))
+                down_a[:rank, down_col_start:down_col_end] = d_a
+                down_a_blocks.append(down_a)
+                down_a_experts.append(expert)
+            if "lora_B" in down:
+                down_b_blocks.append(_pad_b(down["lora_B"], vllm_rank))
+                down_b_experts.append(expert)
+            for module_name, loras in modules.items():
+                for lora_name in loras:
+                    used_keys.add(f"{prefix}.{expert}.{module_name}.{lora_name}.weight")
+
+        def add_blocks(
+            key: str,
+            blocks: list[torch.Tensor],
+            experts_for_blocks: list[int],
+            *,
+            cat_dim: int,
+            slice_dim: int,
+        ) -> None:
+            if not blocks:
+                return
+            expert_start, expert_end = _contiguous_experts(experts_for_blocks)
+            start = expert_start * vllm_rank
+            end = expert_end * vllm_rank
+            transformed[key] = torch.cat(blocks, dim=cat_dim).contiguous()
+            transformed_manifest[key] = _sum_slice_manifest(
+                dim=slice_dim,
+                start=start,
+                end=end,
+            )
+
+        add_blocks(
+            f"{vllm_prefix}.base_layer.lora_A.weight",
+            gate_up_a_blocks,
+            gate_up_a_experts,
+            cat_dim=0,
+            slice_dim=0,
+        )
+        add_blocks(
+            f"{vllm_prefix}.base_layer.lora_B.weight",
+            base_b_blocks,
+            base_b_experts,
+            cat_dim=1,
+            slice_dim=1,
+        )
+        add_blocks(
+            f"{vllm_prefix}.lora_A.weight",
+            down_a_blocks,
+            down_a_experts,
+            cat_dim=0,
+            slice_dim=0,
+        )
+        add_blocks(
+            f"{vllm_prefix}.lora_B.weight",
+            down_b_blocks,
+            down_b_experts,
+            cat_dim=1,
+            slice_dim=1,
+        )
+    for key, tensor in tensors.items():
+        if key in used_keys:
+            continue
+        vllm_key = _to_vllm_key(key)
+        if vllm_key.endswith(".lora_A.weight"):
+            tensor = _pad_a(tensor, vllm_rank)
+        elif vllm_key.endswith(".lora_B.weight"):
+            tensor = _pad_b(tensor, vllm_rank)
+        transformed[vllm_key] = tensor.contiguous()
+        transformed_manifest[vllm_key] = manifest[key]
+    return transformed, transformed_manifest, _vllm_moe_config(adapter_config, rank)
 
 
 def _ensure_bridge_qwen35_adapter_name_map() -> None:

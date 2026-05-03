@@ -62,6 +62,7 @@ from art.megatron.model_chunks import (
     as_megatron_api_chunks,
     validate_model_chunks,
 )
+from art.megatron.model_support.lora_disk import convert_shard_to_vllm
 from art.megatron.offload import (
     OffloadState,
     offload_to_cpu,
@@ -382,9 +383,7 @@ def build_training_runtime(
             _compile_transformer_layers(chunk)
 
     optimizer_config = optimizer_config or _default_optimizer_config()
-    optimizer = (
-        _build_optimizer(model, optimizer_config) if build_optimizer else None
-    )
+    optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
 
     runtime = TrainingRuntime(
         provider_bundle=provider_bundle,
@@ -699,7 +698,9 @@ def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
 
 def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
     if isinstance(job, MegatronSyncJob):
-        adapter_model = _load_adapter_into_model(runtime.model, job.lora_path, runtime.rank)
+        adapter_model = _load_adapter_into_model(
+            runtime.model, job.lora_path, runtime.rank
+        )
         del adapter_model
         _sync_merged_weights_to_vllm(
             runtime,
@@ -737,6 +738,7 @@ def _load_lora_and_optimizer(
         runtime.model,
         lora_path,
         runtime.rank,
+        handler=runtime.model_support_handler,
     )
     runtime.optimizer = _build_optimizer(
         runtime.model,
@@ -767,10 +769,11 @@ def _load_adapter_into_model(
     lora_path: str,
     rank: int,
     *,
+    handler: Any | None = None,
     optimizer: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
-    adapter_model = load_lora_adapter_state_dict(lora_path)
+    adapter_model = load_lora_adapter_state_dict(lora_path, handler=handler)
     load_adapter_into_model(model_chunks, adapter_model, optimizer)
     return adapter_model
 
@@ -786,6 +789,12 @@ def _save_lora_and_optimizer(
     sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
         runtime.model,
         adapter_model,
+    )
+    sharded_state_dict, sharded_state_manifest = convert_shard_to_vllm(
+        lora_path,
+        sharded_state_dict,
+        sharded_state_manifest,
+        handler=runtime.model_support_handler,
     )
     shard_path = os.path.join(
         lora_path,

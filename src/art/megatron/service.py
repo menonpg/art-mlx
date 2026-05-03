@@ -44,6 +44,7 @@ from .jobs import (
     MergedWeightTransferSpec,
 )
 from .lora import LORA_ALPHA, LORA_RANK
+from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
@@ -119,7 +120,7 @@ def create_identity_lora(
     peft_model.save_pretrained(lora_path)
     convert_checkpoint_if_needed(lora_path)
 
-    # Write final adapter_config with per-expert target_modules
+    # Write final adapter_config in ART's vLLM-canonical disk format.
     LoraConfig(
         base_model_name_or_path=base_model,
         r=rank,
@@ -127,6 +128,7 @@ def create_identity_lora(
         target_modules=target_modules,
         bias="none",
     ).save_pretrained(lora_path)
+    normalize_lora_checkpoint_to_vllm(lora_path, handler=handler)
     del peft_model, model
     if torch.cuda.is_available():
         torch.cuda.synchronize()

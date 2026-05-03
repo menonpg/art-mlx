@@ -24,9 +24,7 @@ class DefaultDenseHandler:
         target_modules: list[str],
     ) -> list[str]:
         suffixes = self._identity_lora_parameter_suffixes(target_modules)
-        return [
-            name for name, _ in model.named_parameters() if name.endswith(suffixes)
-        ]
+        return [name for name, _ in model.named_parameters() if name.endswith(suffixes)]
 
     def _identity_lora_parameter_suffixes(
         self,
@@ -75,6 +73,32 @@ class DefaultDenseHandler:
             hf_tensor_map,
             expected_keys=expected_keys,
         )
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return tensors, adapter_config
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        del adapter_config
+        return tensors
+
+    def to_vllm_lora_shard_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        manifest: dict[str, dict[str, Any]],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]], dict[str, Any]]:
+        return tensors, manifest, adapter_config
 
     def _shared_expert_compile_state(
         self,
@@ -218,7 +242,9 @@ def _expected_unfused_experts_for_prefix(
     *,
     param: str,
 ) -> bool:
-    simplified_expected_keys = {_strip_language_model_prefix(key) for key in expected_keys}
+    simplified_expected_keys = {
+        _strip_language_model_prefix(key) for key in expected_keys
+    }
     if param == "gate_up_proj":
         return (
             f"{prefix}.0.gate_proj.weight" in simplified_expected_keys
