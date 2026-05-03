@@ -258,6 +258,17 @@ def run_correctness_sensitivity_stage(
     base_model: str,
     architecture: ArchitectureReport,
 ) -> ValidationStageResult:
+    if not any(
+        family.key == "grouped_moe_mlp" for family in architecture.layer_families
+    ):
+        return ValidationStageResult(
+            name="correctness_sensitivity",
+            passed=True,
+            metrics={
+                "skipped": True,
+                "reason": "router-trace replay only applies to MoE routing models",
+            },
+        )
     oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,

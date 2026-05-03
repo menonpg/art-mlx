@@ -373,6 +373,29 @@ def test_run_chat_template_rollout_stage(monkeypatch) -> None:
     assert result.artifact_dir == "/tmp/chat-template"
 
 
+def test_run_correctness_sensitivity_stage_skips_dense_models() -> None:
+    result = run_correctness_sensitivity_stage(
+        base_model="Qwen/Qwen3.5-4B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-4B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[
+                LayerFamilyInstance(key="dense_mlp", layer_index=0),
+                LayerFamilyInstance(key="gated_delta_net_attention", layer_index=0),
+                LayerFamilyInstance(key="standard_attention", layer_index=3),
+            ],
+            recommended_min_layers=4,
+        ),
+    )
+
+    assert result.passed is True
+    assert result.metrics == {
+        "skipped": True,
+        "reason": "router-trace replay only applies to MoE routing models",
+    }
+
+
 def test_run_yes_no_trainability_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._import_integration_module",
@@ -517,6 +540,7 @@ def test_run_lora_coverage_stage_reports_missing_targets(monkeypatch) -> None:
         base_model="Qwen/Qwen3.5-35B-A3B",
         model_key="qwen3_5_moe",
         handler_key="qwen3_5_moe",
+        layer_families=[LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)],
         recommended_min_layers=4,
     )
     oracle_module = SimpleNamespace(
@@ -564,6 +588,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
         base_model="Qwen/Qwen3.5-35B-A3B",
         model_key="qwen3_5_moe",
         handler_key="qwen3_5_moe",
+        layer_families=[LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)],
         recommended_min_layers=4,
     )
     oracle_module = SimpleNamespace(

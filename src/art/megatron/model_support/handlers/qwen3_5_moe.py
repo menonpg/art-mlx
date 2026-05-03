@@ -407,14 +407,21 @@ def _register_qwen35_text_only_module_types() -> None:
     AutoMapping.register_module_type("GatedDeltaNet", "column")
 
 
-def _qwen35_text_only_mapping_registry() -> Any:
+def _qwen35_text_only_mapping_registry(
+    bridge_type: type[Any] | None = None,
+) -> Any:
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
     )
-    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
+    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+        Qwen35VLBridge,
+        Qwen35VLMoEBridge,
+    )
 
     _register_qwen35_text_only_module_types()
-    upstream_registry = Qwen35VLMoEBridge().mapping_registry()
+    upstream_bridge_type = bridge_type or Qwen35VLMoEBridge
+    assert upstream_bridge_type in {Qwen35VLBridge, Qwen35VLMoEBridge}
+    upstream_registry = upstream_bridge_type().mapping_registry()
     language_mappings = [
         _text_only_qwen35_mapping(mapping)
         for mapping in upstream_registry.mappings
@@ -581,7 +588,7 @@ from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
 )
 class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
     def mapping_registry(self) -> Any:
-        return _qwen35_text_only_mapping_registry()
+        return _qwen35_text_only_mapping_registry(Qwen35VLBridge)
 
 
 @MegatronModelBridge.register_bridge(
@@ -592,7 +599,7 @@ class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
 )
 class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
     def mapping_registry(self) -> Any:
-        return _qwen35_text_only_mapping_registry()
+        return _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge)
 
 
 def _optional_gated_delta_net_type() -> type[Any] | None:

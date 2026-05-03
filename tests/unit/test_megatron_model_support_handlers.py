@@ -276,6 +276,32 @@ def test_qwen35_text_only_bridge_registry_uses_decoder_root_names() -> None:
     assert "language_model.embedding.word_embeddings.weight" not in names
 
 
+def test_qwen35_text_only_bridge_registry_matches_dense_or_moe_surface() -> None:
+    _ensure_qwen35_text_only_bridge_registered()
+    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+        Qwen35VLBridge,
+        Qwen35VLMoEBridge,
+    )
+
+    dense_names = {
+        mapping.megatron_param
+        for mapping in _qwen35_text_only_mapping_registry(Qwen35VLBridge).mappings
+    }
+    moe_names = {
+        mapping.megatron_param
+        for mapping in _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge).mappings
+    }
+
+    assert "decoder.layers.*.mlp.linear_fc1.weight" in dense_names
+    assert "decoder.layers.*.mlp.linear_fc2.weight" in dense_names
+    assert "decoder.layers.*.mlp.router.weight" not in dense_names
+    assert "decoder.layers.*.mlp.experts.linear_fc1.weight*" not in dense_names
+
+    assert "decoder.layers.*.mlp.router.weight" in moe_names
+    assert "decoder.layers.*.mlp.experts.linear_fc1.weight*" in moe_names
+    assert "decoder.layers.*.mlp.linear_fc1.weight" not in moe_names
+
+
 def test_default_dense_handler_identity_lora_targets_dense_shared_and_moe_params() -> None:
     model = _FakeModel(
         [
