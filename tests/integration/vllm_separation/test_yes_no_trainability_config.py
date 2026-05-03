@@ -81,8 +81,24 @@ def test_qwen3_5_shared_variant_allows_default_rollout(monkeypatch) -> None:
         inference_gpu_ids=[0, 1],
     )
 
-    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
+    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
 
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
     assert "enable_expert_parallel" not in config["engine_args"]
+
+
+def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
+    variant = _TrainabilityVariant(
+        name="megatron_shared",
+        backend_name="megatron",
+        placement_mode="shared",
+        trainer_gpu_ids=[0, 1],
+        inference_gpu_ids=[0, 1],
+    )
+
+    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
+
+    assert config["rollout_weights_mode"] == "lora"
+    assert config["engine_args"]["enable_expert_parallel"] is True
