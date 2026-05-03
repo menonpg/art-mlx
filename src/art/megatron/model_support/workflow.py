@@ -28,6 +28,7 @@ CORRECTNESS_LOG_PATH = LOCAL_LOG_DIR / "correctness.log"
 SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
 LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
 ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
+SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -99,6 +100,11 @@ def initialize_validation_report(
 
 def _stage_error_metrics(exc: Exception) -> dict[str, Any]:
     return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _truthy_env(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _import_integration_module(module_name: str) -> Any:
@@ -281,14 +287,17 @@ def run_correctness_sensitivity_stage(
         suite_topologies.extend(oracle_harness.EXTENDED_TOPOLOGIES)
     suite_world_size = max(topology.world_size() for topology in suite_topologies)
     objectives = list(oracle_harness.selected_oracle_objectives())
+    skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
     mutations: list[str] = []
-    for objective in objectives:
-        for mutation in oracle_harness.supported_sensitivity_mutations_for_objective(
-            objective
-        ):
-            if mutation not in mutations:
-                mutations.append(mutation)
-    sensitivity_world_size = oracle_harness.sensitivity_required_world_size(mutations)
+    sensitivity_world_size = 0
+    if not skip_sensitivity:
+        for objective in objectives:
+            for mutation in oracle_harness.supported_sensitivity_mutations_for_objective(
+                objective
+            ):
+                if mutation not in mutations:
+                    mutations.append(mutation)
+        sensitivity_world_size = oracle_harness.sensitivity_required_world_size(mutations)
     available_gpu_count = oracle_harness.available_gpu_count()
     required_gpu_count = max(suite_world_size, sensitivity_world_size)
     if available_gpu_count < required_gpu_count:
@@ -301,11 +310,22 @@ def run_correctness_sensitivity_stage(
     with _temporary_env(**{ORACLE_LIVE_TRAINING_LOG_ENV: str(LIVE_TRAINING_LOG_PATH)}):
         with _redirect_output(CORRECTNESS_LOG_PATH):
             suite_reports = oracle_harness.run_suite(case_config=case_config)
-        with _redirect_output(SENSITIVITY_LOG_PATH):
-            sensitivity_reports = oracle_harness.run_sensitivity_suite(
-                case_config=case_config,
-                mutations=mutations,
+        sensitivity_reports = []
+        if skip_sensitivity:
+            SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SENSITIVITY_LOG_PATH.write_text(
+                (
+                    "Sensitivity suite skipped. "
+                    f"Set {SKIP_SENSITIVITY_ENV}=0 to re-enable workflow sensitivity.\n"
+                ),
+                encoding="utf-8",
             )
+        else:
+            with _redirect_output(SENSITIVITY_LOG_PATH):
+                sensitivity_reports = oracle_harness.run_sensitivity_suite(
+                    case_config=case_config,
+                    mutations=mutations,
+                )
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     return ValidationStageResult(
         name="correctness_sensitivity",
@@ -325,6 +345,12 @@ def run_correctness_sensitivity_stage(
                 }
                 for report in suite_reports
             ],
+            "sensitivity_skipped": skip_sensitivity,
+            "sensitivity_skip_reason": (
+                f"{SKIP_SENSITIVITY_ENV}=1"
+                if skip_sensitivity
+                else None
+            ),
             "sensitivity_variant_count": len(sensitivity_reports),
             "sensitivity_variants": [
                 {

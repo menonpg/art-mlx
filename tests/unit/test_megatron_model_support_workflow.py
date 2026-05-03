@@ -8,6 +8,7 @@ from art.megatron.model_support.spec import (
 from art.megatron.model_support.workflow import (
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
+    SKIP_SENSITIVITY_ENV,
     assess_minimal_layer_coverage,
     build_validation_report,
     build_validation_stage_names,
@@ -640,8 +641,68 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.metrics["sensitivity_mutations"] == ["skip_finalize"]
     assert stage.metrics["required_gpu_count"] == 2
     assert stage.metrics["correctness_variant_count"] == 1
+    assert stage.metrics["sensitivity_skipped"] is False
+    assert stage.metrics["sensitivity_skip_reason"] is None
     assert stage.metrics["sensitivity_variant_count"] == 1
     assert stage.artifact_dir == "/tmp/oracle"
+
+
+def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
+    monkeypatch,
+) -> None:
+    architecture = ArchitectureReport(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        model_key="qwen3_5_moe",
+        handler_key="qwen3_5_moe",
+        layer_families=[LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)],
+        recommended_min_layers=4,
+    )
+    oracle_module = SimpleNamespace(
+        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        TOPOLOGIES=[SimpleNamespace(world_size=lambda: 2)],
+        EXTENDED_TOPOLOGIES=[SimpleNamespace(world_size=lambda: 4)],
+        extended_topologies_enabled=lambda: False,
+        selected_oracle_objectives=lambda: ["sft"],
+        supported_sensitivity_mutations_for_objective=lambda objective: (
+            ["skip_finalize"] if objective == "sft" else []
+        ),
+        sensitivity_required_world_size=lambda mutations: 4,
+        available_gpu_count=lambda: 2,
+        run_suite=lambda case_config: [
+            SimpleNamespace(
+                variant="sft_topology_tp2",
+                topology="tp2",
+                signal="pass",
+                fail_count=0,
+            )
+        ],
+        run_sensitivity_suite=lambda case_config, mutations: (_ for _ in ()).throw(
+            AssertionError("sensitivity suite should be skipped")
+        ),
+        ensure_case_artifacts=lambda case_config: SimpleNamespace(
+            case_dir="/tmp/oracle"
+        ),
+    )
+    monkeypatch.setattr(
+        "art.megatron.model_support.workflow._import_integration_module",
+        lambda name: oracle_module,
+    )
+    monkeypatch.setenv(SKIP_SENSITIVITY_ENV, "1")
+
+    stage = run_correctness_sensitivity_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=architecture,
+    )
+
+    assert stage.name == "correctness_sensitivity"
+    assert stage.passed is True
+    assert stage.metrics["required_gpu_count"] == 2
+    assert stage.metrics["correctness_variant_count"] == 1
+    assert stage.metrics["sensitivity_mutations"] == []
+    assert stage.metrics["sensitivity_skipped"] is True
+    assert stage.metrics["sensitivity_skip_reason"] == f"{SKIP_SENSITIVITY_ENV}=1"
+    assert stage.metrics["sensitivity_variant_count"] == 0
+    assert stage.metrics["sensitivity_variants"] == []
 
 
 def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None:
