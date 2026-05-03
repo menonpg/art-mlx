@@ -134,7 +134,8 @@ def test_qwen3_dense_uses_default_dense_only_in_unsupported_probe_mode():
         "Qwen/Qwen3-4B-Instruct-2507",
         allow_unsupported_arch=True,
     )
-    assert spec.key == "default_dense"
+    assert spec.key == "qwen3_dense"
+    assert spec.handler_key == "qwen3_dense"
     assert (
         model_uses_expert_parallel(
             "Qwen/Qwen3-4B-Instruct-2507",

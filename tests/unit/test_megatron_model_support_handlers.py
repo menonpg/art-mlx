@@ -9,6 +9,7 @@ from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
+    QWEN3_DENSE_HANDLER,
     QWEN3_MOE_HANDLER,
     DefaultMoeHandler,
 )
@@ -37,6 +38,7 @@ def test_default_dense_handler_returns_standard_attention_kwargs() -> None:
 def test_handlers_report_dense_or_moe_contract() -> None:
     assert DEFAULT_DENSE_HANDLER.is_moe is False
     assert QWEN3_5_DENSE_HANDLER.is_moe is False
+    assert QWEN3_DENSE_HANDLER.is_moe is False
     assert DefaultMoeHandler().is_moe is True
     assert QWEN3_MOE_HANDLER.is_moe is True
     assert QWEN3_5_MOE_HANDLER.is_moe is True

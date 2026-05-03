@@ -2,6 +2,7 @@ from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
+    QWEN3_DENSE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
 from art.megatron.model_support.spec import (
@@ -53,6 +54,28 @@ QWEN3_MOE_SPEC = ModelSupportSpec(
     native_vllm_lora_status=QWEN3_MOE_HANDLER.native_vllm_lora_status,
 )
 
+QWEN3_DENSE_SPEC = ModelSupportSpec(
+    key="qwen3_dense",
+    handler_key=QWEN3_DENSE_HANDLER.key,
+    model_names=(
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-0.6B-Base",
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-1.7B-Base",
+        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-4B-Base",
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-8B-Base",
+        "Qwen/Qwen3-14B",
+        "Qwen/Qwen3-14B-Base",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-32B-Base",
+    ),
+    default_target_modules=_DENSE_TARGET_MODULES,
+    native_vllm_lora_status=QWEN3_DENSE_HANDLER.native_vllm_lora_status,
+)
+
 QWEN3_5_DENSE_SPEC = ModelSupportSpec(
     key="qwen3_5_dense",
     handler_key=QWEN3_5_DENSE_HANDLER.key,
@@ -94,10 +117,12 @@ _SPECS_BY_MODEL = {
     **{model_name: QWEN3_5_MOE_SPEC for model_name in QWEN3_5_MOE_SPEC.model_names},
 }
 _UNSUPPORTED_ARCH_SPECS_BY_MODEL = {
+    **{model_name: QWEN3_DENSE_SPEC for model_name in QWEN3_DENSE_SPEC.model_names},
     **{model_name: QWEN3_5_DENSE_SPEC for model_name in QWEN3_5_DENSE_SPEC.model_names},
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {
     DEFAULT_DENSE_HANDLER.key: DEFAULT_DENSE_HANDLER,
+    QWEN3_DENSE_HANDLER.key: QWEN3_DENSE_HANDLER,
     QWEN3_MOE_HANDLER.key: QWEN3_MOE_HANDLER,
     QWEN3_5_DENSE_HANDLER.key: QWEN3_5_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER.key: QWEN3_5_MOE_HANDLER,
