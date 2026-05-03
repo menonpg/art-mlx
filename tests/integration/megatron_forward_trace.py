@@ -331,6 +331,7 @@ class ForwardTraceCapture:
                     "op": "concat",
                     "dim": -1,
                     "layout": "gate_up_rank_interleaved",
+                    "world_size_key": "etp_world_size",
                 }
             return {"op": "concat", "dim": 0}
         if ".mlp.experts.linear_fc2" in name and ".lora" not in name:
@@ -339,6 +340,14 @@ class ForwardTraceCapture:
             return {"op": "concat", "dim": 0}
 
         if ".mlp.linear_fc1" in name and ".lora" not in name:
+            tp_world_size = _safe_ps_stat("get_tensor_model_parallel_world_size", 1)
+            if tp_world_size > 1:
+                return {
+                    "op": "concat",
+                    "dim": -1,
+                    "layout": "gate_up_rank_interleaved",
+                    "world_size_key": "tp_world_size",
+                }
             return {"op": "concat", "dim": -1}
         if ".mlp.linear_fc2.row_parallel_lora" in name and ".lora" not in name:
             if self._sequence_parallel_enabled(module):
@@ -635,41 +644,44 @@ class ForwardTraceCapture:
         return primary_hint
 
     @classmethod
-    def _canonicalize_etp_fc1_feature_layout(
+    def _canonicalize_gate_up_rank_interleaved_feature_layout(
         cls,
         *,
         module_name: str,
         tensor: torch.Tensor,
         call: dict[str, Any],
     ) -> torch.Tensor:
-        """Normalizes expert-TP fc1 feature order to a topology-independent layout."""
-        if ".mlp.experts.linear_fc1" not in module_name or ".lora" in module_name:
-            return tensor
-        if tensor.ndim != 2:
-            return tensor
+        """Normalizes TP/ETP fused gate-up fc1 output feature order."""
+        del module_name
         primary_hint = cls._primary_output_merge_hint(call)
         if not isinstance(primary_hint, dict):
             return tensor
         if primary_hint.get("layout") != "gate_up_rank_interleaved":
             return tensor
+        world_size_key = primary_hint.get("world_size_key")
+        if not isinstance(world_size_key, str):
+            raise RuntimeError("gate_up_rank_interleaved hint requires world_size_key")
         rank_meta = call.get("rank_meta")
-        etp_world_size = None
+        rank_world_size = None
         if isinstance(rank_meta, list) and rank_meta:
             first_meta = rank_meta[0]
             if isinstance(first_meta, dict):
-                etp_world_size = first_meta.get("etp_world_size")
+                rank_world_size = first_meta.get(world_size_key)
         elif isinstance(rank_meta, dict):
-            etp_world_size = rank_meta.get("etp_world_size")
-        if not isinstance(etp_world_size, int) or etp_world_size <= 1:
+            rank_world_size = rank_meta.get(world_size_key)
+        if not isinstance(rank_world_size, int) or rank_world_size <= 1:
             return tensor
-        block_count = 2 * etp_world_size
-        if tensor.shape[1] % block_count != 0:
-            return tensor
-        blocks = torch.chunk(tensor, block_count, dim=1)
+        block_count = 2 * rank_world_size
+        if tensor.ndim < 1 or tensor.shape[-1] % block_count != 0:
+            raise RuntimeError(
+                "gate_up_rank_interleaved tensor feature size must divide by "
+                f"{block_count}, got shape={tuple(tensor.shape)}"
+            )
+        blocks = torch.chunk(tensor, block_count, dim=-1)
         reordered = [blocks[index] for index in range(0, block_count, 2)] + [
             blocks[index] for index in range(1, block_count, 2)
         ]
-        return torch.cat(reordered, dim=1).contiguous()
+        return torch.cat(reordered, dim=-1).contiguous()
 
     @classmethod
     def _canonicalize_moe_expert_row_order(
@@ -706,7 +718,7 @@ class ForwardTraceCapture:
         call: dict[str, Any],
     ) -> torch.Tensor:
         """Runs all remaining primary-output canonicalization passes for one call."""
-        tensor = cls._canonicalize_etp_fc1_feature_layout(
+        tensor = cls._canonicalize_gate_up_rank_interleaved_feature_layout(
             module_name=module_name,
             tensor=tensor,
             call=call,

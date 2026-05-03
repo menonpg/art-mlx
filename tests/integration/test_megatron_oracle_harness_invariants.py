@@ -1,5 +1,6 @@
 import torch
 
+from .megatron_forward_trace import ForwardTraceCapture
 from .megatron_oracle_harness import (
     DENSE_ORACLE_TOPOLOGY,
     ORACLE_TOPOLOGY,
@@ -89,3 +90,25 @@ def test_max_world_size_arg_filters_sensitivity_mutations() -> None:
     )
 
     assert mutations == []
+
+
+def test_gate_up_rank_interleaved_trace_layout_canonicalizes_dense_tp() -> None:
+    canonical = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8)
+    gate0, gate1, up0, up1 = canonical.chunk(4, dim=-1)
+    rank_concat = torch.cat((gate0, up0, gate1, up1), dim=-1)
+
+    actual = ForwardTraceCapture._canonicalize_primary_output_tensor(
+        module_name="chunk0.module.decoder.layers.0.mlp.linear_fc1",
+        tensor=rank_concat,
+        call={
+            "merge_hints": {
+                "primary_output": {
+                    "layout": "gate_up_rank_interleaved",
+                    "world_size_key": "tp_world_size",
+                }
+            },
+            "rank_meta": [{"tp_world_size": 2}, {"tp_world_size": 2}],
+        },
+    )
+
+    assert torch.equal(actual, canonical)
