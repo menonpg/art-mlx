@@ -5,12 +5,6 @@ from typing import Any
 
 import torch
 
-from art.utils.lora_checkpoint import (
-    normalize_runtime_lora_checkpoint,
-    resolve_adapter_base_model,
-    to_megatron_adapter_tensors,
-)
-
 safetensors = importlib.import_module("safetensors")
 safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
@@ -156,18 +150,14 @@ def _load_adapter_shards(
 def load_lora_adapter_state_dict(lora_path: str) -> dict[str, torch.Tensor]:
     base_dir = Path(lora_path)
     adapter_model_path = base_dir / "adapter_model.safetensors"
-    base_model = resolve_adapter_base_model(lora_path)
     if adapter_model_path.exists():
         with safe_open(adapter_model_path, framework="pt") as file:
-            return to_megatron_adapter_tensors(
-                {key: file.get_tensor(key) for key in file.keys()},
-                base_model=base_model,
-            )
+            return {key: file.get_tensor(key) for key in file.keys()}
 
     adapter_model, _shard_filenames, _manifest_filenames = _load_adapter_shards(
         base_dir
     )
-    return to_megatron_adapter_tensors(adapter_model, base_model=base_model)
+    return adapter_model
 
 
 def merge_lora_adapter(lora_path: str) -> None:
@@ -181,7 +171,6 @@ def merge_lora_adapter(lora_path: str) -> None:
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
     save_file(adapter_model, adapter_model_path)
-    normalize_runtime_lora_checkpoint(str(base_dir))
     for filename in shard_filenames:
         filename.unlink()
     for filename in manifest_filenames:
