@@ -364,9 +364,7 @@ def run_gdn_layer(
         )
     seq_len, batch_size, _ = hidden_states.shape
     requested_cp_size = (
-        execution_plan.cp_size
-        if execution_plan is not None
-        else int(getattr(gdn, "sp_size", 1))
+        execution_plan.cp_size if execution_plan is not None else _default_cp_size()
     )
     cp_rank = (
         execution_plan.cp_rank
@@ -374,13 +372,18 @@ def run_gdn_layer(
         else _default_cp_rank(requested_cp_size)
     )
     full_shape_required = requested_cp_size == 1
+    expected_group_seq_len = seq_len
+    if full_shape_required and _gdn_uses_sequence_parallel(gdn):
+        expected_group_seq_len *= int(getattr(gdn, "sp_size", 1))
     if full_shape_required and (
-        int(group_ids.shape[0]) != batch_size or int(group_ids.shape[1]) != seq_len
+        int(group_ids.shape[0]) != batch_size
+        or int(group_ids.shape[1]) != expected_group_seq_len
     ):
         raise ValueError(
-            "shared-prefix GDN currently requires local hidden_states to match "
-            f"group_ids shape exactly, got hidden={tuple(hidden_states.shape)} "
-            f"group_ids={tuple(group_ids.shape)}"
+            "shared-prefix GDN group_ids shape must match the logical sequence "
+            "processed by Megatron GDN after sequence-parallel input gather, got "
+            f"hidden={tuple(hidden_states.shape)} group_ids={tuple(group_ids.shape)} "
+            f"expected_group_shape={(batch_size, expected_group_seq_len)}"
         )
 
     if require_prebuilt_plan and execution_plan is None:
@@ -1908,6 +1911,12 @@ def _uses_sequence_parallel(projection: Any) -> bool:
     )
 
 
+def _gdn_uses_sequence_parallel(gdn: Any) -> bool:
+    projection = getattr(gdn, "in_proj", None)
+    base_projection = getattr(projection, "in_proj", projection)
+    return _uses_sequence_parallel(base_projection)
+
+
 def _tp_world_size(projection: Any) -> int:
     del projection
     from megatron.core import parallel_state as ps
@@ -2735,6 +2744,12 @@ def _default_cp_rank(cp_size: int) -> int:
     from megatron.core import parallel_state as ps
 
     return int(ps.get_context_parallel_rank())
+
+
+def _default_cp_size() -> int:
+    from megatron.core import parallel_state as ps
+
+    return max(1, int(ps.get_context_parallel_world_size()))
 
 
 def _default_cp_group(cp_size: int) -> Any:
