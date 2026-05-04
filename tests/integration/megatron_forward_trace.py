@@ -252,6 +252,7 @@ class ForwardTraceCapture:
         self.current_step_outputs: list[
             tuple[int | None, int, int | None, torch.Tensor]
         ] = []
+        self._trace_metadata_by_name: dict[str, dict[str, Any]] = {}
         self._next_micro_order = 0
         self._hook_handles: list[Any] = []
         if not enabled:
@@ -269,8 +270,17 @@ class ForwardTraceCapture:
             root_module.register_forward_hook(self._root_post_hook)
         )
         for chunk_index, chunk in enumerate(model_chunks):
-            for module_name, module in chunk.named_modules():
+            named_modules = list(chunk.named_modules())
+            module_by_name = dict(named_modules)
+            for module_name, module in named_modules:
                 trace_module_name = f"chunk{chunk_index}.{module_name}"
+                metadata = self._build_module_trace_metadata(
+                    module_name=module_name,
+                    module=module,
+                    module_by_name=module_by_name,
+                )
+                if metadata:
+                    self._trace_metadata_by_name[trace_module_name] = metadata
                 is_layer_output = (
                     ".decoder.layers." in module_name
                     and module_name.rsplit(".", 1)[-1].isdigit()
@@ -284,6 +294,45 @@ class ForwardTraceCapture:
                         self._make_hook(trace_module_name, module)
                     )
                 )
+
+    @classmethod
+    def _build_module_trace_metadata(
+        cls,
+        *,
+        module_name: str,
+        module: Any,
+        module_by_name: dict[str, Any],
+    ) -> dict[str, Any]:
+        if module_name.endswith(".self_attention.in_proj"):
+            return {
+                "component_sizes": cls._gdn_in_proj_component_sizes(module),
+            }
+        if module_name.endswith(".self_attention.in_proj.in_proj"):
+            parent_module = module_by_name[module_name.rsplit(".", 1)[0]]
+            return {
+                "component_sizes": cls._gdn_in_proj_component_sizes(parent_module),
+            }
+        if module_name.endswith(".self_attention.out_norm"):
+            gdn_module = module_by_name[module_name.removesuffix(".out_norm")]
+            return {
+                "local_heads": int(gdn_module.num_value_heads // gdn_module.tp_size),
+            }
+        return {}
+
+    @staticmethod
+    def _gdn_in_proj_component_sizes(module: Any) -> tuple[int, ...]:
+        qkv_sizes = tuple(
+            int(size)
+            for size in getattr(module.qkv_lora.B_T, "lora_tp_component_sizes")
+        )
+        z_world_size = _shard_world_size_for_domain(module.z_lora.B_T.lora_shard_domain)
+        tp_world_size = _safe_ps_stat("get_tensor_model_parallel_world_size", 1)
+        return (
+            *qkv_sizes,
+            int(module.z_lora.B_T.shape[-1]) * z_world_size,
+            int(module.num_value_heads_per_partition) * tp_world_size,
+            int(module.num_value_heads_per_partition) * tp_world_size,
+        )
 
     @staticmethod
     def _sequence_parallel_enabled(module: Any) -> bool:
@@ -349,7 +398,8 @@ class ForwardTraceCapture:
         if lora_hint is not None:
             return lora_hint
 
-        component_sizes = getattr(module, "_art_forward_trace_component_sizes", None)
+        trace_metadata = self._trace_metadata_by_name.get(name, {})
+        component_sizes = trace_metadata.get("component_sizes")
         if isinstance(component_sizes, tuple) and component_sizes:
             return {
                 "op": "concat",
@@ -359,7 +409,7 @@ class ForwardTraceCapture:
                 "world_size_key": "tp_world_size",
             }
 
-        local_heads = getattr(module, "_art_forward_trace_local_heads", None)
+        local_heads = trace_metadata.get("local_heads")
         if isinstance(local_heads, int) and local_heads > 0:
             return {
                 "op": "concat",
