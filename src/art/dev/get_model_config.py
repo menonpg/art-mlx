@@ -76,6 +76,8 @@ def get_model_config(
         tinker_args=config.get("tinker_args"),
         trainer_args=trainer_args,
     )
+    if "allow_unvalidated_arch" in config:
+        result["allow_unvalidated_arch"] = config["allow_unvalidated_arch"]
     if "trainer_gpu_ids" in config:
         result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
     if "inference_gpu_ids" in config:

@@ -45,6 +45,8 @@ def save_adapter_config(lora_path: str | Path, adapter_config: dict[str, Any]) -
 def resolve_lora_handler(
     lora_path: str | Path,
     handler: Any | None = None,
+    *,
+    allow_unvalidated_arch: bool = False,
 ) -> Any:
     if handler is not None:
         return handler
@@ -53,7 +55,10 @@ def resolve_lora_handler(
         raise RuntimeError(f"Missing base_model_name_or_path in {lora_path}")
     from art.megatron.model_support import get_model_support_handler
 
-    return get_model_support_handler(base_model)
+    return get_model_support_handler(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
 
 
 def load_vllm_lora_tensors(
@@ -80,11 +85,16 @@ def normalize_lora_checkpoint_to_vllm(
     *,
     handler: Any | None = None,
     adapter_config: dict[str, Any] | None = None,
+    allow_unvalidated_arch: bool = False,
 ) -> None:
     adapter_model_path = Path(lora_path) / "adapter_model.safetensors"
     if not adapter_model_path.exists():
         return
-    resolved_handler = resolve_lora_handler(lora_path, handler)
+    resolved_handler = resolve_lora_handler(
+        lora_path,
+        handler,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     if adapter_config is None:
         adapter_config = load_adapter_config(lora_path)
     tensors = load_vllm_lora_tensors(lora_path)
@@ -99,8 +109,13 @@ def load_lora_tensors_for_megatron(
     lora_path: str | Path,
     *,
     handler: Any | None = None,
+    allow_unvalidated_arch: bool = False,
 ) -> dict[str, torch.Tensor]:
-    resolved_handler = resolve_lora_handler(lora_path, handler)
+    resolved_handler = resolve_lora_handler(
+        lora_path,
+        handler,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     return resolved_handler.from_vllm_lora_tensors(
         load_vllm_lora_tensors(lora_path),
         adapter_config=load_adapter_config(lora_path),

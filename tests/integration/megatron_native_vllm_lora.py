@@ -118,6 +118,7 @@ async def _run_native_vllm_lora(
         trainer_gpu_ids=trainer_gpu_ids,
         inference_gpu_ids=inference_gpu_ids,
         rollout_weights_mode="lora",
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
     )
     dev.validate_dedicated_config(internal_config)
     with provider_topology_env(ORACLE_TOPOLOGY):

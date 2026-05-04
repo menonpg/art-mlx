@@ -26,6 +26,7 @@ class MergedWeightTransferSpec(BaseModel):
 
 class _MegatronTrainingJobBase(BaseModel):
     lora_path: str
+    allow_unvalidated_arch: bool = False
     optimizer_state_path: str
     disk_packed_tensors: DiskPackedTensors
     config: types.TrainConfig
@@ -47,6 +48,7 @@ class MegatronMergedTrainingJob(_MegatronTrainingJobBase):
 class MegatronSyncJob(BaseModel):
     kind: Literal["sync"] = "sync"
     lora_path: str
+    allow_unvalidated_arch: bool = False
     merged_weight_transfer: MergedWeightTransferSpec
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
@@ -54,6 +56,7 @@ class MegatronSyncJob(BaseModel):
 class MegatronSFTTrainingJob(BaseModel):
     kind: Literal["sft"] = "sft"
     lora_path: str
+    allow_unvalidated_arch: bool = False
     optimizer_state_path: str
     sft_data_dir: str
     num_batches: int

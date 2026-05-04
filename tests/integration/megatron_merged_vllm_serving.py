@@ -77,6 +77,7 @@ async def _run_merged_vllm_serving(
         trainer_gpu_ids=trainer_gpu_ids,
         inference_gpu_ids=inference_gpu_ids,
         rollout_weights_mode="merged",
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
     )
     dev.validate_dedicated_config(internal_config)
     with provider_topology_env(ORACLE_TOPOLOGY):

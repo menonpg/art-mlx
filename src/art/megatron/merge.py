@@ -153,11 +153,16 @@ def load_lora_adapter_state_dict(
     lora_path: str,
     *,
     handler: Any | None = None,
+    allow_unvalidated_arch: bool = False,
 ) -> dict[str, torch.Tensor]:
     base_dir = Path(lora_path)
     adapter_model_path = base_dir / "adapter_model.safetensors"
     if adapter_model_path.exists():
-        return load_lora_tensors_for_megatron(lora_path, handler=handler)
+        return load_lora_tensors_for_megatron(
+            lora_path,
+            handler=handler,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
 
     adapter_model, _shard_filenames, _manifest_filenames = _load_adapter_shards(
         base_dir
@@ -165,13 +170,20 @@ def load_lora_adapter_state_dict(
     return adapter_model
 
 
-def merge_lora_adapter(lora_path: str) -> None:
+def merge_lora_adapter(
+    lora_path: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> None:
     base_dir = Path(lora_path)
     adapter_model, shard_filenames, manifest_filenames = _load_adapter_shards(base_dir)
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
     save_file(adapter_model, adapter_model_path)
-    normalize_lora_checkpoint_to_vllm(base_dir)
+    normalize_lora_checkpoint_to_vllm(
+        base_dir,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     for filename in shard_filenames:
         filename.unlink()
     for filename in manifest_filenames:

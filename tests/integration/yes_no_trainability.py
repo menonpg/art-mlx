@@ -426,6 +426,7 @@ def _build_internal_config(
         ),
         engine_args=engine_args,
         init_args=_variant_init_args(variant),
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     if not shared:
         internal_config["trainer_gpu_ids"] = variant.trainer_gpu_ids

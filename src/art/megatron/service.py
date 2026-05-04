@@ -57,6 +57,7 @@ def create_identity_lora(
     rank: int = LORA_RANK,
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
+    allow_unvalidated_arch: bool = False,
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
@@ -81,7 +82,10 @@ def create_identity_lora(
     if random_state is not None:
         torch.manual_seed(random_state)
     target_modules = default_target_modules(base_model)
-    handler = get_model_support_handler(base_model)
+    handler = get_model_support_handler(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     model_config = handler.identity_lora_model_config(base_config)
     with init_empty_weights():
@@ -184,6 +188,10 @@ class MegatronService:
             if random_state is not None:
                 return int(random_state)
         return None
+
+    @property
+    def _allow_unvalidated_arch(self) -> bool:
+        return bool(self.config.get("allow_unvalidated_arch", False))
 
     def _megatron_runtime_paths(self) -> tuple[str, str, str]:
         runtime_dir = Path(self.output_dir) / "megatron_runtime"
@@ -297,6 +305,7 @@ class MegatronService:
             self.base_model,
             lora_path,
             random_state=self._megatron_random_state(),
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
 
     def _ensure_identity_lora(self, lora_path: str) -> None:
@@ -483,6 +492,7 @@ class MegatronService:
         job_path, log_path = self._create_megatron_job_paths()
         job = MegatronSyncJob(
             lora_path=lora_path,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
             merged_weight_transfer=self._build_merged_weight_transfer_spec(step),
             log_path=log_path,
         )
@@ -561,6 +571,8 @@ class MegatronService:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         env["MODEL_IDENTIFIER"] = self.base_model
+        if self._allow_unvalidated_arch:
+            env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
         master_addr = env.get("MASTER_ADDR", "127.0.0.1")
@@ -710,6 +722,7 @@ class MegatronService:
                     job: MegatronTrainingJob | MegatronMergedTrainingJob = (
                         MegatronMergedTrainingJob(
                             lora_path=lora_path,
+                            allow_unvalidated_arch=self._allow_unvalidated_arch,
                             optimizer_state_path=self._get_optimizer_state_path("rl"),
                             disk_packed_tensors=disk_packed_tensors,
                             config=config,
@@ -730,6 +743,7 @@ class MegatronService:
                 else:
                     job = MegatronTrainingJob(
                         lora_path=lora_path,
+                        allow_unvalidated_arch=self._allow_unvalidated_arch,
                         optimizer_state_path=self._get_optimizer_state_path("rl"),
                         disk_packed_tensors=disk_packed_tensors,
                         config=config,
@@ -769,6 +783,7 @@ class MegatronService:
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
                 lora_path=lora_path,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),
                 disk_packed_tensors=disk_packed_tensors,
                 config=config,
@@ -813,6 +828,7 @@ class MegatronService:
             )
             job = MegatronSFTTrainingJob(
                 lora_path=lora_path,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("sft"),
                 sft_data_dir=serialized_batches.sft_data_dir,
                 num_batches=serialized_batches.num_batches,

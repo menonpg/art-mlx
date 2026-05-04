@@ -291,6 +291,7 @@ def run_hf_parity(
     coverage = assess_minimal_layer_coverage(
         base_model=case_config.base_model,
         num_layers=case_config.num_layers,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
     )
     if not coverage.covered:
         raise AssertionError(

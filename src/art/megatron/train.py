@@ -700,7 +700,10 @@ def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
 def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
     if isinstance(job, MegatronSyncJob):
         adapter_model = _load_adapter_into_model(
-            runtime.model, job.lora_path, runtime.rank
+            runtime.model,
+            job.lora_path,
+            runtime.rank,
+            handler=runtime.model_support_handler,
         )
         del adapter_model
         _sync_merged_weights_to_vllm(
@@ -1432,6 +1435,10 @@ def main() -> None:
     runtime = build_training_runtime(
         model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         build_optimizer=False,
+        allow_unvalidated_arch=os.environ.get(
+            "ART_MEGATRON_ALLOW_UNVALIDATED_ARCH", ""
+        ).lower()
+        in {"1", "true", "yes", "on"},
     )
     _run_service_loop(runtime)
 

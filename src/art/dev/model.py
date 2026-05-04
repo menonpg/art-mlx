@@ -127,6 +127,8 @@ class InternalModelConfig(TypedDict, total=False):
             - "lora": load LoRA adapters into vLLM directly
             - "merged": keep training LoRA adapters, but push merged weights
               into vLLM for inference
+        allow_unvalidated_arch: Permit model-support validation workflows to run
+            architectures that are not yet in the supported-model registry.
     """
 
     init_args: "InitArgs"
@@ -138,6 +140,7 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     rollout_weights_mode: "RolloutWeightsMode"
+    allow_unvalidated_arch: bool
 
 
 class TinkerArgs(TypedDict, total=False):

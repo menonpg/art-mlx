@@ -59,7 +59,10 @@ async def stream_megatron_job(
                     continue
                 if line == "all done":
                     if not isinstance(job, MegatronSyncJob):
-                        merge_lora_adapter(job.lora_path)
+                        merge_lora_adapter(
+                            job.lora_path,
+                            allow_unvalidated_arch=job.allow_unvalidated_arch,
+                        )
                     return
                 num_lines += 1
                 yield json.loads(line)

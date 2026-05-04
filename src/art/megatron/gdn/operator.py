@@ -1783,12 +1783,10 @@ def _out_proj_cp_full_shape(
 
 def _apply_gated_rms_norm(gdn: Any, x: Tensor, gate: Tensor) -> Tensor:
     x_dtype = x.dtype
-    hidden = _apply_explicit_norm(
+    hidden = _apply_explicit_rms_norm(
         gdn.out_norm,
         x.reshape(-1, int(x.shape[-1])),
-        config=getattr(gdn, "config", None),
-        weight_name="weight",
-        bias_name="bias",
+        config=gdn.config,
     )
     gate = gate.reshape(-1, int(gate.shape[-1]))
     return (hidden * gdn.act_fn(gate.float())).to(x_dtype)
@@ -1819,6 +1817,27 @@ def _explicit_out_proj(gdn: Any, hidden_states: Tensor) -> tuple[Tensor, Tensor 
     return out, bias if _returns_bias(base_projection) else None
 
 
+def _apply_explicit_rms_norm(
+    module: Any,
+    x: Tensor,
+    *,
+    config: Any,
+) -> Tensor:
+    if config.normalization != "RMSNorm":
+        raise ValueError(
+            f"GDN explicit norm requires RMSNorm, got {config.normalization}"
+        )
+    x_dtype = x.dtype
+    x_float = x.float()
+    normed = x_float * torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + float(module.eps)
+    )
+    scale = module.weight.float()
+    if config.layernorm_zero_centered_gamma:
+        scale = scale + 1.0
+    return (normed * scale).to(dtype=x_dtype)
+
+
 def _apply_explicit_norm(
     module: Any,
     x: Tensor,
@@ -1827,28 +1846,28 @@ def _apply_explicit_norm(
     weight_name: str,
     bias_name: str,
 ) -> Tensor:
-    weight = getattr(module, weight_name)
+    del config
     x_dtype = x.dtype
     x_float = x.float()
-    eps = float(module.eps)
-    normalization = module.normalization
-    normalization = str(normalization)
+    normalization = str(module.normalization)
     if normalization == "RMSNorm":
         normed = x_float * torch.rsqrt(
-            x_float.square().mean(dim=-1, keepdim=True) + eps
+            x_float.square().mean(dim=-1, keepdim=True) + float(module.eps)
         )
+        bias = None
     elif normalization == "LayerNorm":
         centered = x_float - x_float.mean(dim=-1, keepdim=True)
         normed = centered * torch.rsqrt(
-            centered.square().mean(dim=-1, keepdim=True) + eps
+            centered.square().mean(dim=-1, keepdim=True) + float(module.eps)
         )
+        bias = getattr(module, bias_name)
     else:
         raise ValueError(f"unsupported GDN normalization '{normalization}'")
-    scale = weight.float()
-    if bool(getattr(module, "zero_centered_gamma", False)):
+
+    scale = getattr(module, weight_name).float()
+    if bool(module.zero_centered_gamma):
         scale = scale + 1.0
     normed = normed * scale
-    bias = getattr(module, bias_name, None)
     if isinstance(bias, Tensor):
         normed = normed + bias.float()
     return normed.to(dtype=x_dtype)
