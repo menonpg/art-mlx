@@ -1564,34 +1564,7 @@ def _project_gdn_inputs(
 
 
 def _in_proj(gdn: Any, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
-    projection = gdn.in_proj
-    base_projection = getattr(projection, "in_proj", projection)
-    if not isinstance(getattr(base_projection, "weight", None), Tensor):
-        return projection(hidden_states)
-    x = _apply_explicit_norm(
-        base_projection,
-        hidden_states,
-        config=getattr(gdn, "config", None),
-        weight_name="layer_norm_weight",
-        bias_name="layer_norm_bias",
-    )
-    x = _column_parallel_input(x, base_projection)
-    linear_output = F.linear(
-        x,
-        base_projection.weight,
-        None if _returns_bias(base_projection) else _linear_bias(base_projection),
-    )
-    if hasattr(projection, "qkv_lora") and hasattr(projection, "z_lora"):
-        qkv = projection.qkv_lora(x)
-        z = projection.z_lora(x)
-        beta = qkv.new_zeros(
-            qkv.shape[0], qkv.shape[1], projection.num_value_heads_per_partition
-        )
-        adapter_output = torch.cat([qkv, z, beta, beta.clone()], dim=-1)
-        linear_output = linear_output + adapter_output
-    return linear_output, (
-        _linear_bias(base_projection) if _returns_bias(base_projection) else None
-    )
+    return gdn.in_proj(hidden_states)
 
 
 def _gather_bucket_streams(
@@ -1783,59 +1756,13 @@ def _out_proj_cp_full_shape(
 
 def _apply_gated_rms_norm(gdn: Any, x: Tensor, gate: Tensor) -> Tensor:
     x_dtype = x.dtype
-    hidden = _apply_explicit_rms_norm(
-        gdn.out_norm,
-        x.reshape(-1, int(x.shape[-1])),
-        config=gdn.config,
-    )
+    hidden = gdn.out_norm(x.reshape(-1, int(x.shape[-1])))
     gate = gate.reshape(-1, int(gate.shape[-1]))
     return (hidden * gdn.act_fn(gate.float())).to(x_dtype)
 
 
-def _out_proj(
-    gdn: Any, hidden_states: Tensor, *, force_explicit: bool = False
-) -> tuple[Tensor, Tensor | None]:
-    projection = gdn.out_proj
-    if int(hidden_states.numel()) != 0 and not force_explicit:
-        return projection(hidden_states)
-    return _explicit_out_proj(gdn, hidden_states)
-
-
-def _explicit_out_proj(gdn: Any, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
-    projection = gdn.out_proj
-    base_projection = getattr(projection, "linear_proj", projection)
-    bias = _linear_bias(base_projection)
-    out = F.linear(hidden_states, base_projection.weight, None)
-    out = _row_parallel_output(out, base_projection)
-    if bias is not None and not _returns_bias(base_projection):
-        out = out + bias
-    if hasattr(projection, "lora"):
-        lora_output = projection.lora(hidden_states)
-        if bool(getattr(projection, "reduce_output", True)):
-            lora_output = _row_parallel_output(lora_output, base_projection)
-        out = out + lora_output
-    return out, bias if _returns_bias(base_projection) else None
-
-
-def _apply_explicit_rms_norm(
-    module: Any,
-    x: Tensor,
-    *,
-    config: Any,
-) -> Tensor:
-    if config.normalization != "RMSNorm":
-        raise ValueError(
-            f"GDN explicit norm requires RMSNorm, got {config.normalization}"
-        )
-    x_dtype = x.dtype
-    x_float = x.float()
-    normed = x_float * torch.rsqrt(
-        x_float.square().mean(dim=-1, keepdim=True) + float(module.eps)
-    )
-    scale = module.weight.float()
-    if config.layernorm_zero_centered_gamma:
-        scale = scale + 1.0
-    return (normed * scale).to(dtype=x_dtype)
+def _out_proj(gdn: Any, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
+    return gdn.out_proj(hidden_states)
 
 
 def _apply_explicit_norm(
@@ -1873,34 +1800,6 @@ def _apply_explicit_norm(
     return normed.to(dtype=x_dtype)
 
 
-def _column_parallel_input(x: Tensor, projection: Any) -> Tensor:
-    if not _uses_sequence_parallel(projection):
-        return x
-    from megatron.core.tensor_parallel.mappings import (
-        gather_from_sequence_parallel_region,
-    )
-
-    return gather_from_sequence_parallel_region(x, group=_tp_group(projection))
-
-
-def _row_parallel_output(x: Tensor, projection: Any) -> Tensor:
-    if _tp_world_size(projection) <= 1:
-        return x
-    if _uses_sequence_parallel(projection):
-        from megatron.core.tensor_parallel.mappings import (
-            reduce_scatter_to_sequence_parallel_region,
-        )
-
-        return reduce_scatter_to_sequence_parallel_region(
-            x, group=_tp_group(projection)
-        )
-    from megatron.core.tensor_parallel.mappings import (
-        reduce_from_tensor_model_parallel_region,
-    )
-
-    return reduce_from_tensor_model_parallel_region(x, group=_tp_group(projection))
-
-
 def _uses_sequence_parallel(projection: Any) -> bool:
     return bool(getattr(projection, "sequence_parallel", False)) and (
         _tp_world_size(projection) > 1
@@ -1925,24 +1824,6 @@ def _tp_rank(projection: Any) -> int:
     from megatron.core import parallel_state as ps
 
     return int(ps.get_tensor_model_parallel_rank())
-
-
-def _tp_group(projection: Any) -> Any | None:
-    del projection
-    from megatron.core import parallel_state as ps
-
-    return ps.get_tensor_model_parallel_group()
-
-
-def _linear_bias(projection: Any) -> Tensor | None:
-    bias = getattr(projection, "bias", None)
-    if not isinstance(bias, Tensor) or int(bias.numel()) == 0:
-        return None
-    return bias
-
-
-def _returns_bias(projection: Any) -> bool:
-    return bool(getattr(projection, "te_return_bias", False))
 
 
 def _local_key_heads(gdn: Any) -> int:
