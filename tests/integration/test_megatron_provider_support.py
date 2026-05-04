@@ -82,7 +82,7 @@ def test_get_provider_accepts_registry_supported_models(
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
 
-    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
 
     assert resolved is provider
     assert provider.finalized is True
@@ -294,7 +294,7 @@ def test_get_provider_bundle_disables_recompute_from_env(
     monkeypatch.setenv("ART_MEGATRON_RECOMPUTE_NUM_LAYERS", "disabled")
     monkeypatch.setenv("ART_MEGATRON_RECOMPUTE_MODULES", "disabled")
 
-    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
+    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     assert resolved.recompute_granularity is None
     assert resolved.recompute_method is None
