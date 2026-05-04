@@ -404,12 +404,13 @@ def run_gdn_layer(
         and requested_cp_size == 1
         and (
             execution_spec.batch_size != batch_size
-            or execution_spec.sequence_length != seq_len
+            or execution_spec.sequence_length != expected_group_seq_len
         )
     ):
         raise ValueError(
             "GDN execution spec shape must match hidden_states, got "
             f"spec={(execution_spec.batch_size, execution_spec.sequence_length)} "
+            f"expected={(batch_size, expected_group_seq_len)} "
             f"hidden={(batch_size, seq_len)}"
         )
     if execution_plan is None:
