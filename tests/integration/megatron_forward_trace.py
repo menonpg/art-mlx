@@ -7,6 +7,14 @@ from typing import Any, Callable, cast
 import torch
 
 CAPTURE_NAME_TOKENS = (
+    ".self_attention",
+    ".self_attention.in_proj",
+    ".self_attention.in_proj.in_proj",
+    ".self_attention.in_proj.qkv_lora",
+    ".self_attention.in_proj.z_lora",
+    ".self_attention.out_norm",
+    ".self_attention.out_proj",
+    ".self_attention.out_proj.lora",
     ".self_attention.linear_qkv",
     ".self_attention.linear_qkv.q_proj_lora",
     ".self_attention.linear_qkv.k_proj_lora",
@@ -367,6 +375,14 @@ class ForwardTraceCapture:
 
         if ".self_attention.linear_qkv" in name:
             return {"op": "concat", "dim": -1}
+        if name.endswith(".self_attention.in_proj"):
+            return {"op": "concat", "dim": -1}
+        if name.endswith(
+            ".self_attention.out_proj"
+        ) and self._sequence_parallel_enabled(module):
+            return {"op": "concat", "dim": 0}
+        if name.endswith(".self_attention") and self._sequence_parallel_enabled(module):
+            return {"op": "concat", "dim": 0}
 
         if ".mlp.experts." in name:
             return {"op": "concat", "dim": 0}
