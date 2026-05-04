@@ -82,7 +82,7 @@ def test_get_provider_accepts_registry_supported_models(
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
 
-    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
+    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     assert resolved is provider
     assert provider.finalized is True
@@ -140,7 +140,7 @@ def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
         ),
     )
 
-    resolved = provider_module.get_provider("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
 
     assert resolved.moe_shared_expert_overlap is False
     assert resolved.scatter_embedding_sequence_parallel is True
