@@ -119,8 +119,12 @@ def test_build_validation_report_populates_architecture_stage(
                 passed=True,
                 metrics={
                     "rollout_weights_mode": "lora",
-                    "latest_step": 2,
-                    "final_eval_reward": 0.97,
+                    "step0_name": "validation@0",
+                    "step1_name": "validation@1",
+                    "model_ids_before": ["validation@0"],
+                    "model_ids_after": ["validation@0", "validation@1"],
+                    "step0_served": True,
+                    "step1_served": True,
                 },
                 artifact_dir="/tmp/native-vllm-lora",
             ),
@@ -220,8 +224,12 @@ def test_build_validation_report_populates_architecture_stage(
     assert native_vllm_lora_stage.passed is True
     assert native_vllm_lora_stage.metrics == {
         "rollout_weights_mode": "lora",
-        "latest_step": 2,
-        "final_eval_reward": 0.97,
+        "step0_name": "validation@0",
+        "step1_name": "validation@1",
+        "model_ids_before": ["validation@0"],
+        "model_ids_after": ["validation@0", "validation@1"],
+        "step0_served": True,
+        "step1_served": True,
     }
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
 
@@ -454,9 +462,7 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_yes_no_trainability=lambda *,
-            base_model,
-            allow_unvalidated_arch=False: (
+            run_yes_no_trainability=lambda *, base_model, allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     latest_step=2,
                     initial_eval_reward=0.4,
@@ -492,23 +498,31 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 def test_run_native_vllm_lora_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._import_integration_module",
-        lambda name: SimpleNamespace(
-            run_native_vllm_lora=lambda *, base_model: SimpleNamespace(
-                rollout_weights_mode="lora",
-                latest_step=2,
-                initial_eval_reward=0.4,
-                final_eval_reward=0.95,
-                reward_threshold=0.95,
-                saturated_step=2,
-                output_dir="/tmp/native-vllm-lora",
-                model_dump=lambda mode="json": {
-                    "rollout_weights_mode": "lora",
-                    "latest_step": 2,
-                    "initial_eval_reward": 0.4,
-                    "final_eval_reward": 0.95,
-                    "reward_threshold": 0.95,
-                    "saturated_step": 2,
-                },
+        lambda name: (
+            SimpleNamespace(
+                OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+            )
+            if name == "integration.megatron_oracle_harness"
+            else SimpleNamespace(
+                run_native_vllm_lora=lambda case_config: SimpleNamespace(
+                    rollout_weights_mode="lora",
+                    step0_name="validation@0",
+                    step1_name="validation@1",
+                    model_ids_before=["validation@0"],
+                    model_ids_after=["validation@0", "validation@1"],
+                    step0_served=True,
+                    step1_served=True,
+                    output_dir="/tmp/native-vllm-lora",
+                    model_dump=lambda mode="json": {
+                        "rollout_weights_mode": "lora",
+                        "step0_name": "validation@0",
+                        "step1_name": "validation@1",
+                        "model_ids_before": ["validation@0"],
+                        "model_ids_after": ["validation@0", "validation@1"],
+                        "step0_served": True,
+                        "step1_served": True,
+                    },
+                )
             )
         ),
     )
@@ -531,10 +545,7 @@ def test_run_packed_position_ids_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_packed_position_ids=lambda *,
-            base_model,
-            num_layers,
-            allow_unvalidated_arch=False: (
+            run_packed_position_ids=lambda *, base_model, num_layers, allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     output_dir="/tmp/packed-position-ids",
                     model_dump=lambda mode="json": {

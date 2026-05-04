@@ -524,20 +524,31 @@ def run_native_vllm_lora_stage(
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
-    del architecture
-    del allow_unvalidated_arch
     native_vllm_lora = _import_integration_module(
         "integration.megatron_native_vllm_lora"
     )
-    report = native_vllm_lora.run_native_vllm_lora(base_model=base_model)
+    oracle_harness = _import_integration_module("integration.megatron_oracle_harness")
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    handler = get_model_support_handler_for_spec(spec)
+    case_config = oracle_harness.OracleCaseConfig(
+        base_model=base_model,
+        is_moe=handler.is_moe,
+        precision="fp32",
+        num_layers=max(1, architecture.recommended_min_layers),
+        num_steps=1,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    report = native_vllm_lora.run_native_vllm_lora(case_config)
     passed = (
         report.rollout_weights_mode == "lora"
-        and report.saturated_step is not None
-        and report.saturated_step > 0
-        and report.initial_eval_reward < report.reward_threshold
-        and report.final_eval_reward is not None
-        and report.final_eval_reward >= report.reward_threshold
-        and report.final_eval_reward > report.initial_eval_reward
+        and report.step0_served
+        and report.step1_served
+        and report.step0_name in report.model_ids_before
+        and report.step0_name in report.model_ids_after
+        and report.step1_name in report.model_ids_after
     )
     return ValidationStageResult(
         name=NATIVE_VLLM_LORA_STAGE,
