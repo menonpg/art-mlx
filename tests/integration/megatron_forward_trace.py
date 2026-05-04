@@ -141,6 +141,14 @@ def _shard_world_size_for_domain(domain: Any) -> int:
     return 1
 
 
+def _world_size_key_for_domain(domain: Any) -> str | None:
+    if domain == "tp":
+        return "tp_world_size"
+    if domain == "expert_tp":
+        return "etp_world_size"
+    return None
+
+
 def _extract_primary_tensor(value: Any) -> torch.Tensor | None:
     if isinstance(value, torch.Tensor):
         return value
@@ -306,7 +314,21 @@ class ForwardTraceCapture:
         if bool(getattr(b_param, "lora_tp_sharded", False)) and b_world_size > 1:
             shard_dim = getattr(b_param, "lora_tp_shard_dim", None)
             if isinstance(shard_dim, int):
-                return {"op": "concat", "dim": shard_dim}
+                hint: dict[str, Any] = {"op": "concat", "dim": shard_dim}
+                component_sizes = tuple(
+                    int(size)
+                    for size in getattr(b_param, "lora_tp_component_sizes", ())
+                )
+                world_size_key = _world_size_key_for_domain(b_domain)
+                if component_sizes and world_size_key is not None:
+                    hint.update(
+                        {
+                            "layout": "componentwise",
+                            "component_sizes": component_sizes,
+                            "world_size_key": world_size_key,
+                        }
+                    )
+                return hint
         a_param = getattr(lora_module, "A_T", None)
         if a_param is None:
             return None
@@ -700,6 +722,71 @@ class ForwardTraceCapture:
         return torch.cat(reordered, dim=-1).contiguous()
 
     @classmethod
+    def _canonicalize_componentwise_feature_layout(
+        cls,
+        *,
+        module_name: str,
+        tensor: torch.Tensor,
+        call: dict[str, Any],
+    ) -> torch.Tensor:
+        """Normalizes fused componentwise TP output order, e.g. GDN q/k/v."""
+        del module_name
+        primary_hint = cls._primary_output_merge_hint(call)
+        if not isinstance(primary_hint, dict):
+            return tensor
+        if primary_hint.get("layout") != "componentwise":
+            return tensor
+        dim = primary_hint.get("dim")
+        component_sizes = primary_hint.get("component_sizes")
+        world_size_key = primary_hint.get("world_size_key")
+        if not isinstance(dim, int) or not isinstance(world_size_key, str):
+            raise RuntimeError("componentwise hint requires dim and world_size_key")
+        if not isinstance(component_sizes, tuple) or not all(
+            isinstance(size, int) and size > 0 for size in component_sizes
+        ):
+            raise RuntimeError("componentwise hint requires positive component sizes")
+        rank_meta = call.get("rank_meta")
+        rank_world_size = None
+        if isinstance(rank_meta, list) and rank_meta:
+            first_meta = rank_meta[0]
+            if isinstance(first_meta, dict):
+                rank_world_size = first_meta.get(world_size_key)
+        elif isinstance(rank_meta, dict):
+            rank_world_size = rank_meta.get(world_size_key)
+        if not isinstance(rank_world_size, int) or rank_world_size <= 1:
+            return tensor
+        axis = dim if dim >= 0 else tensor.ndim + dim
+        if axis < 0 or axis >= tensor.ndim:
+            raise RuntimeError(
+                f"Invalid componentwise axis {dim} for {tensor.ndim}D tensor"
+            )
+        if sum(component_sizes) != tensor.shape[axis]:
+            raise RuntimeError(
+                "componentwise component sizes must match tensor extent, got "
+                f"sizes={component_sizes} shape={tuple(tensor.shape)} axis={axis}"
+            )
+        if any(size % rank_world_size != 0 for size in component_sizes):
+            raise RuntimeError(
+                "componentwise component sizes must divide rank world size, got "
+                f"sizes={component_sizes} world_size={rank_world_size}"
+            )
+        local_sizes = [size // rank_world_size for size in component_sizes]
+        rank_chunks: list[list[torch.Tensor]] = []
+        cursor = 0
+        for _rank in range(rank_world_size):
+            rank_components = []
+            for local_size in local_sizes:
+                rank_components.append(tensor.narrow(axis, cursor, local_size))
+                cursor += local_size
+            rank_chunks.append(rank_components)
+        ordered = [
+            rank_chunks[rank][component_index]
+            for component_index in range(len(component_sizes))
+            for rank in range(rank_world_size)
+        ]
+        return torch.cat(ordered, dim=axis).contiguous()
+
+    @classmethod
     def _canonicalize_moe_expert_row_order(
         cls,
         *,
@@ -735,6 +822,11 @@ class ForwardTraceCapture:
     ) -> torch.Tensor:
         """Runs all remaining primary-output canonicalization passes for one call."""
         tensor = cls._canonicalize_gate_up_rank_interleaved_feature_layout(
+            module_name=module_name,
+            tensor=tensor,
+            call=call,
+        )
+        tensor = cls._canonicalize_componentwise_feature_layout(
             module_name=module_name,
             tensor=tensor,
             call=call,
