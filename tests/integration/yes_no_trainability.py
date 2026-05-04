@@ -487,8 +487,8 @@ async def _evaluate_groups(
     step: int,
 ) -> list[art.TrajectoryGroup]:
     client = model.openai_client()
-    groups: list[art.TrajectoryGroup] = []
-    for prompt in prompts:
+
+    async def _group_for_prompt(prompt: str) -> art.TrajectoryGroup:
         messages = _render_chat_messages(base_model, prompt)
         completion = await client.chat.completions.create(
             messages=messages,
@@ -502,17 +502,18 @@ async def _evaluate_groups(
             timeout=_request_timeout("ART_MODEL_SUPPORT_YES_NO_EVAL_TIMEOUT", 180.0),
         )
         choice = completion.choices[0]
-        groups.append(
-            art.TrajectoryGroup(
-                [
-                    art.Trajectory(
-                        messages_and_choices=[*messages, choice],
-                        reward=reward_for_answer(choice.message.content or ""),
-                    )
-                ]
-            )
+        return art.TrajectoryGroup(
+            [
+                art.Trajectory(
+                    messages_and_choices=[*messages, choice],
+                    reward=reward_for_answer(choice.message.content or ""),
+                )
+            ]
         )
-    return groups
+
+    return await art.gather_trajectory_groups(
+        [_group_for_prompt(prompt) for prompt in prompts]  # ty: ignore[invalid-argument-type]
+    )
 
 
 def _mean_group_reward(groups: list[art.TrajectoryGroup]) -> float:

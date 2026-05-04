@@ -1,3 +1,7 @@
+import asyncio
+
+from openai.types.chat.chat_completion import ChatCompletion, Choice
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
 from art.megatron.model_support import UnsupportedModelArchitectureError
@@ -5,6 +9,7 @@ from art.megatron.model_support import UnsupportedModelArchitectureError
 from .yes_no_trainability import (
     _build_internal_config,
     _default_variant_name,
+    _evaluate_groups,
     _TrainabilityVariant,
     _variant_init_args,
     _variant_max_steps,
@@ -12,6 +17,80 @@ from .yes_no_trainability import (
     _variant_rollouts_per_prompt,
     _variant_train_kwargs,
 )
+
+
+class _ConcurrentCompletions:
+    def __init__(self, expected: int) -> None:
+        self.expected = expected
+        self.started = 0
+        self.active = 0
+        self.max_active = 0
+        self.all_started = asyncio.Event()
+
+    async def create(self, **kwargs):
+        self.started += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.started == self.expected:
+            self.all_started.set()
+        try:
+            await asyncio.wait_for(self.all_started.wait(), timeout=1.0)
+            return ChatCompletion(
+                id=f"completion-{self.started}",
+                choices=[
+                    Choice(
+                        finish_reason="stop",
+                        index=0,
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content="maybe",
+                        ),
+                    )
+                ],
+                created=0,
+                model=str(kwargs["model"]),
+                object="chat.completion",
+            )
+        finally:
+            self.active -= 1
+
+
+class _FakeChat:
+    def __init__(self, completions: _ConcurrentCompletions) -> None:
+        self.completions = completions
+
+
+class _FakeClient:
+    def __init__(self, completions: _ConcurrentCompletions) -> None:
+        self.chat = _FakeChat(completions)
+
+
+class _FakeModel:
+    def __init__(self, client: _FakeClient) -> None:
+        self.client = client
+
+    def openai_client(self) -> _FakeClient:
+        return self.client
+
+    def get_inference_name(self, *, step: int | None = None) -> str:
+        return f"fake@{step}"
+
+
+@pytest.mark.asyncio
+async def test_eval_prompts_are_submitted_concurrently() -> None:
+    completions = _ConcurrentCompletions(expected=3)
+
+    groups = await _evaluate_groups(
+        _FakeModel(_FakeClient(completions)),
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        prompts=["a", "b", "c"],
+        step=1,
+    )
+
+    assert len(groups) == 3
+    assert completions.started == 3
+    assert completions.max_active == 3
+    assert [group.trajectories[0].reward for group in groups] == [1.0, 1.0, 1.0]
 
 
 def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> None:
