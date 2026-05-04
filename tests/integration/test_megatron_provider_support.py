@@ -126,7 +126,7 @@ def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
     monkeypatch.setattr(
         qwen35_handler_module,
-        "_optional_qwen35_provider_types",
+        "_qwen35_provider_types",
         lambda: (_FakeProvider,),
     )
     monkeypatch.setattr(

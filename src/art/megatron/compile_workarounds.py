@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import torch
 
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
 _INSTALLED_CONFIG: tuple[frozenset[str], str] | None = None
+
+
+def _require_attr(obj: Any, name: str) -> Any:
+    value = getattr(obj, name, None)
+    if value is None:
+        raise RuntimeError(
+            f"Required compile workaround target is missing: {obj}.{name}"
+        )
+    return value
 
 
 def _disable(fn):
@@ -42,10 +52,8 @@ def install_torch_compile_workarounds(
             )
         return
     from megatron.core.extensions import transformer_engine as te_ext
-    from megatron.core.transformer.moe import token_dispatcher
-    from megatron.core.transformer.moe import moe_utils
-    from megatron.core.transformer.moe import moe_layer
     from megatron.core.transformer.moe import experts as moe_experts
+    from megatron.core.transformer.moe import moe_layer, moe_utils, token_dispatcher
 
     if "fake_sync_dealloc" in flags:
         try:
@@ -62,21 +70,25 @@ def install_torch_compile_workarounds(
             if "already has a fake impl registered" not in str(exc):
                 raise
 
-    deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
-    if deepep_manager is not None:
-        if "deepep_permute_restore" in flags:
-            deepep_manager.get_permuted_hidden_states_by_experts = _disable(
-                deepep_manager.get_permuted_hidden_states_by_experts
-            )
-            deepep_manager.get_restored_hidden_states_by_experts = _disable(
-                deepep_manager.get_restored_hidden_states_by_experts
-            )
-        if "deepep_dispatch_combine" in flags:
-            deepep_manager.dispatch = _disable(deepep_manager.dispatch)
-            deepep_manager.combine = _disable(deepep_manager.combine)
+    deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
+    deepep_manager = (
+        _require_attr(token_dispatcher, "_DeepepManager") if deepep_flags else None
+    )
+    if "deepep_permute_restore" in flags:
+        deepep_manager.get_permuted_hidden_states_by_experts = _disable(
+            deepep_manager.get_permuted_hidden_states_by_experts
+        )
+        deepep_manager.get_restored_hidden_states_by_experts = _disable(
+            deepep_manager.get_restored_hidden_states_by_experts
+        )
+    if "deepep_dispatch_combine" in flags:
+        deepep_manager.dispatch = _disable(deepep_manager.dispatch)
+        deepep_manager.combine = _disable(deepep_manager.combine)
     if "alltoall_dtoh" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
+        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
+            _disable(
+                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
+            )
         )
     if "alltoall_dispatch_preprocess" in flags:
         token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess = _disable(
@@ -87,32 +99,29 @@ def install_torch_compile_workarounds(
             token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess
         )
     if "te_moe_permute_with_probs" in flags:
-        try:
-            from transformer_engine.pytorch import permutation as te_permutation
-        except ImportError:
-            te_permutation = None
-        if te_permutation is not None:
-            te_permutation.moe_permute_with_probs = _disable(te_permutation.moe_permute_with_probs)
+        from transformer_engine.pytorch import permutation as te_permutation
+
+        te_permutation.moe_permute_with_probs = _disable(
+            te_permutation.moe_permute_with_probs
+        )
         if te_ext.fused_permute_with_probs is not None:
             te_ext.fused_permute_with_probs = _disable(te_ext.fused_permute_with_probs)
         if moe_utils.fused_permute_with_probs is not None:
-            moe_utils.fused_permute_with_probs = _disable(moe_utils.fused_permute_with_probs)
-    if "te_triton_permute_with_mask_map" in flags:
-        try:
-            from transformer_engine.pytorch.triton import permutation as te_triton_permutation
-        except ImportError:
-            te_triton_permutation = None
-        if te_triton_permutation is not None:
-            te_triton_permutation.permute_with_mask_map = _disable(
-                te_triton_permutation.permute_with_mask_map
+            moe_utils.fused_permute_with_probs = _disable(
+                moe_utils.fused_permute_with_probs
             )
+    if "te_triton_permute_with_mask_map" in flags:
+        from transformer_engine.pytorch.triton import (
+            permutation as te_triton_permutation,
+        )
+
+        te_triton_permutation.permute_with_mask_map = _disable(
+            te_triton_permutation.permute_with_mask_map
+        )
     if "te_moe_unpermute" in flags:
-        try:
-            from transformer_engine.pytorch import permutation as te_permutation
-        except ImportError:
-            te_permutation = None
-        if te_permutation is not None:
-            te_permutation.moe_unpermute = _disable(te_permutation.moe_unpermute)
+        from transformer_engine.pytorch import permutation as te_permutation
+
+        te_permutation.moe_unpermute = _disable(te_permutation.moe_unpermute)
         if te_ext.fused_unpermute is not None:
             te_ext.fused_unpermute = _disable(te_ext.fused_unpermute)
         if moe_utils.fused_unpermute is not None:
@@ -122,23 +131,19 @@ def install_torch_compile_workarounds(
     if "moe_utils_unpermute" in flags:
         moe_utils.unpermute = _disable(moe_utils.unpermute)
     if "te_moe_unpermute_backward" in flags:
-        try:
-            from transformer_engine.pytorch import permutation as te_permutation
-        except ImportError:
-            te_permutation = None
-        if te_permutation is not None:
-            te_permutation._moe_unpermute_mask_map.backward = staticmethod(
-                _disable(te_permutation._moe_unpermute_mask_map.backward)
-            )
+        from transformer_engine.pytorch import permutation as te_permutation
+
+        te_permutation._moe_unpermute_mask_map.backward = staticmethod(
+            _disable(te_permutation._moe_unpermute_mask_map.backward)
+        )
     if "te_triton_unpermute_bwd_with_merging_probs" in flags:
-        try:
-            from transformer_engine.pytorch.triton import permutation as te_triton_permutation
-        except ImportError:
-            te_triton_permutation = None
-        if te_triton_permutation is not None:
-            te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs = _disable(
-                te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs
-            )
+        from transformer_engine.pytorch.triton import (
+            permutation as te_triton_permutation,
+        )
+
+        te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs = _disable(
+            te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs
+        )
     if "flex_token_dispatch_combine" in flags:
         token_dispatcher.MoEFlexTokenDispatcher.token_dispatch = _disable(
             token_dispatcher.MoEFlexTokenDispatcher.token_dispatch

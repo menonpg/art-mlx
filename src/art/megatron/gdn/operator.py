@@ -5,6 +5,13 @@ from contextvars import ContextVar
 from types import MethodType
 from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
+from causal_conv1d import causal_conv1d_fn
+from fla.modules.l2norm import l2norm
+from fla.ops.gated_delta_rule import (
+    naive_recurrent_gated_delta_rule as fla_naive_recurrent_gated_delta_rule,
+)
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
 from torch import Tensor
@@ -36,14 +43,11 @@ class _BucketFlatLayout(BaseModel):
 def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
     """Patch Megatron GatedDeltaNet modules to honor ART shared-prefix packing."""
 
-    gated_delta_net_type = _optional_gated_delta_net_type()
-    if gated_delta_net_type is None:
-        return
     for chunk in model_chunks:
         if not hasattr(chunk, "modules"):
             continue
         for module in chunk.modules():
-            if not isinstance(module, gated_delta_net_type):
+            if not isinstance(module, GatedDeltaNet):
                 continue
             if getattr(module, "_art_shared_prefix_gdn_hooked", False):
                 continue
@@ -56,11 +60,6 @@ def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
 def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
     """Hoist CP layout conversion across consecutive Transformer GDN layers."""
 
-    gated_delta_net_type = _optional_gated_delta_net_type()
-    transformer_layer_type = _optional_transformer_layer_type()
-    if gated_delta_net_type is None or transformer_layer_type is None:
-        return
-
     for chunk in model_chunks:
         if not hasattr(chunk, "modules"):
             continue
@@ -68,11 +67,11 @@ def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
         layers = [
             module
             for module in chunk.modules()
-            if isinstance(module, transformer_layer_type)
+            if isinstance(module, TransformerLayer)
             and hasattr(module, "self_attention")
         ]
         layer_is_gdn = [
-            isinstance(layer.self_attention, gated_delta_net_type) for layer in layers
+            isinstance(layer.self_attention, GatedDeltaNet) for layer in layers
         ]
         for index, layer in enumerate(layers):
             is_gdn = layer_is_gdn[index]
@@ -86,22 +85,6 @@ def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
             layer._art_gdn_island_physical_forward = layer.forward
             layer.forward = MethodType(_gdn_island_layer_forward, layer)
             layer._art_gdn_island_hooked = True
-
-
-def _optional_gated_delta_net_type() -> type[Any] | None:
-    try:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-    except ImportError:
-        return None
-    return GatedDeltaNet
-
-
-def _optional_transformer_layer_type() -> type[Any] | None:
-    try:
-        from megatron.core.transformer.transformer_layer import TransformerLayer
-    except ImportError:
-        return None
-    return TransformerLayer
 
 
 def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -2603,12 +2586,9 @@ def _causal_conv1d_with_state(
 ) -> tuple[Tensor, Tensor | None]:
     weight = gdn.conv1d.weight.squeeze(1)
     bias = gdn.conv1d.bias
-    causal_conv1d_fn = _causal_conv1d_fn()
-    if (
-        causal_conv1d_fn is not None
-        and not bool(getattr(gdn.config, "deterministic_mode", False))
-        and gdn.activation in ("silu", "swish")
-    ):
+    if not bool(
+        getattr(gdn.config, "deterministic_mode", False)
+    ) and gdn.activation in ("silu", "swish"):
         qkv_fast = _channel_last_conv1d_layout(qkv)
         conv_initial_fast = _channel_last_conv1d_layout(conv_initial)
         if qkv_fast is not None and conv_initial_fast is not None:
@@ -2627,9 +2607,7 @@ def _causal_conv1d_with_state(
             return out, final
 
     qkv_dtype = qkv.dtype
-    if causal_conv1d_fn is not None and not bool(
-        getattr(gdn.config, "deterministic_mode", False)
-    ):
+    if not bool(getattr(gdn.config, "deterministic_mode", False)):
         final = (
             _conv_final_from_dense_qkv(qkv, conv_initial, weight.shape[1])
             if output_final_state
@@ -2761,22 +2739,12 @@ def _default_cp_group(cp_size: int) -> Any:
 
 
 def _l2norm(x: Tensor) -> Tensor:
-    try:
-        from fla.modules.l2norm import l2norm
-    except ImportError:
-        return F.normalize(x, p=2, dim=-1)
     return l2norm(x)
 
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:
-    try:
-        from fla.ops.gated_delta_rule import naive_recurrent_gated_delta_rule
-    except ImportError as exc:
-        raise ImportError(
-            "FLA is required for ART shared-prefix GDN execution."
-        ) from exc
     return _naive_recurrent_gated_delta_rule(
-        naive_recurrent_gated_delta_rule, *args, **kwargs
+        fla_naive_recurrent_gated_delta_rule, *args, **kwargs
     )
 
 
@@ -2824,14 +2792,6 @@ def _naive_recurrent_gated_delta_rule(
     return torch.cat(outputs, dim=1), (
         torch.cat(final_states, dim=0) if final_states else None
     )
-
-
-def _causal_conv1d_fn() -> Callable[..., Any] | None:
-    try:
-        from causal_conv1d import causal_conv1d_fn
-    except ImportError:
-        return None
-    return causal_conv1d_fn
 
 
 @contextmanager

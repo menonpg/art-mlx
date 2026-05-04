@@ -426,10 +426,10 @@ def move_cp_exchange_plan_to_device(
                 source_rank=transfer.source_rank,
                 dest_rank=transfer.dest_rank,
                 token_count=transfer.token_count,
-                source_positions_tensor=_move_optional_index_tensor(
+                source_positions_tensor=_move_index_tensor_if_present(
                     transfer.source_positions_tensor, target
                 ),
-                dest_positions_tensor=_move_optional_index_tensor(
+                dest_positions_tensor=_move_index_tensor_if_present(
                     transfer.dest_positions_tensor, target
                 ),
             )
@@ -439,7 +439,7 @@ def move_cp_exchange_plan_to_device(
     )
 
 
-def _move_optional_index_tensor(
+def _move_index_tensor_if_present(
     tensor: Tensor | None, device: torch.device
 ) -> Tensor | None:
     if tensor is None or tensor.device == device:

@@ -4,6 +4,7 @@ from types import MethodType
 from typing import Any, Callable, Sequence, cast
 
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 import torch
 
 from art.megatron.model_chunks import ModelChunks
@@ -218,7 +219,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         )
 
         target_set = set(target_modules)
-        gated_delta_net_type = _optional_gated_delta_net_type()
         for chunk in model_chunks:
             for module_name, module in chunk.named_modules():
                 if not isinstance(module, TransformerLayer):
@@ -235,9 +235,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                         rank=rank,
                         alpha=alpha,
                     )
-                elif gated_delta_net_type is not None and isinstance(
-                    module.self_attention, gated_delta_net_type
-                ):
+                elif isinstance(module.self_attention, GatedDeltaNet):
                     wrap_gated_delta_net_attention(
                         module.self_attention,
                         adapter_model_prefix=adapter_model_prefix,
@@ -276,7 +274,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
         _ensure_bridge_qwen35_adapter_name_map()
         adapter_weights_by_base: dict[str, list[Any]] = {}
-        gated_delta_net_type = _optional_gated_delta_net_type()
         for chunk in model_chunks:
             for module_name, module in chunk.named_modules():
                 if not isinstance(module, TransformerLayer):
@@ -290,9 +287,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                         layer_prefix=layer_prefix,
                         self_attention=module.self_attention,
                     )
-                elif gated_delta_net_type is not None and isinstance(
-                    module.self_attention, gated_delta_net_type
-                ):
+                elif isinstance(module.self_attention, GatedDeltaNet):
                     add_gated_delta_net_adapter_weights(
                         adapter_weights_by_base,
                         layer_prefix=layer_prefix,
@@ -726,21 +721,16 @@ def _ensure_bridge_qwen35_adapter_name_map() -> None:
 
 
 def _is_qwen35_vl_provider(provider: object) -> bool:
-    return isinstance(provider, _optional_qwen35_provider_types())
+    return isinstance(provider, _qwen35_provider_types())
 
 
-def _optional_qwen35_provider_types() -> tuple[type[Any], ...]:
+def _qwen35_provider_types() -> tuple[type[Any], ...]:
     from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
         Qwen35VLModelProvider,
         Qwen35VLMoEModelProvider,
     )
 
     return (Qwen35VLModelProvider, Qwen35VLMoEModelProvider)
-
-
-def _optional_qwen35_provider_type() -> type[Any] | None:
-    provider_types = _optional_qwen35_provider_types()
-    return provider_types[0] if provider_types else None
 
 
 def _require_qwen35_provider_symbols() -> tuple[Any, ...]:
@@ -964,12 +954,6 @@ class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
 class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
     def mapping_registry(self) -> Any:
         return _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge)
-
-
-def _optional_gated_delta_net_type() -> type[Any] | None:
-    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-
-    return GatedDeltaNet
 
 
 def _linear_attention_pattern(provider: Any) -> list[int]:

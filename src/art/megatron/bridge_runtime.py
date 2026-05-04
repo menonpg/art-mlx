@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 import contextlib
 import fnmatch
-from collections.abc import Iterable, Mapping
 from typing import Any
 
-import torch
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
@@ -20,6 +19,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
+import torch
 
 
 def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -67,9 +67,11 @@ def load_unique_hf_keys_once(
     if not keys:
         return {}
     if hasattr(hf_state_dict, "__getitem__"):
-        loaded = hf_state_dict[keys] if not isinstance(hf_state_dict, dict) else {
-            key: hf_state_dict[key] for key in keys
-        }
+        loaded = (
+            hf_state_dict[keys]
+            if not isinstance(hf_state_dict, dict)
+            else {key: hf_state_dict[key] for key in keys}
+        )
     else:
         loaded = {key: hf_state_dict[key] for key in keys}
     return {key: _pin_cpu_tensor(value) for key, value in loaded.items()}
@@ -80,25 +82,25 @@ class _CachedStateLookup(Mapping[str, torch.Tensor]):
         self,
         *,
         cache: Mapping[str, torch.Tensor],
-        fallback: Mapping[str, torch.Tensor],
+        source: Mapping[str, torch.Tensor],
     ) -> None:
         self._cache = cache
-        self._fallback = fallback
+        self._source = source
 
     def __getitem__(self, key: str) -> torch.Tensor:
         if key in self._cache:
             return self._cache[key]
-        return _pin_cpu_tensor(self._fallback[key])
+        return _pin_cpu_tensor(self._source[key])
 
     def __iter__(self):
         seen = set(self._cache)
         yield from self._cache
-        for key in self._fallback:
+        for key in self._source:
             if key not in seen:
                 yield key
 
     def __len__(self) -> int:
-        return len(set(self._cache).union(self._fallback))
+        return len(set(self._cache).union(self._source))
 
 
 def _materialization_device() -> torch.device:
@@ -141,7 +143,9 @@ def _wrap_with_mp_wrapper(
                 expert_bias = getattr(submodule, "expert_bias", None)
                 if expert_bias is not None:
                     keep_in_fp32.append((submodule, expert_bias.data.clone()))
-    wrapped = [mixed_precision_wrapper(model_config, model_module) for model_module in model]
+    wrapped = [
+        mixed_precision_wrapper(model_config, model_module) for model_module in model
+    ]
     for submodule, fp32_data in keep_in_fp32:
         submodule.expert_bias.data = fp32_data
     return wrapped
@@ -191,7 +195,8 @@ def _art_get_model(
     if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         device = _materialization_device()
         model = [
-            to_empty_if_meta_device(model_module, device=device) for model_module in model
+            to_empty_if_meta_device(model_module, device=device)
+            for model_module in model
         ]
 
     model = _apply_pre_wrap_hook(model, pre_wrap_hook)
@@ -262,7 +267,9 @@ def _scatter_to_tp_ranks(
             return None
         return splits[0].to(device=device, dtype=dtype, non_blocking=True)
     output = torch.empty(output_shape, dtype=dtype, device=device)
-    global_src = torch.distributed.get_global_rank(group=self.tp_group, group_rank=src_rank)
+    global_src = torch.distributed.get_global_rank(
+        group=self.tp_group, group_rank=src_rank
+    )
     scatter_list = None
     if self.tp_rank == src_rank and splits:
         scatter_list = [
@@ -284,7 +291,10 @@ def _replicated_hf_to_megatron(
     if self.tp_size == 1:
         return hf_weights.to(device=target_device, non_blocking=True)
     broadcast_device = target_device
-    if broadcast_device.type != "cuda" or broadcast_device.index != torch.cuda.current_device():
+    if (
+        broadcast_device.type != "cuda"
+        or broadcast_device.index != torch.cuda.current_device()
+    ):
         broadcast_device = _materialization_device()
     if self.tp_rank == 0:
         tensor = hf_weights.to(device=broadcast_device, non_blocking=True)
@@ -309,24 +319,30 @@ def _optimized_load_weights_hf_to_megatron(
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
     hf_state_dict = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
     raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict)
-    cached_state = _CachedStateLookup(cache=raw_cache, fallback=hf_state_dict)
+    cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
     pending_device_copy = False
     for task in self._with_progress_tracking(tasks, description):
         if task is None or task.megatron_module is None:
             continue
-        hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, cached_state)
-        converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+        hf_weights = self.maybe_modify_loaded_hf_weight(
+            task.mapping.hf_param, cached_state
+        )
+        converted_weights = task.mapping.hf_to_megatron(
+            hf_weights, task.megatron_module
+        )
         if converted_weights is None:
             continue
-        assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
+        assert task.param_weight is not None, (
+            "param_weight is required for HF->Megatron conversion"
+        )
         if converted_weights.shape != task.param_weight.shape:
             is_whitelisted = False
             if allowed_mismatched_params:
                 for pattern in allowed_mismatched_params:
-                    if fnmatch.fnmatch(task.mapping.megatron_param, pattern) or fnmatch.fnmatch(
-                        task.param_name, pattern
-                    ):
+                    if fnmatch.fnmatch(
+                        task.mapping.megatron_param, pattern
+                    ) or fnmatch.fnmatch(task.param_name, pattern):
                         is_whitelisted = True
                         break
             if is_whitelisted:
@@ -350,10 +366,14 @@ def _optimized_load_weights_hf_to_megatron(
 def install_art_bridge_runtime_patches() -> None:
     from megatron.bridge.models import model_provider as model_provider_module
 
-    if not getattr(model_provider_module.get_model, "__art_meta_materialization__", False):
+    if not getattr(
+        model_provider_module.get_model, "__art_meta_materialization__", False
+    ):
         setattr(_art_get_model, "__art_meta_materialization__", True)
         model_provider_module.get_model = _art_get_model
-    if not getattr(MegatronParamMapping.scatter_to_tp_ranks, "__art_non_blocking__", False):
+    if not getattr(
+        MegatronParamMapping.scatter_to_tp_ranks, "__art_non_blocking__", False
+    ):
         setattr(_scatter_to_tp_ranks, "__art_non_blocking__", True)
         MegatronParamMapping.scatter_to_tp_ranks = _scatter_to_tp_ranks
     if not getattr(ColumnParallelMapping.hf_to_megatron, "__art_cast_last__", False):
@@ -362,6 +382,10 @@ def install_art_bridge_runtime_patches() -> None:
     if not getattr(ReplicatedMapping.hf_to_megatron, "__art_cast_last__", False):
         setattr(_replicated_hf_to_megatron, "__art_cast_last__", True)
         ReplicatedMapping.hf_to_megatron = _replicated_hf_to_megatron
-    if not getattr(MegatronModelBridge.load_weights_hf_to_megatron, "__art_cached_load__", False):
+    if not getattr(
+        MegatronModelBridge.load_weights_hf_to_megatron, "__art_cached_load__", False
+    ):
         setattr(_optimized_load_weights_hf_to_megatron, "__art_cached_load__", True)
-        MegatronModelBridge.load_weights_hf_to_megatron = _optimized_load_weights_hf_to_megatron
+        MegatronModelBridge.load_weights_hf_to_megatron = (
+            _optimized_load_weights_hf_to_megatron
+        )

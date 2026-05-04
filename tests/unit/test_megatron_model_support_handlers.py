@@ -202,7 +202,7 @@ def test_qwen35_handler_uses_shared_expert_workaround_pair_when_overlap_disabled
     }
 
 
-def test_qwen35_handler_falls_back_to_moe_forward_when_overlap_enabled() -> None:
+def test_qwen35_handler_uses_moe_forward_workaround_when_overlap_enabled() -> None:
     provider = type("Provider", (), {"moe_shared_expert_overlap": True})()
 
     assert QWEN3_5_MOE_HANDLER.compile_workaround_config(provider).model_dump() == {
@@ -258,7 +258,7 @@ def test_qwen35_handler_rebinds_provider_to_language_only_runtime(
         return SimpleNamespace(layer_specs=[gdn_layer, attention_layer])
 
     monkeypatch.setattr(
-        "art.megatron.model_support.handlers.qwen3_5._optional_qwen35_provider_types",
+        "art.megatron.model_support.handlers.qwen3_5._qwen35_provider_types",
         lambda: (_FakeQwen35Provider,),
     )
     monkeypatch.setattr(
