@@ -25,8 +25,6 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     "Qwen/Qwen3.5-27B": ModelPricing(prefill=1.24, sample=3.73, train=3.73),
     "Qwen/Qwen3.5-35B-A3B": ModelPricing(prefill=0.36, sample=0.89, train=1.07),
     "Qwen/Qwen3.5-397B-A17B": ModelPricing(prefill=2.00, sample=5.00, train=6.00),
-    "Qwen/Qwen3.6-27B": ModelPricing(prefill=1.24, sample=3.73, train=3.73),
-    "Qwen/Qwen3.6-35B-A3B": ModelPricing(prefill=0.36, sample=0.89, train=1.07),
     "Qwen/Qwen3-4B-Instruct-2507": ModelPricing(prefill=0.07, sample=0.22, train=0.22),
     "Qwen/Qwen3-8B": ModelPricing(prefill=0.13, sample=0.40, train=0.40),
     "Qwen/Qwen3-8B-Base": ModelPricing(prefill=0.13, sample=0.40, train=0.40),
