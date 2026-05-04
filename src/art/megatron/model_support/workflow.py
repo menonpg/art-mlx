@@ -547,6 +547,7 @@ def run_native_vllm_lora_stage(
         and report.step0_served
         and report.step1_served
         and report.step0_name in report.model_ids_before
+        and report.step1_name not in report.model_ids_before
         and report.step0_name in report.model_ids_after
         and report.step1_name in report.model_ids_after
     )

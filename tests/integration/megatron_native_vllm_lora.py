@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import tempfile
 
 from pydantic import BaseModel, Field
 import torch
@@ -110,8 +111,9 @@ async def _run_native_vllm_lora(
     trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
     service_name = "model_support_native_lora_validation"
     case_artifacts = ensure_case_artifacts(case_config)
-    output_dir = str(Path(case_artifacts.case_dir) / "native_vllm_lora")
-    os.makedirs(output_dir, exist_ok=True)
+    output_root = Path(case_artifacts.case_dir) / "native_vllm_lora"
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_dir = tempfile.mkdtemp(prefix="run_", dir=output_root)
     internal_config = dev.InternalModelConfig(
         trainer_gpu_ids=trainer_gpu_ids,
         inference_gpu_ids=inference_gpu_ids,
