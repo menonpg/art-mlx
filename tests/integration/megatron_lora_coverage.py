@@ -138,7 +138,7 @@ def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
                 ),
                 print_env=False,
                 build_optimizer=False,
-                allow_unsupported_arch=case_config.allow_unsupported_arch,
+                allow_unvalidated_arch=case_config.allow_unvalidated_arch,
             )
         adapter_prefixes = {
             module.adapter_model_prefix

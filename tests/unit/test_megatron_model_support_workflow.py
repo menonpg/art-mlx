@@ -53,7 +53,7 @@ def test_build_validation_report_populates_architecture_stage(
     )
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._run_stage_in_subprocess",
-        lambda *, stage_name, base_model, architecture, allow_unsupported_arch=False: {
+        lambda *, stage_name, base_model, architecture, allow_unvalidated_arch=False: {
             "hf_parity": ValidationStageResult(
                 name="hf_parity",
                 passed=True,
@@ -244,7 +244,7 @@ def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None
 
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._run_stage_in_subprocess",
-        lambda *, stage_name, base_model, architecture, allow_unsupported_arch=False: (
+        lambda *, stage_name, base_model, architecture, allow_unvalidated_arch=False: (
             ValidationStageResult(
                 name="hf_parity",
                 passed=False,
@@ -286,7 +286,7 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
     )
     monkeypatch.setattr(
         "art.megatron.model_support.workflow._run_stage_in_subprocess",
-        lambda *, stage_name, base_model, architecture, allow_unsupported_arch=False: (
+        lambda *, stage_name, base_model, architecture, allow_unvalidated_arch=False: (
             ValidationStageResult(
                 name="lora_coverage",
                 passed=False,
@@ -425,7 +425,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
 
     result = run_correctness_sensitivity_stage(
         base_model="Qwen/Qwen3.5-4B",
-        allow_unsupported_arch=True,
+        allow_unvalidated_arch=True,
         architecture=ArchitectureReport(
             base_model="Qwen/Qwen3.5-4B",
             model_key="qwen3_5_dense",
@@ -456,7 +456,7 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
         lambda name: SimpleNamespace(
             run_yes_no_trainability=lambda *,
             base_model,
-            allow_unsupported_arch=False: (
+            allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     latest_step=2,
                     initial_eval_reward=0.4,
@@ -534,7 +534,7 @@ def test_run_packed_position_ids_stage(monkeypatch) -> None:
             run_packed_position_ids=lambda *,
             base_model,
             num_layers,
-            allow_unsupported_arch=False: (
+            allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     output_dir="/tmp/packed-position-ids",
                     model_dump=lambda mode="json": {

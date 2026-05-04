@@ -289,23 +289,6 @@ class MetricThresholdRule(BaseModel):
         return len(self.failure_reasons(summary)) == 0
 
 
-class LossThresholdRule(MetricThresholdRule):
-    """Scalar loss rule with an absolute floor for near-zero losses."""
-
-    mean_abs_diff_floor: float = 1e-7
-
-    def failure_reasons(self, summary: MetricSummary) -> list[str]:
-        reasons = super().failure_reasons(summary)
-        if not reasons:
-            return []
-        mean_abs_diff = summary.get("mean_abs_diff")
-        if isinstance(mean_abs_diff, (int, float)) and (
-            float(mean_abs_diff) <= self.mean_abs_diff_floor
-        ):
-            return []
-        return reasons
-
-
 class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
@@ -321,7 +304,7 @@ class OracleCaseConfig(BaseModel):
     loss_scale: float = 1
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
-    allow_unsupported_arch: bool = False
+    allow_unvalidated_arch: bool = False
 
 
 class DiskPackedTensorsSpec(BaseModel):
@@ -1684,8 +1667,7 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out_loss = LossThresholdRule(limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0})
-    fwd_out = MetricThresholdRule(
+    fwd_out_loss = MetricThresholdRule(
         limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
         minimums=non_zero_scales,
     )
@@ -1701,7 +1683,7 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
             }
         )
     )
-    return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
+    return {"forward": fwd_out_loss, "outputs": fwd_out_loss, "losses": fwd_out_loss} | {
         "grads": grads_deltas,
         "deltas": grads_deltas,
         "router_topk_ids": router_topk_rule,

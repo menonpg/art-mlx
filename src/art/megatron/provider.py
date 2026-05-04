@@ -244,11 +244,11 @@ def _build_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     spec = get_model_support_spec(
         model,
-        allow_unsupported_arch=allow_unsupported_arch,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
     bridge = AutoBridge.from_hf_pretrained(
@@ -269,12 +269,12 @@ def prepare_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     bundle = _build_provider_bundle(
         model,
         torch_dtype=torch_dtype,
-        allow_unsupported_arch=allow_unsupported_arch,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     provider = bundle.provider
     setattr(provider, "_art_model_support_handler", bundle.handler)
@@ -307,13 +307,13 @@ def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
             torch_dtype=torch_dtype,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
 
@@ -322,10 +322,10 @@ def get_provider(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> GPTModelProvider:
     return get_provider_bundle(
         model,
         torch_dtype=torch_dtype,
-        allow_unsupported_arch=allow_unsupported_arch,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     ).provider

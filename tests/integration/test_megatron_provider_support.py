@@ -180,7 +180,7 @@ def test_get_provider_preserves_hybrid_layer_specs(
 
     resolved = provider_module.get_provider(
         "unused-qwen",
-        allow_unsupported_arch=True,
+        allow_unvalidated_arch=True,
     )
     layer_spec = cast(Any, resolved).transformer_layer_spec(resolved, vp_stage=0)
 

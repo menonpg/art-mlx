@@ -20,7 +20,7 @@ def test_unsupported_model_support_requires_explicit_opt_in():
     with pytest.raises(UnsupportedModelArchitectureError):
         get_model_support_spec("test-model")
 
-    spec = get_model_support_spec("test-model", allow_unsupported_arch=True)
+    spec = get_model_support_spec("test-model", allow_unvalidated_arch=True)
     assert spec.key == "default_dense"
     assert spec.handler_key == "default_dense"
     assert list(spec.default_target_modules) == [
@@ -49,14 +49,14 @@ def test_qwen3_5_dense_model_support_spec():
     with pytest.raises(UnsupportedModelArchitectureError):
         get_model_support_spec("Qwen/Qwen3.5-4B")
 
-    spec = get_model_support_spec("Qwen/Qwen3.5-4B", allow_unsupported_arch=True)
+    spec = get_model_support_spec("Qwen/Qwen3.5-4B", allow_unvalidated_arch=True)
     assert spec.key == "qwen3_5_dense"
     assert spec.handler_key == "qwen3_5_dense"
     assert spec.default_rollout_weights_mode == "lora"
     assert (
         native_vllm_lora_status_for_model(
             "Qwen/Qwen3.5-4B",
-            allow_unsupported_arch=True,
+            allow_unvalidated_arch=True,
         )
         == "validated"
     )
@@ -79,7 +79,7 @@ def test_qwen3_5_registry_exports():
     assert QWEN3_5_MODELS == QWEN3_5_MOE_MODELS
     assert default_target_modules_for_model(
         "Qwen/Qwen3.6-27B",
-        allow_unsupported_arch=True,
+        allow_unvalidated_arch=True,
     ) == [
         "q_proj",
         "k_proj",
@@ -97,14 +97,14 @@ def test_qwen3_5_registry_exports():
     assert (
         model_uses_expert_parallel(
             "Qwen/Qwen3.6-27B",
-            allow_unsupported_arch=True,
+            allow_unvalidated_arch=True,
         )
         is False
     )
     assert (
         get_model_support_handler(
             "Qwen/Qwen3.6-27B",
-            allow_unsupported_arch=True,
+            allow_unvalidated_arch=True,
         ).key
         == "qwen3_5_dense"
     )
@@ -132,14 +132,14 @@ def test_qwen3_dense_uses_default_dense_only_in_unsupported_probe_mode():
 
     spec = get_model_support_spec(
         "Qwen/Qwen3-4B-Instruct-2507",
-        allow_unsupported_arch=True,
+        allow_unvalidated_arch=True,
     )
     assert spec.key == "qwen3_dense"
     assert spec.handler_key == "qwen3_dense"
     assert (
         model_uses_expert_parallel(
             "Qwen/Qwen3-4B-Instruct-2507",
-            allow_unsupported_arch=True,
+            allow_unvalidated_arch=True,
         )
         is False
     )

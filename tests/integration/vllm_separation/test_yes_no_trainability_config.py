@@ -93,7 +93,7 @@ def test_unvalidated_dense_model_is_not_default_megatron_trainability_model(
     config = _build_internal_config(
         variant,
         base_model="Qwen/Qwen3.5-4B",
-        allow_unsupported_arch=True,
+        allow_unvalidated_arch=True,
     )
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True

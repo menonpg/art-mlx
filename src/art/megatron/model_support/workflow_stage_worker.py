@@ -44,7 +44,7 @@ def main() -> None:
     result = stage_runner(
         base_model=args.base_model,
         architecture=architecture,
-        allow_unsupported_arch=args.allow_unsupported_arch,
+        allow_unvalidated_arch=args.allow_unvalidated_arch,
     )
     Path(args.output_json).write_text(
         result.model_dump_json(indent=2),

@@ -369,23 +369,23 @@ def _variant_rollouts_per_prompt(variant: _TrainabilityVariant) -> int:
 def _rollout_weights_mode(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> RolloutWeightsMode:
     return get_model_support_spec(
         base_model,
-        allow_unsupported_arch=allow_unsupported_arch,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     ).default_rollout_weights_mode
 
 
 def _default_variant_name(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> _VARIANT_NAME:
     if (
         _rollout_weights_mode(
             base_model,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         )
         == "merged"
     ):
@@ -398,7 +398,7 @@ def _build_internal_config(
     *,
     base_model: str,
     rollout_weights_mode: RolloutWeightsMode | None = None,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = (
@@ -412,7 +412,7 @@ def _build_internal_config(
             and variant.backend_name == "megatron"
             and model_uses_expert_parallel(
                 base_model,
-                allow_unsupported_arch=allow_unsupported_arch,
+                allow_unvalidated_arch=allow_unvalidated_arch,
             )
         ),
         enable_sleep_mode=True if shared else None,
@@ -422,7 +422,7 @@ def _build_internal_config(
         rollout_weights_mode=rollout_weights_mode
         or _rollout_weights_mode(
             base_model,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         ),
         engine_args=engine_args,
         init_args=_variant_init_args(variant),
@@ -632,7 +632,7 @@ async def run_yes_no_trainability_async(
     variant_name: _VARIANT_NAME = "megatron_shared",
     artifact_root: Path | None = None,
     rollout_weights_mode: RolloutWeightsMode | None = None,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> YesNoTrainabilityReport:
     variant = _build_variant(variant_name)
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
@@ -647,7 +647,7 @@ async def run_yes_no_trainability_async(
         variant,
         base_model=base_model,
         rollout_weights_mode=rollout_weights_mode,
-        allow_unsupported_arch=allow_unsupported_arch,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     model = art.TrainableModel(
@@ -764,16 +764,16 @@ async def run_yes_no_trainability_async(
 def run_yes_no_trainability(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> YesNoTrainabilityReport:
     return asyncio.run(
         run_yes_no_trainability_async(
             base_model=base_model,
             variant_name=_default_variant_name(
                 base_model,
-                allow_unsupported_arch=allow_unsupported_arch,
+                allow_unvalidated_arch=allow_unvalidated_arch,
             ),
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
 

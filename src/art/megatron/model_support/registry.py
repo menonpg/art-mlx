@@ -125,7 +125,7 @@ _SPECS_BY_MODEL = {
     for spec in VALIDATED_MODEL_SUPPORT_SPECS
     for model_name in spec.model_names
 }
-_UNSUPPORTED_ARCH_SPECS_BY_MODEL = {
+_UNVALIDATED_ARCH_SPECS_BY_MODEL = {
     model_name: spec
     for spec in PROBE_ONLY_MODEL_SUPPORT_SPECS
     for model_name in spec.model_names
@@ -151,16 +151,16 @@ class UnsupportedModelArchitectureError(ValueError):
 def get_model_support_spec(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> ModelSupportSpec:
     if spec := _SPECS_BY_MODEL.get(base_model):
         return spec
-    if allow_unsupported_arch:
-        return _UNSUPPORTED_ARCH_SPECS_BY_MODEL.get(base_model, DEFAULT_DENSE_SPEC)
+    if allow_unvalidated_arch:
+        return _UNVALIDATED_ARCH_SPECS_BY_MODEL.get(base_model, DEFAULT_DENSE_SPEC)
     supported = ", ".join(sorted(_SPECS_BY_MODEL))
     raise UnsupportedModelArchitectureError(
         f"{base_model!r} has not passed the Megatron model-support workflow. "
-        "Pass allow_unsupported_arch=True only for explicit validation/probing. "
+        "Pass allow_unvalidated_arch=True only for explicit validation/probing. "
         f"Supported models: {supported}."
     )
 
@@ -168,12 +168,12 @@ def get_model_support_spec(
 def get_model_support_handler(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> ModelSupportHandler:
     return get_model_support_handler_for_spec(
         get_model_support_spec(
             base_model,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
 
@@ -187,12 +187,12 @@ def get_model_support_handler_for_spec(
 def default_target_modules_for_model(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> list[str]:
     return list(
         get_model_support_spec(
             base_model,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         ).default_target_modules
     )
 
@@ -200,23 +200,23 @@ def default_target_modules_for_model(
 def native_vllm_lora_status_for_model(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> str:
     return get_model_support_handler(
         base_model,
-        allow_unsupported_arch=allow_unsupported_arch,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     ).native_vllm_lora_status
 
 
 def model_requires_merged_rollout(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> bool:
     return (
         get_model_support_spec(
             base_model,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         ).default_rollout_weights_mode
         == "merged"
     )
@@ -225,12 +225,12 @@ def model_requires_merged_rollout(
 def model_uses_expert_parallel(
     base_model: str,
     *,
-    allow_unsupported_arch: bool = False,
+    allow_unvalidated_arch: bool = False,
 ) -> bool:
     return bool(
         get_model_support_handler(
             base_model,
-            allow_unsupported_arch=allow_unsupported_arch,
+            allow_unvalidated_arch=allow_unvalidated_arch,
         ).is_moe
     )
 

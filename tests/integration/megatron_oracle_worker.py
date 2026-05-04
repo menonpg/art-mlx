@@ -907,7 +907,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 ),
                 optimizer_config=_build_optimizer_config(request.case_config),
                 print_env=False,
-                allow_unsupported_arch=request.case_config.allow_unsupported_arch,
+                allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
             )
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
