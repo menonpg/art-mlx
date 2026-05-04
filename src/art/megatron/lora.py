@@ -765,6 +765,19 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             alpha=alpha,
             out_features=z_out_features_per_partition,
         )
+        component_sizes = (
+            *getattr(self.qkv_lora.B_T, "lora_tp_component_sizes"),
+            int(self.z_lora.B_T.shape[-1]) * ps.get_tensor_model_parallel_world_size(),
+            self.num_value_heads_per_partition
+            * ps.get_tensor_model_parallel_world_size(),
+            self.num_value_heads_per_partition
+            * ps.get_tensor_model_parallel_world_size(),
+        )
+        self._art_forward_trace_component_sizes = component_sizes
+        in_proj._art_forward_trace_component_sizes = component_sizes
+        gated_delta_net.out_norm._art_forward_trace_local_heads = (
+            self.num_value_heads_per_partition
+        )
 
     @staticmethod
     def _build_in_proj_lora(

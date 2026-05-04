@@ -349,6 +349,26 @@ class ForwardTraceCapture:
         if lora_hint is not None:
             return lora_hint
 
+        component_sizes = getattr(module, "_art_forward_trace_component_sizes", None)
+        if isinstance(component_sizes, tuple) and component_sizes:
+            return {
+                "op": "concat",
+                "dim": -1,
+                "layout": "componentwise",
+                "component_sizes": component_sizes,
+                "world_size_key": "tp_world_size",
+            }
+
+        local_heads = getattr(module, "_art_forward_trace_local_heads", None)
+        if isinstance(local_heads, int) and local_heads > 0:
+            return {
+                "op": "concat",
+                "dim": 0,
+                "layout": "rank_blocked_token_heads",
+                "local_heads": local_heads,
+                "world_size_key": "tp_world_size",
+            }
+
         # Base MoE expert linears need expert-TP aware merge semantics.
         # With etp>1:
         # - FC1 (column-parallel) shards output features -> concat on feature dim.
@@ -787,6 +807,60 @@ class ForwardTraceCapture:
         return torch.cat(ordered, dim=axis).contiguous()
 
     @classmethod
+    def _canonicalize_rank_blocked_token_heads(
+        cls,
+        *,
+        module_name: str,
+        tensor: torch.Tensor,
+        call: dict[str, Any],
+    ) -> torch.Tensor:
+        del module_name
+        primary_hint = cls._primary_output_merge_hint(call)
+        if not isinstance(primary_hint, dict):
+            return tensor
+        if primary_hint.get("layout") != "rank_blocked_token_heads":
+            return tensor
+        local_heads = primary_hint.get("local_heads")
+        world_size_key = primary_hint.get("world_size_key")
+        if not isinstance(local_heads, int) or local_heads <= 0:
+            raise RuntimeError("rank_blocked_token_heads hint requires local_heads")
+        if not isinstance(world_size_key, str):
+            raise RuntimeError("rank_blocked_token_heads hint requires world_size_key")
+        rank_meta = call.get("rank_meta")
+        rank_world_size = None
+        if isinstance(rank_meta, list) and rank_meta:
+            first_meta = rank_meta[0]
+            if isinstance(first_meta, dict):
+                rank_world_size = first_meta.get(world_size_key)
+        elif isinstance(rank_meta, dict):
+            rank_world_size = rank_meta.get(world_size_key)
+        if not isinstance(rank_world_size, int) or rank_world_size <= 1:
+            return tensor
+        if tensor.ndim != 2:
+            raise RuntimeError(
+                "rank_blocked_token_heads expects a 2D [rows, head_dim] tensor, "
+                f"got shape={tuple(tensor.shape)}"
+            )
+        rows_per_rank, remainder = divmod(int(tensor.shape[0]), rank_world_size)
+        if remainder != 0:
+            raise RuntimeError(
+                "rank_blocked_token_heads rows must divide rank world size, got "
+                f"shape={tuple(tensor.shape)} world_size={rank_world_size}"
+            )
+        token_count, head_remainder = divmod(rows_per_rank, local_heads)
+        if head_remainder != 0:
+            raise RuntimeError(
+                "rank_blocked_token_heads rows per rank must divide local_heads, got "
+                f"rows_per_rank={rows_per_rank} local_heads={local_heads}"
+            )
+        return (
+            tensor.reshape(rank_world_size, token_count, local_heads, tensor.shape[-1])
+            .permute(1, 0, 2, 3)
+            .reshape(tensor.shape)
+            .contiguous()
+        )
+
+    @classmethod
     def _canonicalize_moe_expert_row_order(
         cls,
         *,
@@ -827,6 +901,11 @@ class ForwardTraceCapture:
             call=call,
         )
         tensor = cls._canonicalize_componentwise_feature_layout(
+            module_name=module_name,
+            tensor=tensor,
+            call=call,
+        )
+        tensor = cls._canonicalize_rank_blocked_token_heads(
             module_name=module_name,
             tensor=tensor,
             call=call,
