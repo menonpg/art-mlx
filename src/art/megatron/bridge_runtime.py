@@ -317,7 +317,7 @@ def _optimized_load_weights_hf_to_megatron(
         if hasattr(megatron_model[0], "hide_loss_modules"):
             stack.enter_context(megatron_model[0].hide_loss_modules())
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
-    hf_state_dict = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
+    hf_state_dict = hf_pretrained.state
     raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict)
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"

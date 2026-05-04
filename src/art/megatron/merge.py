@@ -167,12 +167,7 @@ def load_lora_adapter_state_dict(
 
 def merge_lora_adapter(lora_path: str) -> None:
     base_dir = Path(lora_path)
-    try:
-        adapter_model, shard_filenames, manifest_filenames = _load_adapter_shards(
-            base_dir
-        )
-    except FileNotFoundError:
-        return
+    adapter_model, shard_filenames, manifest_filenames = _load_adapter_shards(base_dir)
 
     adapter_model_path = base_dir / "adapter_model.safetensors"
     save_file(adapter_model, adapter_model_path)

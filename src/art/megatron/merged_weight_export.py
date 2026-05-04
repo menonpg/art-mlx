@@ -33,15 +33,10 @@ class MergedWeightExport(BaseModel):
     adapter_weights_by_base: dict[str, list[Any]]
 
 
-def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
-    if getattr(mapping, "allow_hf_name_mismatch", False):
-        return True
-    hf_param = mapping.hf_param
+def _hf_param_names(hf_param: Any) -> list[str]:
     if isinstance(hf_param, str):
-        return hf_param in hf_keys
-    if isinstance(hf_param, dict):
-        return all(param in hf_keys for param in hf_param.values())
-    return False
+        return [hf_param]
+    return list(hf_param.values())
 
 
 def build_art_conversion_tasks(*, bridge: Any, model: ModelChunks) -> list[Any]:
@@ -74,8 +69,13 @@ def build_art_conversion_tasks(*, bridge: Any, model: ModelChunks) -> list[Any]:
                 vp_stage,
             )
             mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-            if mapping is None or not _mapping_hf_weights_exist(mapping, hf_keys):
-                continue
+            hf_params = _hf_param_names(mapping.hf_param)
+            missing_hf_params = sorted(set(hf_params) - hf_keys)
+            if missing_hf_params:
+                raise RuntimeError(
+                    f"Missing HF checkpoint weights for Megatron param {global_name}: "
+                    f"{missing_hf_params}"
+                )
             local_module, local_weights = cast(
                 tuple[Any, torch.Tensor],
                 get_module_and_param_from_name(

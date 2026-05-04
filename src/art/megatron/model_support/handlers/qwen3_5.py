@@ -150,8 +150,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
         del bridge
-        if not _is_qwen35_vl_provider(provider):
-            return
         (
             qwen3_vl_self_attention,
             qwen35_provider_types,
@@ -161,15 +159,10 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         from art.megatron.flex_attention import FlexDotProductAttention
 
         matched_provider_type = next(
-            (
-                provider_type
-                for provider_type in qwen35_provider_types
-                if isinstance(provider, provider_type)
-            ),
-            None,
+            provider_type
+            for provider_type in qwen35_provider_types
+            if isinstance(provider, provider_type)
         )
-        if matched_provider_type is None:
-            return
 
         def _patch_qwen35_block_spec(block_spec: object) -> None:
             patch_standard_attention_specs(block_spec, qwen3_vl_self_attention)
@@ -718,10 +711,6 @@ def _ensure_bridge_qwen35_adapter_name_map() -> None:
     for suffix, adapter_key in extra_entries.items():
         peft_bridge.ADAPTER_NAME_MAP.setdefault(suffix, adapter_key)
         peft_bridge.ADAPTER_KEY_TO_SUFFIX.setdefault(adapter_key, suffix)
-
-
-def _is_qwen35_vl_provider(provider: object) -> bool:
-    return isinstance(provider, _qwen35_provider_types())
 
 
 def _qwen35_provider_types() -> tuple[type[Any], ...]:

@@ -1827,18 +1827,11 @@ def _apply_explicit_norm(
     weight_name: str,
     bias_name: str,
 ) -> Tensor:
-    weight = getattr(module, weight_name, None)
-    if not isinstance(weight, Tensor):
-        return x
+    weight = getattr(module, weight_name)
     x_dtype = x.dtype
     x_float = x.float()
-    eps = float(getattr(module, "eps", getattr(config, "layernorm_epsilon", 1e-5)))
-    normalization = getattr(module, "normalization", None)
-    if normalization is None and config is not None:
-        normalization = getattr(config, "normalization", None)
-    if normalization is None:
-        module_name = type(module).__name__
-        normalization = "LayerNorm" if module_name == "LayerNorm" else "RMSNorm"
+    eps = float(module.eps)
+    normalization = module.normalization
     normalization = str(normalization)
     if normalization == "RMSNorm":
         normed = x_float * torch.rsqrt(

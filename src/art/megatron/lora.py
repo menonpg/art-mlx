@@ -133,9 +133,10 @@ def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
     if _linear_disables_tensor_parallel_comm(linear):
         return x
-    if bool(getattr(linear, "sequence_parallel", False)) and int(
-        getattr(linear, "tp_size", 1)
-    ) > 1:
+    if (
+        bool(getattr(linear, "sequence_parallel", False))
+        and int(getattr(linear, "tp_size", 1)) > 1
+    ):
         return gather_from_sequence_parallel_region(x)
     return x
 
@@ -212,7 +213,9 @@ def _exported_shard_dim(param: torch.nn.Parameter) -> int:
             raise ValueError("LoRA expert shard_dim cannot reference the expert axis")
         axis -= 1
     if axis not in (0, 1):
-        raise ValueError(f"Unsupported exported LoRA shard axis {axis} for ndim={param.ndim}")
+        raise ValueError(
+            f"Unsupported exported LoRA shard axis {axis} for ndim={param.ndim}"
+        )
     return 1 - axis
 
 
@@ -350,8 +353,7 @@ class LoRA(torch.nn.Module):
             strategy = getattr(into, "lora_tp_shard_strategy", "uniform")
             if strategy == "componentwise":
                 component_sizes = tuple(
-                    int(size)
-                    for size in getattr(into, "lora_tp_component_sizes", ())
+                    int(size) for size in getattr(into, "lora_tp_component_sizes", ())
                 )
                 if not component_sizes:
                     raise ValueError(
@@ -1283,11 +1285,9 @@ def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,
 ) -> list[torch.nn.Module]:
-    from art.megatron.model_support.handlers import DEFAULT_DENSE_HANDLER
-
-    handler = getattr(provider, "_art_model_support_handler", DEFAULT_DENSE_HANDLER)
-    spec = getattr(provider, "_art_model_support_spec", None)
-    target_modules = [] if spec is None else list(spec.default_target_modules)
+    handler = provider._art_model_support_handler
+    spec = provider._art_model_support_spec
+    target_modules = list(spec.default_target_modules)
     handler.apply_lora_adapters(
         model,
         provider,
