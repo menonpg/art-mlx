@@ -5,7 +5,6 @@ from .megatron_oracle_harness import (
     DENSE_ORACLE_TOPOLOGY,
     ORACLE_TOPOLOGY,
     DiffAccumulator,
-    LossThresholdRule,
     MetricThresholdRule,
     _default_phase_pass_fns,
     _suite_variants,
@@ -19,7 +18,7 @@ def test_metric_threshold_rule_can_require_strictly_positive_values() -> None:
     summary = {"candidate_abs_scale": 0.0}
 
     assert not rule(summary)
-    assert rule.failure_reasons(summary) == ["candidate_abs_scale=0<=0"]e
+    assert rule.failure_reasons(summary) == ["candidate_abs_scale=0<=0"]
 
 
 def test_diff_accumulator_summary_tracks_candidate_abs_scale() -> None:
@@ -36,7 +35,7 @@ def test_diff_accumulator_summary_tracks_candidate_abs_scale() -> None:
     assert summary["candidate_abs_scale"] == 0.25
 
 
-def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas() -> (
+def test_default_phase_rules_require_non_zero_forward_outputs_losses_grads_and_deltas() -> (
     None
 ):
     phase_pass = _default_phase_pass_fns()
@@ -49,9 +48,9 @@ def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas()
 
     assert not phase_pass["forward"](zero_signal_summary)
     assert not phase_pass["outputs"](zero_signal_summary)
+    assert not phase_pass["losses"](zero_signal_summary)
     assert not phase_pass["grads"](zero_signal_summary)
     assert not phase_pass["deltas"](zero_signal_summary)
-    assert phase_pass["losses"](zero_signal_summary)
 
 
 def test_suite_variants_skip_duplicate_oracle_replay_variant() -> None:
@@ -69,6 +68,23 @@ def test_dense_suite_variants_include_tp2_dp2_without_oracle_duplicate() -> None
     assert all(variant.topology != DENSE_ORACLE_TOPOLOGY for variant in variants)
     assert any(
         variant.topology.tp == 2 and variant.topology.dp == 2 for variant in variants
+    )
+
+
+def test_moe_suite_variants_include_dp2_ep_and_etp_topologies() -> None:
+    variants = _suite_variants("rl", is_moe=True)
+
+    assert any(
+        variant.topology.tp == 1
+        and variant.topology.ep == 2
+        and variant.topology.dp == 2
+        for variant in variants
+    )
+    assert any(
+        variant.topology.tp == 1
+        and variant.topology.etp == 2
+        and variant.topology.dp == 2
+        for variant in variants
     )
 
 

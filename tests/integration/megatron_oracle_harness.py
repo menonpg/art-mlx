@@ -23,7 +23,6 @@ ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_correctness")
 ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
 
 REGENERATE_ENV = "ART_REGENERATE_ORACLE"
-EXTENDED_TOPOLOGIES_ENV = "ART_ENABLE_EXTENDED_TOPOLOGIES"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
 
@@ -179,6 +178,9 @@ TOPOLOGIES = [
     Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
     Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
     Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
+    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
+    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
+    Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
@@ -186,12 +188,6 @@ DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
 ]
-EXTENDED_TOPOLOGIES = [
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
-]
-DENSE_EXTENDED_TOPOLOGIES: list[Topology] = []
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
 DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
@@ -218,10 +214,7 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
 
 
 def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
-    topologies = list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
-    if extended_topologies_enabled():
-        topologies.extend(EXTENDED_TOPOLOGIES if is_moe else DENSE_EXTENDED_TOPOLOGIES)
-    return topologies
+    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
 
 
 class PackedTensorConfig(BaseModel):
@@ -645,11 +638,6 @@ def sensitivity_required_world_size(
         sensitivity_topology_for_mutation(mutation, is_moe=is_moe).world_size()
         for mutation in mutations
     )
-
-
-def extended_topologies_enabled() -> bool:
-    """Returns whether extended topologies are enabled for the suite."""
-    return _truthy(os.environ.get(EXTENDED_TOPOLOGIES_ENV))
 
 
 def regenerate_requested() -> bool:
@@ -1683,7 +1671,11 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
             }
         )
     )
-    return {"forward": fwd_out_loss, "outputs": fwd_out_loss, "losses": fwd_out_loss} | {
+    return {
+        "forward": fwd_out_loss,
+        "outputs": fwd_out_loss,
+        "losses": fwd_out_loss,
+    } | {
         "grads": grads_deltas,
         "deltas": grads_deltas,
         "router_topk_ids": router_topk_rule,
