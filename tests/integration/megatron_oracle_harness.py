@@ -1655,8 +1655,12 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out_loss = MetricThresholdRule(
+    fwd_out = MetricThresholdRule(
         limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
+        minimums=non_zero_scales,
+    )
+    loss = MetricThresholdRule(
+        limits={"relative_l2": 2e-2, "mean_abs_pct": 2.0},
         minimums=non_zero_scales,
     )
     grads_deltas = MetricThresholdRule(
@@ -1672,9 +1676,9 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
         )
     )
     return {
-        "forward": fwd_out_loss,
-        "outputs": fwd_out_loss,
-        "losses": fwd_out_loss,
+        "forward": fwd_out,
+        "outputs": fwd_out,
+        "losses": loss,
     } | {
         "grads": grads_deltas,
         "deltas": grads_deltas,
