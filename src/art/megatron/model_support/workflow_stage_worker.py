@@ -31,7 +31,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--architecture-json", required=True)
     parser.add_argument("--output-json", required=True)
-    parser.add_argument("--allow-unsupported-arch", action="store_true")
+    parser.add_argument(
+        "--allow-unsupported-arch",
+        dest="allow_unvalidated_arch",
+        action="store_true",
+    )
     return parser.parse_args()
 
 
