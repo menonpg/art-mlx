@@ -131,6 +131,65 @@ def _qwen35_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
     return tensors
 
 
+def _qwen3_dense_lora_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
+    module_dims = {
+        "self_attn.q_proj": (rank, 3, 3),
+        "self_attn.k_proj": (rank, 3, 3),
+        "self_attn.v_proj": (rank, 3, 3),
+        "self_attn.o_proj": (rank, 3, 3),
+        "mlp.gate_proj": (rank, 3, 4),
+        "mlp.up_proj": (rank, 3, 4),
+        "mlp.down_proj": (rank, 4, 3),
+    }
+    tensors: dict[str, torch.Tensor] = {}
+    offset = 0
+    for module, (rank_dim, in_dim, out_dim) in module_dims.items():
+        tensors[f"{prefix}.{module}.lora_A.weight"] = (
+            torch.arange(rank_dim * in_dim, dtype=torch.float32).reshape(
+                rank_dim,
+                in_dim,
+            )
+            + offset
+        )
+        offset += 100
+        tensors[f"{prefix}.{module}.lora_B.weight"] = (
+            torch.arange(out_dim * rank_dim, dtype=torch.float32).reshape(
+                out_dim,
+                rank_dim,
+            )
+            + offset
+        )
+        offset += 100
+    return tensors
+
+
+def _qwen3_moe_lora_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
+    tensors = {
+        key: value
+        for key, value in _qwen3_dense_lora_tensors(prefix, rank=rank).items()
+        if ".mlp." not in key
+    }
+    offset = 1000
+    for expert in range(2):
+        for module, in_dim, out_dim in (
+            ("gate_proj", 3, 4),
+            ("up_proj", 3, 4),
+            ("down_proj", 4, 3),
+        ):
+            expert_prefix = f"{prefix}.mlp.experts.{expert}.{module}"
+            tensors[f"{expert_prefix}.lora_A.weight"] = (
+                torch.arange(rank * in_dim, dtype=torch.float32).reshape(rank, in_dim)
+                + offset
+            )
+            offset += 100
+            tensors[f"{expert_prefix}.lora_B.weight"] = (
+                torch.arange(out_dim * rank, dtype=torch.float32).reshape(out_dim, rank)
+                + offset
+            )
+            offset += 100
+    return tensors
+
+
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _qwen35_moe_art_tensors(art_prefix)
@@ -198,16 +257,7 @@ def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Pat
 
 
 def test_qwen3_dense_and_moe_are_already_vllm_canonical(tmp_path: Path):
-    dense = {
-        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(
-            2,
-            3,
-        ),
-        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(
-            3,
-            2,
-        ),
-    }
+    dense = _qwen3_dense_lora_tensors("base_model.model.model.layers.0")
     assert (
         DEFAULT_DENSE_HANDLER.to_vllm_lora_tensors(
             dense,
@@ -217,20 +267,28 @@ def test_qwen3_dense_and_moe_are_already_vllm_canonical(tmp_path: Path):
     )
     dense_dir = tmp_path / "qwen3_dense"
     _save_adapter(dense_dir, dense, _config("Qwen/Qwen3-0.6B"))
-    assert _assert_stock_vllm_loads(dense_dir, expected_modules={"q_proj"}) == [
-        "model.layers.0.self_attn.q_proj"
+    assert _assert_stock_vllm_loads(
+        dense_dir,
+        expected_modules={
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        },
+    ) == [
+        "model.layers.0.mlp.down_proj",
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.up_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.v_proj",
     ]
 
-    moe = {
-        "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight": torch.ones(
-            2,
-            3,
-        ),
-        "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_B.weight": torch.ones(
-            4,
-            2,
-        ),
-    }
+    moe = _qwen3_moe_lora_tensors("base_model.model.model.layers.0")
     assert (
         QWEN3_MOE_HANDLER.to_vllm_lora_tensors(
             moe,
@@ -242,8 +300,30 @@ def test_qwen3_dense_and_moe_are_already_vllm_canonical(tmp_path: Path):
     _save_adapter(moe_dir, moe, _config("Qwen/Qwen3-30B-A3B"))
     assert _assert_stock_vllm_loads(
         moe_dir,
-        expected_modules={"experts.0.gate_proj"},
-    ) == ["model.layers.0.mlp.experts.0.gate_proj"]
+        expected_modules={
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "experts.0.gate_proj",
+            "experts.0.up_proj",
+            "experts.0.down_proj",
+            "experts.1.gate_proj",
+            "experts.1.up_proj",
+            "experts.1.down_proj",
+        },
+    ) == [
+        "model.layers.0.mlp.experts.0.down_proj",
+        "model.layers.0.mlp.experts.0.gate_proj",
+        "model.layers.0.mlp.experts.0.up_proj",
+        "model.layers.0.mlp.experts.1.down_proj",
+        "model.layers.0.mlp.experts.1.gate_proj",
+        "model.layers.0.mlp.experts.1.up_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.v_proj",
+    ]
 
 
 def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(

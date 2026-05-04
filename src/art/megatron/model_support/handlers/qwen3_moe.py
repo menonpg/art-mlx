@@ -15,7 +15,7 @@ _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
 
 class Qwen3MoeHandler(DefaultMoeHandler):
     key = "qwen3_moe"
-    native_vllm_lora_status = "disabled"
+    native_vllm_lora_status = "validated"
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_qwen3_text_preprocess_patch(model_chunks)

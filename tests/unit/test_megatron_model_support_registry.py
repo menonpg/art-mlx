@@ -121,6 +121,11 @@ def test_qwen3_moe_model_support_spec():
     spec = get_model_support_spec("Qwen/Qwen3-30B-A3B-Instruct-2507")
     assert spec.key == "qwen3_moe"
     assert spec.handler_key == "qwen3_moe"
+    assert spec.default_rollout_weights_mode == "lora"
+    assert (
+        native_vllm_lora_status_for_model("Qwen/Qwen3-30B-A3B-Instruct-2507")
+        == "validated"
+    )
     assert get_model_support_handler("Qwen/Qwen3-30B-A3B-Instruct-2507").key == (
         "qwen3_moe"
     )
