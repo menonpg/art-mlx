@@ -196,6 +196,7 @@ def test_qwen35_handler_uses_shared_expert_workaround_pair_when_overlap_disabled
         "flags": (
             "alltoall_dtoh",
             "alltoall_dispatch_preprocess",
+            "deepep_permute_restore",
         ),
         "shared_expert_state": "shared_experts",
         "disable_compile": False,
