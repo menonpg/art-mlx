@@ -1,7 +1,3 @@
-from art.megatron.model_support.discovery import (
-    inspect_architecture,
-    summarize_layer_families,
-)
 from art.megatron.model_support.registry import (
     DEFAULT_DENSE_SPEC,
     PROBE_ONLY_MODEL_SUPPORT_SPECS,
@@ -38,15 +34,31 @@ from art.megatron.model_support.spec import (
     ValidationReport,
     ValidationStageResult,
 )
-from art.megatron.model_support.workflow import (
-    MANDATORY_VALIDATION_STAGES,
-    NATIVE_VLLM_LORA_STAGE,
-    assess_minimal_layer_coverage,
-    build_validation_report,
-    build_validation_stage_names,
-    detect_dependency_versions,
-    initialize_validation_report,
-)
+
+_LAZY_EXPORT_MODULES = {
+    "inspect_architecture": "art.megatron.model_support.discovery",
+    "summarize_layer_families": "art.megatron.model_support.discovery",
+    "MANDATORY_VALIDATION_STAGES": "art.megatron.model_support.workflow",
+    "NATIVE_VLLM_LORA_STAGE": "art.megatron.model_support.workflow",
+    "assess_minimal_layer_coverage": "art.megatron.model_support.workflow",
+    "build_validation_report": "art.megatron.model_support.workflow",
+    "build_validation_stage_names": "art.megatron.model_support.workflow",
+    "detect_dependency_versions": "art.megatron.model_support.workflow",
+    "initialize_validation_report": "art.megatron.model_support.workflow",
+}
+
+
+def __getattr__(name: str):
+    import importlib
+
+    try:
+        module_name = _LAZY_EXPORT_MODULES[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "ArchitectureReport",
