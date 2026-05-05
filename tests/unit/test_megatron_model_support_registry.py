@@ -142,6 +142,13 @@ def test_qwen3_dense_uses_default_dense_only_in_unsupported_probe_mode():
     assert spec.key == "qwen3_dense"
     assert spec.handler_key == "qwen3_dense"
     assert (
+        native_vllm_lora_status_for_model(
+            "Qwen/Qwen3-4B-Instruct-2507",
+            allow_unvalidated_arch=True,
+        )
+        == "validated"
+    )
+    assert (
         model_uses_expert_parallel(
             "Qwen/Qwen3-4B-Instruct-2507",
             allow_unvalidated_arch=True,
