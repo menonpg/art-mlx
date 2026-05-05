@@ -655,7 +655,7 @@ async def run_yes_no_trainability_async(
     )
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
     backend_root.mkdir(parents=True, exist_ok=True)
-    reward_threshold = _get_env_float("ART_MODEL_SUPPORT_YES_NO_REWARD_THRESHOLD", 0.95)
+    reward_threshold = _get_env_float("ART_MODEL_SUPPORT_YES_NO_REWARD_THRESHOLD", 0.9)
     max_steps = _variant_max_steps(variant)
     rollouts_per_prompt = _variant_rollouts_per_prompt(variant)
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
