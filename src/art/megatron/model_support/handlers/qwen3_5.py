@@ -22,6 +22,7 @@ from art.megatron.provider_common import patch_layer_spec_tree
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
+    "deepep_permute_restore",
 )
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
