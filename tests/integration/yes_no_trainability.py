@@ -24,7 +24,7 @@ from art.megatron.model_support.registry import (
 )
 from art.megatron.model_support.spec import RolloutWeightsMode
 
-from .megatron_oracle_harness import ORACLE_TOPOLOGY, Topology
+from .megatron_oracle_harness import Topology, oracle_topology
 from .megatron_oracle_worker import provider_topology_env
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
@@ -34,6 +34,7 @@ _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[3] / ".local" / "model_support_validation"
 )
 _SHARED_MEGATRON_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+_DENSE_SHARED_MEGATRON_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
 _VARIANT_NAME = Literal[
     "megatron_shared",
     "megatron_dedicated",
@@ -312,14 +313,25 @@ def _artifact_dir(base_model: str, variant_name: _VARIANT_NAME) -> Path:
     return path
 
 
-def _build_variant(variant_name: _VARIANT_NAME) -> _TrainabilityVariant:
+def _build_variant(
+    variant_name: _VARIANT_NAME,
+    *,
+    base_model: str,
+    allow_unvalidated_arch: bool = False,
+) -> _TrainabilityVariant:
+    is_moe = model_uses_expert_parallel(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     if variant_name == "megatron_shared":
         shared_gpu_ids = _resolve_shared_gpu_ids()
         return _TrainabilityVariant(
             name=variant_name,
             backend_name="megatron",
             placement_mode="shared",
-            topology=_SHARED_MEGATRON_TOPOLOGY,
+            topology=_SHARED_MEGATRON_TOPOLOGY
+            if is_moe
+            else _DENSE_SHARED_MEGATRON_TOPOLOGY,
             trainer_gpu_ids=shared_gpu_ids,
             inference_gpu_ids=shared_gpu_ids,
         )
@@ -329,7 +341,7 @@ def _build_variant(variant_name: _VARIANT_NAME) -> _TrainabilityVariant:
             name=variant_name,
             backend_name="megatron",
             placement_mode="dedicated",
-            topology=ORACLE_TOPOLOGY,
+            topology=oracle_topology(is_moe=is_moe),
             trainer_gpu_ids=trainer_gpu_ids,
             inference_gpu_ids=inference_gpu_ids,
         )
@@ -636,7 +648,11 @@ async def run_yes_no_trainability_async(
     rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> YesNoTrainabilityReport:
-    variant = _build_variant(variant_name)
+    variant = _build_variant(
+        variant_name,
+        base_model=base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
     backend_root.mkdir(parents=True, exist_ok=True)
     reward_threshold = _get_env_float("ART_MODEL_SUPPORT_YES_NO_REWARD_THRESHOLD", 0.95)

@@ -8,6 +8,7 @@ from art.megatron.model_support import UnsupportedModelArchitectureError
 
 from .yes_no_trainability import (
     _build_internal_config,
+    _build_variant,
     _default_variant_name,
     _evaluate_groups,
     _TrainabilityVariant,
@@ -158,6 +159,16 @@ def test_unvalidated_dense_model_is_not_default_megatron_trainability_model(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
+    built_variant = _build_variant(
+        "megatron_shared",
+        base_model="Qwen/Qwen3.5-4B",
+        allow_unvalidated_arch=True,
+    )
+    assert built_variant.topology is not None
+    assert built_variant.topology.tp == 2
+    assert built_variant.topology.ep == 1
+    assert built_variant.topology.etp == 1
+
     variant = _TrainabilityVariant(
         name="megatron_shared",
         backend_name="megatron",
