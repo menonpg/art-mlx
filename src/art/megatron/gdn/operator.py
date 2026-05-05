@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from .conv_gelu import gdn_varlen_causal_conv_gelu
+from .conv_gelu import gdn_varlen_causal_conv_gelu, packed_varlen_causal_conv
 from .gdn_shared_prefix import (
     GdnPackedExecutionSpec,
     GdnParentStateTransferPlan,
@@ -25,6 +25,15 @@ from .gdn_shared_prefix import (
     GdnSegmentBucketPlan,
     build_gdn_rank_execution_plan,
     parse_gdn_shared_prefix_segments,
+)
+from .segment_layout import (
+    gather_bucket_streams_compact as _gather_bucket_streams_compact_fused,
+)
+from .segment_layout import (
+    prepare_packed_recurrent_inputs as _prepare_packed_recurrent_inputs_fused,
+)
+from .segment_layout import (
+    scatter_bucket_output_compact as _scatter_bucket_output_fused,
 )
 
 _NVTX_ENABLED: ContextVar[bool] = ContextVar("art_gdn_nvtx_enabled", default=False)
@@ -462,27 +471,28 @@ def _run_chunk_aligned_prefixes_and_completions(
 
     for bucket in plan.prefix_boundary_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
+            prefix_qkv, prefix_beta, prefix_g = _gather_compact_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
-        zero_conv = _zero_conv_state(gdn, hidden_states, batch_size=prefix_qkv.shape[0])
+        zero_conv = _zero_conv_state(
+            gdn, hidden_states, batch_size=bucket.segment_count
+        )
         zero_rec = _zero_recurrent_state(
-            gdn, hidden_states, batch_size=prefix_qkv.shape[0]
+            gdn, hidden_states, batch_size=bucket.segment_count
         )
         with _nvtx_range("art_gdn_prefix_boundary_segment", prefix_qkv):
-            prefix_out, prefix_conv, prefix_rec = _run_gdn_prepared_varlen_batch(
-                gdn,
-                prefix_qkv,
-                beta=prefix_beta,
-                recurrent_g=prefix_g,
-                bucket=bucket,
-                conv_initial=zero_conv,
-                recurrent_initial=zero_rec,
+            prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
+                bucket,
+                (prefix_qkv, prefix_beta, prefix_g),
+                (zero_conv, zero_rec),
+                gdn=gdn,
                 output_final_state=True,
             )
         if prefix_conv is None or prefix_rec is None:
             raise RuntimeError("prefix boundary GDN execution must return final states")
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, prefix_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, prefix_out
+        )
         boundary_family_chunks.append(bucket.family_indices)
         boundary_conv_chunks.append(prefix_conv)
         boundary_rec_chunks.append(prefix_rec)
@@ -507,26 +517,25 @@ def _run_chunk_aligned_prefixes_and_completions(
     tail_rec_chunks: list[Tensor] = []
     for bucket in plan.prefix_tail_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            tail_qkv, tail_beta, tail_g = _gather_bucket_streams(
+            tail_qkv, tail_beta, tail_g = _gather_compact_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
         with _nvtx_range("art_gdn_state_fanout", tail_qkv):
             tail_conv = boundary_conv_table.index_select(0, bucket.family_indices)
             tail_rec = boundary_rec_table.index_select(0, bucket.family_indices)
         with _nvtx_range("art_gdn_prefix_tail_segment", tail_qkv):
-            tail_out, tail_conv, tail_rec = _run_gdn_prepared_varlen_batch(
-                gdn,
-                tail_qkv,
-                beta=tail_beta,
-                recurrent_g=tail_g,
-                bucket=bucket,
-                conv_initial=tail_conv,
-                recurrent_initial=tail_rec,
+            tail_out, tail_conv, tail_rec = run_gdn_bucket(
+                bucket,
+                (tail_qkv, tail_beta, tail_g),
+                (tail_conv, tail_rec),
+                gdn=gdn,
                 output_final_state=True,
             )
         if tail_conv is None or tail_rec is None:
             raise RuntimeError("prefix tail GDN execution must return final states")
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, tail_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, tail_out
+        )
         tail_family_chunks.append(bucket.family_indices)
         tail_conv_chunks.append(tail_conv)
         tail_rec_chunks.append(tail_rec)
@@ -547,38 +556,20 @@ def _run_chunk_aligned_prefixes_and_completions(
             completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
             completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
-                qkv, beta, recurrent_g, bucket
+            completion_qkv, completion_beta, completion_g = (
+                _gather_compact_bucket_streams(qkv, beta, recurrent_g, bucket)
             )
-        for (
-            column_bucket,
-            qkv_col,
-            beta_col,
-            g_col,
-            conv_col,
-            rec_col,
-        ) in _iter_prepared_bucket_columns(
-            bucket,
-            completion_qkv,
-            completion_beta,
-            completion_g,
-            completion_conv,
-            completion_rec,
-        ):
-            with _nvtx_range("art_gdn_completion_warmup_segment", qkv_col):
-                completion_out, _, _ = _run_gdn_prepared_varlen_batch(
-                    gdn,
-                    qkv_col,
-                    beta=beta_col,
-                    recurrent_g=g_col,
-                    bucket=column_bucket,
-                    conv_initial=conv_col,
-                    recurrent_initial=rec_col,
-                    output_final_state=False,
-                )
-            _scatter_bucket_recurrent_output(
-                recurrent_output, column_bucket, completion_out
+        with _nvtx_range("art_gdn_completion_warmup_segment", completion_qkv):
+            completion_out, _, _ = run_gdn_bucket(
+                bucket,
+                (completion_qkv, completion_beta, completion_g),
+                (completion_conv, completion_rec),
+                gdn=gdn,
+                output_final_state=False,
             )
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, completion_out
+        )
 
     return _project_gdn_output(gdn, recurrent_output, gate, plan)
 
@@ -635,10 +626,7 @@ def _run_legacy_planned_prefixes_and_completions(
 ) -> tuple[Tensor, Tensor | None]:
     with _nvtx_range("art_gdn_in_proj", hidden_states):
         qkv, gate, beta, recurrent_g = _project_gdn_inputs(gdn, hidden_states)
-    qkv_flat = qkv.reshape(-1, int(qkv.shape[-1]))
     gate_flat = gate.reshape(-1, int(gate.shape[-2]), int(gate.shape[-1]))
-    beta_flat = beta.reshape(-1, int(beta.shape[-1]))
-    recurrent_g_flat = recurrent_g.reshape(-1, int(recurrent_g.shape[-1]))
     recurrent_chunks: list[Tensor] = []
     gate_chunks: list[Tensor] = []
     output_index_chunks: list[Tensor] = []
@@ -649,32 +637,24 @@ def _run_legacy_planned_prefixes_and_completions(
     for bucket in plan.prefix_buckets:
         layout = _bucket_flat_layout(bucket, sequence_length=plan.sequence_length)
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            prefix_qkv, prefix_beta, prefix_g = _gather_flat_bucket_streams(
-                qkv_flat,
-                beta_flat,
-                recurrent_g_flat,
-                layout=layout,
-                length=int(bucket.length),
-                segment_count=int(bucket.segment_count),
+            prefix_qkv, prefix_beta, prefix_g = _gather_compact_bucket_streams(
+                qkv, beta, recurrent_g, bucket
             )
             prefix_gate = _gather_compact_tokens(gate_flat, layout.real_indices)
         with _nvtx_range("art_gdn_conv_state_materialization", hidden_states):
             zero_conv = _zero_conv_state(
-                gdn, hidden_states, batch_size=prefix_qkv.shape[0]
+                gdn, hidden_states, batch_size=bucket.segment_count
             )
         with _nvtx_range("art_gdn_recurrent_state_materialization", hidden_states):
             zero_rec = _zero_recurrent_state(
-                gdn, hidden_states, batch_size=prefix_qkv.shape[0]
+                gdn, hidden_states, batch_size=bucket.segment_count
             )
         with _nvtx_range("art_gdn_prefix_segment", prefix_qkv):
-            prefix_out, prefix_conv, prefix_rec = _run_gdn_prepared_varlen_batch(
-                gdn,
-                prefix_qkv,
-                beta=prefix_beta,
-                recurrent_g=prefix_g,
-                bucket=bucket,
-                conv_initial=zero_conv,
-                recurrent_initial=zero_rec,
+            prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
+                bucket,
+                (prefix_qkv, prefix_beta, prefix_g),
+                (zero_conv, zero_rec),
+                gdn=gdn,
                 output_final_state=True,
             )
             if prefix_conv is None or prefix_rec is None:
@@ -707,27 +687,19 @@ def _run_legacy_planned_prefixes_and_completions(
     for bucket in plan.completion_buckets:
         layout = _bucket_flat_layout(bucket, sequence_length=plan.sequence_length)
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            completion_qkv, completion_beta, completion_g = _gather_flat_bucket_streams(
-                qkv_flat,
-                beta_flat,
-                recurrent_g_flat,
-                layout=layout,
-                length=int(bucket.length),
-                segment_count=int(bucket.segment_count),
+            completion_qkv, completion_beta, completion_g = (
+                _gather_compact_bucket_streams(qkv, beta, recurrent_g, bucket)
             )
             completion_gate = _gather_compact_tokens(gate_flat, layout.real_indices)
         with _nvtx_range("art_gdn_state_fanout", completion_qkv):
             completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
             completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
         with _nvtx_range("art_gdn_completion_segment", completion_qkv):
-            completion_out, _, _ = _run_gdn_prepared_varlen_batch(
-                gdn,
-                completion_qkv,
-                beta=completion_beta,
-                recurrent_g=completion_g,
-                bucket=bucket,
-                conv_initial=completion_conv,
-                recurrent_initial=completion_rec,
+            completion_out, _, _ = run_gdn_bucket(
+                bucket,
+                (completion_qkv, completion_beta, completion_g),
+                (completion_conv, completion_rec),
+                gdn=gdn,
                 output_final_state=False,
             )
         completion_out, completion_gate, output_indices = _select_bucket_outputs(
@@ -816,7 +788,9 @@ def _run_cp_planned_prefixes_and_completions(
         prefix_conv = _add_autograd_dependency(prefix_conv, cp_dependency)
         prefix_rec = _add_autograd_dependency(prefix_rec, cp_dependency)
         cp_dependency = _make_autograd_dependency(prefix_out, prefix_conv, prefix_rec)
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, prefix_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, prefix_out
+        )
         prefix_family_chunks.append(bucket.family_indices)
         prefix_conv_chunks.append(prefix_conv)
         prefix_rec_chunks.append(prefix_rec)
@@ -849,7 +823,9 @@ def _run_cp_planned_prefixes_and_completions(
         prefix_out = _add_autograd_dependency(prefix_out, cp_dependency)
         prefix_conv = _add_autograd_dependency(prefix_conv, cp_dependency)
         prefix_rec = _add_autograd_dependency(prefix_rec, cp_dependency)
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, prefix_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, prefix_out
+        )
         boundary_family_chunks.append(bucket.family_indices)
         boundary_conv_chunks.append(prefix_conv)
         boundary_rec_chunks.append(prefix_rec)
@@ -898,7 +874,9 @@ def _run_cp_planned_prefixes_and_completions(
             tail_out = _add_autograd_dependency(tail_out, cp_dependency)
             tail_conv = _add_autograd_dependency(tail_conv, cp_dependency)
             tail_rec = _add_autograd_dependency(tail_rec, cp_dependency)
-            _scatter_bucket_recurrent_output(recurrent_output, bucket, tail_out)
+            recurrent_output = _scatter_bucket_recurrent_output(
+                recurrent_output, bucket, tail_out
+            )
             tail_family_chunks.append(bucket.family_indices)
             tail_conv_chunks.append(tail_conv)
             tail_rec_chunks.append(tail_rec)
@@ -952,7 +930,7 @@ def _run_cp_planned_prefixes_and_completions(
                         output_final_state=False,
                     )
                 completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-                _scatter_bucket_recurrent_output(
+                recurrent_output = _scatter_bucket_recurrent_output(
                     recurrent_output, column_bucket, completion_out
                 )
 
@@ -981,7 +959,9 @@ def _run_cp_planned_prefixes_and_completions(
         prefix_out = _add_autograd_dependency(prefix_out, cp_dependency)
         prefix_conv = _add_autograd_dependency(prefix_conv, cp_dependency)
         prefix_rec = _add_autograd_dependency(prefix_rec, cp_dependency)
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, prefix_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, prefix_out
+        )
         prefix_family_chunks.append(bucket.family_indices)
         prefix_conv_chunks.append(prefix_conv)
         prefix_rec_chunks.append(prefix_rec)
@@ -1029,7 +1009,9 @@ def _run_cp_planned_prefixes_and_completions(
             )
         completion_out = _add_autograd_dependency(completion_out, cp_dependency)
         cp_dependency = _make_autograd_dependency(completion_out)
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, completion_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, completion_out
+        )
 
     ready_completion_buckets = (
         plan.ready_local_completion_buckets
@@ -1058,7 +1040,9 @@ def _run_cp_planned_prefixes_and_completions(
                 output_final_state=False,
             )
         completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, completion_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, completion_out
+        )
 
     if plan.parent_state_exchange_family_indices:
         if not plan.parent_state_transfers:
@@ -1096,7 +1080,9 @@ def _run_cp_planned_prefixes_and_completions(
                 output_final_state=False,
             )
         completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-        _scatter_bucket_recurrent_output(recurrent_output, bucket, completion_out)
+        recurrent_output = _scatter_bucket_recurrent_output(
+            recurrent_output, bucket, completion_out
+        )
 
     projected, out_bias = _project_gdn_output(gdn, recurrent_output, gate, plan)
     projected = _add_autograd_dependency(projected, cp_dependency)
@@ -1365,6 +1351,25 @@ def _gather_flat_bucket_streams(
         layout.padded_mask,
         length,
         segment_count,
+    )
+
+
+def _gather_compact_bucket_streams(
+    qkv: Tensor,
+    beta: Tensor,
+    recurrent_g: Tensor,
+    bucket: GdnSegmentBucketPlan,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _gather_bucket_streams_compact_fused(
+        qkv.reshape(-1, int(qkv.shape[-1])),
+        beta.reshape(-1, int(beta.shape[-1])),
+        recurrent_g.reshape(-1, int(recurrent_g.shape[-1])),
+        bucket.row_indices,
+        bucket.position_indices,
+        bucket.cu_seqlens,
+        token_count=int(bucket.real_token_count),
+        segment_count=int(bucket.segment_count),
+        sequence_length=int(qkv.shape[1]),
     )
 
 
@@ -1840,14 +1845,15 @@ def _local_value_dim(gdn: Any) -> int:
 
 def _scatter_bucket_recurrent_output(
     output: Tensor, bucket: GdnSegmentBucketPlan, bucket_output: Tensor
-) -> None:
-    real_mask = bucket.real_mask.transpose(0, 1)
-    output_mask = _bucket_output_mask(bucket).transpose(0, 1)
-    flat_output_mask = output_mask[real_mask]
-    output[
-        bucket.row_indices.transpose(0, 1)[output_mask],
-        bucket.position_indices.transpose(0, 1)[output_mask],
-    ] = bucket_output.squeeze(0)[flat_output_mask].to(dtype=output.dtype)
+) -> Tensor:
+    return _scatter_bucket_output_fused(
+        output,
+        bucket_output,
+        bucket.row_indices,
+        bucket.position_indices,
+        _bucket_output_mask(bucket),
+        bucket.cu_seqlens,
+    )
 
 
 def _bucket_output_mask(bucket: GdnSegmentBucketPlan) -> Tensor:
@@ -2470,6 +2476,25 @@ def _causal_conv1d_varlen_with_state(
     return out, conv_final
 
 
+def _causal_conv1d_packed_varlen_with_state(
+    gdn: Any,
+    qkv: Tensor,
+    conv_initial: Tensor,
+    cu_seqlens: Tensor,
+    *,
+    output_final_state: bool,
+) -> tuple[Tensor, Tensor | None]:
+    return packed_varlen_causal_conv(
+        qkv,
+        cu_seqlens,
+        conv_initial,
+        gdn.conv1d.weight.squeeze(1),
+        gdn.conv1d.bias,
+        activation=str(getattr(gdn, "activation", "gelu")),
+        output_final_state=output_final_state,
+    )
+
+
 def _causal_conv1d_with_state(
     gdn: Any,
     qkv: Tensor,
@@ -2577,6 +2602,85 @@ def _disable_reentrant_te_linear_transpose_cache(gdn: Any) -> None:
             if hasattr(linear, "disable_parameter_transpose_cache"):
                 linear.disable_parameter_transpose_cache = True
     gdn._art_reentrant_te_linear_transpose_cache_disabled = True
+
+
+def run_gdn_bucket(
+    bucket: GdnSegmentBucketPlan,
+    projected_streams: tuple[Tensor, Tensor, Tensor],
+    parent_states: tuple[Tensor, Tensor],
+    *,
+    gdn: Any,
+    output_final_state: bool = True,
+) -> tuple[Tensor, Tensor | None, Tensor | None]:
+    _disable_reentrant_te_linear_transpose_cache(gdn)
+    qkv, beta, recurrent_g = projected_streams
+    conv_initial, recurrent_initial = parent_states
+    token_count = int(qkv.shape[0]) if qkv.ndim == 2 else -1
+    segment_count = int(bucket.segment_count)
+    if qkv.ndim != 2:
+        raise ValueError(
+            "GDN bucket execution requires compact projected streams; "
+            f"got qkv shape {tuple(qkv.shape)}"
+        )
+    if token_count != int(bucket.real_token_count):
+        raise ValueError(
+            "GDN packed varlen token count mismatch, got "
+            f"qkv={tuple(qkv.shape)} and bucket tokens={bucket.real_token_count}"
+        )
+    if tuple(beta.shape[:1]) != (token_count,) or tuple(recurrent_g.shape) != tuple(
+        beta.shape
+    ):
+        raise ValueError(
+            "packed beta/recurrent_g must be [tokens, heads], got "
+            f"{tuple(beta.shape)} and {tuple(recurrent_g.shape)}"
+        )
+    if int(conv_initial.shape[0]) != segment_count:
+        raise ValueError(
+            "conv_initial batch must match bucket segment count, got "
+            f"{tuple(conv_initial.shape)} for {segment_count} segments"
+        )
+    if int(recurrent_initial.shape[0]) != segment_count:
+        raise ValueError(
+            "recurrent_initial batch must match bucket segment count, got "
+            f"{tuple(recurrent_initial.shape)} for {segment_count} segments"
+        )
+
+    with _nvtx_range("art_gdn_causal_conv_forward", qkv):
+        qkv, conv_final = _causal_conv1d_packed_varlen_with_state(
+            gdn,
+            qkv,
+            conv_initial,
+            bucket.cu_seqlens,
+            output_final_state=output_final_state,
+        )
+
+    with _nvtx_range("art_gdn_qkv_head_prepare", qkv):
+        query, key, value, beta, recurrent_g = _prepare_packed_recurrent_inputs_fused(
+            qkv,
+            beta,
+            recurrent_g,
+            key_heads=_local_key_heads(gdn),
+            value_heads=_local_value_heads(gdn),
+            key_dim=int(gdn.key_head_dim),
+            value_dim=int(gdn.value_head_dim),
+        )
+        if gdn.use_qk_l2norm:
+            query = l2norm(query.contiguous())
+            key = l2norm(key.contiguous())
+
+    with _nvtx_range("art_gdn_recurrent_forward", query):
+        recurrent_out, recurrent_final = _chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=recurrent_g,
+            beta=beta,
+            initial_state=recurrent_initial,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=bucket.cu_seqlens,
+        )
+    return recurrent_out, conv_final, recurrent_final
 
 
 def _zero_conv_state(
