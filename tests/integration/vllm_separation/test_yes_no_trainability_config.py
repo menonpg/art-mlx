@@ -4,8 +4,6 @@ from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
-from art.megatron.model_support import UnsupportedModelArchitectureError
-
 from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
@@ -155,14 +153,13 @@ def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
     assert "inference_gpu_ids" not in config
 
 
-def test_unvalidated_dense_model_is_not_default_megatron_trainability_model(
+def test_validated_dense_model_uses_dense_shared_topology(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_SHARED_GPU_IDS", "0,1")
     built_variant = _build_variant(
         "megatron_shared",
         base_model="Qwen/Qwen3.5-4B",
-        allow_unvalidated_arch=True,
     )
     assert built_variant.topology is not None
     assert built_variant.topology.tp == 2
@@ -177,14 +174,7 @@ def test_unvalidated_dense_model_is_not_default_megatron_trainability_model(
         inference_gpu_ids=[0, 1],
     )
 
-    with pytest.raises(UnsupportedModelArchitectureError):
-        _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
-
-    config = _build_internal_config(
-        variant,
-        base_model="Qwen/Qwen3.5-4B",
-        allow_unvalidated_arch=True,
-    )
+    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
     assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
     assert "enable_expert_parallel" not in config["engine_args"]

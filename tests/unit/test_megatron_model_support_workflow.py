@@ -433,7 +433,6 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
 
     result = run_correctness_sensitivity_stage(
         base_model="Qwen/Qwen3.5-4B",
-        allow_unvalidated_arch=True,
         architecture=ArchitectureReport(
             base_model="Qwen/Qwen3.5-4B",
             model_key="qwen3_5_dense",

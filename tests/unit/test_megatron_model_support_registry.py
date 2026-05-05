@@ -4,6 +4,7 @@ from art.megatron.model_support import (
     QWEN3_5_DENSE_MODELS,
     QWEN3_5_MODELS,
     QWEN3_5_MOE_MODELS,
+    QWEN3_DENSE_MODELS,
     QWEN3_MOE_MODELS,
     UnsupportedModelArchitectureError,
     default_target_modules_for_model,
@@ -46,18 +47,12 @@ def test_qwen3_5_model_support_spec():
 
 
 def test_qwen3_5_dense_model_support_spec():
-    with pytest.raises(UnsupportedModelArchitectureError):
-        get_model_support_spec("Qwen/Qwen3.5-4B")
-
-    spec = get_model_support_spec("Qwen/Qwen3.5-4B", allow_unvalidated_arch=True)
+    spec = get_model_support_spec("Qwen/Qwen3.5-4B")
     assert spec.key == "qwen3_5_dense"
     assert spec.handler_key == "qwen3_5_dense"
     assert spec.default_rollout_weights_mode == "lora"
     assert (
-        native_vllm_lora_status_for_model(
-            "Qwen/Qwen3.5-4B",
-            allow_unvalidated_arch=True,
-        )
+        native_vllm_lora_status_for_model("Qwen/Qwen3.5-4B")
         == "validated"
     )
     assert spec.dependency_floor.megatron_bridge == (
@@ -76,11 +71,8 @@ def test_qwen3_5_registry_exports():
         "Qwen/Qwen3.5-397B-A17B",
         "Qwen/Qwen3.6-35B-A3B",
     }
-    assert QWEN3_5_MODELS == QWEN3_5_MOE_MODELS
-    assert default_target_modules_for_model(
-        "Qwen/Qwen3.6-27B",
-        allow_unvalidated_arch=True,
-    ) == [
+    assert QWEN3_5_MODELS == QWEN3_5_DENSE_MODELS | QWEN3_5_MOE_MODELS
+    assert default_target_modules_for_model("Qwen/Qwen3.6-27B") == [
         "q_proj",
         "k_proj",
         "v_proj",
@@ -94,20 +86,8 @@ def test_qwen3_5_registry_exports():
     ]
     assert model_requires_merged_rollout("Qwen/Qwen3.6-35B-A3B") is False
     assert model_uses_expert_parallel("Qwen/Qwen3.6-35B-A3B") is True
-    assert (
-        model_uses_expert_parallel(
-            "Qwen/Qwen3.6-27B",
-            allow_unvalidated_arch=True,
-        )
-        is False
-    )
-    assert (
-        get_model_support_handler(
-            "Qwen/Qwen3.6-27B",
-            allow_unvalidated_arch=True,
-        ).key
-        == "qwen3_5_dense"
-    )
+    assert model_uses_expert_parallel("Qwen/Qwen3.6-27B") is False
+    assert get_model_support_handler("Qwen/Qwen3.6-27B").key == "qwen3_5_dense"
     assert get_model_support_handler("Qwen/Qwen3.6-35B-A3B").key == "qwen3_5_moe"
 
 
@@ -131,28 +111,31 @@ def test_qwen3_moe_model_support_spec():
     )
 
 
-def test_qwen3_dense_uses_default_dense_only_in_unsupported_probe_mode():
-    with pytest.raises(UnsupportedModelArchitectureError):
-        get_model_support_spec("Qwen/Qwen3-4B-Instruct-2507")
-
-    spec = get_model_support_spec(
+def test_qwen3_dense_model_support_spec():
+    assert QWEN3_DENSE_MODELS == {
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-0.6B-Base",
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-1.7B-Base",
+        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-4B-Base",
         "Qwen/Qwen3-4B-Instruct-2507",
-        allow_unvalidated_arch=True,
-    )
+        "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-8B-Base",
+        "Qwen/Qwen3-14B",
+        "Qwen/Qwen3-14B-Base",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-32B-Base",
+    }
+    spec = get_model_support_spec("Qwen/Qwen3-4B-Instruct-2507")
     assert spec.key == "qwen3_dense"
     assert spec.handler_key == "qwen3_dense"
     assert (
-        native_vllm_lora_status_for_model(
-            "Qwen/Qwen3-4B-Instruct-2507",
-            allow_unvalidated_arch=True,
-        )
+        native_vllm_lora_status_for_model("Qwen/Qwen3-4B-Instruct-2507")
         == "validated"
     )
     assert (
-        model_uses_expert_parallel(
-            "Qwen/Qwen3-4B-Instruct-2507",
-            allow_unvalidated_arch=True,
-        )
+        model_uses_expert_parallel("Qwen/Qwen3-4B-Instruct-2507")
         is False
     )
 
@@ -161,5 +144,7 @@ def test_model_support_specs_list_is_stable():
     specs = list_model_support_specs()
     assert [spec.key for spec in specs] == [
         "qwen3_moe",
+        "qwen3_dense",
         "qwen3_5_moe",
+        "qwen3_5_dense",
     ]
