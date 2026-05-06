@@ -287,6 +287,8 @@ def prepare_provider_bundle(
     provider.moe_aux_loss_coeff = 0.0
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
+    provider.cross_entropy_loss_fusion = True
+    provider.cross_entropy_fusion_impl = "te"
     _apply_art_training_runtime_prepare_defaults(provider)
     bundle.handler.configure_provider_for_runtime(provider)
     _apply_runtime_env_overrides(provider)
