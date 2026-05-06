@@ -142,6 +142,7 @@ class GdnSegmentBucketPlan(BaseModel):
     row_indices: torch.Tensor
     position_indices: torch.Tensor
     family_indices: torch.Tensor
+    real_token_count_static: int = Field(ge=0)
     output_mask: torch.Tensor | None = None
 
     @property
@@ -150,7 +151,7 @@ class GdnSegmentBucketPlan(BaseModel):
 
     @property
     def real_token_count(self) -> int:
-        return int(self.cu_seqlens[-1].item())
+        return self.real_token_count_static
 
 
 class GdnParentStateTransferPlan(BaseModel):
@@ -349,6 +350,18 @@ def build_gdn_rank_execution_plan(
     """
 
     planner_config = planner_config or GdnPlannerConfig()
+    target_device = torch.device(device)
+    if target_device.type != "cpu":
+        cpu_plan = build_gdn_rank_execution_plan(
+            spec,
+            device="cpu",
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            attention_token_layout_index=attention_token_layout_index,
+            cp_segment_schedule=cp_segment_schedule,
+            planner_config=planner_config,
+        )
+        return move_gdn_rank_execution_plan_to_device(cpu_plan, target_device)
     if cp_size != 1 or cp_rank != 0:
         return _build_cp_rank_execution_plan(
             spec,
@@ -359,20 +372,6 @@ def build_gdn_rank_execution_plan(
             cp_segment_schedule=cp_segment_schedule,
             planner_config=planner_config,
         )
-    prefix_segments = tuple(family.prefix for family in spec.families)
-    completion_segments = tuple(
-        completion for family in spec.families for completion in family.completions
-    )
-    prefix_segment_buckets = _batch_segments_by_padded_work(
-        prefix_segments,
-        max_padding_ratio=planner_config.max_padding_ratio,
-        max_segments_per_batch=planner_config.max_segments_per_batch,
-    )
-    completion_segment_buckets = _batch_segments_by_padded_work(
-        completion_segments,
-        max_padding_ratio=planner_config.max_padding_ratio,
-        max_segments_per_batch=planner_config.max_segments_per_batch,
-    )
     (
         prefix_boundary_buckets,
         prefix_tail_buckets,
@@ -388,9 +387,6 @@ def build_gdn_rank_execution_plan(
         dtype=torch.long,
     )
     positions = torch.arange(spec.sequence_length, device=device, dtype=torch.long)
-    prefix_family_order = tuple(
-        segment.family_index for bucket in prefix_segment_buckets for segment in bucket
-    )
     local_range_list: list[tuple[int, int, int]] = []
     local_position = 0
     for row_index, length in enumerate(spec.valid_lengths):
@@ -409,21 +405,15 @@ def build_gdn_rank_execution_plan(
         real_token_mask=positions.unsqueeze(0) < valid_lengths.unsqueeze(1),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=_build_segment_bucket_plans(
-            prefix_segment_buckets, device=device
-        ),
-        completion_buckets=_build_segment_bucket_plans(
-            completion_segment_buckets, device=device
-        ),
+        prefix_buckets=(),
+        completion_buckets=(),
         local_prefix_buckets=(),
         local_completion_buckets=(),
         ready_local_completion_buckets=(),
         remote_local_completion_buckets=(),
         chain_prefix_buckets=(),
         chain_completion_buckets=(),
-        prefix_table_is_dense_ordered=(
-            prefix_family_order == tuple(range(spec.family_count))
-        ),
+        prefix_table_is_dense_ordered=False,
         attention_token_ranges=local_ranges,
         gdn_token_ranges=local_ranges,
         attention_token_count=spec.real_token_count,
@@ -502,6 +492,7 @@ def _move_bucket_plans(
             row_indices=_move_planner_tensor(bucket.row_indices, device),
             position_indices=_move_planner_tensor(bucket.position_indices, device),
             family_indices=_move_planner_tensor(bucket.family_indices, device),
+            real_token_count_static=bucket.real_token_count,
             output_mask=(
                 _move_planner_tensor(bucket.output_mask, device)
                 if bucket.output_mask is not None
@@ -1494,6 +1485,7 @@ def _build_explicit_bucket_plan(
         row_indices=_move_planner_tensor(row_indices_cpu, device),
         position_indices=_move_planner_tensor(position_indices_cpu, device),
         family_indices=_move_planner_tensor(family_indices_cpu, device),
+        real_token_count_static=int(lengths_cpu.sum().item()),
         output_mask=_move_planner_tensor(output_mask_cpu, device),
     )
 
@@ -3001,6 +2993,7 @@ def _build_position_bucket_plan(
         row_indices=_move_planner_tensor(row_indices_cpu, device),
         position_indices=_move_planner_tensor(position_indices_cpu, device),
         family_indices=_move_planner_tensor(family_indices_cpu, device),
+        real_token_count_static=sum(lengths),
     )
 
 
@@ -3050,6 +3043,7 @@ def _build_exact_range_position_bucket_plan(
         row_indices=_move_planner_tensor(row_indices_cpu, device),
         position_indices=_move_planner_tensor(position_indices_cpu, device),
         family_indices=_move_planner_tensor(family_indices_cpu, device),
+        real_token_count_static=sum(lengths),
     )
 
 
@@ -3127,6 +3121,7 @@ def _build_segment_bucket_plan(
             device=device,
             dtype=torch.long,
         ),
+        real_token_count_static=sum(segment.length for segment in segments),
     )
 
 

@@ -443,7 +443,10 @@ def _run_planned_prefixes_and_completions(
 ) -> tuple[Tensor, Tensor | None]:
     if _has_chunk_aligned_local_plan(plan):
         return _run_chunk_aligned_prefixes_and_completions(gdn, hidden_states, plan)
-    return _run_legacy_planned_prefixes_and_completions(gdn, hidden_states, plan)
+    raise ValueError(
+        "shared-prefix GDN requires a chunk-aligned execution plan; "
+        "prefix/completion bucket execution has been removed"
+    )
 
 
 def _has_chunk_aligned_local_plan(plan: GdnRankExecutionPlan) -> bool:
@@ -613,106 +616,8 @@ def _slice_bucket_column(
         row_indices=bucket.row_indices[:length, column : column + 1],
         position_indices=bucket.position_indices[:length, column : column + 1],
         family_indices=bucket.family_indices[column : column + 1],
+        real_token_count_static=length,
         output_mask=output_mask,
-    )
-
-
-def _run_legacy_planned_prefixes_and_completions(
-    gdn: Any,
-    hidden_states: Tensor,
-    plan: GdnRankExecutionPlan,
-) -> tuple[Tensor, Tensor | None]:
-    with _nvtx_range("art_gdn_in_proj", hidden_states):
-        qkv, gate, beta, recurrent_g = _project_gdn_inputs(gdn, hidden_states)
-    gate_flat = gate.reshape(-1, int(gate.shape[-2]), int(gate.shape[-1]))
-    recurrent_chunks: list[Tensor] = []
-    gate_chunks: list[Tensor] = []
-    output_index_chunks: list[Tensor] = []
-    prefix_family_chunks: list[Tensor] = []
-    prefix_conv_chunks: list[Tensor] = []
-    prefix_rec_chunks: list[Tensor] = []
-
-    for bucket in plan.prefix_buckets:
-        layout = _bucket_flat_layout(bucket, sequence_length=plan.sequence_length)
-        with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            prefix_qkv, prefix_beta, prefix_g = _gather_compact_bucket_streams(
-                qkv, beta, recurrent_g, bucket
-            )
-            prefix_gate = _gather_compact_tokens(gate_flat, layout.real_indices)
-        with _nvtx_range("art_gdn_conv_state_materialization", hidden_states):
-            zero_conv = _zero_conv_state(
-                gdn, hidden_states, batch_size=bucket.segment_count
-            )
-        with _nvtx_range("art_gdn_recurrent_state_materialization", hidden_states):
-            zero_rec = _zero_recurrent_state(
-                gdn, hidden_states, batch_size=bucket.segment_count
-            )
-        with _nvtx_range("art_gdn_prefix_segment", prefix_qkv):
-            prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
-                bucket,
-                (prefix_qkv, prefix_beta, prefix_g),
-                (zero_conv, zero_rec),
-                gdn=gdn,
-                output_final_state=True,
-            )
-            if prefix_conv is None or prefix_rec is None:
-                raise RuntimeError("prefix GDN execution must return final states")
-        prefix_out, prefix_gate, output_indices = _select_bucket_outputs(
-            prefix_out, prefix_gate, layout
-        )
-        recurrent_chunks.append(prefix_out)
-        gate_chunks.append(prefix_gate)
-        output_index_chunks.append(output_indices)
-        prefix_family_chunks.append(bucket.family_indices)
-        prefix_conv_chunks.append(prefix_conv)
-        prefix_rec_chunks.append(prefix_rec)
-
-    if not prefix_conv_chunks:
-        recurrent_output = torch.zeros_like(gate)
-        return _project_gdn_output(gdn, recurrent_output, gate, plan)
-
-    prefix_conv_table = _materialize_family_state_table(
-        plan=plan,
-        family_chunks=prefix_family_chunks,
-        state_chunks=prefix_conv_chunks,
-    )
-    prefix_rec_table = _materialize_family_state_table(
-        plan=plan,
-        family_chunks=prefix_family_chunks,
-        state_chunks=prefix_rec_chunks,
-    )
-
-    for bucket in plan.completion_buckets:
-        layout = _bucket_flat_layout(bucket, sequence_length=plan.sequence_length)
-        with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            completion_qkv, completion_beta, completion_g = (
-                _gather_compact_bucket_streams(qkv, beta, recurrent_g, bucket)
-            )
-            completion_gate = _gather_compact_tokens(gate_flat, layout.real_indices)
-        with _nvtx_range("art_gdn_state_fanout", completion_qkv):
-            completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
-            completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
-        with _nvtx_range("art_gdn_completion_segment", completion_qkv):
-            completion_out, _, _ = run_gdn_bucket(
-                bucket,
-                (completion_qkv, completion_beta, completion_g),
-                (completion_conv, completion_rec),
-                gdn=gdn,
-                output_final_state=False,
-            )
-        completion_out, completion_gate, output_indices = _select_bucket_outputs(
-            completion_out, completion_gate, layout
-        )
-        recurrent_chunks.append(completion_out)
-        gate_chunks.append(completion_gate)
-        output_index_chunks.append(output_indices)
-    return _project_compact_local_dag_output(
-        gdn,
-        recurrent_chunks=recurrent_chunks,
-        gate_chunks=gate_chunks,
-        output_index_chunks=output_index_chunks,
-        hidden_states=hidden_states,
-        plan=plan,
     )
 
 
@@ -734,12 +639,6 @@ def _run_cp_planned_prefixes_and_completions(
         raise ValueError(
             f"unsupported GDN CP layouts: {input_layout=} {output_layout=}"
         )
-    local_only_plan = _local_only_cp_plan(plan)
-    if local_only_plan is not None:
-        return _run_planned_prefixes_and_completions(
-            gdn, hidden_states, local_only_plan
-        )
-
     from .cp_runtime import run_gdn_prepared_varlen_native_fla_cp
 
     if input_layout == "attention":
@@ -1197,31 +1096,6 @@ def _cp_output_to_attention(
     return _restore_hidden_from_cp_flat(attention_flat, original_shape)
 
 
-def _local_only_cp_plan(plan: GdnRankExecutionPlan) -> GdnRankExecutionPlan | None:
-    if plan.chain_prefix_buckets or plan.chain_completion_buckets:
-        return None
-    if plan.parent_state_exchange_family_indices:
-        return None
-    if plan.attention_to_gdn is None or plan.gdn_to_attention is None:
-        return None
-    if plan.attention_token_ranges != plan.gdn_token_ranges:
-        return None
-    if plan.attention_to_gdn.cross_rank_token_count != 0:
-        return None
-    if plan.gdn_to_attention.cross_rank_token_count != 0:
-        return None
-    return plan.model_copy(
-        update={
-            "prefix_buckets": plan.local_prefix_buckets,
-            "completion_buckets": plan.local_completion_buckets,
-            "local_prefix_buckets": (),
-            "local_completion_buckets": (),
-            "ready_local_completion_buckets": (),
-            "remote_local_completion_buckets": (),
-        }
-    )
-
-
 def _flatten_hidden_for_cp_plan(
     hidden_states: Tensor, plan: GdnRankExecutionPlan
 ) -> tuple[Tensor, tuple[int, int, int]]:
@@ -1471,27 +1345,6 @@ def _bucket_stream_grad_to_flat(
     return grad_flat.index_add(0, safe_indices, grad_flat_values)
 
 
-def _gather_compact_tokens(tensor_flat: Tensor, indices: Tensor) -> Tensor:
-    return _CompactTokenGather.apply(tensor_flat, indices)
-
-
-class _CompactTokenGather(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, tensor_flat: Tensor, indices: Tensor) -> Tensor:
-        ctx.save_for_backward(indices)
-        ctx.flat_count = int(tensor_flat.shape[0])
-        return tensor_flat.index_select(0, indices)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: Tensor | None) -> tuple[Tensor | None, None]:
-        if grad_output is None:
-            return None, None
-        (indices,) = ctx.saved_tensors
-        grad_flat = grad_output.new_zeros(ctx.flat_count, *grad_output.shape[1:])
-        grad_values = grad_output.reshape(int(indices.numel()), *grad_output.shape[1:])
-        return grad_flat.index_add(0, indices, grad_values), None
-
-
 def _scatter_compact_hidden(
     compact: Tensor,
     indices: Tensor,
@@ -1624,58 +1477,6 @@ def _project_gdn_output(
         norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
         norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
         norm_out = norm_out.transpose(0, 1).contiguous()
-    with _nvtx_range("art_gdn_out_proj", norm_out):
-        if plan.cp_size > 1:
-            out, out_bias = _out_proj_cp_full_shape(gdn, norm_out, plan)
-        else:
-            out, out_bias = _out_proj(gdn, norm_out)
-    return _mask_gdn_output(gdn, out, plan), out_bias
-
-
-def _select_bucket_outputs(
-    recurrent_out: Tensor,
-    gate: Tensor,
-    layout: _BucketFlatLayout,
-) -> tuple[Tensor, Tensor, Tensor]:
-    if layout.output_selector is None:
-        return recurrent_out, gate, layout.output_indices
-    return (
-        recurrent_out[:, layout.output_selector].contiguous(),
-        gate[layout.output_selector].contiguous(),
-        layout.output_indices,
-    )
-
-
-def _project_compact_local_dag_output(
-    gdn: Any,
-    *,
-    recurrent_chunks: list[Tensor],
-    gate_chunks: list[Tensor],
-    output_index_chunks: list[Tensor],
-    hidden_states: Tensor,
-    plan: GdnRankExecutionPlan,
-) -> tuple[Tensor, Tensor | None]:
-    if not recurrent_chunks:
-        recurrent_output = hidden_states.new_zeros(
-            plan.batch_size,
-            plan.sequence_length,
-            _local_value_heads(gdn),
-            int(gdn.value_head_dim),
-        )
-        gate = torch.zeros_like(recurrent_output)
-        return _project_gdn_output(gdn, recurrent_output, gate, plan)
-    recurrent_output = torch.cat(recurrent_chunks, dim=1)
-    compact_gate = torch.cat(gate_chunks, dim=0).unsqueeze(0)
-    compact_indices = torch.cat(output_index_chunks, dim=0)
-    with _nvtx_range("art_gdn_output_norm_gate", recurrent_output):
-        norm_out = _apply_gated_rms_norm(gdn, recurrent_output, compact_gate)
-        norm_out = norm_out.reshape(-1, _local_value_dim(gdn))
-        norm_out = _scatter_compact_hidden(
-            norm_out,
-            compact_indices,
-            batch_size=int(plan.batch_size),
-            sequence_length=int(plan.sequence_length),
-        )
     with _nvtx_range("art_gdn_out_proj", norm_out):
         if plan.cp_size > 1:
             out, out_bias = _out_proj_cp_full_shape(gdn, norm_out, plan)
@@ -1857,20 +1658,6 @@ def _scatter_bucket_recurrent_output(
 def _bucket_output_mask(bucket: GdnSegmentBucketPlan) -> Tensor:
     output_mask = bucket.output_mask
     return bucket.real_mask if output_mask is None else output_mask
-
-
-def _materialize_family_state_table(
-    *,
-    plan: GdnRankExecutionPlan,
-    family_chunks: list[Tensor],
-    state_chunks: list[Tensor],
-) -> Tensor:
-    values = torch.cat(state_chunks, dim=0)
-    if plan.prefix_table_is_dense_ordered:
-        return values
-    family_indices = torch.cat(family_chunks, dim=0)
-    table = values.new_zeros((plan.family_count, *values.shape[1:]))
-    return table.index_copy(0, family_indices, values)
 
 
 def _materialize_indexed_family_state_table(

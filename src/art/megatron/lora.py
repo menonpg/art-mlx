@@ -497,8 +497,7 @@ class LoRA(torch.nn.Module):
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
-            # If no tokens routed locally, return zeros.
-            if isinstance(bsz, torch.Tensor) and int(torch.count_nonzero(bsz)) == 0:
+            if x.shape[0] == 0:
                 return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
             return quack_grouped_lora(x, self.A_T, self.B_T, bsz, scale=self.scale)
         out = (x @ self.A_T) @ self.B_T
@@ -898,7 +897,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         counts = tokens_per_expert
         if isinstance(counts, list):
             counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
-        if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
+        if x.shape[0] == 0:
             adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
         else:
             adapter_out = quack_grouped_lora_dual(
