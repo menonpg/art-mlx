@@ -7,9 +7,7 @@ from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
 from causal_conv1d import causal_conv1d_fn
 from fla.modules.l2norm import l2norm
-from fla.ops.gated_delta_rule import (
-    naive_recurrent_gated_delta_rule as fla_naive_recurrent_gated_delta_rule,
-)
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
@@ -2740,55 +2738,7 @@ def _l2norm(x: Tensor) -> Tensor:
 
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:
-    return _naive_recurrent_gated_delta_rule(
-        fla_naive_recurrent_gated_delta_rule, *args, **kwargs
-    )
-
-
-def _naive_recurrent_gated_delta_rule(
-    fn: Callable[..., tuple[Tensor, Tensor | None]], *args: Any, **kwargs: Any
-) -> tuple[Tensor, Tensor | None]:
-    q, k, v = (args[0], args[1], args[2])
-    g = kwargs["g"]
-    beta = kwargs["beta"]
-    cu_seqlens = kwargs.get("cu_seqlens")
-    initial_state = kwargs.get("initial_state")
-    output_final_state = bool(kwargs.get("output_final_state", False))
-    scale = kwargs.get("scale")
-    if cu_seqlens is None:
-        return fn(
-            q,
-            k,
-            v,
-            beta=beta,
-            g=g,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-        )
-    outputs = []
-    final_states = []
-    for index in range(int(cu_seqlens.numel()) - 1):
-        start = int(cu_seqlens[index].item())
-        end = int(cu_seqlens[index + 1].item())
-        out, final = fn(
-            q[:, start:end],
-            k[:, start:end],
-            v[:, start:end],
-            beta=beta[:, start:end],
-            g=g[:, start:end],
-            scale=scale,
-            initial_state=(
-                None if initial_state is None else initial_state[index : index + 1]
-            ),
-            output_final_state=output_final_state,
-        )
-        outputs.append(out)
-        if final is not None:
-            final_states.append(final)
-    return torch.cat(outputs, dim=1), (
-        torch.cat(final_states, dim=0) if final_states else None
-    )
+    return chunk_gated_delta_rule(*args, **kwargs)
 
 
 @contextmanager
