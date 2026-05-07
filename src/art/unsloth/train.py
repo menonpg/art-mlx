@@ -840,16 +840,7 @@ async def run_unsloth_rl_training(
                     ctx.train_task,
                 ],
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=300.0,
             )
-            if not done:
-                train_task_state = "done" if ctx.train_task.done() else "running"
-                raise TimeoutError(
-                    f"[run_unsloth_rl_training] asyncio.wait timed out after 300s! "
-                    f"warmup={warmup} offset={offset} train_task={train_task_state} "
-                    f"results_queue.qsize={ctx.results_queue.qsize()} "
-                    f"inputs_queue.qsize={ctx.inputs_queue.qsize()}"
-                )
             print(
                 f"[run_unsloth_rl_training] asyncio.wait returned: "
                 f"done={len(done)} tasks, train_task_in_done={ctx.train_task in done}"
