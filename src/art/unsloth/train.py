@@ -793,15 +793,17 @@ async def run_unsloth_rl_training(
 
     packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
 
-    unfinished = getattr(ctx.results_queue, "_unfinished_tasks", "?")
-    qsize = ctx.results_queue.qsize()
-    print(
-        f"[run_unsloth_rl_training] before join: warmup_pending={ctx.warmup_pending} "
-        f"train_task={'none' if ctx.train_task is None else ('done' if ctx.train_task.done() else 'running')} "
-        f"results_queue.qsize={qsize} results_queue._unfinished_tasks={unfinished}"
-    )
+    if verbose:
+        unfinished = getattr(ctx.results_queue, "_unfinished_tasks", "?")
+        qsize = ctx.results_queue.qsize()
+        print(
+            f"[run_unsloth_rl_training] before join: warmup_pending={ctx.warmup_pending} "
+            f"train_task={'none' if ctx.train_task is None else ('done' if ctx.train_task.done() else 'running')} "
+            f"results_queue.qsize={qsize} results_queue._unfinished_tasks={unfinished}"
+        )
     await ctx.results_queue.join()
-    print("[run_unsloth_rl_training] join complete")
+    if verbose:
+        print("[run_unsloth_rl_training] join complete")
 
     if ctx.train_task is None:
         ctx.train_task = asyncio.create_task(
@@ -829,10 +831,11 @@ async def run_unsloth_rl_training(
             ctx.inputs_queue.put_nowait(
                 create_train_inputs(packed_tensors, offset, config, _config, warmup)
             )
-            print(
-                f"[run_unsloth_rl_training] put input (warmup={warmup}, offset={offset}), "
-                f"inputs_queue.qsize={ctx.inputs_queue.qsize()}"
-            )
+            if verbose:
+                print(
+                    f"[run_unsloth_rl_training] put input (warmup={warmup}, offset={offset}), "
+                    f"inputs_queue.qsize={ctx.inputs_queue.qsize()}"
+                )
 
             done, pending = await asyncio.wait(
                 [
@@ -841,10 +844,11 @@ async def run_unsloth_rl_training(
                 ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            print(
-                f"[run_unsloth_rl_training] asyncio.wait returned: "
-                f"done={len(done)} tasks, train_task_in_done={ctx.train_task in done}"
-            )
+            if verbose:
+                print(
+                    f"[run_unsloth_rl_training] asyncio.wait returned: "
+                    f"done={len(done)} tasks, train_task_in_done={ctx.train_task in done}"
+                )
             # Cancel any abandoned results_queue.get() tasks that didn't complete
             for t in pending:
                 if t is not ctx.train_task:
