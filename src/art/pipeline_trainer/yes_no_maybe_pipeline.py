@@ -134,7 +134,7 @@ async def main() -> None:
         eval_fn=eval_callback,
         max_steps=MAX_STEPS,
         eval_every_n_steps=EVAL_EVERY_N_STEPS,
-        eval_step_0=False,
+        eval_at_start=False,
         total_scenarios=None,
     )
 
