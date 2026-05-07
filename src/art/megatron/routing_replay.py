@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from safetensors.torch import load_file, save_file
 import torch
 
-from art.megatron.param_name_canonicalization import canonical_art_param_name
+from art.megatron.weights.param_name_canonicalization import canonical_art_param_name
 
 ROUTER_NAME_TOKEN = ".mlp.router"
 ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v1"

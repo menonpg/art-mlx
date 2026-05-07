@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from art.megatron.jobs import MergedWeightTransferInitInfo, MergedWeightTransferSpec
+from art.megatron.runtime.jobs import (
+    MergedWeightTransferInitInfo,
+    MergedWeightTransferSpec,
+)
 from art.megatron.service import MegatronService
 from art.types import TrainConfig
 
@@ -176,9 +179,9 @@ def test_stop_megatron_process_kills_process_group(
         returncode = None
 
     seen: dict[str, int] = {}
-    monkeypatch.setattr("art.utils.lifecycle.os.getpgid", lambda pid: pid + 1)
+    monkeypatch.setattr("art.megatron.service.os.getpgid", lambda pid: pid + 1)
     monkeypatch.setattr(
-        "art.utils.lifecycle.os.killpg",
+        "art.megatron.service.os.killpg",
         lambda pgid, sig: seen.update({"pgid": pgid, "sig": int(sig)}),
     )
     service._megatron_process = cast(Any, _Process())
@@ -208,13 +211,13 @@ def test_stop_megatron_process_ignores_missing_process(
         pid = 4321
         returncode = None
 
-    monkeypatch.setattr("art.utils.lifecycle.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("art.megatron.service.os.getpgid", lambda pid: pid)
 
     def _raise_process_lookup(pgid: int, sig: int) -> None:
         del pgid, sig
         raise ProcessLookupError
 
-    monkeypatch.setattr("art.utils.lifecycle.os.killpg", _raise_process_lookup)
+    monkeypatch.setattr("art.megatron.service.os.killpg", _raise_process_lookup)
     service._megatron_process = cast(Any, _Process())
 
     service._stop_megatron_process()

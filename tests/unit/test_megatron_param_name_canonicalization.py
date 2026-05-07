@@ -1,4 +1,4 @@
-from art.megatron.param_name_canonicalization import (
+from art.megatron.weights.param_name_canonicalization import (
     canonical_art_param_name,
     is_art_adapter_param_name,
 )

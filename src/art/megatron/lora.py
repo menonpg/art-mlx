@@ -24,7 +24,10 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
 
-from .cute_grouped_lora_quack import quack_grouped_lora, quack_grouped_lora_dual
+from .kernels.cute_grouped_lora_quack import (
+    quack_grouped_lora,
+    quack_grouped_lora_dual,
+)
 
 LORA_RANK = 1
 LORA_ALPHA = 32

@@ -1,4 +1,4 @@
-from art.megatron.jobs import (
+from art.megatron.runtime.jobs import (
     MegatronMergedTrainingJob,
     MegatronSyncJob,
     MegatronTrainingJob,

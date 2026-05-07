@@ -11,7 +11,7 @@ from megatron.core.transformer.moe import grouped_gemm_util
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 import torch
 
-from art.megatron.cute_grouped_lora_quack import quack_grouped_lora
+from art.megatron.kernels.cute_grouped_lora_quack import quack_grouped_lora
 
 GroupedLoraFn = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],

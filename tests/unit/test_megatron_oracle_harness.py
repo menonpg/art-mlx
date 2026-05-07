@@ -8,7 +8,7 @@ import torch
 TESTS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TESTS_ROOT))
 
-megatron_oracle_harness = importlib.import_module("integration.megatron_oracle_harness")
+megatron_oracle_harness = importlib.import_module("integration.megatron.model_support.oracle_harness")
 PackedTensorConfig = megatron_oracle_harness.PackedTensorConfig
 _build_packed_tensors = megatron_oracle_harness._build_packed_tensors
 

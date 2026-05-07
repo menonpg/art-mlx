@@ -1,37 +1,5 @@
 import json
-import sys
-import types
 from typing import cast
-
-_fake_tinker = types.ModuleType("tinker")
-
-
-class _EncodedTextChunk:
-    def __init__(self, tokens: list[int]) -> None:
-        self.tokens = tokens
-
-
-class _ImageChunk:
-    def __init__(self, *, bytes_: bytes | None = None, image_format: str | None = None):
-        self.bytes_ = bytes_
-        self.image_format = image_format
-
-
-class _ModelInput:
-    def __init__(self, chunks: list[object]) -> None:
-        self.chunks = chunks
-
-
-_fake_tinker.EncodedTextChunk = _EncodedTextChunk
-_fake_tinker.ModelInputChunk = object
-_fake_tinker.ImageChunk = _ImageChunk
-_fake_tinker.ModelInput = _ModelInput
-_fake_tinker.types = types.SimpleNamespace(
-    EncodedTextChunk=_EncodedTextChunk,
-    ModelInputChunk=object,
-    ImageChunk=_ImageChunk,
-)
-sys.modules.setdefault("tinker", _fake_tinker)
 
 from art.tinker.cookbook_v import renderers
 from art.tinker.cookbook_v.tokenizer_utils import Tokenizer
@@ -95,11 +63,7 @@ def _get_test_renderer(name: str, tokenizer: FakeTokenizer) -> renderers.Rendere
 
 
 def test_get_renderer_name_autodetects_qwen3_5() -> None:
-    assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5_disable_thinking"
-
-
-def test_get_renderer_name_autodetects_qwen3_6() -> None:
-    assert get_renderer_name("Qwen/Qwen3.6-35B-A3B") == "qwen3_5_disable_thinking"
+    assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5"
 
 
 def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:

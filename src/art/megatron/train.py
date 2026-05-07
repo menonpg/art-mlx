@@ -1,5 +1,5 @@
 # isort: off
-from art.megatron.runtime_env import configure_megatron_runtime_env
+from art.megatron.runtime.runtime_env import configure_megatron_runtime_env
 
 configure_megatron_runtime_env()
 # isort: on
@@ -33,14 +33,20 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
-from art.megatron.bridge_runtime import install_art_bridge_runtime_patches
+from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
 
 install_art_bridge_runtime_patches()
 
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
-from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
-from art.megatron.jobs import (
+from art.megatron.lora import apply_lora_adapters
+from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
+from art.megatron.provider_common import ProviderBundle
+from art.megatron.routing_replay import (
+    MoeRoutingReplayBundle,
+    MoeRoutingReplayController,
+)
+from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronJob,
@@ -52,28 +58,22 @@ from art.megatron.jobs import (
     MergedWeightTransferSpec,
     load_megatron_job,
 )
-from art.megatron.lora import apply_lora_adapters
-from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
-from art.megatron.merged_weight_export import (
-    sync_merged_weights_to_vllm,
-)
-from art.megatron.model_chunks import (
+from art.megatron.training.finalize_grads import finalize_model_grads_extended
+from art.megatron.training.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
     validate_model_chunks,
 )
-from art.megatron.offload import (
+from art.megatron.training.offload import (
     OffloadState,
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
-from art.megatron.provider_common import ProviderBundle
-from art.megatron.routing_replay import (
-    MoeRoutingReplayBundle,
-    MoeRoutingReplayController,
+from art.megatron.training.sft_batches import load_sft_batch_from_disk
+from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.weights.merged_weight_export import (
+    sync_merged_weights_to_vllm,
 )
-from art.megatron.sft_batches import load_sft_batch_from_disk
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.pack import (
     PackedTensors,

@@ -34,8 +34,14 @@ from ..vllm_runtime import (
     get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
-from .client import create_megatron_job_paths, stream_megatron_job, write_megatron_job
-from .jobs import (
+from .lora import LORA_ALPHA, LORA_RANK
+from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
+from .runtime.client import (
+    create_megatron_job_paths,
+    stream_megatron_job,
+    write_megatron_job,
+)
+from .runtime.jobs import (
     MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
     MegatronSyncJob,
@@ -43,9 +49,7 @@ from .jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )
-from .lora import LORA_ALPHA, LORA_RANK
-from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
-from .sft_batches import materialize_sft_batches
+from .training.sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open

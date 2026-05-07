@@ -155,7 +155,7 @@ class DefaultDenseHandler:
     ) -> dict[str, list[Any]]:
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        from art.megatron.adapter_export import (
+        from art.megatron.weights.adapter_export import (
             add_dense_mlp_adapter_weights,
             add_standard_self_attention_adapter_weights,
             layer_base_prefix,
@@ -262,7 +262,7 @@ class DefaultMoeHandler(DefaultDenseHandler):
     ) -> dict[str, list[Any]]:
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        from art.megatron.adapter_export import (
+        from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
             add_shared_experts_adapter_weights,
             add_standard_self_attention_adapter_weights,

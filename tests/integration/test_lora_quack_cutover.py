@@ -5,7 +5,7 @@ import torch
 
 pytest.importorskip("quack")
 
-from art.megatron.cute_grouped_lora_quack import quack_grouped_lora_dual
+from art.megatron.kernels.cute_grouped_lora_quack import quack_grouped_lora_dual
 from art.megatron.lora import LoRA
 
 

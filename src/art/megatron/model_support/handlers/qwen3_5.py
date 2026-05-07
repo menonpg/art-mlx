@@ -7,7 +7,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 import torch
 
-from art.megatron.model_chunks import ModelChunks
 from art.megatron.model_support.handlers.default_dense import (
     DefaultDenseHandler,
     _require_dense_mlp,
@@ -18,6 +17,7 @@ from art.megatron.model_support.spec import (
     LayerFamilyInstance,
 )
 from art.megatron.provider_common import patch_layer_spec_tree
+from art.megatron.training.model_chunks import ModelChunks
 
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
@@ -259,12 +259,12 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        from art.megatron.adapter_export import (
+        from art.megatron.lora import _is_language_transformer_layer_name
+        from art.megatron.weights.adapter_export import (
             add_gated_delta_net_adapter_weights,
             add_standard_self_attention_adapter_weights,
             layer_base_prefix,
         )
-        from art.megatron.lora import _is_language_transformer_layer_name
 
         _ensure_bridge_qwen35_adapter_name_map()
         adapter_weights_by_base: dict[str, list[Any]] = {}
@@ -323,7 +323,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         layer_prefix: str,
         module: Any,
     ) -> None:
-        from art.megatron.adapter_export import add_dense_mlp_adapter_weights
+        from art.megatron.weights.adapter_export import add_dense_mlp_adapter_weights
 
         _require_dense_mlp(module)
         add_dense_mlp_adapter_weights(
@@ -418,7 +418,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         layer_prefix: str,
         module: Any,
     ) -> None:
-        from art.megatron.adapter_export import (
+        from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
             add_shared_experts_adapter_weights,
         )

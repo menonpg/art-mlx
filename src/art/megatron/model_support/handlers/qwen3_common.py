@@ -3,7 +3,7 @@ from typing import Any, Sequence, cast
 from megatron.core.models.gpt.gpt_model import GPTModel
 import torch
 
-from art.megatron.model_chunks import ModelChunks
+from art.megatron.training.model_chunks import ModelChunks
 
 
 def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
