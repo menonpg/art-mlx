@@ -5,7 +5,6 @@ import os
 import signal
 import time
 from typing import Any, AsyncIterator, Generic, Iterable, TypeVar, cast
-import warnings
 
 T = TypeVar("T")
 
@@ -90,7 +89,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         # Eval/Checkpointing
         eval_every_n_steps: int = 20,
         eval_at_start: bool = True,
-        eval_step_0: bool | None = None,  # deprecated: use eval_at_start
         save_checkpoint: bool = True,
         # Resumption
         resume: bool = True,
@@ -136,13 +134,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
-        if eval_step_0 is not None:
-            warnings.warn(
-                "eval_step_0 is deprecated, use eval_at_start instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            eval_at_start = eval_step_0
         self.eval_at_start = eval_at_start
         self.save_checkpoint = save_checkpoint
         self.resume = resume
