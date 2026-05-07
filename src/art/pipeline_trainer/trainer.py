@@ -90,6 +90,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         eval_every_n_steps: int = 20,
         eval_step_0: bool = True,
         save_checkpoint: bool = True,
+        save_checkpoint_artifact: bool = False,
         # Resumption
         resume: bool = True,
     ) -> None:
@@ -113,6 +114,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if save_checkpoint_artifact and not save_checkpoint:
+            raise ValueError("save_checkpoint_artifact=True requires save_checkpoint=True")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -136,6 +139,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.eval_every_n_steps = eval_every_n_steps
         self.eval_step_0 = eval_step_0
         self.save_checkpoint = save_checkpoint
+        self.save_checkpoint_artifact = save_checkpoint_artifact
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
         self._discard_queue: list[TrajectoryGroup] = []
@@ -469,6 +473,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     batch,
                     **train_kwargs,
                 )
+                checkpoint_path = getattr(result, "checkpoint_path", None)
+                if (
+                    should_checkpoint
+                    and self.save_checkpoint_artifact
+                    and checkpoint_path is not None
+                ):
+                    self._save_checkpoint_artifact(
+                        checkpoint_path=checkpoint_path,
+                        step=result.step,
+                    )
             except Exception:
                 self._status.note_training_end()
                 raise
@@ -808,6 +822,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self.eval_every_n_steps <= 0:
             return False
         return (step - self.state.last_eval_step) >= self.eval_every_n_steps
+
+    def _save_checkpoint_artifact(self, *, checkpoint_path: str, step: int) -> None:
+        from art.utils.deployment import WandbDeploymentConfig, deploy_wandb
+
+        deploy_wandb(
+            model=self.model,
+            checkpoint_path=checkpoint_path,
+            step=step,
+            config=WandbDeploymentConfig(provenance=["local-rl"]),
+            verbose=True,
+        )
 
     def _read_pipeline_state(self) -> dict[str, Any]:
         state = self.model.read_state() or {}
