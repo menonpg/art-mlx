@@ -192,7 +192,7 @@ async def main() -> None:
     max_batch_size_env = os.environ.get("MAX_BATCH_SIZE")
     max_batch_size = int(max_batch_size_env) if max_batch_size_env else None
     eval_every_n_steps = int(os.environ.get("EVAL_EVERY_N_STEPS", "2"))
-    eval_step_0 = os.environ.get("EVAL_STEP_0", "1") == "1"
+    eval_at_start = os.environ.get("EVAL_AT_START", "1") == "1"
     max_steps = int(os.environ.get("MAX_STEPS", "10"))
     save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "0") == "1"
     resume_env = os.environ.get("RESUME")
@@ -338,7 +338,7 @@ async def main() -> None:
         learning_rate=float(os.environ.get("LEARNING_RATE", "1e-4")),
         log_interval_seconds=log_interval_seconds,
         eval_every_n_steps=eval_every_n_steps,
-        eval_step_0=eval_step_0,
+        eval_at_start=eval_at_start,
         save_checkpoint=save_checkpoint,
         resume=resume,
         max_steps=max_steps,

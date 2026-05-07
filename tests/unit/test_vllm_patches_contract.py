@@ -79,7 +79,7 @@ def test_patch_transformers_v5_compat_normalizes_rope_ignore_keys() -> None:
             self.ignore_keys = ignore_keys
 
     dummy = DummyRopeConfig()
-    PretrainedConfig.convert_rope_params_to_dict(
+    PretrainedConfig.convert_rope_params_to_dict(  # type: ignore[attr-defined]
         cast(Any, dummy),
         ignore_keys_at_rope_validation=cast(Any, ["mrope_section"]),
         partial_rotary_factor=0.25,
