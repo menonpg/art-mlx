@@ -4,6 +4,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER
 from art.megatron.model_support.spec import MinimalLayerCoverageReport
 
 from . import hf_parity as hf_parity_module
@@ -166,7 +167,9 @@ def test_run_hf_parity_always_reruns_existing_report(
     assert report.pass_count == 1
 
 
-def test_run_hf_parity_subprocess_does_not_override_recompute(monkeypatch, tmp_path) -> None:
+def test_run_hf_parity_subprocess_does_not_override_recompute(
+    monkeypatch, tmp_path
+) -> None:
     request = HfParityRunRequest(
         case_id="case-id",
         case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
@@ -272,6 +275,7 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
             "model.language_model.layers.0.input_layernorm.weight",
             "lm_head.weight",
         },
+        model_support_handler=QWEN3_5_MOE_HANDLER,
     )
 
     assert set(normalized) == {
@@ -315,7 +319,10 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     kwargs = calls[0]
     assert kwargs["model_identifier"] == "Qwen/Qwen3.5-35B-A3B"
     assert kwargs["provider_torch_dtype"] == torch.float32
-    assert kwargs["provider_bundle_configure"] is hf_parity_worker_module._install_bridge_timing_debug
+    assert (
+        kwargs["provider_bundle_configure"]
+        is hf_parity_worker_module._install_bridge_timing_debug
+    )
     assert kwargs["print_env"] is False
     assert kwargs["trainable_parameter_mode"] == "base_model"
     configured_provider = SimpleNamespace()
