@@ -1387,7 +1387,9 @@ class MoeRoutingReplayController:
         last_call_key = self._router_last_call_keys.get(router_key)
         next_call_key = None
         if call_cursor < len(call_sequence):
-            next_call_key = self._router_call_key(router_calls[call_sequence[call_cursor]])
+            next_call_key = self._router_call_key(
+                router_calls[call_sequence[call_cursor]]
+            )
 
         if (
             active_call_key is not None

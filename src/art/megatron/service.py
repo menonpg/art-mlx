@@ -7,7 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
 from peft.tuners.lora.config import LoraConfig
 import torch
@@ -53,6 +53,10 @@ from .training.sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
+
+
+class _RuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
 
 
 def create_identity_lora(
@@ -269,7 +273,7 @@ class MegatronService:
             return {}
         return {"Authorization": f"Bearer {self._vllm_api_key}"}
 
-    def _runtime_request_kwargs(self) -> dict[str, dict[str, str]]:
+    def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
 

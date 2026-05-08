@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import httpx
 import torch
 
@@ -83,12 +85,16 @@ def test_ensure_merged_weight_transfer_group_non_sender_skips_runtime_init(
     monkeypatch.setattr(
         export,
         "trainer_init",
-        lambda init_info: (_ for _ in ()).throw(AssertionError("unexpected trainer_init")),
+        lambda init_info: (_ for _ in ()).throw(
+            AssertionError("unexpected trainer_init")
+        ),
     )
     monkeypatch.setattr(
         httpx,
         "post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected post")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected post")
+        ),
     )
     monkeypatch.setattr(export, "_maybe_distributed_barrier", barriers.append)
 
@@ -130,7 +136,9 @@ def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
     monkeypatch.setattr(
         export,
         "trainer_send_weights",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected send")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected send")
+        ),
     )
     monkeypatch.setattr(
         httpx,
@@ -140,7 +148,7 @@ def test_sync_merged_weights_to_vllm_non_sender_only_drains_export(
 
     group, init_info = export.sync_merged_weights_to_vllm(
         bridge=object(),
-        model=object(),
+        model=cast(Any, object()),
         model_support_handler=object(),
         rank=1,
         world_size=2,
@@ -162,7 +170,9 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
     spec = _spec()
     barrier_calls: list[int] = []
     sent_items: list[list[tuple[str, torch.Tensor]]] = []
-    posts: list[tuple[str, dict[str, object] | None, dict[str, object] | None, float]] = []
+    posts: list[
+        tuple[str, dict[str, object] | None, dict[str, object] | None, float]
+    ] = []
 
     monkeypatch.setattr(
         export,
@@ -206,7 +216,7 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
 
     group, init_info = export.sync_merged_weights_to_vllm(
         bridge=object(),
-        model=object(),
+        model=cast(Any, object()),
         model_support_handler=object(),
         rank=0,
         world_size=2,

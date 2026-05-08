@@ -44,9 +44,7 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
 
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
-    assert (
-        'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
-    )
+    assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
 
 
 def test_runtime_project_restores_nccl_unique_id_from_raw_bytes(
@@ -164,12 +162,12 @@ def test_runtime_project_passes_ep_expert_map_into_moe_lora_alignment(
                 "FakeMeta = type('FakeMeta', (), {'meta_args': staticmethod(lambda num_tokens, specialize: (torch.zeros(num_tokens, dtype=torch.int32), None, None, None, torch.zeros(1, dtype=torch.int32), None, None))}); "
                 "FakeConfig = type('FakeConfig', (), {'specialize_active_lora': False}); "
                 "FakeWrapper = type('FakeWrapper', (), {'token_mapping_meta': FakeMeta(), 'lora_config': FakeConfig()}); "
-                "exec(\"def fake_align(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids, expert_map=None):\\n"
+                'exec("def fake_align(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids, expert_map=None):\\n'
                 "    captured['num_experts'] = int(num_experts)\\n"
                 "    captured['expert_map_shape'] = None if expert_map is None else list(expert_map.shape)\\n"
                 "    expert_ids.fill_(-1)\\n"
                 "    expert_ids[:2] = torch.tensor([0, 1], device=expert_ids.device, dtype=expert_ids.dtype)\\n"
-                "    num_tokens_post_pad.zero_()\", globals(), locals()); "
+                '    num_tokens_post_pad.zero_()", globals(), locals()); '
                 "punica_gpu.ops.moe_lora_align_block_size = fake_align; "
                 "wrapper = FakeWrapper(); "
                 "expert_map = torch.full((128,), -1, dtype=torch.int32); "

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Any, AsyncIterator, Iterator, Literal, cast
+from typing import Any, AsyncIterator, Iterator, Literal, TypedDict, cast
 import uuid
 
 from pydantic import BaseModel, Field
@@ -40,6 +40,10 @@ _VARIANT_NAME = Literal[
     "megatron_dedicated",
     "unsloth_dedicated",
 ]
+
+
+class _TrainKwargs(TypedDict):
+    packed_sequence_length: int
 
 
 class TrainabilityStepReport(BaseModel):
@@ -358,13 +362,11 @@ def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", 1024)
 
 
-def _variant_train_kwargs(variant: _TrainabilityVariant) -> dict[str, object]:
-    return {
-        "packed_sequence_length": _variant_packed_sequence_length(variant),
-    }
+def _variant_train_kwargs(variant: _TrainabilityVariant) -> _TrainKwargs:
+    return {"packed_sequence_length": _variant_packed_sequence_length(variant)}
 
 
-def _variant_init_args(variant: _TrainabilityVariant) -> dict[str, object]:
+def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
     return {"max_seq_length": _variant_packed_sequence_length(variant)}
 
 
@@ -727,7 +729,7 @@ async def run_yes_no_trainability_async(
                     1e-4,
                 ),
                 loss_fn="cispo",
-                **train_kwargs,
+                packed_sequence_length=train_kwargs["packed_sequence_length"],
             )
             await model.log(
                 train_groups,

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
-from typing import AsyncIterator, cast
+from typing import Any, AsyncIterator, cast
 import uuid
 
 import httpx
@@ -101,16 +101,19 @@ def _require_opt_in(env_name: str) -> None:
 
 
 def _shared_live_config() -> dev.InternalModelConfig:
-    return {
-        "rollout_weights_mode": "lora",
-        "engine_args": {
-            **_engine_args_for_yes_no_trainability(inference_gpu_ids=[0, 1]),
-            "tensor_parallel_size": 2,
-            "enable_expert_parallel": True,
-            "enable_sleep_mode": True,
+    return cast(
+        dev.InternalModelConfig,
+        {
+            "rollout_weights_mode": "lora",
+            "engine_args": {
+                **_engine_args_for_yes_no_trainability(inference_gpu_ids=[0, 1]),
+                "tensor_parallel_size": 2,
+                "enable_expert_parallel": True,
+                "enable_sleep_mode": True,
+            },
+            "init_args": {"max_seq_length": _max_seq_length()},
         },
-        "init_args": {"max_seq_length": _max_seq_length()},
-    }
+    )
 
 
 def _dedicated_merged_config() -> dev.InternalModelConfig:
@@ -476,7 +479,9 @@ async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
             "inference_gpu_ids": _multirank_inference_gpu_ids(),
             "topology": SHARED_TOPOLOGY.model_dump(),
         }
-        (artifact_dir / "dedicated_megatron_multirank_merged_live_result.json").write_text(
+        (
+            artifact_dir / "dedicated_megatron_multirank_merged_live_result.json"
+        ).write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
@@ -567,7 +572,7 @@ async def test_megatron_backend_shared_lora_ten_step_live_smoke(
                 }
             )
 
-        latest_step = int(step_reports[-1]["step"])
+        latest_step = int(cast(Any, step_reports[-1]["step"]))
         latest_name = model.get_inference_name(step=latest_step)
         model_ids_after = await _list_model_ids(model)
         latest_snapshot = await _chat_snapshot(model, step=latest_step)

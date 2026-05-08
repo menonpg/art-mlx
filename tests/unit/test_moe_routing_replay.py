@@ -152,7 +152,9 @@ def _make_multi_call_bundle() -> MoeRoutingReplayBundle:
         steps={
             0: StepRoutes(
                 routers={
-                    router_key: StepRouterRoutes(calls={0: route0, 1: route1, 2: route2})
+                    router_key: StepRouterRoutes(
+                        calls={0: route0, 1: route1, 2: route2}
+                    )
                 },
                 global_token_uids=torch.arange(1, dtype=torch.int64),
             )
@@ -237,20 +239,28 @@ class _FakeChunk(nn.Module):
 
 
 def test_build_router_key_from_compiled_module_name() -> None:
-    assert build_router_key_from_module_name(
-        chunk_index=0,
-        module_name="module.decoder.layers.0._orig_mod.mlp.router",
-    ) == "chunk_00.layer_0000.mlp.router"
+    assert (
+        build_router_key_from_module_name(
+            chunk_index=0,
+            module_name="module.decoder.layers.0._orig_mod.mlp.router",
+        )
+        == "chunk_00.layer_0000.mlp.router"
+    )
 
 
 def test_build_router_key_from_nested_compiled_module_name() -> None:
-    assert build_router_key_from_module_name(
-        chunk_index=3,
-        module_name="module.decoder.layers.12.mlp._orig_mod.router",
-    ) == "chunk_03.layer_0012.mlp.router"
+    assert (
+        build_router_key_from_module_name(
+            chunk_index=3,
+            module_name="module.decoder.layers.12.mlp._orig_mod.router",
+        )
+        == "chunk_03.layer_0012.mlp.router"
+    )
 
 
-def test_topology_aware_local_token_indexer_keeps_merged_rows_when_counts_match() -> None:
+def test_topology_aware_local_token_indexer_keeps_merged_rows_when_counts_match() -> (
+    None
+):
     indexer = TopologyAwareLocalTokenIndexer(
         parallel_state_module=_FakeParallelState(tp_world_size=2, tp_rank=1)
     )

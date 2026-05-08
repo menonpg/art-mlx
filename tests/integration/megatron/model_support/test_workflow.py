@@ -462,7 +462,9 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_yes_no_trainability=lambda *, base_model, allow_unvalidated_arch=False: (
+            run_yes_no_trainability=lambda *,
+            base_model,
+            allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     latest_step=2,
                     initial_eval_reward=0.4,
@@ -545,7 +547,10 @@ def test_run_packed_position_ids_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_packed_position_ids=lambda *, base_model, num_layers, allow_unvalidated_arch=False: (
+            run_packed_position_ids=lambda *,
+            base_model,
+            num_layers,
+            allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     output_dir="/tmp/packed-position-ids",
                     model_dump=lambda mode="json": {

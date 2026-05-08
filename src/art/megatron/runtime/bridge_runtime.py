@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 import contextlib
 import fnmatch
-from typing import Any
+from typing import Any, cast
 
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -67,14 +67,18 @@ def load_unique_hf_keys_once(
     if not keys:
         return {}
     if hasattr(hf_state_dict, "__getitem__"):
+        hf_state_dict_getter = cast(Any, hf_state_dict)
         loaded = (
-            hf_state_dict[keys]
+            hf_state_dict_getter[keys]
             if not isinstance(hf_state_dict, dict)
             else {key: hf_state_dict[key] for key in keys}
         )
     else:
         loaded = {key: hf_state_dict[key] for key in keys}
-    return {key: _pin_cpu_tensor(value) for key, value in loaded.items()}
+    return {
+        key: _pin_cpu_tensor(value)
+        for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
+    }
 
 
 class _CachedStateLookup(Mapping[str, torch.Tensor]):
@@ -172,13 +176,13 @@ def _art_get_model(
     from megatron.bridge.models import model_provider as model_provider_module
 
     if fp16:
-        model_provider.fp16 = fp16
+        setattr(model_provider, "fp16", fp16)
     if bf16:
-        model_provider.bf16 = bf16
+        setattr(model_provider, "bf16", bf16)
 
-    model_provider.use_cpu_initialization = bool(use_cpu_initialization)
+    setattr(model_provider, "use_cpu_initialization", bool(use_cpu_initialization))
     if init_model_with_meta_device:
-        model_provider.init_model_with_meta_device = True
+        setattr(model_provider, "init_model_with_meta_device", True)
         with torch.device("meta"):
             model = model_provider_module._create_model(
                 model_provider,
@@ -214,7 +218,7 @@ def _art_get_model(
 
     model = _wrap_with_mp_wrapper(model, model_config, mixed_precision_wrapper)
     if model_provider_module.correct_amax_history_if_needed is not None:
-        model_provider_module.correct_amax_history_if_needed(model)
+        model_provider_module.correct_amax_history_if_needed(cast(Any, model))
     if wrap_with_ddp:
         model = model_provider_module._ddp_wrap(
             model,
@@ -236,14 +240,16 @@ def _column_parallel_hf_to_megatron(
     if self.tp_size == 1:
         return hf_weights
     normalized_param = self._normalize_expert_param_name(self.megatron_param)
-    _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
+    target_param = get_module_and_param_from_name(
+        cast(Any, megatron_module), normalized_param
+    )[1]
     if self.tp_rank == 0:
         full_size = hf_weights.shape[0]
         if full_size % self.tp_size != 0:
             raise ValueError(
                 f"Cannot evenly split dimension 0 size {full_size} across {self.tp_size} TP ranks"
             )
-        splits = torch.chunk(hf_weights, self.tp_size, dim=0)
+        splits = list(torch.chunk(hf_weights, self.tp_size, dim=0))
     else:
         splits = None
     return self.scatter_to_tp_ranks(
@@ -263,19 +269,18 @@ def _scatter_to_tp_ranks(
     src_rank: int = 0,
 ) -> torch.Tensor:
     if self.tp_size == 1:
-        if not splits:
-            return None
-        return splits[0].to(device=device, dtype=dtype, non_blocking=True)
+        return cast(list[torch.Tensor], splits)[0].to(
+            device=device, dtype=dtype, non_blocking=True
+        )
     output = torch.empty(output_shape, dtype=dtype, device=device)
-    global_src = torch.distributed.get_global_rank(
-        group=self.tp_group, group_rank=src_rank
-    )
+    dist = cast(Any, torch.distributed)
+    global_src = dist.get_global_rank(group=self.tp_group, group_rank=src_rank)
     scatter_list = None
     if self.tp_rank == src_rank and splits:
         scatter_list = [
             shard.to(device=device, dtype=dtype, non_blocking=True) for shard in splits
         ]
-    torch.distributed.scatter(output, scatter_list, src=global_src, group=self.tp_group)
+    dist.scatter(output, scatter_list, src=global_src, group=self.tp_group)
     return output
 
 
@@ -285,7 +290,7 @@ def _replicated_hf_to_megatron(
     megatron_module: torch.nn.Module,
 ) -> torch.Tensor:
     if hasattr(megatron_module, "weight"):
-        target_device = megatron_module.weight.device
+        target_device = cast(Any, megatron_module).weight.device
     else:
         target_device = next(megatron_module.parameters()).device
     if self.tp_size == 1:
@@ -297,9 +302,9 @@ def _replicated_hf_to_megatron(
     ):
         broadcast_device = _materialization_device()
     if self.tp_rank == 0:
-        tensor = hf_weights.to(device=broadcast_device, non_blocking=True)
+        tensor = hf_weights.to(device=cast(Any, broadcast_device), non_blocking=True)
     else:
-        tensor = torch.empty_like(hf_weights, device=broadcast_device)
+        tensor = torch.empty_like(hf_weights, device=cast(Any, broadcast_device))
     return self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
 
 
@@ -370,22 +375,26 @@ def install_art_bridge_runtime_patches() -> None:
         model_provider_module.get_model, "__art_meta_materialization__", False
     ):
         setattr(_art_get_model, "__art_meta_materialization__", True)
-        model_provider_module.get_model = _art_get_model
+        setattr(model_provider_module, "get_model", _art_get_model)
     if not getattr(
         MegatronParamMapping.scatter_to_tp_ranks, "__art_non_blocking__", False
     ):
         setattr(_scatter_to_tp_ranks, "__art_non_blocking__", True)
-        MegatronParamMapping.scatter_to_tp_ranks = _scatter_to_tp_ranks
+        setattr(MegatronParamMapping, "scatter_to_tp_ranks", _scatter_to_tp_ranks)
     if not getattr(ColumnParallelMapping.hf_to_megatron, "__art_cast_last__", False):
         setattr(_column_parallel_hf_to_megatron, "__art_cast_last__", True)
-        ColumnParallelMapping.hf_to_megatron = _column_parallel_hf_to_megatron
+        setattr(
+            ColumnParallelMapping, "hf_to_megatron", _column_parallel_hf_to_megatron
+        )
     if not getattr(ReplicatedMapping.hf_to_megatron, "__art_cast_last__", False):
         setattr(_replicated_hf_to_megatron, "__art_cast_last__", True)
-        ReplicatedMapping.hf_to_megatron = _replicated_hf_to_megatron
+        setattr(ReplicatedMapping, "hf_to_megatron", _replicated_hf_to_megatron)
     if not getattr(
         MegatronModelBridge.load_weights_hf_to_megatron, "__art_cached_load__", False
     ):
         setattr(_optimized_load_weights_hf_to_megatron, "__art_cached_load__", True)
-        MegatronModelBridge.load_weights_hf_to_megatron = (
-            _optimized_load_weights_hf_to_megatron
+        setattr(
+            MegatronModelBridge,
+            "load_weights_hf_to_megatron",
+            _optimized_load_weights_hf_to_megatron,
         )

@@ -693,11 +693,7 @@ class _PreparePackedRecurrentInputs(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any,
-        grad_query: Tensor | None,
-        grad_key: Tensor | None,
-        grad_value: Tensor | None,
-        grad_beta_out: Tensor | None,
-        grad_g_out: Tensor | None,
+        *grad_outputs: Any,
     ) -> tuple[
         Tensor | None,
         Tensor | None,
@@ -707,6 +703,7 @@ class _PreparePackedRecurrentInputs(torch.autograd.Function):
         None,
         None,
     ]:
+        grad_query, grad_key, grad_value, grad_beta_out, grad_g_out = grad_outputs
         token_count, channels = ctx.input_shape
         grad_qkv = None
         device = None
@@ -840,8 +837,9 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: Any, grad_out: Tensor
+        ctx: Any, *grad_outputs: Any
     ) -> tuple[Tensor, Tensor, None, None, None, None]:
+        (grad_out,) = grad_outputs
         row_indices, position_indices, output_mask, cu_seqlens = ctx.saved_tensors
         _, output_sequence_length, heads, dim = ctx.output_shape
         grad_out = grad_out.contiguous()

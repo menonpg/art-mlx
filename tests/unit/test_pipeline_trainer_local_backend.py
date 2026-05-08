@@ -332,6 +332,7 @@ def test_load_adapter_into_model_reloads_optimizer_when_provided() -> None:
     assert module.loaded_adapter is adapter_model
     assert optimizer.reload_calls == 1
 
+
 @pytest.mark.asyncio
 async def test_local_backend_async_context_manager_awaits_async_cleanup(
     tmp_path: Path,

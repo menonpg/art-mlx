@@ -653,7 +653,9 @@ class OpenAICompatibleTinkerServerWorker:
                         content=[
                             ChatCompletionTokenLogprob(
                                 token=f"token_id:{token}",
-                                bytes=list(renderer.tokenizer.decode(token).encode()),
+                                bytes=list(
+                                    cast(str, renderer.tokenizer.decode(token)).encode()
+                                ),
                                 logprob=logprob,
                                 top_logprobs=[],
                             )

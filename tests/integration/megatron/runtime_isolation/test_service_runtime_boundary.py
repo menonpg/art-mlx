@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import httpx
@@ -213,7 +214,7 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     monkeypatch.setattr(service, "_allocate_master_port", lambda: 12345)
 
     await service._ensure_megatron_running()
-    command = recorded["command"]
+    command = cast(list[str], recorded["command"])
     assert isinstance(command, list)
     assert command[0] == sys.executable
     assert command[1].endswith("managed_process.py")

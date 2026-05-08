@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import importlib
 from types import MethodType
 from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
@@ -639,7 +640,9 @@ def _run_cp_planned_prefixes_and_completions(
         raise ValueError(
             f"unsupported GDN CP layouts: {input_layout=} {output_layout=}"
         )
-    from .cp_runtime import run_gdn_prepared_varlen_native_fla_cp
+    run_gdn_prepared_varlen_native_fla_cp = importlib.import_module(
+        "art.megatron.gdn.cp_runtime"
+    ).run_gdn_prepared_varlen_native_fla_cp
 
     if input_layout == "attention":
         gdn_hidden, original_shape = gdn_cp_attention_to_gdn_layout(
@@ -1379,8 +1382,9 @@ class _CompactHiddenScatter(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: Any, grad_output: Tensor | None
+        ctx: Any, *grad_outputs: Any
     ) -> tuple[Tensor | None, None, None, None]:
+        (grad_output,) = grad_outputs
         if grad_output is None:
             return None, None, None, None
         (indices,) = ctx.saved_tensors

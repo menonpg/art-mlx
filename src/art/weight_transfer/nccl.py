@@ -7,7 +7,7 @@ from datetime import timedelta
 import os
 import pickle
 import socket
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -81,7 +81,9 @@ class _NcclLibrary:
     def __init__(self, so_file: str | None = None):
         self._lib = ctypes.CDLL(so_file or _find_nccl_library())
         self._configure("ncclGetErrorString", ctypes.c_char_p, [_nccl_result_t])
-        self._configure("ncclGetUniqueId", _nccl_result_t, [ctypes.POINTER(_NcclUniqueId)])
+        self._configure(
+            "ncclGetUniqueId", _nccl_result_t, [ctypes.POINTER(_NcclUniqueId)]
+        )
         self._configure(
             "ncclCommInitRank",
             _nccl_result_t,
@@ -132,9 +134,7 @@ class _NcclLibrary:
     def init_rank(self, world_size: int, unique_id: _NcclUniqueId, rank: int) -> Any:
         comm = _nccl_comm_t()
         self._check(
-            self._lib.ncclCommInitRank(
-                ctypes.byref(comm), world_size, unique_id, rank
-            )
+            self._lib.ncclCommInitRank(ctypes.byref(comm), world_size, unique_id, rank)
         )
         return comm
 
@@ -227,7 +227,7 @@ class _BootstrapGroup:
     def broadcast_obj(self, obj: Any | None, *, src: int) -> Any:
         if self.rank == src:
             key = f"broadcast_from/{src}/{self._broadcast_send_counter}"
-            self.store.set(key, pickle.dumps(obj))
+            self.store.set(key, cast(Any, pickle.dumps(obj)))
             self._broadcast_send_counter += 1
             return obj
         key = f"broadcast_from/{src}/{self._broadcast_recv_counter[src]}"
@@ -315,9 +315,9 @@ def _find_nccl_library() -> str:
 def trainer_init(init_info: dict[str, object]) -> TrainerNcclCommunicator:
     return TrainerNcclCommunicator(
         host=str(init_info["master_address"]),
-        port=int(init_info["master_port"]),
+        port=int(cast(Any, init_info["master_port"])),
         rank=0,
-        world_size=int(init_info["world_size"]),
+        world_size=int(cast(Any, init_info["world_size"])),
         device=torch.cuda.current_device(),
     )
 

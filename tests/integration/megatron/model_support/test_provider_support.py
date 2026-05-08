@@ -19,6 +19,7 @@ class _FakeProvider:
         self.transformer_layer_spec = self._base_layer_spec
         self.finalized = False
         self.overlap_moe_expert_parallel_comm = False
+        self.num_moe_experts = 0
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None

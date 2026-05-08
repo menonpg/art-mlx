@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 import math
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core import parallel_state as ps
@@ -481,11 +481,11 @@ class LoRA(torch.nn.Module):
                 raise RuntimeError(
                     f"LoRA param missing main_grad attribute for key '{key}'"
                 )
-            grad = param.main_grad
+            grad = cast(torch.Tensor, param.main_grad)
             if grad is None:
                 raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
             if hasattr(grad, "_local_tensor"):
-                grad = grad._local_tensor
+                grad = cast(Any, grad)._local_tensor
             local_grad = grad[expert] if expert is not None else grad
             grads[key] = local_grad.T
         return grads
@@ -1287,6 +1287,7 @@ def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,
 ) -> list[torch.nn.Module]:
+    provider = cast(Any, provider)
     handler = provider._art_model_support_handler
     spec = provider._art_model_support_spec
     target_modules = list(spec.default_target_modules)

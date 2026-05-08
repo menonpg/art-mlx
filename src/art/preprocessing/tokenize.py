@@ -292,7 +292,7 @@ def tokenize_trajectory(
     )
     chat = cast(
         str,
-        tokenizer.apply_chat_template(
+        cast(Any, tokenizer).apply_chat_template(
             messages,
             tools=tools,
             continue_final_message=True,

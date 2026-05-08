@@ -1,8 +1,11 @@
 import asyncio
+from typing import cast
 
 from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
+
+import art
 
 from .yes_no_trainability import (
     _build_internal_config,
@@ -80,7 +83,7 @@ async def test_eval_prompts_are_submitted_concurrently() -> None:
     completions = _ConcurrentCompletions(expected=3)
 
     groups = await _evaluate_groups(
-        _FakeModel(_FakeClient(completions)),
+        cast(art.TrainableModel, _FakeModel(_FakeClient(completions))),
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         prompts=["a", "b", "c"],
         step=1,

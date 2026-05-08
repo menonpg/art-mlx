@@ -27,6 +27,10 @@ def _disable(fn):
     return wrapped
 
 
+def _disable_attr(obj: Any, name: str) -> None:
+    setattr(obj, name, _disable(_require_attr(obj, name)))
+
+
 def _selected_workaround_flags(
     config: CompileWorkaroundConfig | None,
 ) -> set[str]:
@@ -71,19 +75,14 @@ def install_torch_compile_workarounds(
                 raise
 
     deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
-    deepep_manager = (
-        _require_attr(token_dispatcher, "_DeepepManager") if deepep_flags else None
-    )
-    if "deepep_permute_restore" in flags:
-        deepep_manager.get_permuted_hidden_states_by_experts = _disable(
-            deepep_manager.get_permuted_hidden_states_by_experts
-        )
-        deepep_manager.get_restored_hidden_states_by_experts = _disable(
-            deepep_manager.get_restored_hidden_states_by_experts
-        )
-    if "deepep_dispatch_combine" in flags:
-        deepep_manager.dispatch = _disable(deepep_manager.dispatch)
-        deepep_manager.combine = _disable(deepep_manager.combine)
+    if deepep_flags:
+        deepep_manager = _require_attr(token_dispatcher, "_DeepepManager")
+        if "deepep_permute_restore" in flags:
+            _disable_attr(deepep_manager, "get_permuted_hidden_states_by_experts")
+            _disable_attr(deepep_manager, "get_restored_hidden_states_by_experts")
+        if "deepep_dispatch_combine" in flags:
+            _disable_attr(deepep_manager, "dispatch")
+            _disable_attr(deepep_manager, "combine")
     if "alltoall_dtoh" in flags:
         token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
             _disable(
@@ -133,8 +132,10 @@ def install_torch_compile_workarounds(
     if "te_moe_unpermute_backward" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 
-        te_permutation._moe_unpermute_mask_map.backward = staticmethod(
-            _disable(te_permutation._moe_unpermute_mask_map.backward)
+        setattr(
+            te_permutation._moe_unpermute_mask_map,
+            "backward",
+            staticmethod(_disable(te_permutation._moe_unpermute_mask_map.backward)),
         )
     if "te_triton_unpermute_bwd_with_merging_probs" in flags:
         from transformer_engine.pytorch.triton import (
@@ -160,7 +161,7 @@ def install_torch_compile_workarounds(
             moe_layer.MoELayer.routed_experts_compute
         )
     if "grouped_mlp_forward" in flags:
-        moe_experts.GroupedMLP.forward = _disable(moe_experts.GroupedMLP.forward)
+        _disable_attr(_require_attr(moe_experts, "GroupedMLP"), "forward")
     if "te_grouped_mlp_forward" in flags:
         moe_experts.TEGroupedMLP.forward = _disable(moe_experts.TEGroupedMLP.forward)
     _INSTALLED_CONFIG = installed_config

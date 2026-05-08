@@ -224,8 +224,12 @@ def run_hf_parity_stage(
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
-    hf_parity = _import_integration_module("integration.megatron.model_support.hf_parity")
-    oracle_harness = _import_integration_module("integration.megatron.model_support.oracle_harness")
+    hf_parity = _import_integration_module(
+        "integration.megatron.model_support.hf_parity"
+    )
+    oracle_harness = _import_integration_module(
+        "integration.megatron.model_support.oracle_harness"
+    )
     spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -265,8 +269,12 @@ def run_lora_coverage_stage(
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
-    lora_coverage = _import_integration_module("integration.megatron.model_support.lora_coverage")
-    oracle_harness = _import_integration_module("integration.megatron.model_support.oracle_harness")
+    lora_coverage = _import_integration_module(
+        "integration.megatron.model_support.lora_coverage"
+    )
+    oracle_harness = _import_integration_module(
+        "integration.megatron.model_support.oracle_harness"
+    )
     spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -295,7 +303,9 @@ def run_correctness_sensitivity_stage(
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
-    oracle_harness = _import_integration_module("integration.megatron.model_support.oracle_harness")
+    oracle_harness = _import_integration_module(
+        "integration.megatron.model_support.oracle_harness"
+    )
     spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -454,7 +464,9 @@ def run_merged_vllm_serving_stage(
     merged_vllm_serving = _import_integration_module(
         "integration.megatron.lora.merged_vllm_serving"
     )
-    oracle_harness = _import_integration_module("integration.megatron.model_support.oracle_harness")
+    oracle_harness = _import_integration_module(
+        "integration.megatron.model_support.oracle_harness"
+    )
     spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -504,7 +516,9 @@ def run_yes_no_trainability_stage(
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
     del architecture
-    yes_no_trainability = _import_integration_module("integration.megatron.trainability.yes_no_trainability")
+    yes_no_trainability = _import_integration_module(
+        "integration.megatron.trainability.yes_no_trainability"
+    )
     report = yes_no_trainability.run_yes_no_trainability(
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -534,7 +548,9 @@ def run_native_vllm_lora_stage(
     native_vllm_lora = _import_integration_module(
         "integration.megatron.lora.native_vllm_lora"
     )
-    oracle_harness = _import_integration_module("integration.megatron.model_support.oracle_harness")
+    oracle_harness = _import_integration_module(
+        "integration.megatron.model_support.oracle_harness"
+    )
     spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,

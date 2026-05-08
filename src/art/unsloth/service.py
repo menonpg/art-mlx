@@ -7,7 +7,7 @@ import logging
 import os
 import socket
 import subprocess
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
 import torch
 from trl import GRPOTrainer
@@ -47,6 +47,10 @@ from .train import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _RuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
 
 
 def save_checkpoint(
@@ -193,7 +197,7 @@ class UnslothService:
             return {}
         return {"Authorization": f"Bearer {self._vllm_api_key}"}
 
-    def _runtime_request_kwargs(self) -> dict[str, dict[str, str]]:
+    def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
 

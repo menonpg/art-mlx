@@ -104,8 +104,9 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
 
 
 def _etp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
-    return int(provider.expert_tensor_parallel_size) * int(
-        provider.expert_model_parallel_size
+    return (
+        cast(int, provider.expert_tensor_parallel_size)
+        * provider.expert_model_parallel_size
     )
 
 

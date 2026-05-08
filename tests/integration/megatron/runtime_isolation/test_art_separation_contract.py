@@ -22,7 +22,9 @@ def test_art_pyproject_has_no_vllm_dependency_or_plugin_entrypoint() -> None:
     dev = pyproject["dependency-groups"]["dev"]
 
     def _contains_vllm(values: list[str]) -> bool:
-        return any(value.startswith("vllm") or value == "art-vllm-runtime" for value in values)
+        return any(
+            value.startswith("vllm") or value == "art-vllm-runtime" for value in values
+        )
 
     assert not _contains_vllm(backend)
     assert not _contains_vllm(megatron)

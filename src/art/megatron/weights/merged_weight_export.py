@@ -192,9 +192,10 @@ def _is_sender_rank(rank: int) -> bool:
 def _maybe_distributed_barrier(world_size: int) -> None:
     if world_size <= 1:
         return
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+    dist = cast(Any, torch.distributed)
+    if not dist.is_available() or not dist.is_initialized():
         return
-    torch.distributed.barrier()
+    dist.barrier()
 
 
 def _runtime_headers(spec: MergedWeightTransferSpec) -> dict[str, str]:
@@ -234,9 +235,8 @@ def _sync_rank_zero_status(
     phase: str,
     error: BaseException | None,
 ) -> None:
-    if world_size <= 1 or not (
-        torch.distributed.is_available() and torch.distributed.is_initialized()
-    ):
+    dist = cast(Any, torch.distributed)
+    if world_size <= 1 or not (dist.is_available() and dist.is_initialized()):
         if error is not None:
             raise RuntimeError(f"{phase} failed on rank 0") from error
         return
@@ -245,7 +245,7 @@ def _sync_rank_zero_status(
         if _is_sender_rank(rank) and error is not None
         else None
     ]
-    torch.distributed.broadcast_object_list(payload, src=0)
+    dist.broadcast_object_list(payload, src=0)
     if payload[0] is None:
         return
     if _is_sender_rank(rank):

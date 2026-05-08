@@ -1,4 +1,5 @@
 """Validation functions for model configuration."""
+
 from .model import InternalModelConfig, RolloutWeightsMode
 
 
@@ -12,6 +13,7 @@ def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
     if mode in {"lora", "merged"}:
         return mode
     raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
+
 
 def validate_dedicated_config(config: InternalModelConfig) -> None:
     """Validate dedicated mode GPU configuration.
