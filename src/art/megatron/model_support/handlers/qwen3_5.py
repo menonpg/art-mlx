@@ -98,6 +98,8 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                 if isinstance(module, GPTModel)
                 else cast(GPTModel, getattr(module, "language_model"))
             )
+            if getattr(gpt_module, "mtp_process", False) or hasattr(gpt_module, "mtp"):
+                raise RuntimeError("ART Qwen3.5 Megatron training does not use MTP.")
             preprocess = gpt_module._preprocess
 
             def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
