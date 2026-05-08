@@ -187,7 +187,11 @@ class FlexDotProductAttention(torch.nn.Module):
             block_mask = attention_bias.block_mask
         else:
             if not isinstance(attention_bias, BlockMask):
-                raise TypeError("Expected a flex BlockMask in attention_bias.")
+                actual_type = type(attention_bias)
+                raise TypeError(
+                    "Expected a flex BlockMask in attention_bias; got "
+                    f"{actual_type.__module__}.{actual_type.__qualname__}."
+                )
             block_mask = attention_bias
 
         # Megatron uses [S, B, H, D], while flex attention expects [B, H, S, D].
