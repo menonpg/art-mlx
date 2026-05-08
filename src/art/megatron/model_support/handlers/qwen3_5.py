@@ -776,14 +776,14 @@ def _qwen35_text_only_mapping_registry(
 
 def _text_only_qwen35_mapping(mapping: Any) -> Any:
     from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-        ExpertMLPDownProjMapping,
-        ExpertMLPGateUpProjMapping,
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
     )
 
     megatron_param = mapping.megatron_param.removeprefix("language_model.")
-    if isinstance(mapping, ExpertMLPGateUpProjMapping):
+    if isinstance(mapping, FusedGatedExpertMapping):
         return _ArtExpertMLPGateUpProjMapping(megatron_param, mapping.hf_param)
-    if isinstance(mapping, ExpertMLPDownProjMapping):
+    if isinstance(mapping, FusedExpertMapping):
         return _ArtExpertMLPDownProjMapping(megatron_param, mapping.hf_param)
     cloned = copy(mapping)
     cloned.megatron_param = megatron_param
@@ -791,10 +791,10 @@ def _text_only_qwen35_mapping(mapping: Any) -> Any:
 
 
 from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-    ExpertMLPDownProjMapping as _BridgeExpertMLPDownProjMapping,
+    FusedExpertMapping as _BridgeExpertMLPDownProjMapping,
 )
 from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-    ExpertMLPGateUpProjMapping as _BridgeExpertMLPGateUpProjMapping,
+    FusedGatedExpertMapping as _BridgeExpertMLPGateUpProjMapping,
 )
 
 
@@ -804,11 +804,11 @@ class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
         hf_weights: torch.Tensor | dict[str, torch.Tensor],
         megatron_module: Any,
     ) -> torch.Tensor:
+        from megatron.bridge.models.conversion.param_mapping import (
+            _align_expert_weight_to_shape,
+        )
         from megatron.bridge.models.conversion.utils import (
             get_module_and_param_from_name,
-        )
-        from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-            _align_weight_to_shape,
         )
         from megatron.bridge.utils.common_utils import (
             extract_expert_number_from_param,
@@ -841,10 +841,14 @@ class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
             and expert_weight.ndim == 3
             and expert_weight.shape[0] == 2
         ):
-            gate = _align_weight_to_shape(expert_weight[0], gate_target_shape, "gate")
-            up = _align_weight_to_shape(expert_weight[1], gate_target_shape, "up")
+            gate = _align_expert_weight_to_shape(
+                expert_weight[0], torch.Size(gate_target_shape), "gate"
+            )
+            up = _align_expert_weight_to_shape(
+                expert_weight[1], torch.Size(gate_target_shape), "up"
+            )
         else:
-            fused = _align_weight_to_shape(
+            fused = _align_expert_weight_to_shape(
                 cast(torch.Tensor, expert_weight),
                 torch.Size(full_target_shape),
                 "gate_up",
@@ -865,12 +869,10 @@ class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
         from megatron.bridge.models.conversion.param_mapping import (
             ColumnParallelMapping,
             RowParallelMapping,
+            _align_expert_weight_to_shape,
         )
         from megatron.bridge.models.conversion.utils import (
             get_module_and_param_from_name,
-        )
-        from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-            _align_weight_to_shape,
         )
         from megatron.bridge.utils.common_utils import (
             extract_expert_number_from_param,
@@ -899,7 +901,7 @@ class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
             )
         else:
             full_target_shape = tuple(target_param.shape)
-        aligned = _align_weight_to_shape(
+        aligned = _align_expert_weight_to_shape(
             expert_weight,
             torch.Size(full_target_shape),
             "down_proj",
