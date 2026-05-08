@@ -19,7 +19,6 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 
 import aiohttp
 import numpy as np
-from openai import AsyncOpenAI
 import polars as pl
 import torch
 from tqdm import auto as tqdm
@@ -106,12 +105,12 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
+        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
-        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
 
     def supports_automatic_train_step_metrics(self) -> bool:
@@ -421,7 +420,8 @@ class LocalBackend(Backend):
                 f"{len(too_long_results)} tokenized results from "
                 f"{len({id(result.trajectory) for result in too_long_results})} "
                 f"trajectories longer than packed_sequence_length={sequence_length} "
-                f"(max seen {max(len(result.token_ids) for result in too_long_results)}).",
+                f"(max seen {max(len(result.token_ids) for result in too_long_results)}). "
+                "This affects training, but your model may still learn.",
                 stacklevel=2,
             )
             tokenized_results = [
@@ -550,13 +550,8 @@ class LocalBackend(Backend):
         self, model: AnyTrainableModel, base_url: str, api_key: str
     ) -> None:
         model_name = model.name
-        openai_client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-        )
         consecutive_failures = 0
         max_consecutive_failures = 3
-        first_health_check = True
         async with aiohttp.ClientSession() as session:
             while True:
                 # Wait 30 seconds before checking again
@@ -585,29 +580,22 @@ class LocalBackend(Backend):
                             running_requests = int(float(line.split()[1]))
                         elif line.startswith("vllm:num_requests_waiting"):
                             pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, verify the model can
-                    # still serve a real generation request. The first idle probe gets
-                    # a longer timeout to tolerate cold-start compile.
+                    # If there are no running or pending requests, send a cheap liveness
+                    # probe rather than a real generation request. Large models can take
+                    # longer than a short completion-based probe while still being healthy.
                     if running_requests == 0 and pending_requests == 0:
                         try:
-                            timeout = float(
-                                os.environ.get(
-                                    (
-                                        "ART_SERVER_MONITOR_INITIAL_TIMEOUT"
-                                        if first_health_check
-                                        else "ART_SERVER_MONITOR_TIMEOUT"
-                                    ),
-                                    60.0 if first_health_check else 5.0,
-                                )
-                            )
-                            await openai_client.completions.create(
-                                model=self._model_inference_name(model),
-                                prompt="Hi",
-                                max_tokens=1,
-                                temperature=0.0,
-                                timeout=timeout,
-                            )
-                            first_health_check = False
+                            async with session.get(
+                                f"{base_url.split('/v1')[0]}/health",
+                                timeout=float(
+                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
+                                ),
+                            ) as health_response:
+                                if health_response.status >= 400:
+                                    raise RuntimeError(
+                                        "OpenAI server health check failed with "
+                                        f"status {health_response.status}"
+                                    )
                         except Exception as e:
                             # If the server is sleeping, a failed health check is okay
                             if await self._services[

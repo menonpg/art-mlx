@@ -60,7 +60,7 @@ class TestMetricRoutingBaseline:
 
         assert run is fake_run
         define_calls = [
-            (call.args, call.kwargs) for call in fake_wandb.define_metric.call_args_list
+            (call.args, call.kwargs) for call in fake_run.define_metric.call_args_list
         ]
         assert define_calls == [
             (("training_step",), {}),
@@ -107,7 +107,7 @@ class TestMetricRoutingBaseline:
                 )
 
         define_calls = [
-            (call.args, call.kwargs) for call in fake_wandb.define_metric.call_args_list
+            (call.args, call.kwargs) for call in fake_run.define_metric.call_args_list
         ]
         assert (
             ("costs/train/sample",),
