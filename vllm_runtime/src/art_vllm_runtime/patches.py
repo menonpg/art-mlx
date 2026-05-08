@@ -20,7 +20,6 @@ def apply_vllm_runtime_patches() -> None:
 def patch_transformers_v5_compat() -> None:
     _patch_rope_validation_ignore_keys()
     _patch_qwen3_vl_moe_tie_word_embeddings()
-    _patch_qwen3_5_lora()
 
 
 def _patch_rope_validation_ignore_keys() -> None:
@@ -49,54 +48,6 @@ def _patch_qwen3_vl_moe_tie_word_embeddings() -> None:
     setattr(Qwen3VLMoeTextConfig, "tie_word_embeddings", False)
 
 
-def _patch_qwen3_5_lora() -> None:
-    from vllm.lora.layers.column_parallel_linear import (
-        MergedColumnParallelLinearWithLoRA,
-        MergedColumnParallelLinearWithShardedLoRA,
-    )
-    from vllm.lora.layers.utils import _not_fully_sharded_can_replace
-    from vllm.model_executor.models.qwen3_5 import (
-        Qwen3_5ForCausalLMBase,
-        Qwen3_5ForConditionalGeneration,
-    )
-
-    projections = ["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z"]
-    Qwen3_5ForCausalLMBase.packed_modules_mapping["in_proj_qkvz"] = projections
-    Qwen3_5ForConditionalGeneration.packed_modules_mapping["in_proj_qkvz"] = projections
-
-    @classmethod
-    @_not_fully_sharded_can_replace
-    def can_replace_layer(
-        cls,
-        source_layer: Any,
-        lora_config: Any,
-        packed_modules_list: list[str],
-        model_config: Any = None,
-    ) -> bool:
-        from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-
-        return type(source_layer) is MergedColumnParallelLinear and len(
-            packed_modules_list
-        ) == len(source_layer.output_sizes)
-
-    MergedColumnParallelLinearWithLoRA.can_replace_layer = can_replace_layer
-
-    def slice_lora_a(
-        self: Any,
-        lora_a: "list[Tensor | None]",
-    ) -> "list[Tensor | None]":
-        output_shard_size = self.lora_a_stacked[0].shape[2]
-        output_start_idx = self.tp_rank * output_shard_size
-        return [
-            a[output_start_idx : output_start_idx + output_shard_size, :]
-            if a is not None
-            else None
-            for a in lora_a
-        ]
-
-    MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a  # ty:ignore[invalid-assignment]
-
-
 def _ep_local_expert_global_indices(expert_map: "Tensor") -> "Tensor":
     import torch
 
@@ -111,7 +62,7 @@ def _slice_ep_local_experts(
     expert_map: "Tensor",
     local_num_experts: int,
 ) -> "Tensor | None":
-    if lora_tensor is None or lora_tensor.shape[0] == local_num_experts:
+    if lora_tensor is None:
         return lora_tensor
     global_indices = _ep_local_expert_global_indices(expert_map)
     assert global_indices.numel() == local_num_experts, (
@@ -164,9 +115,7 @@ def patch_punica_ep_moe_lora_alignment() -> None:
             if topk_ids.numel() < num_experts:
                 max_num_tokens_padded = topk_ids.numel() * block_size
             sorted_ids = topk_ids.new_empty((max_loras * max_num_tokens_padded,))
-            max_num_m_blocks = punica_gpu.triton.cdiv(
-                max_num_tokens_padded, block_size
-            )
+            max_num_m_blocks = punica_gpu.triton.cdiv(max_num_tokens_padded, block_size)
             expert_ids = torch.full(
                 (max_loras * max_num_m_blocks,),
                 -1,
@@ -194,12 +143,14 @@ def patch_punica_ep_moe_lora_alignment() -> None:
         return None, sorted_ids, expert_ids, num_tokens_post_pad
 
     patched_moe_lora_align_block_size.__art_patched__ = True  # type: ignore[attr-defined]
-    punica_gpu.PunicaWrapperGPU.moe_lora_align_block_size = patched_moe_lora_align_block_size  # type: ignore[method-assign]
+    punica_gpu.PunicaWrapperGPU.moe_lora_align_block_size = (
+        patched_moe_lora_align_block_size  # type: ignore[method-assign]
+    )
 
 
 def patch_fused_moe_ep_lora_support() -> None:
-    from vllm.lora.layers import base
-    from vllm.lora.layers import fused_moe
+    from vllm.lora import model_manager
+    from vllm.lora.layers import base, fused_moe
 
     original_init = fused_moe.FusedMoEWithLoRA.__init__
     if not getattr(original_init, "__art_patched__", False):
@@ -246,24 +197,74 @@ def patch_fused_moe_ep_lora_support() -> None:
         patched_set_lora.__art_patched__ = True  # type: ignore[attr-defined]
         fused_moe.FusedMoEWithLoRA.set_lora = patched_set_lora  # type: ignore[method-assign]
 
-    original_3d_set_lora = fused_moe.FusedMoE3DWithLoRA.set_lora
-    if not getattr(original_3d_set_lora, "__art_patched__", False):
+    original_stack = model_manager.LoRAModelManager._stack_moe_lora_weights
+    if not getattr(original_stack, "__art_patched__", False):
 
-        def patched_3d_set_lora(
+        def patched_stack_moe_lora_weights(
             self: Any,
-            index: int,
-            lora_a: object,
-            lora_b: object,
+            lora_model: Any,
+            module: Any,
+            module_name: str,
         ) -> None:
-            return original_3d_set_lora(
-                self,
-                index,
-                localize_loras(self, lora_a),
-                localize_loras(self, lora_b),
+            if not isinstance(module, fused_moe.FusedMoE3DWithLoRA):
+                return original_stack(self, lora_model, module, module_name)
+            if not module.base_layer.use_ep:
+                return original_stack(self, lora_model, module, module_name)
+            module_lora = self._get_lora_layer_weights(lora_model, module_name)
+            if not module_lora:
+                return
+            gate_up_lora = self._get_lora_layer_weights(
+                lora_model,
+                module_name + ".base_layer",
             )
+            assert gate_up_lora is not None
+            rank = int(gate_up_lora.rank)
+            num_global_experts = gate_up_lora.lora_a.shape[0] // rank
+            expert_map = module.base_layer._expert_map
 
-        patched_3d_set_lora.__art_patched__ = True  # type: ignore[attr-defined]
-        fused_moe.FusedMoE3DWithLoRA.set_lora = patched_3d_set_lora  # type: ignore[method-assign]
+            def stack_a(tensor: "Tensor") -> "Tensor":
+                return tensor.reshape(num_global_experts, -1, tensor.shape[-1])
+
+            def stack_b(tensor: "Tensor") -> "Tensor":
+                return (
+                    tensor.reshape(tensor.shape[0], -1, num_global_experts)
+                    .permute(
+                        2,
+                        0,
+                        1,
+                    )
+                    .contiguous()
+                )
+
+            module_lora.lora_a = [
+                _slice_ep_local_experts(
+                    stack_a(gate_up_lora.lora_a),
+                    expert_map,
+                    module.base_layer.local_num_experts,
+                ),
+                _slice_ep_local_experts(
+                    stack_a(module_lora.lora_a),
+                    expert_map,
+                    module.base_layer.local_num_experts,
+                ),
+            ]
+            module_lora.lora_b = [
+                _slice_ep_local_experts(
+                    stack_b(gate_up_lora.lora_b),
+                    expert_map,
+                    module.base_layer.local_num_experts,
+                ),
+                _slice_ep_local_experts(
+                    stack_b(module_lora.lora_b),
+                    expert_map,
+                    module.base_layer.local_num_experts,
+                ),
+            ]
+
+        patched_stack_moe_lora_weights.__art_patched__ = True  # type: ignore[attr-defined]
+        model_manager.LoRAModelManager._stack_moe_lora_weights = (
+            patched_stack_moe_lora_weights  # type: ignore[method-assign]
+        )
 
 
 def subclass_chat_completion_request() -> None:
@@ -361,7 +362,9 @@ def patch_nccl_unique_id_bootstrap() -> None:
     if not getattr(original_broadcast, "__art_patched__", False):
 
         def patched_broadcast(self: Any, obj: Any | None, src: int) -> Any:
-            return _restore_nccl_unique_id_payload(original_broadcast(self, obj, src), obj)
+            return _restore_nccl_unique_id_payload(
+                original_broadcast(self, obj, src), obj
+            )
 
         patched_broadcast.__art_patched__ = True  # type: ignore[attr-defined]
         StatelessProcessGroup.broadcast_obj = patched_broadcast  # type: ignore[method-assign]

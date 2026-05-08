@@ -497,6 +497,20 @@ def _pad_b(tensor: torch.Tensor, rank: int) -> torch.Tensor:
     return padded.contiguous()
 
 
+def _pack_vllm_3d_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
+def _unpack_vllm_3d_lora_b(
+    tensor: torch.Tensor,
+    *,
+    num_experts: int,
+    rank: int,
+) -> torch.Tensor:
+    return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
+
+
 def _adapter_scale(adapter_config: dict[str, Any]) -> float:
     rank = int(adapter_config.get("r", 1) or 1)
     alpha = int(adapter_config.get("lora_alpha", rank) or rank)
@@ -590,18 +604,14 @@ def _to_vllm_lora_tensors(
             gate_up_a,
             dim=0,
         ).contiguous()
-        transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = torch.cat(
-            gate_up_b,
-            dim=1,
-        ).contiguous()
+        transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = _pack_vllm_3d_lora_b(
+            gate_up_b
+        )
         transformed[f"{vllm_prefix}.lora_A.weight"] = torch.cat(
             down_a,
             dim=0,
         ).contiguous()
-        transformed[f"{vllm_prefix}.lora_B.weight"] = torch.cat(
-            down_b,
-            dim=1,
-        ).contiguous()
+        transformed[f"{vllm_prefix}.lora_B.weight"] = _pack_vllm_3d_lora_b(down_b)
     for key, tensor in tensors.items():
         if key in used_keys:
             continue
@@ -655,13 +665,22 @@ def _from_vllm_lora_tensors(
         num_experts = gate_up_a.shape[0] // vllm_rank
         intermediate = gate_up_b.shape[0] // 2
         art_prefix = _from_vllm_key(prefix)
+        gate_up_b_by_expert = _unpack_vllm_3d_lora_b(
+            gate_up_b,
+            num_experts=num_experts,
+            rank=vllm_rank,
+        )
+        down_b_by_expert = _unpack_vllm_3d_lora_b(
+            down_b,
+            num_experts=num_experts,
+            rank=vllm_rank,
+        )
         for expert in range(num_experts):
             row = expert * vllm_rank
-            col = expert * vllm_rank
             gate_up_a_block = gate_up_a[row : row + vllm_rank]
-            gate_up_b_block = gate_up_b[:, col : col + vllm_rank]
             down_a_block = down_a[row : row + vllm_rank]
-            down_b_block = down_b[:, col : col + vllm_rank]
+            gate_up_b_block = gate_up_b_by_expert[expert]
+            down_b_block = down_b_by_expert[expert]
             transformed[f"{art_prefix}.{expert}.gate_proj.lora_A.weight"] = (
                 gate_up_a_block[:rank].contiguous()
             )
