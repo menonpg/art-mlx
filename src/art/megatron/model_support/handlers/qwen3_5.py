@@ -344,12 +344,34 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
 def _install_mtp_shared_prefix_attention_hooks(model_chunks: Sequence[Any]) -> None:
     from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionBlock,
         MultiTokenPredictionLayer,
     )
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     for chunk in model_chunks:
         for module in chunk.modules():
+            if isinstance(module, MultiTokenPredictionBlock) and not getattr(
+                module,
+                "_art_mtp_block_attention_bias_hooked",
+                False,
+            ):
+                original_block_forward = module.forward
+
+                def patched_block_forward(
+                    self: Any,
+                    *args: Any,
+                    _original_block_forward: Callable[..., Any] = original_block_forward,
+                    **kwargs: Any,
+                ) -> Any:
+                    extra_block_kwargs = dict(kwargs.get("extra_block_kwargs") or {})
+                    extra_block_kwargs["attention_bias"] = kwargs["attention_bias"]
+                    kwargs = dict(kwargs)
+                    kwargs["extra_block_kwargs"] = extra_block_kwargs
+                    return _original_block_forward(*args, **kwargs)
+
+                module.forward = MethodType(patched_block_forward, module)
+                module._art_mtp_block_attention_bias_hooked = True
             if not isinstance(module, MultiTokenPredictionLayer):
                 continue
             if getattr(module, "mtp_layer_pattern", None) is None:
