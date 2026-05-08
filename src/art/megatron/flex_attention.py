@@ -180,16 +180,14 @@ class FlexDotProductAttention(torch.nn.Module):
         """
 
         del attention_mask, attn_mask_type
-        assert packed_seq_params is None, (
-            "PackedSeqParams is not used in ART Megatron flex path."
-        )
+        if packed_seq_params is not None:
+            raise RuntimeError("PackedSeqParams is not used in ART Megatron flex path.")
 
         if isinstance(attention_bias, SharedPrefixAttentionState):
             block_mask = attention_bias.block_mask
         else:
-            assert isinstance(attention_bias, BlockMask), (
-                "Expected a flex BlockMask in attention_bias."
-            )
+            if not isinstance(attention_bias, BlockMask):
+                raise TypeError("Expected a flex BlockMask in attention_bias.")
             block_mask = attention_bias
 
         # Megatron uses [S, B, H, D], while flex attention expects [B, H, S, D].
