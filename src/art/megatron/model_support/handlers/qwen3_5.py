@@ -89,6 +89,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
         install_shared_prefix_gdn_hooks(model_chunks)
         install_gdn_island_hooks(model_chunks)
+        _install_mtp_shared_prefix_attention_hooks(model_chunks)
         for chunk in cast(ModelChunks, list(model_chunks)):
             module: Any = chunk
             while hasattr(module, "module"):
@@ -339,6 +340,63 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         if type(unwrapped).__name__ == "Qwen3VLModel":
             return {"extra_block_kwargs": {"extra_block_kwargs": kwargs}}
         return {"extra_block_kwargs": kwargs}
+
+
+def _install_mtp_shared_prefix_attention_hooks(model_chunks: Sequence[Any]) -> None:
+    from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionLayer,
+    )
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if not isinstance(module, MultiTokenPredictionLayer):
+                continue
+            if getattr(module, "mtp_layer_pattern", None) is None:
+                continue
+            stack = module.mtp_model_layer
+            if not getattr(module, "_art_mtp_attention_bias_hooked", False):
+                original_proj_and_transformer_layer = module._proj_and_transformer_layer
+
+                def patched_proj_and_transformer_layer(
+                    self: Any,
+                    *args: Any,
+                    _original_proj_and_transformer_layer: Callable[..., Any]
+                    = original_proj_and_transformer_layer,
+                    **kwargs: Any,
+                ) -> Any:
+                    self.mtp_model_layer._art_attention_bias = kwargs["attention_bias"]
+                    try:
+                        return _original_proj_and_transformer_layer(*args, **kwargs)
+                    finally:
+                        self.mtp_model_layer._art_attention_bias = None
+
+                module._proj_and_transformer_layer = MethodType(
+                    patched_proj_and_transformer_layer,
+                    module,
+                )
+                module._art_mtp_attention_bias_hooked = True
+            for layer in stack.layers:
+                if not isinstance(layer, TransformerLayer):
+                    continue
+                if getattr(layer, "_art_mtp_attention_bias_hooked", False):
+                    continue
+                original_forward = layer.forward
+
+                def patched_layer_forward(
+                    self: Any,
+                    *args: Any,
+                    _original_forward: Callable[..., Any] = original_forward,
+                    _stack: Any = stack,
+                    **kwargs: Any,
+                ) -> Any:
+                    if kwargs.get("attention_bias") is None:
+                        kwargs = dict(kwargs)
+                        kwargs["attention_bias"] = _stack._art_attention_bias
+                    return _original_forward(*args, **kwargs)
+
+                layer.forward = MethodType(patched_layer_forward, layer)
+                layer._art_mtp_attention_bias_hooked = True
 
 
 class Qwen35DenseHandler(Qwen35BaseHandler):
