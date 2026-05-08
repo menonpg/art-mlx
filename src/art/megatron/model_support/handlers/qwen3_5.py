@@ -1,7 +1,7 @@
 from copy import copy
 import re
 from types import MethodType
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Sequence, cast
 
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -89,7 +89,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
         install_shared_prefix_gdn_hooks(model_chunks)
         install_gdn_island_hooks(model_chunks)
-        _install_mtp_shared_prefix_attention_hooks(model_chunks)
         for chunk in cast(ModelChunks, list(model_chunks)):
             module: Any = chunk
             while hasattr(module, "module"):
@@ -149,6 +148,10 @@ class Qwen35BaseHandler(DefaultDenseHandler):
     def patch_bridge(self, bridge: Any) -> None:
         del bridge
         _ensure_qwen35_text_only_bridge_registered()
+
+    def configure_provider_for_runtime(self, provider: Any) -> None:
+        provider.mtp_num_layers = None
+        provider.mtp_loss_scaling_factor = None
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
         del bridge
@@ -342,89 +345,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         return {"extra_block_kwargs": kwargs}
 
 
-def _install_mtp_shared_prefix_attention_hooks(model_chunks: Sequence[Any]) -> None:
-    from megatron.core.transformer.multi_token_prediction import (
-        MultiTokenPredictionBlock,
-        MultiTokenPredictionLayer,
-    )
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            if isinstance(module, MultiTokenPredictionBlock) and not getattr(
-                module,
-                "_art_mtp_block_attention_bias_hooked",
-                False,
-            ):
-                original_block_forward = module.forward
-
-                def patched_block_forward(
-                    self: Any,
-                    *args: Any,
-                    _original_block_forward: Callable[..., Any] = original_block_forward,
-                    **kwargs: Any,
-                ) -> Any:
-                    attention_bias = kwargs["attention_bias"]
-                    for layer in self.layers:
-                        layer._art_attention_bias = attention_bias
-                    return _original_block_forward(*args, **kwargs)
-
-                module.forward = MethodType(patched_block_forward, module)
-                module._art_mtp_block_attention_bias_hooked = True
-            if not isinstance(module, MultiTokenPredictionLayer):
-                continue
-            if not getattr(module, "_art_mtp_attention_bias_hooked", False):
-                original_proj_and_transformer_layer = module._proj_and_transformer_layer
-
-                def patched_proj_and_transformer_layer(
-                    self: Any,
-                    *args: Any,
-                    _original_proj_and_transformer_layer: Callable[..., Any]
-                    = original_proj_and_transformer_layer,
-                    **kwargs: Any,
-                ) -> Any:
-                    attention_bias = self._art_attention_bias
-                    if len(args) > 8 and args[8] is None:
-                        args_list = list(args)
-                        args_list[8] = attention_bias
-                        args = tuple(args_list)
-                    elif kwargs.get("attention_bias") is None:
-                        kwargs = dict(kwargs)
-                        kwargs["attention_bias"] = attention_bias
-                    self.mtp_model_layer._art_attention_bias = attention_bias
-                    return _original_proj_and_transformer_layer(*args, **kwargs)
-
-                module._proj_and_transformer_layer = MethodType(
-                    patched_proj_and_transformer_layer,
-                    module,
-                )
-                module._art_mtp_attention_bias_hooked = True
-            stack = module.mtp_model_layer
-            if not hasattr(stack, "layers"):
-                continue
-            for layer in stack.layers:
-                if not isinstance(layer, TransformerLayer):
-                    continue
-                if getattr(layer, "_art_mtp_attention_bias_hooked", False):
-                    continue
-                original_forward = layer.forward
-
-                def patched_layer_forward(
-                    self: Any,
-                    *args: Any,
-                    _original_forward: Callable[..., Any] = original_forward,
-                    _stack: Any = stack,
-                    **kwargs: Any,
-                ) -> Any:
-                    if kwargs.get("attention_bias") is None:
-                        kwargs = dict(kwargs)
-                        kwargs["attention_bias"] = _stack._art_attention_bias
-                    return _original_forward(*args, **kwargs)
-
-                layer.forward = MethodType(patched_layer_forward, layer)
-                layer._art_mtp_attention_bias_hooked = True
-
-
 class Qwen35DenseHandler(Qwen35BaseHandler):
     key = "qwen3_5_dense"
 
@@ -450,6 +370,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         return _from_vllm_lora_tensors(tensors, adapter_config=adapter_config)
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
+        super().configure_provider_for_runtime(provider)
         provider.moe_shared_expert_overlap = False
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
@@ -873,6 +794,7 @@ def _qwen35_text_only_mapping_registry(
         _text_only_qwen35_mapping(mapping)
         for mapping in upstream_registry.mappings
         if mapping.megatron_param.startswith("language_model.")
+        and not mapping.megatron_param.startswith("language_model.mtp.")
     ]
     return MegatronMappingRegistry(*language_mappings)
 
