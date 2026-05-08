@@ -1,8 +1,8 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
+from collections.abc import Callable
 import math
-import os
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, TypeAlias, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
     BlockMask,
+    FlexKernelOptions,
     create_block_mask,
     flex_attention,
 )
@@ -28,11 +29,23 @@ class SharedPrefixAttentionState(BaseModel):
     parent_ids: Tensor
 
 
+CompileOptions: TypeAlias = dict[str, str | int | bool | Callable[..., Any]]
+
+
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
     # Torchtitan inductor options for compiling flex attention.
-    _compile_options = None
+    _compile_options: ClassVar[CompileOptions] = {
+        "max_autotune": True,
+        "coordinate_descent_tuning": True,
+        "triton.cudagraphs": False,
+    }
+    # Force the regular flex kernel. The flex-decoding specialization has hit
+    # shared-memory OOMs and symbolic-shape assertions on long packed training sequences.
+    _kernel_options: ClassVar[FlexKernelOptions] = {
+        "FORCE_USE_FLEX_ATTENTION": True,
+    }
     _compiled_flex_attention: ClassVar = torch.compile(
         flex_attention,
         options=_compile_options,
@@ -58,6 +71,7 @@ class FlexAttentionWrapper(torch.nn.Module):
                 block_mask=block_mask,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                kernel_options=FlexAttentionWrapper._kernel_options,
             ),
         )
 

@@ -26,15 +26,15 @@ from openai.types.chat.chat_completion_tool_union_param import (
 )
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
-from pydantic import BaseModel, Field, SkipValidation
+from pydantic import BaseModel, Field, SkipValidation, TypeAdapter
 import tinker
+from tinker_cookbook import renderers
+from tinker_cookbook.tokenizer_utils import get_tokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
 
-from art.tinker.cookbook_v import renderers
-from art.tinker.cookbook_v.tokenizer_utils import get_tokenizer
 from art.tinker.prefix_cache import LRUTrieCache
-from art.tinker.renderers import get_renderer_name, is_qwen3_5_family_model
+from art.tinker.renderers import get_renderer_name, is_qwen3_dot_family_model
 from art.types import Message, Tools
 from mp_actors import close_proxy, move_to_child_process
 
@@ -49,6 +49,7 @@ class ModelUpsert(BaseModel):
 
 
 WireMessagesAndChoices = list[Choice | Message]
+_MESSAGE_ADAPTER = TypeAdapter(ChatCompletionMessageParam)
 
 
 class MessagesAndChoicesWithLogprobsArgs(BaseModel):
@@ -63,11 +64,19 @@ class MessagesAndChoicesWithLogprobs(BaseModel):
     usages: list[CompletionUsage]
 
 
-def _normalize_qwen3_5_messages(
+def _normalize_message_or_choice(
+    message_or_choice: Choice | Message,
+) -> Choice | Message:
+    if isinstance(message_or_choice, Choice):
+        return message_or_choice
+    return cast(Message, _MESSAGE_ADAPTER.validate_python(message_or_choice))
+
+
+def _normalize_qwen3_dot_messages(
     base_model: str, messages: list[ChatCompletionMessageParam]
 ) -> list[dict[str, Any]]:
     normalized_messages = [cast(dict[str, Any], message) for message in messages]
-    if not is_qwen3_5_family_model(base_model):
+    if not is_qwen3_dot_family_model(base_model):
         return normalized_messages
     for i, message in enumerate(normalized_messages):
         tool_calls = message.get("tool_calls")
@@ -102,6 +111,10 @@ def _normalize_qwen3_5_messages(
         if changed:
             normalized_messages[i] = {**message, "tool_calls": normalized_tool_calls}
     return normalized_messages
+
+
+def _chat_template_disables_thinking(base_model: str) -> bool:
+    return is_qwen3_dot_family_model(base_model)
 
 
 @dataclass
@@ -197,6 +210,10 @@ class OpenAICompatibleTinkerServer:
             # Minimal Prometheus-style metrics to satisfy the health monitor
             return "# Tinker service metrics\n"
 
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
+
         @app.post("/v1/completions")
         async def completions() -> dict:
             # Minimal completions endpoint for health checks
@@ -275,7 +292,10 @@ class OpenAICompatibleTinkerServer:
                 ]
             )
             return MessagesAndChoicesWithLogprobs(
-                messages_and_choices=args.messages_and_choices,
+                messages_and_choices=[
+                    _normalize_message_or_choice(item)
+                    for item in args.messages_and_choices
+                ],
                 usages=usages,
             )
 
@@ -534,12 +554,21 @@ class OpenAICompatibleTinkerServerWorker:
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolUnionParam] | None,
     ) -> list[int]:
-        normalized_messages = _normalize_qwen3_5_messages(base_model, messages)
-        encoding = self._get_renderer(base_model).tokenizer.apply_chat_template(
-            cast(Any, normalized_messages),
-            tools=cast(Any, tools),
-            add_generation_prompt=True,
-        )
+        normalized_messages = _normalize_qwen3_dot_messages(base_model, messages)
+        tokenizer = self._get_renderer(base_model).tokenizer
+        if _chat_template_disables_thinking(base_model):
+            encoding = tokenizer.apply_chat_template(
+                cast(Any, normalized_messages),
+                tools=cast(Any, tools),
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        else:
+            encoding = tokenizer.apply_chat_template(
+                cast(Any, normalized_messages),
+                tools=cast(Any, tools),
+                add_generation_prompt=True,
+            )
         if isinstance(encoding, BatchEncoding):
             return encoding.input_ids
         else:

@@ -32,6 +32,7 @@ def serialize_sft_batch_to_disk(batch: "SFTBatch", batch_dir: str) -> None:
         "num_trajectories": batch.num_trajectories,
         "num_tokens": batch.num_tokens,
         "num_trainable_tokens": batch.num_trainable_tokens,
+        "num_dropped_trajectories": batch.num_dropped_trajectories,
         "num_trajectory_tensors": len(batch.trajectory_tensors),
     }
     with open(os.path.join(batch_dir, "metadata.json"), "w", encoding="utf-8") as f:

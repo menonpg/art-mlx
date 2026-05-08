@@ -1,8 +1,9 @@
 import json
 from typing import cast
 
-from art.tinker.cookbook_v import renderers
-from art.tinker.cookbook_v.tokenizer_utils import Tokenizer
+from tinker_cookbook import renderers
+from tinker_cookbook.tokenizer_utils import Tokenizer
+
 from art.tinker.renderers import get_renderer_name
 from art.tinker_native.data import convert_openai_messages_to_renderer_format
 
@@ -10,7 +11,7 @@ from art.tinker_native.data import convert_openai_messages_to_renderer_format
 class FakeTokenizer:
     name_or_path = "fake/qwen3_5"
 
-    _SPECIAL_TOKENS = ("<|im_end|>", "</think>")
+    _SPECIAL_TOKENS = ("<|im_end|>", "<think>", "</think>")
 
     def __init__(self) -> None:
         self._text_to_id: dict[str, int] = {}
@@ -63,7 +64,7 @@ def _get_test_renderer(name: str, tokenizer: FakeTokenizer) -> renderers.Rendere
 
 
 def test_get_renderer_name_autodetects_qwen3_5() -> None:
-    assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5"
+    assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5_disable_thinking"
 
 
 def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:

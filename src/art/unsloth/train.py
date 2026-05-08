@@ -313,6 +313,34 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
     }
 
 
+def _get_dtype_for_autocasting(model: torch.nn.Module) -> torch.dtype:
+    match os.environ.get("ACCELERATE_MIXED_PRECISION"):
+        case "fp16":
+            return torch.float16
+        case "bf16":
+            return torch.bfloat16
+        case None:
+            pass
+        case mixed_precision:
+            raise AssertionError(
+                f"Unsupported ACCELERATE_MIXED_PRECISION={mixed_precision!r}"
+            )
+
+    dtype_numels: dict[torch.dtype, int] = defaultdict(int)
+    for param in model.parameters():
+        if param.is_floating_point():
+            dtype_numels[param.dtype] += param.numel()
+
+    assert dtype_numels, "Expected model to have floating-point parameters"
+    model_dtype, _ = max(dtype_numels.items(), key=lambda item: item[1])
+    if model_dtype == torch.bfloat16:
+        return torch.bfloat16
+    if model_dtype in (torch.float16, torch.float32):
+        return torch.float16
+
+    raise AssertionError(f"Unsupported model dtype {model_dtype}")
+
+
 async def train(
     trainer: "GRPOTrainer",
     results_queue: asyncio.Queue[dict[str, float]],
@@ -339,6 +367,9 @@ async def train(
 
 
 def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
+    assert isinstance(trainer.model, torch.nn.Module)
+    dtype_for_autocasting = _get_dtype_for_autocasting(trainer.model)
+
     def compute_loss(
         model: "PeftModel",
         inputs: "TrainInputs",
@@ -378,18 +409,6 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             key: tensor.to(trainer.accelerator.device)  # type: ignore
             for key, tensor in inputs.items()
         }  # ty:ignore[invalid-assignment]
-
-        accelerate_mixed_precision = os.environ.get("ACCELERATE_MIXED_PRECISION")
-        force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32")
-
-        if (
-            accelerate_mixed_precision is None
-            or accelerate_mixed_precision == "fp16"
-            or force_float32 == "1"
-        ):
-            dtype_for_autocasting = torch.float16
-        else:
-            dtype_for_autocasting = torch.bfloat16
 
         batch_size, seq_len = inputs["tokens"].size()
         attn_bias = calculate_attn_bias(
@@ -877,28 +896,31 @@ async def run_unsloth_sft_training(
             device=device,
         )
 
-        for trajectory_tensor in batch.trajectory_tensors:
-            input_ids = trajectory_tensor["input_ids"].to(device)
-            attention_mask = trajectory_tensor["attention_mask"].to(device)
-            labels = trajectory_tensor["labels"].to(device)
+        if batch.trajectory_tensors:
+            for trajectory_tensor in batch.trajectory_tensors:
+                input_ids = trajectory_tensor["input_ids"].to(device)
+                attention_mask = trajectory_tensor["attention_mask"].to(device)
+                labels = trajectory_tensor["labels"].to(device)
 
-            outputs = ctx.peft_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                num_items_in_batch=num_trainable_tokens,
-            )
-            loss = outputs.loss
-            loss.backward()
-            batch_loss += loss.item()
+                outputs = ctx.peft_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    num_items_in_batch=num_trainable_tokens,
+                )
+                loss = outputs.loss
+                loss.backward()
+                batch_loss += loss.item()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            ctx.peft_model.parameters(),
-            max_grad_norm,
-        ).item()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                ctx.peft_model.parameters(),
+                max_grad_norm,
+            ).item()
 
-        optimizer.step()
-        optimizer.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
+        else:
+            grad_norm = 0.0
 
         batch_time = time.perf_counter() - batch_start_time
         tokens_per_second = batch.num_tokens / batch_time if batch_time > 0 else 0.0
@@ -916,5 +938,6 @@ async def run_unsloth_sft_training(
             "num_trajectories": float(batch.num_trajectories),
             "num_tokens": float(batch.num_tokens),
             "num_trainable_tokens": float(batch.num_trainable_tokens),
+            "num_dropped_trajectories": float(batch.num_dropped_trajectories),
             "tokens_per_second": tokens_per_second,
         }

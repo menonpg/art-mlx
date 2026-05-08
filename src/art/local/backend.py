@@ -110,6 +110,9 @@ class LocalBackend(Backend):
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
+        self._supports_result_packing = False
+        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
+        self._closing = False
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -188,6 +191,8 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        self._closing = True
+        await self._cancel_monitor_tasks()
         for service in self._services.values():
             aclose = getattr(service, "aclose", None)
             if aclose is None:
@@ -203,7 +208,19 @@ class LocalBackend(Backend):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
+    async def _cancel_monitor_tasks(self) -> None:
+        tasks = list(self._monitor_tasks.values())
+        self._monitor_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _close(self) -> None:
+        self._closing = True
+        for task in self._monitor_tasks.values():
+            task.cancel()
+        self._monitor_tasks.clear()
         for service in self._services.values():
             close = getattr(service, "close", None)
             if close is not None:
@@ -421,6 +438,7 @@ class LocalBackend(Backend):
             pad_token_id=tokenizer.eos_token_id,
             truncate_long_results=False,
             advantage_balance=advantage_balance,
+            pack_results=self._supports_result_packing,
         )
         if (
             not allow_training_without_logprobs
@@ -491,7 +509,25 @@ class LocalBackend(Backend):
         base_url = f"http://{host}:{port}/v1"
         api_key = server_args.get("api_key") or "default"
 
-        def done_callback(_: asyncio.Task[None]) -> None:
+        def done_callback(task: asyncio.Task[None]) -> None:
+            registered_task = self._monitor_tasks.get(model.name)
+            if registered_task is not task:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                return
+            self._monitor_tasks.pop(model.name, None)
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+            if self._closing:
+                return
             service = self._services.pop(model.name, None)
             if service is not None:
                 close = getattr(service, "close", None)
@@ -499,15 +535,14 @@ class LocalBackend(Backend):
                     close()
                 close_proxy(service)
 
-        if os.environ.get("ART_DISABLE_SERVER_MONITOR", "").lower() not in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            asyncio.create_task(
-                self._monitor_openai_server(model, base_url, api_key)
-            ).add_done_callback(done_callback)
+        old_task = self._monitor_tasks.pop(model.name, None)
+        if old_task is not None:
+            old_task.cancel()
+        task = asyncio.create_task(
+            self._monitor_openai_server(model, base_url, api_key)
+        )
+        task.add_done_callback(done_callback)
+        self._monitor_tasks[model.name] = task
 
         return base_url, api_key
 
@@ -996,6 +1031,13 @@ class LocalBackend(Backend):
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
+        max_seq_length = (
+            (model._internal_config or dev.InternalModelConfig())
+            .get("init_args", {})
+            .get("max_seq_length", 32_768)
+        )
+        max_seq_length = int(max_seq_length) if max_seq_length is not None else None
+
         import itertools
         from typing import Iterator
 
@@ -1018,6 +1060,7 @@ class LocalBackend(Backend):
                     tokenizer=tokenizer,
                     instruction_part=instruction_part,
                     response_part=response_part,
+                    max_seq_length=max_seq_length,
                 )
             )
 
@@ -1027,16 +1070,25 @@ class LocalBackend(Backend):
         pbar = tqdm.tqdm(total=len(batches), desc="sft train")
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
+        total_dropped_trajectories = sum(
+            batch.num_dropped_trajectories for batch in batches
+        )
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
             pbar.update(1)
-            pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
+            postfix: dict[str, str | int] = {
+                "loss": f"{result.get('loss/train', 0):.4f}"
+            }
+            if total_dropped_trajectories:
+                postfix["dropped"] = total_dropped_trajectories
+            pbar.set_postfix(postfix)
             batch_count += 1
             yield {
                 **result,
                 "data/step_num_trajectories": float(total_trajectories),
                 "data/step_trainer_tokens": float(total_trainable_tokens),
+                "data/step_num_dropped_trajectories": float(total_dropped_trajectories),
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
             }
 

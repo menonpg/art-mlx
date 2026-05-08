@@ -19,6 +19,11 @@ from ..types import MessagesAndChoices
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 
 
+def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
+    chat_template = tokenizer.chat_template
+    return isinstance(chat_template, str) and "enable_thinking" in chat_template
+
+
 def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | None:
     if tools is None:
         return None
@@ -132,6 +137,7 @@ class SFTBatch:
         num_trajectories: Number of trajectories in this batch.
         num_tokens: Total number of non-padding tokens (attention_mask != 0).
         num_trainable_tokens: Total number of tokens being trained on (labels != -100).
+        num_dropped_trajectories: Number of overlength trajectories dropped while tokenizing.
     """
 
     trajectory_tensors: list[dict[str, torch.Tensor]]
@@ -139,6 +145,14 @@ class SFTBatch:
     num_trajectories: int
     num_tokens: int
     num_trainable_tokens: int
+    num_dropped_trajectories: int = 0
+
+
+def _validate_max_seq_length(max_seq_length: int | None) -> None:
+    if max_seq_length is None:
+        return
+    if max_seq_length < 1:
+        raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
 
 
 def _apply_chat_template_token_ids(
@@ -164,6 +178,7 @@ def tokenize_trajectory_groups(
     allow_training_without_logprobs: bool,
     scale_rewards: bool,
     shuffle_group_trajectories: bool = True,
+    drop_zero_advantage_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
@@ -181,8 +196,7 @@ def tokenize_trajectory_groups(
             advantage = trajectory.reward - reward_mean
             if scale_rewards:
                 advantage /= reward_std + 1e-6
-            # Skip trajectories with no advantage
-            if advantage == 0:
+            if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             trajectory_results: list[TokenizedResult] = []
             for history in [
@@ -271,6 +285,11 @@ def tokenize_trajectory(
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
     messages = _messages_for_chat_template(tokenizer, messages_and_choices)
     tools = _normalize_tools_for_chat_template(history.tools)
+    chat_template_kwargs = (
+        {"enable_thinking": False}
+        if _chat_template_disables_thinking(tokenizer)
+        else {}
+    )
     chat = cast(
         str,
         tokenizer.apply_chat_template(
@@ -278,6 +297,7 @@ def tokenize_trajectory(
             tools=tools,
             continue_final_message=True,
             tokenize=False,
+            **chat_template_kwargs,
         ),
     )
     original_token_ids = _apply_chat_template_token_ids(
@@ -285,6 +305,7 @@ def tokenize_trajectory(
         messages,
         tools=tools,
         continue_final_message=True,
+        **chat_template_kwargs,
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinel_token = tokenizer.decode(sentinel_token_id)
@@ -316,6 +337,7 @@ def tokenize_trajectory(
         token_template_messages,
         tools=tools,
         continue_final_message=True,
+        **chat_template_kwargs,
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
@@ -471,6 +493,7 @@ def tokenize_sft_batch(
     tokenizer: PreTrainedTokenizerBase,
     instruction_part: str,
     response_part: str,
+    max_seq_length: int | None = None,
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -480,10 +503,14 @@ def tokenize_sft_batch(
         tokenizer: Tokenizer to use for encoding
         instruction_part: Instruction template part (e.g., "<|im_start|>user")
         response_part: Response template part (e.g., "<|im_start|>assistant")
+        max_seq_length: Optional maximum tokenized trajectory length. Trajectories
+            longer than this limit are dropped before tensors are created.
 
     Returns:
         SFTBatch object for this batch
     """
+    _validate_max_seq_length(max_seq_length)
+
     import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
     from unsloth_zoo.dataset_utils import train_on_responses_only
 
@@ -499,12 +526,18 @@ def tokenize_sft_batch(
     trajectory_tensors = []
     num_tokens = 0
     num_trainable_tokens = 0
+    num_dropped_trajectories = 0
     for trajectory in trajectory_batch:
         messages = _messages_for_chat_template(
             tokenizer,
             trajectory.messages_and_choices,
         )
         tools = _normalize_tools_for_chat_template(trajectory.tools)
+        chat_template_kwargs = (
+            {"enable_thinking": False}
+            if _chat_template_disables_thinking(tokenizer)
+            else {}
+        )
 
         # Single-step tokenization: apply_chat_template with tokenize=True
         input_ids = _apply_chat_template_token_ids(
@@ -513,7 +546,11 @@ def tokenize_sft_batch(
             tools=tools,
             tokenize=True,
             add_generation_prompt=False,
+            **chat_template_kwargs,
         )
+        if max_seq_length is not None and len(input_ids) > max_seq_length:
+            num_dropped_trajectories += 1
+            continue
 
         attention_mask = [1] * len(input_ids)
 
@@ -529,10 +566,18 @@ def tokenize_sft_batch(
         num_tokens += sum(attention_mask)
         num_trainable_tokens += sum(1 for l in labels if l != -100)
 
+    if num_dropped_trajectories:
+        print(
+            "WARNING: Dropped "
+            f"{num_dropped_trajectories}/{len(trajectory_batch)} SFT trajectories "
+            f"because they exceed max_seq_length={max_seq_length}."
+        )
+
     return SFTBatch(
         trajectory_tensors=trajectory_tensors,
         learning_rate=learning_rate,
         num_trajectories=len(trajectory_tensors),
         num_tokens=num_tokens,
         num_trainable_tokens=num_trainable_tokens,
+        num_dropped_trajectories=num_dropped_trajectories,
     )

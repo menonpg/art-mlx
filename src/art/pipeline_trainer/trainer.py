@@ -88,7 +88,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         total_scenarios: int | None = None,
         # Eval/Checkpointing
         eval_every_n_steps: int = 20,
-        eval_step_0: bool = True,
+        eval_at_start: bool = True,
         save_checkpoint: bool = True,
         # Resumption
         resume: bool = True,
@@ -134,7 +134,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
-        self.eval_step_0 = eval_step_0
+        self.eval_at_start = eval_at_start
         self.save_checkpoint = save_checkpoint
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
@@ -193,7 +193,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
 
-        if self.eval_fn is not None and self.eval_step_0 and start_step == 0:
+        if self.eval_fn is not None and self.eval_at_start:
             await self._eval_queue.put(start_step)
             self.state.last_eval_step = start_step
             self._persist_state(start_step)
@@ -767,7 +767,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _log_zero_variance_groups(self, step: int) -> None:
         if not self._discard_queue:
             return
-        discarded = list(self._discard_queue)
+        discarded = list(self._discard_queue[:50])
         await self.model.log(discarded, split="discarded", step=step)
         self._discard_queue.clear()
 
