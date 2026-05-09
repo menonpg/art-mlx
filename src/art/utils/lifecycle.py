@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import atexit
 from collections.abc import Callable, Sequence
 import os
@@ -62,6 +63,80 @@ def terminate_asyncio_process_group(process: Any, *, timeout: float = 5.0) -> No
         os.waitpid(process.pid, 0)
     except ChildProcessError:
         pass
+
+
+class ChildProcessSupervisor:
+    def __init__(self, on_unexpected_exit: Callable[[RuntimeError], None]) -> None:
+        self._on_unexpected_exit = on_unexpected_exit
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._failure: RuntimeError | None = None
+        self._closing = False
+
+    def watch_popen(
+        self,
+        name: str,
+        process: subprocess.Popen[Any],
+        *,
+        log_path: str,
+    ) -> None:
+        self._watch(name, self._wait_popen(process), log_path=log_path)
+
+    def watch_asyncio_process(
+        self,
+        name: str,
+        process: Any,
+        *,
+        log_path: str,
+    ) -> None:
+        self._watch(name, process.wait(), log_path=log_path)
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def close(self) -> None:
+        self._closing = True
+        current = self._current_task()
+        for task in self._tasks.values():
+            if task is not current:
+                task.cancel()
+        self._tasks.clear()
+
+    def _watch(
+        self,
+        name: str,
+        wait: Any,
+        *,
+        log_path: str,
+    ) -> None:
+        previous = self._tasks.pop(name, None)
+        if previous is not None:
+            previous.cancel()
+        self._tasks[name] = asyncio.create_task(
+            self._watch_exit(name, wait, log_path=log_path)
+        )
+
+    async def _watch_exit(self, name: str, wait: Any, *, log_path: str) -> None:
+        try:
+            returncode = await wait
+        except asyncio.CancelledError:
+            return
+        if self._closing:
+            return
+        error = RuntimeError(
+            f"{name} exited with code {returncode}. Check logs at {log_path}"
+        )
+        self._failure = error
+        self._on_unexpected_exit(error)
+
+    async def _wait_popen(self, process: subprocess.Popen[Any]) -> int:
+        return int(await asyncio.to_thread(process.wait))
+
+    def _current_task(self) -> asyncio.Task[Any] | None:
+        try:
+            return asyncio.current_task()
+        except RuntimeError:
+            return None
 
 
 class ServiceLifecycle:

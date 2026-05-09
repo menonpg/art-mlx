@@ -1,4 +1,3 @@
-import asyncio
 import gc
 import json
 import logging
@@ -17,7 +16,6 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
 }
 
-import aiohttp
 import numpy as np
 import polars as pl
 import torch
@@ -105,13 +103,11 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
-        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
-        self._closing = False
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -190,8 +186,6 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        self._closing = True
-        await self._cancel_monitor_tasks()
         for service in self._services.values():
             aclose = getattr(service, "aclose", None)
             if aclose is None:
@@ -207,19 +201,7 @@ class LocalBackend(Backend):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-    async def _cancel_monitor_tasks(self) -> None:
-        tasks = list(self._monitor_tasks.values())
-        self._monitor_tasks.clear()
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
     def _close(self) -> None:
-        self._closing = True
-        for task in self._monitor_tasks.values():
-            task.cancel()
-        self._monitor_tasks.clear()
         for service in self._services.values():
             close = getattr(service, "close", None)
             if close is not None:
@@ -509,115 +491,7 @@ class LocalBackend(Backend):
         base_url = f"http://{host}:{port}/v1"
         api_key = server_args.get("api_key") or "default"
 
-        def done_callback(task: asyncio.Task[None]) -> None:
-            registered_task = self._monitor_tasks.get(model.name)
-            if registered_task is not task:
-                try:
-                    task.result()
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-                return
-            self._monitor_tasks.pop(model.name, None)
-            try:
-                task.result()
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                pass
-            if self._closing:
-                return
-            service = self._services.pop(model.name, None)
-            if service is not None:
-                close = getattr(service, "close", None)
-                if close is not None:
-                    close()
-                close_proxy(service)
-
-        old_task = self._monitor_tasks.pop(model.name, None)
-        if old_task is not None:
-            old_task.cancel()
-        task = asyncio.create_task(
-            self._monitor_openai_server(model, base_url, api_key)
-        )
-        task.add_done_callback(done_callback)
-        self._monitor_tasks[model.name] = task
-
         return base_url, api_key
-
-    async def _monitor_openai_server(
-        self, model: AnyTrainableModel, base_url: str, api_key: str
-    ) -> None:
-        model_name = model.name
-        consecutive_failures = 0
-        max_consecutive_failures = 3
-        async with aiohttp.ClientSession() as session:
-            while True:
-                # Wait 30 seconds before checking again
-                await asyncio.sleep(30)
-                try:
-                    # If the server is sleeping, skip the check
-                    if await self._services[model_name].vllm_engine_is_sleeping():
-                        consecutive_failures = 0
-                        continue
-                    async with session.get(
-                        f"{base_url.split('/v1')[0]}/health",
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as response:
-                        response.raise_for_status()
-                    # Check the metrics with a timeout
-                    async with session.get(
-                        f"{base_url.split('/v1')[0]}/metrics",
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as response:
-                        metrics = await response.text()
-                    # Parse Prometheus metrics for running requests
-                    running_requests = 0
-                    pending_requests = 0
-                    for line in metrics.split("\n"):
-                        if line.startswith("vllm:num_requests_running"):
-                            running_requests = int(float(line.split()[1]))
-                        elif line.startswith("vllm:num_requests_waiting"):
-                            pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, send a cheap liveness
-                    # probe rather than a real generation request. Large models can take
-                    # longer than a short completion-based probe while still being healthy.
-                    if running_requests == 0 and pending_requests == 0:
-                        try:
-                            async with session.get(
-                                f"{base_url.split('/v1')[0]}/health",
-                                timeout=float(
-                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
-                                ),
-                            ) as health_response:
-                                if health_response.status >= 400:
-                                    raise RuntimeError(
-                                        "OpenAI server health check failed with "
-                                        f"status {health_response.status}"
-                                    )
-                        except Exception as e:
-                            # If the server is sleeping, a failed health check is okay
-                            if await self._services[
-                                model_name
-                            ].vllm_engine_is_sleeping():
-                                consecutive_failures = 0
-                                continue
-                            raise e
-                    # Reset failure counter on success
-                    consecutive_failures = 0
-                except Exception:
-                    # If the server is sleeping during an exception, it's okay
-                    try:
-                        if await self._services[model_name].vllm_engine_is_sleeping():
-                            consecutive_failures = 0
-                            continue
-                    except Exception:
-                        pass  # If we can't check sleeping status, count it as a failure
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        raise
-                    # Otherwise, continue and try again
 
     # Note: _log() method has been moved to the Model class (frontend)
 

@@ -21,6 +21,7 @@ from ..preprocessing.tokenize import SFTBatch
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
+    ChildProcessSupervisor,
     ServiceLifecycle,
     managed_process_cmd,
     terminate_popen_process_group,
@@ -129,6 +130,7 @@ class UnslothService:
     # Dedicated mode subprocess state
     _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
     _vllm_log_file: Any = field(default=None, repr=False)
+    _vllm_log_path: str | None = None
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _vllm_api_key: str | None = None
@@ -138,6 +140,17 @@ class UnslothService:
         init=False,
         repr=False,
     )
+    _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
+
+    def _on_child_process_exit(self, error: RuntimeError) -> None:
+        logger.error("%s", error)
+        self.close()
+
+    def _raise_if_child_failed(self) -> None:
+        self._child_processes.raise_if_failed()
 
     @property
     def is_dedicated(self) -> bool:
@@ -220,6 +233,7 @@ class UnslothService:
         port: int,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, int]:
+        self._raise_if_child_failed()
         server_args = self._runtime_server_args(config)
         api_key = server_args.get("api_key")
         self._vllm_api_key = api_key if isinstance(api_key, str) else None
@@ -240,9 +254,8 @@ class UnslothService:
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_file = open(
-            os.path.join(log_dir, "vllm-runtime.log"), "w", buffering=1
-        )
+        self._vllm_log_path = os.path.join(log_dir, "vllm-runtime.log")
+        self._vllm_log_file = open(self._vllm_log_path, "w", buffering=1)
 
         self._vllm_process = subprocess.Popen(
             managed_process_cmd(cmd),
@@ -294,6 +307,13 @@ class UnslothService:
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
 
+        assert self._vllm_process is not None
+        assert self._vllm_log_path is not None
+        self._child_processes.watch_popen(
+            "vLLM runtime",
+            self._vllm_process,
+            log_path=self._vllm_log_path,
+        )
         logger.info(
             "vLLM runtime ready on port %d (GPUs: %s)",
             port,
@@ -304,6 +324,7 @@ class UnslothService:
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         served_model_name = f"{self.model_name}@{step}"
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -321,6 +342,7 @@ class UnslothService:
     async def _init_merged_weight_transfer(self) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         if self._weight_transfer_group is not None:
             return
 
@@ -405,6 +427,7 @@ class UnslothService:
     ) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         assert self._weight_transfer_group is not None
 
         peft_model = self._state.peft_model
@@ -499,6 +522,7 @@ class UnslothService:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
         import httpx
 
+        self._raise_if_child_failed()
         lora_name = f"{self.model_name}@{step}"
         logger.info(
             f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
@@ -527,12 +551,14 @@ class UnslothService:
             return
         self._weight_transfer_group = None
         try:
+            self._child_processes.close()
             if self._vllm_process is not None:
                 terminate_popen_process_group(self._vllm_process)
                 self._vllm_process = None
             if self._vllm_log_file is not None:
                 self._vllm_log_file.close()
                 self._vllm_log_file = None
+            self._vllm_log_path = None
         finally:
             self._lifecycle.restore_parent_cleanup()
 
@@ -543,6 +569,7 @@ class UnslothService:
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
+        self._raise_if_child_failed()
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
@@ -583,6 +610,7 @@ class UnslothService:
     async def _sleep_runtime(self) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/sleep",
@@ -596,6 +624,7 @@ class UnslothService:
     async def _wake_runtime(self) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/wake_up",
@@ -620,6 +649,7 @@ class UnslothService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         try:
+            self._raise_if_child_failed()
             if self.is_dedicated:
                 async for result in self._train_dedicated(
                     disk_packed_tensors, config, _config, verbose
@@ -735,6 +765,7 @@ class UnslothService:
             Dictionary containing training metrics for each batch.
         """
         try:
+            self._raise_if_child_failed()
             if self.is_dedicated:
                 raise NotImplementedError(
                     "train_sft is not yet supported in dedicated mode"

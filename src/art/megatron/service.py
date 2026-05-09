@@ -22,6 +22,7 @@ from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
+    ChildProcessSupervisor,
     ServiceLifecycle,
     managed_process_cmd,
     terminate_asyncio_process_group,
@@ -163,6 +164,7 @@ class MegatronService:
     _megatron_log_path: str | None = None
     _vllm_process: subprocess.Popen[Any] | None = None
     _vllm_log_file: Any = None
+    _vllm_log_path: str | None = None
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _vllm_api_key: str | None = None
@@ -172,9 +174,17 @@ class MegatronService:
         init=False,
         repr=False,
     )
+    _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
         self._validate_megatron_dependencies()
+
+    def _on_child_process_exit(self, _error: RuntimeError) -> None:
+        self.close()
+
+    def _raise_if_child_failed(self) -> None:
+        self._child_processes.raise_if_failed()
 
     @property
     def is_dedicated(self) -> bool:
@@ -359,6 +369,7 @@ class MegatronService:
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/art/set_served_model_name",
@@ -372,6 +383,7 @@ class MegatronService:
     async def _init_merged_weight_transfer(self) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         if self._merged_weight_transfer_init_info is not None:
             return
         async with httpx.AsyncClient() as client:
@@ -397,6 +409,7 @@ class MegatronService:
     ) -> tuple[str, int]:
         import httpx
 
+        self._raise_if_child_failed()
         server_args = self._runtime_server_args(config)
         api_key = server_args.get("api_key")
         self._vllm_api_key = api_key if isinstance(api_key, str) else None
@@ -416,11 +429,8 @@ class MegatronService:
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_file = open(
-            os.path.join(log_dir, "vllm-runtime.log"),
-            "w",
-            buffering=1,
-        )
+        self._vllm_log_path = os.path.join(log_dir, "vllm-runtime.log")
+        self._vllm_log_file = open(self._vllm_log_path, "w", buffering=1)
         self._vllm_process = subprocess.Popen(
             managed_process_cmd(cmd),
             cwd=str(get_vllm_runtime_working_dir()),
@@ -469,11 +479,19 @@ class MegatronService:
                     "vLLM passed /health but /v1/models was not reachable. "
                     f"Check logs at {log_dir}/vllm-runtime.log"
                 ) from exc
+        assert self._vllm_process is not None
+        assert self._vllm_log_path is not None
+        self._child_processes.watch_popen(
+            "vLLM runtime",
+            self._vllm_process,
+            log_path=self._vllm_log_path,
+        )
         return self._vllm_host, self._vllm_port
 
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
@@ -494,6 +512,7 @@ class MegatronService:
         lora_path: str,
         step: int,
     ) -> None:
+        self._raise_if_child_failed()
         await self._ensure_megatron_running()
         await self._init_merged_weight_transfer()
         self._clear_pending_jobs()
@@ -517,6 +536,7 @@ class MegatronService:
     async def _sleep_runtime(self) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/sleep",
@@ -530,6 +550,7 @@ class MegatronService:
     async def _wake_runtime(self) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/wake_up",
@@ -540,6 +561,7 @@ class MegatronService:
         self._is_sleeping = False
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
+        self._raise_if_child_failed()
         if self.rollout_weights_mode == "merged":
             await self._set_served_model_name(step)
         else:
@@ -559,6 +581,7 @@ class MegatronService:
 
     async def _ensure_megatron_running(self) -> None:
         """Lazily start Megatron training process if not running."""
+        self._raise_if_child_failed()
         if self._megatron_process is not None:
             if self._megatron_process.returncode is None:
                 return
@@ -605,9 +628,10 @@ class MegatronService:
         ]
         log_dir = Path(self.output_dir) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        self._megatron_log_path = str(log_dir / "megatron-runtime.log")
+        megatron_log_path = str(log_dir / "megatron-runtime.log")
+        self._megatron_log_path = megatron_log_path
         self._megatron_log_file = open(
-            self._megatron_log_path,
+            megatron_log_path,
             "w",
             buffering=1,
         )
@@ -620,6 +644,11 @@ class MegatronService:
             start_new_session=True,
         )
         self._install_parent_signal_cleanup()
+        self._child_processes.watch_asyncio_process(
+            "Megatron worker",
+            self._megatron_process,
+            log_path=megatron_log_path,
+        )
 
     def _clear_pending_jobs(self) -> None:
         jobs_dir, _training_log_dir, _wake_lock_path = self._megatron_runtime_paths()
@@ -645,6 +674,7 @@ class MegatronService:
         return lora_path
 
     async def _prepare_for_training(self) -> str:
+        self._raise_if_child_failed()
         self._validate_megatron_dependencies()
         await self._ensure_megatron_running()
         await self._sleep_runtime()
@@ -682,6 +712,7 @@ class MegatronService:
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
+        self._raise_if_child_failed()
         lora_path = self._resolve_active_lora_path()
 
         if not self.is_dedicated and not self._sleep_mode_enabled():
@@ -714,6 +745,7 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         try:
+            self._raise_if_child_failed()
             if _config.get("moe_routing_replay_bundle") is not None:
                 raise RuntimeError(
                     "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
@@ -824,6 +856,7 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         try:
+            self._raise_if_child_failed()
             if self.is_dedicated:
                 raise NotImplementedError(
                     "train_sft is not yet supported in dedicated mode"
@@ -873,6 +906,7 @@ class MegatronService:
         if self._vllm_log_file is not None:
             self._vllm_log_file.close()
             self._vllm_log_file = None
+        self._vllm_log_path = None
         self._merged_weight_transfer_init_info = None
 
     def _stop_megatron_process(self) -> None:
@@ -893,6 +927,7 @@ class MegatronService:
         if not self._lifecycle.begin_close():
             return
         try:
+            self._child_processes.close()
             self._stop_vllm_subprocess()
             self._stop_megatron_process()
             self._clear_wake_lock()
