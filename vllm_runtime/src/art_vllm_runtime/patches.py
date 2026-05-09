@@ -186,6 +186,7 @@ def patch_punica_ep_moe_lora_alignment() -> None:
 
 
 def patch_fused_moe_ep_lora_support() -> None:
+    import torch
     from vllm.lora import model_manager
     from vllm.lora.layers import base, fused_moe
 
@@ -249,6 +250,8 @@ def patch_fused_moe_ep_lora_support() -> None:
                 return original_stack(self, lora_model, module, module_name)
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
             if not module_lora:
+                return
+            if not torch.is_tensor(module_lora.lora_a):
                 return
             gate_up_lora = self._get_lora_layer_weights(
                 lora_model,
