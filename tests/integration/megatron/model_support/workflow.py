@@ -418,6 +418,7 @@ def run_correctness_sensitivity_stage(
             "available_gpu_count": available_gpu_count,
             "max_world_size": max_world_size,
             "required_gpu_count": oracle_world_size,
+            "topology_artifacts_retained": oracle_harness.keep_topology_artifacts(),
             "correctness_variant_count": len(suite_reports),
             "correctness_excluded_topology_count": len(excluded_suite_topologies),
             "correctness_excluded_topologies": [

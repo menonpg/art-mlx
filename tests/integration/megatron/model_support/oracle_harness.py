@@ -25,6 +25,7 @@ ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
 REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
+KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
@@ -645,6 +646,11 @@ def regenerate_requested() -> bool:
     return _truthy(os.environ.get(REGENERATE_ENV))
 
 
+def keep_topology_artifacts() -> bool:
+    """Returns whether oracle topology tensor artifacts should be retained."""
+    return _truthy(os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV))
+
+
 def case_config(
     base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
 ) -> OracleCaseConfig:
@@ -942,6 +948,19 @@ def _replace_topology_dir(path: Path) -> None:
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
     (path / "traces").mkdir(parents=True, exist_ok=True)
+
+
+def _prune_topology_artifacts(path: Path) -> None:
+    """Keeps small diagnostics and removes tensors that are only needed for comparison."""
+    if keep_topology_artifacts() or not path.exists():
+        return
+    for child in path.iterdir():
+        if child.name in {"variant_report.json", "run_request.json", "worker.log"}:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+            continue
+        child.unlink()
 
 
 def _load_manifest(topology_dir: Path) -> RunManifest:
@@ -1573,6 +1592,15 @@ class VariantRunner:
             topology_dir / "variant_report.json", report.model_dump(mode="json")
         )
 
+    def _prune_reference_artifacts(self) -> None:
+        """Drops oracle-only tensors after all comparisons that need them are complete."""
+        _prune_topology_artifacts(self.oracle_dir)
+        if self.case_config.is_moe:
+            _prune_topology_artifacts(self.oracle_routing_bundle_dir)
+            _prune_topology_artifacts(
+                self.case_dir / f"{self.oracle_slug}__oracle_capture"
+            )
+
     def print_report(self, report: VariantReport) -> None:
         """Prints a row-level table excluding expert-specific rows."""
         table_rows = [
@@ -1627,6 +1655,7 @@ class VariantRunner:
         topology_dir = self.ensure_variant_artifacts(variant)
         report = self.compare_variant(variant)
         self._write_variant_report(topology_dir, report)
+        _prune_topology_artifacts(topology_dir)
         self.print_report(report)
         return report
 
@@ -1636,16 +1665,19 @@ class VariantRunner:
     ) -> list[VariantReport]:
         """Runs variants in order and stops at the first unexpected signal."""
         reports: list[VariantReport] = []
-        for variant in variants:
-            report = self.run_variant(variant)
-            reports.append(report)
-            self.assert_expected_signal(
-                report,
-                "Megatron correctness suite mismatch",
-                report_path=self.case_dir
-                / variant.resolved_output_slug()
-                / "variant_report.json",
-            )
+        try:
+            for variant in variants:
+                report = self.run_variant(variant)
+                reports.append(report)
+                self.assert_expected_signal(
+                    report,
+                    "Megatron correctness suite mismatch",
+                    report_path=self.case_dir
+                    / variant.resolved_output_slug()
+                    / "variant_report.json",
+                )
+        finally:
+            self._prune_reference_artifacts()
         return reports
 
 
