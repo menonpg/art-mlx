@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 import os
 from pathlib import Path
 import signal
@@ -79,7 +79,7 @@ class ChildProcessSupervisor:
         *,
         log_path: str,
     ) -> None:
-        self._watch(name, self._wait_popen(process), log_path=log_path)
+        self._watch(name, lambda: self._wait_popen(process), log_path=log_path)
 
     def watch_asyncio_process(
         self,
@@ -88,7 +88,7 @@ class ChildProcessSupervisor:
         *,
         log_path: str,
     ) -> None:
-        self._watch(name, process.wait(), log_path=log_path)
+        self._watch(name, process.wait, log_path=log_path)
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -105,7 +105,7 @@ class ChildProcessSupervisor:
     def _watch(
         self,
         name: str,
-        wait: Any,
+        wait: Callable[[], Awaitable[int]],
         *,
         log_path: str,
     ) -> None:
@@ -116,9 +116,15 @@ class ChildProcessSupervisor:
             self._watch_exit(name, wait, log_path=log_path)
         )
 
-    async def _watch_exit(self, name: str, wait: Any, *, log_path: str) -> None:
+    async def _watch_exit(
+        self,
+        name: str,
+        wait: Callable[[], Awaitable[int]],
+        *,
+        log_path: str,
+    ) -> None:
         try:
-            returncode = await wait
+            returncode = await wait()
         except asyncio.CancelledError:
             return
         if self._closing:
