@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -37,6 +38,14 @@ class _RecordingAsyncClient:
     ) -> _AsyncOkResponse:
         self._posts.append((url, params, timeout))
         return _AsyncOkResponse()
+
+
+class _FakeAsyncioProcess:
+    returncode: int | None = None
+
+    async def wait(self) -> int:
+        await asyncio.Event().wait()
+        return 0
 
 
 @pytest.mark.asyncio
@@ -197,14 +206,14 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
         stdout,
         stderr,
         start_new_session: bool,
-    ) -> SimpleNamespace:
+    ) -> _FakeAsyncioProcess:
         recorded["command"] = list(command)
         recorded["cwd"] = cwd
         recorded["env"] = env
         recorded["stdout"] = stdout
         recorded["stderr"] = stderr
         recorded["start_new_session"] = start_new_session
-        return SimpleNamespace(returncode=None)
+        return _FakeAsyncioProcess()
 
     monkeypatch.setattr(
         "art.megatron.service.asyncio.create_subprocess_exec",
@@ -226,4 +235,5 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     ]
     assert "uv run" not in command
     assert recorded["cwd"] == str(Path(__file__).resolve().parents[4])
+    service._child_processes.close()
     service._megatron_log_file.close()
