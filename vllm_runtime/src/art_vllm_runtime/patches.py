@@ -72,6 +72,43 @@ def _slice_ep_local_experts(
     return lora_tensor.index_select(0, global_indices.to(lora_tensor.device))
 
 
+def _ep_moe_lora_expert_count(
+    *,
+    flat_rank_dim: int,
+    lora_rank: int,
+    expert_map: "Tensor",
+    local_num_experts: int,
+) -> int:
+    """Return the expert axis for vLLM's two EP MoE LoRA input formats."""
+    num_global_experts = int(expert_map.numel())
+    if flat_rank_dim == lora_rank:
+        assert flat_rank_dim % local_num_experts == 0, (
+            "Expected vLLM EP-local dummy LoRA rank dimension to be divisible by "
+            f"local_num_experts={local_num_experts}, got {flat_rank_dim}"
+        )
+        return local_num_experts
+    assert flat_rank_dim == lora_rank * num_global_experts, (
+        "Expected global vLLM MoE LoRA rank dimension to equal "
+        f"rank * num_global_experts = {lora_rank} * {num_global_experts}, "
+        f"got {flat_rank_dim}"
+    )
+    return num_global_experts
+
+
+def _localize_ep_moe_lora_tensor(
+    lora_tensor: "Tensor",
+    *,
+    num_experts: int,
+    expert_map: "Tensor",
+    local_num_experts: int,
+) -> "Tensor":
+    if num_experts == local_num_experts:
+        return lora_tensor
+    localized = _slice_ep_local_experts(lora_tensor, expert_map, local_num_experts)
+    assert localized is not None
+    return localized
+
+
 def patch_punica_ep_moe_lora_alignment() -> None:
     from vllm.lora.punica_wrapper import punica_gpu
 
@@ -218,16 +255,21 @@ def patch_fused_moe_ep_lora_support() -> None:
                 module_name + ".base_layer",
             )
             assert gate_up_lora is not None
-            rank = int(gate_up_lora.rank)
-            num_global_experts = gate_up_lora.lora_a.shape[0] // rank
             expert_map = module.base_layer._expert_map
+            local_num_experts = int(module.base_layer.local_num_experts)
+            num_experts = _ep_moe_lora_expert_count(
+                flat_rank_dim=int(gate_up_lora.lora_a.shape[0]),
+                lora_rank=int(gate_up_lora.rank),
+                expert_map=expert_map,
+                local_num_experts=local_num_experts,
+            )
 
             def stack_a(tensor: "Tensor") -> "Tensor":
-                return tensor.reshape(num_global_experts, -1, tensor.shape[-1])
+                return tensor.reshape(num_experts, -1, tensor.shape[-1])
 
             def stack_b(tensor: "Tensor") -> "Tensor":
                 return (
-                    tensor.reshape(tensor.shape[0], -1, num_global_experts)
+                    tensor.reshape(tensor.shape[0], -1, num_experts)
                     .permute(
                         2,
                         0,
@@ -237,27 +279,31 @@ def patch_fused_moe_ep_lora_support() -> None:
                 )
 
             module_lora.lora_a = [
-                _slice_ep_local_experts(
+                _localize_ep_moe_lora_tensor(
                     stack_a(gate_up_lora.lora_a),
-                    expert_map,
-                    module.base_layer.local_num_experts,
+                    num_experts=num_experts,
+                    expert_map=expert_map,
+                    local_num_experts=local_num_experts,
                 ),
-                _slice_ep_local_experts(
+                _localize_ep_moe_lora_tensor(
                     stack_a(module_lora.lora_a),
-                    expert_map,
-                    module.base_layer.local_num_experts,
+                    num_experts=num_experts,
+                    expert_map=expert_map,
+                    local_num_experts=local_num_experts,
                 ),
             ]
             module_lora.lora_b = [
-                _slice_ep_local_experts(
+                _localize_ep_moe_lora_tensor(
                     stack_b(gate_up_lora.lora_b),
-                    expert_map,
-                    module.base_layer.local_num_experts,
+                    num_experts=num_experts,
+                    expert_map=expert_map,
+                    local_num_experts=local_num_experts,
                 ),
-                _slice_ep_local_experts(
+                _localize_ep_moe_lora_tensor(
                     stack_b(module_lora.lora_b),
-                    expert_map,
-                    module.base_layer.local_num_experts,
+                    num_experts=num_experts,
+                    expert_map=expert_map,
+                    local_num_experts=local_num_experts,
                 ),
             ]
 
