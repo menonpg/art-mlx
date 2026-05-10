@@ -35,6 +35,7 @@ MANDATORY_VALIDATION_STAGES = (
     "architecture_discovery",
     "hf_parity",
     "lora_coverage",
+    "train_inf_mismatch",
     "merged_vllm_serving",
     "correctness_sensitivity",
     "chat_template_rollout",
@@ -46,6 +47,7 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
     {
         "hf_parity",
         "lora_coverage",
+        "train_inf_mismatch",
         "merged_vllm_serving",
         "correctness_sensitivity",
         "chat_template_rollout",
@@ -294,6 +296,26 @@ def run_lora_coverage_stage(
         passed=not report.missing_wrapped_target_modules
         and not report.missing_exported_target_modules,
         metrics=report.model_dump(mode="json"),
+    )
+
+
+def run_train_inf_mismatch_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+    allow_unvalidated_arch: bool = False,
+) -> ValidationStageResult:
+    del architecture
+    del allow_unvalidated_arch
+    train_inf_mismatch = _import_integration_module(
+        "integration.megatron.train_inf_mismatch.workflow_stage"
+    )
+    report = train_inf_mismatch.run_train_inf_mismatch(base_model=base_model)
+    return ValidationStageResult(
+        name="train_inf_mismatch",
+        passed=report.passed,
+        metrics=report.model_dump(mode="json"),
+        artifact_dir=report.artifact_dir,
     )
 
 
@@ -629,6 +651,7 @@ def build_validation_report(
     stage_runners = {
         "hf_parity": run_hf_parity_stage,
         "lora_coverage": run_lora_coverage_stage,
+        "train_inf_mismatch": run_train_inf_mismatch_stage,
         "merged_vllm_serving": run_merged_vllm_serving_stage,
         "correctness_sensitivity": run_correctness_sensitivity_stage,
         "chat_template_rollout": run_chat_template_rollout_stage,

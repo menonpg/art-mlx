@@ -11,12 +11,14 @@ from .workflow import (
     run_merged_vllm_serving_stage,
     run_native_vllm_lora_stage,
     run_packed_position_ids_stage,
+    run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
 )
 
 _STAGE_RUNNERS = {
     "hf_parity": run_hf_parity_stage,
     "lora_coverage": run_lora_coverage_stage,
+    "train_inf_mismatch": run_train_inf_mismatch_stage,
     "merged_vllm_serving": run_merged_vllm_serving_stage,
     "correctness_sensitivity": run_correctness_sensitivity_stage,
     "chat_template_rollout": run_chat_template_rollout_stage,

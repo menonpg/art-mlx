@@ -19,6 +19,7 @@ from .workflow import (
     run_merged_vllm_serving_stage,
     run_native_vllm_lora_stage,
     run_packed_position_ids_stage,
+    run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
 )
 
@@ -65,6 +66,12 @@ def test_build_validation_report_populates_architecture_stage(
                 name="lora_coverage",
                 passed=True,
                 metrics={"wrapped_adapter_prefix_count": 12},
+            ),
+            "train_inf_mismatch": ValidationStageResult(
+                name="train_inf_mismatch",
+                passed=True,
+                metrics={"passed_count": 1, "failed_count": 0},
+                artifact_dir="/tmp/train-inf-mismatch",
             ),
             "merged_vllm_serving": ValidationStageResult(
                 name="merged_vllm_serving",
@@ -170,6 +177,12 @@ def test_build_validation_report_populates_architecture_stage(
     )
     assert lora_coverage_stage.passed is True
     assert lora_coverage_stage.metrics == {"wrapped_adapter_prefix_count": 12}
+    mismatch_stage = next(
+        stage for stage in report.stages if stage.name == "train_inf_mismatch"
+    )
+    assert mismatch_stage.passed is True
+    assert mismatch_stage.metrics == {"passed_count": 1, "failed_count": 0}
+    assert mismatch_stage.artifact_dir == "/tmp/train-inf-mismatch"
     correctness_stage = next(
         stage for stage in report.stages if stage.name == "correctness_sensitivity"
     )
@@ -493,6 +506,43 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 
     assert result.passed is True
     assert result.artifact_dir == "/tmp/trainability"
+
+
+def test_run_train_inf_mismatch_stage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(
+            run_train_inf_mismatch=lambda *, base_model: SimpleNamespace(
+                passed=True,
+                artifact_dir="/tmp/train-inf-mismatch",
+                model_dump=lambda mode="json": {
+                    "base_model": base_model,
+                    "passed": True,
+                    "passed_count": 1,
+                    "failed_count": 0,
+                },
+            )
+        ),
+    )
+
+    result = run_train_inf_mismatch_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+        ),
+    )
+
+    assert result.name == "train_inf_mismatch"
+    assert result.passed is True
+    assert result.artifact_dir == "/tmp/train-inf-mismatch"
+    assert result.metrics == {
+        "base_model": "Qwen/Qwen3.5-35B-A3B",
+        "passed": True,
+        "passed_count": 1,
+        "failed_count": 0,
+    }
 
 
 def test_run_native_vllm_lora_stage(monkeypatch) -> None:
