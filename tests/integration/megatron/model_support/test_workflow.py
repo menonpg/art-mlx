@@ -438,6 +438,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
         ensure_case_artifacts=lambda case_config: SimpleNamespace(
             case_dir="/tmp/oracle"
         ),
+        keep_topology_artifacts=lambda: False,
     )
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
@@ -750,6 +751,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
         ensure_case_artifacts=lambda case_config: SimpleNamespace(
             case_dir="/tmp/oracle"
         ),
+        keep_topology_artifacts=lambda: False,
     )
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
@@ -815,6 +817,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
         ensure_case_artifacts=lambda case_config: SimpleNamespace(
             case_dir="/tmp/oracle"
         ),
+        keep_topology_artifacts=lambda: False,
     )
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
