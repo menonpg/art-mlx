@@ -1,8 +1,10 @@
 import torch
 
 from art.utils.convert_megatron_moe_lora import (
+    add_language_model_prefix_for_vllm,
     convert_megatron_moe_lora_to_peft_target_parameter,
     convert_peft_target_parameter_moe_lora_to_megatron,
+    strip_language_model_prefix_for_megatron,
 )
 
 
@@ -72,3 +74,21 @@ def test_convert_peft_target_parameter_moe_lora_uses_rank_major_b_layout() -> No
         megatron[f"{prefix}.1.down_proj.lora_B.weight"],
         down_b.reshape(3, 2, 2).permute(2, 0, 1)[1],
     )
+
+
+def test_qwen_language_model_prefix_rewrites_round_trip() -> None:
+    tensors = {
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(
+            1
+        ),
+        "base_model.model.lm_head.weight": torch.ones(1),
+    }
+
+    vllm_tensors = add_language_model_prefix_for_vllm(tensors)
+
+    assert (
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight"
+        in vllm_tensors
+    )
+    assert "base_model.model.lm_head.weight" in vllm_tensors
+    assert strip_language_model_prefix_for_megatron(vllm_tensors) == tensors

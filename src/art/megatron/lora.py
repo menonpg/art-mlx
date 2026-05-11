@@ -847,6 +847,9 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.linear_fc1 = linear_fc1
+        if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
+            linear_fc1.return_layernorm_output = True
+            linear_fc1.return_layernorm_output_gathered = True
         self.gate_lora = self._build_fc1_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.gate_proj",
             linear_fc1=linear_fc1,
@@ -897,9 +900,14 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = self.linear_fc1(x)
+        base_output, bias_out = self.linear_fc1(x)
+        if isinstance(base_output, tuple):
+            base_out, lora_input = base_output
+        else:
+            base_out = base_output
+            lora_input = x
         adapter_out = torch.cat(
-            [self.gate_lora(x), self.up_lora(x)],
+            [self.gate_lora(lora_input), self.up_lora(lora_input)],
             dim=-1,
         )
         adapter_out = _match_sequence_parallel_output_shape(

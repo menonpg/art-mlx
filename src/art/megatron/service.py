@@ -27,6 +27,10 @@ from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
+from ..utils.convert_megatron_moe_lora import (
+    add_language_model_prefix_for_vllm,
+    uses_qwen_language_model_prefix,
+)
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -45,6 +49,31 @@ from .sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
+safetensors_torch = importlib.import_module("safetensors.torch")
+save_file = safetensors_torch.save_file
+
+
+def _rewrite_identity_lora_for_vllm(base_model: str, lora_path: str) -> None:
+    if not uses_qwen_language_model_prefix(base_model):
+        return
+
+    adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
+    if os.path.exists(adapter_model_path):
+        with safe_open(adapter_model_path, framework="pt") as adapter_file:
+            adapter_model = {
+                key: adapter_file.get_tensor(key) for key in adapter_file.keys()
+            }
+        save_file(
+            add_language_model_prefix_for_vllm(adapter_model),
+            adapter_model_path,
+        )
+
+
+def _is_moe_model_config(config: Any) -> bool:
+    text_config = getattr(config, "text_config", None)
+    return int(
+        getattr(text_config, "num_experts", getattr(config, "num_experts", 0)) or 0
+    ) > 0
 
 
 def create_identity_lora(
@@ -87,12 +116,20 @@ def create_identity_lora(
         )
     model.name_or_path = base_model
 
-    lora_config = LoraConfig(
-        base_model_name_or_path=base_model,
-        r=rank,
-        lora_alpha=lora_alpha,
-        target_modules=[],
-        target_parameters=[
+    if uses_qwen_language_model_prefix(base_model):
+        target_modules = default_target_modules(base_model)
+        target_parameters = (
+            [
+                "mlp.experts.gate_up_proj",
+                "mlp.experts.down_proj",
+            ]
+            if _is_moe_model_config(base_config)
+            else []
+        )
+        task_type = "CAUSAL_LM"
+    else:
+        target_modules = []
+        target_parameters = [
             name
             for name, _ in model.named_parameters()
             if name.endswith(
@@ -111,7 +148,16 @@ def create_identity_lora(
                     "mlp.shared_expert.down_proj.weight",
                 )
             )
-        ],
+        ]
+        task_type = None
+
+    lora_config = LoraConfig(
+        base_model_name_or_path=base_model,
+        r=rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        target_parameters=target_parameters,
+        task_type=task_type,
         bias="none",
     )
 
@@ -131,6 +177,7 @@ def create_identity_lora(
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)
+    _rewrite_identity_lora_for_vllm(base_model, lora_path)
 
     del peft_model, model
     if torch.cuda.is_available():

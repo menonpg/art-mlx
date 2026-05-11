@@ -1,11 +1,9 @@
 """Yes-no-maybe training demo for the Megatron backend.
 
-By default this runs Qwen 3.6 in dedicated merged mode, which needs two GPUs:
-GPU 0 runs Megatron training and GPU 1 runs the dedicated vLLM inference server.
-After each train step, Megatron keeps the LoRA adapter checkpoint and pushes merged
-weights into vLLM for rollouts, because direct vLLM LoRA serving does not yet
-reflect these target-parameter MoE adapters reliably. Override TRAINER_GPU_IDS,
-INFERENCE_GPU_IDS, or ROLLOUT_WEIGHTS_MODE if you need a different layout.
+By default this runs Qwen 3.6 in standard direct LoRA mode on one GPU. Set
+MEGATRON_DEDICATED=1 to use a dedicated vLLM inference server on a separate GPU;
+then override TRAINER_GPU_IDS and INFERENCE_GPU_IDS if you need a different
+layout.
 """
 
 import asyncio
@@ -55,36 +53,39 @@ async def main():
     load_dotenv()
 
     backend = MegatronBackend()
-    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3.6-35B-A3B")
+    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3.6-27B")
+    use_dedicated = os.environ.get("MEGATRON_DEDICATED", "0") == "1"
+    rollout_weights_mode = os.environ.get("ROLLOUT_WEIGHTS_MODE", "lora")
+    internal_config = art.dev.InternalModelConfig(
+        engine_args=art.dev.EngineArgs(
+            gpu_memory_utilization=float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")),
+            max_model_len=int(os.environ.get("MAX_MODEL_LEN", "4096")),
+            max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "8")),
+            tensor_parallel_size=int(os.environ.get("TENSOR_PARALLEL_SIZE", "1")),
+        ),
+        rollout_weights_mode=rollout_weights_mode,
+        chat_template_kwargs={
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
+    )
+    if use_dedicated:
+        internal_config["trainer_gpu_ids"] = [
+            int(gpu_id)
+            for gpu_id in os.environ.get("TRAINER_GPU_IDS", "0").split(",")
+        ]
+        internal_config["inference_gpu_ids"] = [
+            int(gpu_id)
+            for gpu_id in os.environ.get("INFERENCE_GPU_IDS", "1").split(",")
+        ]
+
     model = art.TrainableModel(
         name=os.environ.get(
             "MODEL_NAME", f"yes-no-maybe-megatron-{uuid.uuid4().hex[:8]}"
         ),
         project="yes-no-maybe-megatron",
         base_model=base_model,
-        _internal_config=art.dev.InternalModelConfig(
-            engine_args=art.dev.EngineArgs(
-                gpu_memory_utilization=float(
-                    os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")
-                ),
-                max_model_len=int(os.environ.get("MAX_MODEL_LEN", "4096")),
-                max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "8")),
-                tensor_parallel_size=int(os.environ.get("TENSOR_PARALLEL_SIZE", "1")),
-            ),
-            trainer_gpu_ids=[
-                int(gpu_id)
-                for gpu_id in os.environ.get("TRAINER_GPU_IDS", "0").split(",")
-            ],
-            inference_gpu_ids=[
-                int(gpu_id)
-                for gpu_id in os.environ.get("INFERENCE_GPU_IDS", "1").split(",")
-            ],
-            rollout_weights_mode=os.environ.get("ROLLOUT_WEIGHTS_MODE", "merged"),
-            chat_template_kwargs={
-                "enable_thinking": False,
-                "preserve_thinking": True,
-            },
-        ),
+        _internal_config=internal_config,
     )
 
     try:

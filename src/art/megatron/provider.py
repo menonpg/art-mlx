@@ -20,8 +20,12 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import (
     Qwen3VLSelfAttention,
 )
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
-from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+    Qwen35VLBridge,
+    Qwen35VLMoEBridge,
+)
 from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+    Qwen35VLModelProvider,
     Qwen35VLMoEModelProvider,
     _patch_standard_attention_specs,
 )
@@ -185,12 +189,18 @@ def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
     return sm_count if sm_count >= 2 else 20
 
 
+def _is_moe_provider(provider: GPTModelProvider) -> bool:
+    return int(getattr(provider, "num_moe_experts", 0) or 0) > 0
+
+
 def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     visible_gpu_count = max(torch.cuda.device_count(), 1)
     provider.tensor_model_parallel_size = visible_gpu_count
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
-    provider.expert_model_parallel_size = visible_gpu_count
+    provider.expert_model_parallel_size = (
+        visible_gpu_count if _is_moe_provider(provider) else 1
+    )
     provider.expert_tensor_parallel_size = 1
 
 
@@ -229,7 +239,10 @@ def _maybe_print_finalized_env_settings(provider: GPTModelProvider) -> None:
                 "recompute_modules": provider.recompute_modules,
                 "moe_shared_expert_overlap": provider.moe_shared_expert_overlap,
                 "moe_flex_dispatcher_backend": (
-                    "deepep" if _tp_ep_parallel_domain_size(provider) > 1 else None
+                    "deepep"
+                    if _is_moe_provider(provider)
+                    and _tp_ep_parallel_domain_size(provider) > 1
+                    else None
                 ),
                 "sequence_parallel": provider.sequence_parallel,
             },
@@ -347,8 +360,11 @@ def get_provider_bundle(
         dtype=torch_dtype,
         trust_remote_code=True,
     )
-    assert isinstance(bridge._model_bridge, (Qwen3MoEBridge, Qwen35VLMoEBridge)), (
-        "Only Qwen3 and Qwen3.5 MoE models are supported"
+    assert isinstance(
+        bridge._model_bridge,
+        (Qwen3MoEBridge, Qwen35VLBridge, Qwen35VLMoEBridge),
+    ), (
+        "Only Qwen3 MoE and Qwen3.5/3.6 dense or MoE models are supported"
     )
     if torch_dtype != torch.bfloat16:
         model_name_or_path = bridge.hf_pretrained.model_name_or_path
@@ -360,7 +376,7 @@ def get_provider_bundle(
             )
         )
     provider = bridge.to_megatron_provider()
-    if isinstance(provider, Qwen35VLMoEModelProvider):
+    if isinstance(provider, (Qwen35VLModelProvider, Qwen35VLMoEModelProvider)):
         from megatron.bridge.models.gpt_provider import mtp_block_spec
 
         def _patch_qwen35_block_spec(block_spec: TransformerBlockSubmodules) -> None:
@@ -384,7 +400,7 @@ def get_provider_bundle(
         provider.transformer_layer_spec = _qwen35_layer_spec
 
         def _provide_qwen35_with_flex_attention(
-            self: Qwen35VLMoEModelProvider,
+            self: Qwen35VLModelProvider | Qwen35VLMoEModelProvider,
             pre_process: bool | None = None,
             post_process: bool | None = None,
             vp_stage: int | None = None,
@@ -446,18 +462,19 @@ def get_provider_bundle(
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
-    provider.moe_shared_expert_overlap = True
+    provider.moe_shared_expert_overlap = _is_moe_provider(provider)
     _apply_default_parallel_topology(provider)
     _apply_runtime_env_overrides(provider)
-    if _tp_ep_parallel_domain_size(provider) > 1:
+    if _is_moe_provider(provider) and _tp_ep_parallel_domain_size(provider) > 1:
         # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
         # compute, so these are very beneficial
         apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
-    provider.moe_permute_fusion = True
-    provider.moe_router_dtype = "fp32"
-    # params are disabled anyways, but should know about this if we switch to full FT
-    # because DP 'dummy' microbatches will unintentionally have loss for this
-    provider.moe_aux_loss_coeff = 0.0
+    if _is_moe_provider(provider):
+        provider.moe_permute_fusion = True
+        provider.moe_router_dtype = "fp32"
+        # params are disabled anyways, but should know about this if we switch to full FT
+        # because DP 'dummy' microbatches will unintentionally have loss for this
+        provider.moe_aux_loss_coeff = 0.0
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
