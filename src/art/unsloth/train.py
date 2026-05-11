@@ -314,6 +314,9 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
 
 
 def _get_dtype_for_autocasting(model: torch.nn.Module) -> torch.dtype:
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32") == "1":
+        return torch.float16
+
     match os.environ.get("ACCELERATE_MIXED_PRECISION"):
         case "fp16":
             return torch.float16
@@ -840,13 +843,16 @@ async def run_unsloth_rl_training(
                 create_train_inputs(packed_tensors, offset, config, _config, warmup)
             )
 
-            done, _ = await asyncio.wait(
+            result_task = asyncio.create_task(ctx.results_queue.get())
+            done, pending = await asyncio.wait(
                 [
-                    asyncio.create_task(ctx.results_queue.get()),
+                    result_task,
                     ctx.train_task,
                 ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if result_task in pending:
+                result_task.cancel()
             if verbose:
                 print(
                     "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"

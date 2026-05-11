@@ -47,6 +47,16 @@ def test_get_dtype_for_autocasting_honors_explicit_fp16(monkeypatch) -> None:
     assert _get_dtype_for_autocasting(model) == torch.float16
 
 
+def test_get_dtype_for_autocasting_honors_force_float32_override(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ACCELERATE_MIXED_PRECISION", "bf16")
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    model = _TinyModel([(torch.bfloat16, 8)])
+
+    assert _get_dtype_for_autocasting(model) == torch.float16
+
+
 def test_get_dtype_for_autocasting_honors_explicit_bfloat16(monkeypatch) -> None:
     monkeypatch.setenv("ACCELERATE_MIXED_PRECISION", "bf16")
     monkeypatch.delenv("UNSLOTH_FORCE_FLOAT32", raising=False)
