@@ -383,7 +383,7 @@
 workdir: .
 resources:
   accelerators: ["H200:1", "H100-SXM:1", "H100:1", "A100-80GB:1"]
-  image_id: docker:pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel
+  image_id: docker:pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
   ports:
     - 7999 # main ART server
     - 8000 # vLLM server
@@ -399,7 +399,8 @@ config:
   kubernetes:
     pod_config:
       spec:
-        schedulerName: gpu-binpack
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 172800
         # Work around uv 0.10.5 stripping execute bits from Ray binaries.
         containers:
           - name: ray-node

@@ -24,7 +24,7 @@ backend = [
     "bitsandbytes>=0.45.5",
     "unsloth[colab-no-deps,huggingface] @ git+https://github.com/Kovbo/unsloth.git@140026a39cfce9ee8702c46140d4c2d4846d1eb6",
     "unsloth-zoo @ git+https://github.com/Kovbo/unsloth-zoo.git@68677b9814e90ccb647cbda91062e0d4001798bd",
-    "torch==2.10.0",
+    "torch==2.11.0",
     "torchao==0.17.0",
     "accelerate==1.13.0",
     "awscli>=1.38.1",
@@ -40,21 +40,21 @@ backend = [
     "gql<5",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
-    "vllm==0.19.1 ; sys_platform == 'linux'",
+    "vllm==0.20.0 ; sys_platform == 'linux'",
 ]
 megatron = [
     "numpy<2",
-    "torch==2.10.0",
+    "torch==2.11.0",
     "apex @ git+https://github.com/NVIDIA/apex.git@25.09",
-    "transformer-engine==2.11.0",
-    "transformer-engine-cu12==2.11.0",
-    "transformer-engine-torch @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.11#subdirectory=transformer_engine/pytorch",
+    "transformer-engine==2.14.1",
+    "transformer-engine-cu13==2.14.1",
+    "transformer-engine-torch==2.14.1",
     "megatron-core==0.16.0rc0",
     "pybind11>=2.13.6",
     "megatron-bridge @ git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@v1.2.1 ; sys_platform == 'linux'",
-    "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
-    "mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
+    "causal-conv1d==1.6.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
+    "mamba-ssm==2.3.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "nvidia-ml-py==13.580.82",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
@@ -73,7 +73,7 @@ tinker = [
     "pyarrow>=15.0.0",
     "pydantic>=2.12.5",
     "tinker>=0.8.1",
-    "torch==2.10.0",
+    "torch==2.11.0",
     "transformers==5.6.2",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
@@ -133,15 +133,16 @@ markers = [
 required-version = ">=0.11.7"
 override-dependencies = [
     "datasets==4.8.5",
-    "flashinfer-python==0.6.6",
+    "flashinfer-python==0.6.8.post1",
     "numpy<2",
     "nvidia-resiliency-ext<0.5",
-    "quack-kernels>=0.2.7",
+    "quack-kernels>=0.3.3",
+    "torch==2.11.0",
     "transformers==5.6.2",
-    "transformer-engine==2.11.0",
+    "transformer-engine==2.14.1",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
+no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu13", "transformer-engine-torch", "megatron-core", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.8.0"]
@@ -166,7 +167,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.11.0"
+version = "2.14.1"
 requires-dist = [
     "einops",
     "onnx",
@@ -174,7 +175,7 @@ requires-dist = [
     "packaging",
     "pydantic",
     "torch",
-    "transformer-engine-cu12",
+    "transformer-engine-cu13",
 ]
 
 [tool.ty.environment]
