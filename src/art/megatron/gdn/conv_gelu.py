@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -670,7 +670,7 @@ class _VarlenCausalConvGelu(torch.autograd.Function):
         )
         block_c, block_t, num_warps = _tile_config(channels, max_len)
         grid = (triton.cdiv(max_len, block_t), triton.cdiv(channels, block_c), batch)
-        cast(Any, _conv_gelu_fwd_kernel)[grid](
+        _conv_gelu_fwd_kernel[grid](
             qkv,
             conv_initial,
             weight,
@@ -695,9 +695,8 @@ class _VarlenCausalConvGelu(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: Any, *grad_outputs: Any
+        ctx: Any, grad_out: Tensor, grad_final: Tensor | None
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, None, None]:
-        grad_out, grad_final = grad_outputs
         qkv, conv_initial, weight, bias, lengths = ctx.saved_tensors
         grad_out = grad_out.contiguous()
         grad_final_tensor = (
@@ -718,7 +717,7 @@ class _VarlenCausalConvGelu(torch.autograd.Function):
             triton.cdiv(channels, block_c),
             batch,
         )
-        cast(Any, _conv_gelu_grad_preact_kernel)[grid_t](
+        _conv_gelu_grad_preact_kernel[grid_t](
             qkv,
             conv_initial,
             weight,
@@ -739,7 +738,7 @@ class _VarlenCausalConvGelu(torch.autograd.Function):
             triton.cdiv(channels, block_c),
             batch,
         )
-        cast(Any, _conv_gelu_bwd_input_kernel)[grid_e](
+        _conv_gelu_bwd_input_kernel[grid_e](
             grad_preact,
             weight,
             lengths,
@@ -755,7 +754,7 @@ class _VarlenCausalConvGelu(torch.autograd.Function):
             num_warps=num_warps,
         )
         reduce_block = 1024
-        cast(Any, _conv_gelu_bwd_weight_kernel)[(channels,)](
+        _conv_gelu_bwd_weight_kernel[(channels,)](
             qkv,
             conv_initial,
             grad_preact,
@@ -822,7 +821,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
         token_local_t = torch.empty_like(token_segment)
         if total_tokens > 0:
             metadata_block_n = 256
-            cast(Any, _packed_conv_token_metadata_kernel)[
+            _packed_conv_token_metadata_kernel[
                 (triton.cdiv(total_tokens, metadata_block_n),)
             ](
                 cu_seqlens,
@@ -834,7 +833,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 BLOCK_N=metadata_block_n,
                 num_warps=4,
             )
-            cast(Any, _packed_conv_fwd_kernel)[
+            _packed_conv_fwd_kernel[
                 (triton.cdiv(total_tokens, block_n), triton.cdiv(channels, block_c))
             ](
                 conv_in,
@@ -855,7 +854,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
             )
         if final is not None and kernel_width > 1 and segments > 0:
             block_r = _tail_block(kernel_width - 1)
-            cast(Any, _packed_conv_final_kernel)[
+            _packed_conv_final_kernel[
                 (
                     triton.cdiv(kernel_width - 1, block_r),
                     triton.cdiv(channels, block_c),
@@ -889,9 +888,8 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: Any, *grad_outputs: Any
+        ctx: Any, grad_out: Tensor, grad_final: Tensor | None
     ) -> tuple[Tensor, None, Tensor, Tensor, Tensor | None, None, None]:
-        grad_out, grad_final = grad_outputs
         (
             conv_in,
             cu_seqlens,
@@ -939,7 +937,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 token_tiles,
                 channel_tiles,
             )
-            cast(Any, _packed_conv_grad_preact_weight_partial_kernel)[grid_n](
+            _packed_conv_grad_preact_weight_partial_kernel[grid_n](
                 conv_in,
                 token_segment,
                 token_local_t,
@@ -960,7 +958,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 BLOCK_C=block_c,
                 num_warps=num_warps,
             )
-            cast(Any, _packed_conv_bwd_input_kernel)[grid_n](
+            _packed_conv_bwd_input_kernel[grid_n](
                 cu_seqlens,
                 token_segment,
                 weight,
@@ -975,9 +973,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 BLOCK_C=block_c,
                 num_warps=num_warps,
             )
-            cast(Any, _packed_conv_bwd_weight_reduce_kernel)[
-                (channel_tiles, kernel_width)
-            ](
+            _packed_conv_bwd_weight_reduce_kernel[(channel_tiles, kernel_width)](
                 grad_weight_partial,
                 grad_weight,
                 channels,
@@ -989,7 +985,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 num_warps=4,
             )
             if grad_bias is not None:
-                cast(Any, _packed_conv_bwd_bias_reduce_kernel)[(channel_tiles,)](
+                _packed_conv_bwd_bias_reduce_kernel[(channel_tiles,)](
                     grad_bias_partial,
                     grad_bias,
                     channels,
@@ -1006,7 +1002,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
         if kernel_width > 1 and segments > 0:
             block_r = _tail_block(kernel_width - 1)
-            cast(Any, _packed_conv_bwd_initial_kernel)[
+            _packed_conv_bwd_initial_kernel[
                 (
                     triton.cdiv(kernel_width - 1, block_r),
                     triton.cdiv(channels, block_c),

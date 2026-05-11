@@ -9,16 +9,18 @@ from megatron.bridge.training.flex_dispatcher_backend import (
 from megatron.core.transformer.enums import AttnBackend
 import torch
 
-from art.megatron.flex_attention import FlexDotProductAttention
+from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
 from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
     get_model_support_spec,
 )
 from art.megatron.provider_common import (
     ProviderBundle,
-    patch_layer_spec_tree,
+    patch_art_flex_attention,
     resolve_layer_spec,
 )
+
+install_art_bridge_runtime_patches()
 
 
 def _env_flag(name: str) -> bool | None:
@@ -33,7 +35,7 @@ def _env_flag(name: str) -> bool | None:
     raise ValueError(f"{name} must be a boolean-like value, got {raw!r}")
 
 
-def _env_override_str(name: str) -> tuple[bool, str | None]:
+def _env_optional_str(name: str) -> tuple[bool, str | None]:
     raw = os.environ.get(name)
     if raw is None:
         return False, None
@@ -43,25 +45,45 @@ def _env_override_str(name: str) -> tuple[bool, str | None]:
     return True, value
 
 
-def _env_override_int(name: str) -> tuple[bool, int | None]:
-    found, value = _env_override_str(name)
+def _env_optional_int(name: str) -> tuple[bool, int | None]:
+    found, value = _env_optional_str(name)
     if not found or value is None:
         return found, None
     return True, int(value)
 
 
-def _env_override_str_list(name: str) -> tuple[bool, list[str] | None]:
-    found, value = _env_override_str(name)
+def _env_default_or_even_positive_int(name: str) -> tuple[bool, int | None]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False, None
+    value = raw.strip().lower()
+    if value == "default":
+        return True, None
+    try:
+        parsed = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be 'default' or a positive, even integer, got {raw!r}"
+        ) from exc
+    if parsed <= 0 or parsed % 2 != 0:
+        raise ValueError(
+            f"{name} must be 'default' or a positive, even integer, got {raw!r}"
+        )
+    return True, parsed
+
+
+def _env_optional_str_list(name: str) -> tuple[bool, list[str] | None]:
+    found, value = _env_optional_str(name)
     if not found or value is None:
         return found, None
     parts = [part.strip() for part in value.split(",")]
     return True, [part for part in parts if part]
 
 
-def _env_override_recompute_granularity(
+def _env_optional_recompute_granularity(
     name: str,
 ) -> tuple[bool, Literal["full", "selective"] | None]:
-    found, value = _env_override_str(name)
+    found, value = _env_optional_str(name)
     if not found or value is None:
         return found, None
     if value not in {"full", "selective"}:
@@ -69,10 +91,10 @@ def _env_override_recompute_granularity(
     return True, cast(Literal["full", "selective"], value)
 
 
-def _env_override_recompute_method(
+def _env_optional_recompute_method(
     name: str,
 ) -> tuple[bool, Literal["uniform", "block"] | None]:
-    found, value = _env_override_str(name)
+    found, value = _env_optional_str(name)
     if not found or value is None:
         return found, None
     if value not in {"uniform", "block"}:
@@ -104,9 +126,8 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
 
 
 def _etp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
-    return (
-        cast(int, provider.expert_tensor_parallel_size)
-        * provider.expert_model_parallel_size
+    return int(provider.expert_tensor_parallel_size or 1) * int(
+        provider.expert_model_parallel_size or 1
     )
 
 
@@ -121,9 +142,26 @@ def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> 
 def _apply_art_training_runtime_finalize_defaults(provider: GPTModelProvider) -> None:
     if _etp_ep_parallel_domain_size(provider) <= 1:
         return
-    # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
-    # compute, so these are very beneficial
-    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+    found, backend = _env_optional_str("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND")
+    if not found:
+        backend = "deepep"
+    if backend is None:
+        return
+    if backend not in {"deepep", "hybridep"}:
+        raise ValueError(
+            "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND must be one of "
+            f"'deepep' or 'hybridep', got {backend!r}"
+        )
+    # Expert communication is comparable to expert MLP compute, so the ART
+    # runtime uses Megatron's optimized flex dispatcher instead of all-to-all.
+    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend=backend)
+
+
+def _normalize_recompute_settings(provider: GPTModelProvider) -> None:
+    if provider.recompute_granularity is None:
+        provider.recompute_method = None
+        provider.recompute_num_layers = None
+        provider.recompute_modules = []
 
 
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
@@ -141,10 +179,16 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if early_attn_release is not None:
         provider.ep_overlap_early_attn_memory_release = early_attn_release
 
-    found, deepep_num_sms = _env_override_int("ART_MEGATRON_MOE_DEEPEP_NUM_SMS")
-    if found and deepep_num_sms is not None:
-        provider.moe_deepep_num_sms = deepep_num_sms
-    if "ART_MEGATRON_MOE_DEEPEP_NUM_SMS" not in os.environ:
+    found, deepep_num_sms = _env_default_or_even_positive_int(
+        "ART_MEGATRON_MOE_DEEPEP_NUM_SMS"
+    )
+    if found:
+        provider.moe_deepep_num_sms = (
+            _resolve_default_deepep_num_sms(provider)
+            if deepep_num_sms is None
+            else deepep_num_sms
+        )
+    else:
         provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
 
     moe_apply_probs_on_input = _env_flag("ART_MEGATRON_MOE_APPLY_PROBS_ON_INPUT")
@@ -161,53 +205,73 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if fine_grained_activation_offloading is not None:
         provider.fine_grained_activation_offloading = fine_grained_activation_offloading
 
-    offload_modules_found, offload_modules = _env_override_str_list(
+    offload_modules_found, offload_modules = _env_optional_str_list(
         "ART_MEGATRON_OFFLOAD_MODULES"
     )
     if offload_modules_found:
         provider.offload_modules = [] if offload_modules is None else offload_modules
 
-    found, tensor_model_parallel_size = _env_override_int(
+    found, tensor_model_parallel_size = _env_optional_int(
         "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE"
     )
     if found and tensor_model_parallel_size is not None:
         provider.tensor_model_parallel_size = tensor_model_parallel_size
 
-    found, expert_model_parallel_size = _env_override_int(
+    found, context_parallel_size = _env_optional_int(
+        "ART_MEGATRON_CONTEXT_PARALLEL_SIZE"
+    )
+    if found and context_parallel_size is not None:
+        provider.context_parallel_size = context_parallel_size
+
+    found, pipeline_model_parallel_size = _env_optional_int(
+        "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE"
+    )
+    if found and pipeline_model_parallel_size is not None:
+        provider.pipeline_model_parallel_size = pipeline_model_parallel_size
+
+    found, virtual_pipeline_model_parallel_size = _env_optional_int(
+        "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"
+    )
+    if found:
+        provider.virtual_pipeline_model_parallel_size = (
+            virtual_pipeline_model_parallel_size
+        )
+
+    found, expert_model_parallel_size = _env_optional_int(
         "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE"
     )
     if found and expert_model_parallel_size is not None:
         provider.expert_model_parallel_size = expert_model_parallel_size
 
-    found, expert_tensor_parallel_size = _env_override_int(
+    found, expert_tensor_parallel_size = _env_optional_int(
         "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE"
     )
     if not found:
-        found, expert_tensor_parallel_size = _env_override_int(
+        found, expert_tensor_parallel_size = _env_optional_int(
             "ART_MEGATRON_EXPERT_TENSOR_MODEL_PARALLEL_SIZE"
         )
     if found and expert_tensor_parallel_size is not None:
         provider.expert_tensor_parallel_size = expert_tensor_parallel_size
 
     recompute_granularity_found, recompute_granularity = (
-        _env_override_recompute_granularity("ART_MEGATRON_RECOMPUTE_GRANULARITY")
+        _env_optional_recompute_granularity("ART_MEGATRON_RECOMPUTE_GRANULARITY")
     )
     if recompute_granularity_found:
         provider.recompute_granularity = recompute_granularity
 
-    recompute_method_found, recompute_method = _env_override_recompute_method(
+    recompute_method_found, recompute_method = _env_optional_recompute_method(
         "ART_MEGATRON_RECOMPUTE_METHOD"
     )
     if recompute_method_found:
         provider.recompute_method = recompute_method
 
-    recompute_num_layers_found, recompute_num_layers = _env_override_int(
+    recompute_num_layers_found, recompute_num_layers = _env_optional_int(
         "ART_MEGATRON_RECOMPUTE_NUM_LAYERS"
     )
     if recompute_num_layers_found:
         provider.recompute_num_layers = recompute_num_layers
 
-    recompute_modules_found, recompute_modules = _env_override_str_list(
+    recompute_modules_found, recompute_modules = _env_optional_str_list(
         "ART_MEGATRON_RECOMPUTE_MODULES"
     )
     if recompute_modules_found:
@@ -226,6 +290,7 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
         provider.recompute_num_layers = None
         if provider.recompute_granularity != "selective":
             provider.recompute_granularity = None
+    _normalize_recompute_settings(provider)
 
 
 def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
@@ -235,7 +300,7 @@ def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
         config: GPTModelProvider, vp_stage: int | None = None
     ) -> object:
         layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
-        patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
+        patch_art_flex_attention(layer_spec, config)
         return layer_spec
 
     provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
@@ -302,8 +367,65 @@ def prepare_provider_bundle(
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     provider = cast(GPTModelProvider, provider_bundle.provider)
     _apply_art_training_runtime_finalize_defaults(provider)
-    provider.finalize()
+    _finalize_provider_with_art_overrides(provider)
+    _normalize_recompute_settings(provider)
     return provider_bundle
+
+
+def _finalize_provider_with_art_overrides(provider: GPTModelProvider) -> None:
+    if not _is_art_gdn_context_parallel_provider(provider):
+        provider.finalize()
+        return
+    _validate_art_gdn_context_parallel_provider(provider)
+    variant = provider.experimental_attention_variant
+    provider.experimental_attention_variant = None
+    try:
+        provider.finalize()
+    finally:
+        provider.experimental_attention_variant = variant
+
+
+def _is_art_gdn_context_parallel_provider(provider: GPTModelProvider) -> bool:
+    return (
+        getattr(provider, "experimental_attention_variant", None) == "gated_delta_net"
+        and int(getattr(provider, "context_parallel_size", 1) or 1) > 1
+    )
+
+
+def _validate_art_gdn_context_parallel_provider(provider: GPTModelProvider) -> None:
+    required = (
+        "linear_attention_freq",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+    )
+    missing = [name for name in required if getattr(provider, name, None) is None]
+    if missing:
+        raise ValueError(
+            "GatedDeltaNet context parallel provider is missing required fields: "
+            + ", ".join(missing)
+        )
+    raw_linear_num_key_heads = provider.linear_num_key_heads
+    raw_linear_num_value_heads = provider.linear_num_value_heads
+    assert raw_linear_num_key_heads is not None
+    assert raw_linear_num_value_heads is not None
+    linear_num_key_heads = int(raw_linear_num_key_heads)
+    linear_num_value_heads = int(raw_linear_num_value_heads)
+    tensor_model_parallel_size = int(provider.tensor_model_parallel_size)
+    if linear_num_value_heads % linear_num_key_heads != 0:
+        raise ValueError(
+            "linear_num_value_heads must be a multiple of linear_num_key_heads."
+        )
+    if linear_num_key_heads % tensor_model_parallel_size != 0:
+        raise ValueError(
+            "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+        )
+    if linear_num_value_heads % tensor_model_parallel_size != 0:
+        raise ValueError(
+            "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+        )
 
 
 def get_provider_bundle(

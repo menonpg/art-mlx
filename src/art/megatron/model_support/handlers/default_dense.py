@@ -9,9 +9,29 @@ from art.megatron.model_support.spec import (
     SharedExpertCompileState,
 )
 
+_CONTEXT_PARALLEL_ATTENTION_WORKAROUND_FLAG = "context_parallel_attention"
+_SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG = (
+    "disable_compile_self_attn_linear_proj_reduce_scatter"
+)
+
+
+def _compile_workaround_flags_for_provider(
+    provider: Any,
+    base_flags: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    flags = base_flags
+    if bool(getattr(provider, "sequence_parallel", False)) and int(
+        getattr(provider, "tensor_model_parallel_size", 1) or 1
+    ) > 1:
+        flags = (*flags, _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG)
+    if int(getattr(provider, "context_parallel_size", 1) or 1) <= 1:
+        return flags
+    return (*flags, _CONTEXT_PARALLEL_ATTENTION_WORKAROUND_FLAG)
+
 
 class DefaultDenseHandler:
     key = "default_dense"
+    build_gdn_execution_spec = False
     is_moe = False
     native_vllm_lora_status = "disabled"
 
@@ -185,7 +205,8 @@ class DefaultDenseHandler:
         provider: Any,
     ) -> CompileWorkaroundConfig:
         return CompileWorkaroundConfig(
-            shared_expert_state=self._shared_expert_compile_state(provider)
+            flags=_compile_workaround_flags_for_provider(provider),
+            shared_expert_state=self._shared_expert_compile_state(provider),
         )
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:

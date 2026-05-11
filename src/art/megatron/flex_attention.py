@@ -1,7 +1,7 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
 import math
-from typing import Any, ClassVar, cast
+from typing import Any, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -11,12 +11,9 @@ from megatron.core.utils import divide
 from pydantic import BaseModel, ConfigDict
 import torch
 from torch import Tensor
-from torch.nn.attention.flex_attention import (
-    BlockMask,
-    FlexKernelOptions,
-    create_block_mask,
-    flex_attention,
-)
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+
+from art.megatron.compiled_flex_attention import dense_compiled_flex_attention
 
 
 class SharedPrefixAttentionState(BaseModel):
@@ -24,19 +21,10 @@ class SharedPrefixAttentionState(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     block_mask: BlockMask
-    group_ids: Tensor
-    parent_ids: Tensor
 
 
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
-
-    # Force the regular flex kernel. The flex-decoding specialization has hit
-    # shared-memory OOMs and symbolic-shape assertions on long packed training sequences.
-    _kernel_options: ClassVar[FlexKernelOptions] = {
-        "FORCE_USE_FLEX_ATTENTION": True,
-    }
-    _compiled_flex_attention: ClassVar = torch.compile(flex_attention)
 
     def forward(
         self,
@@ -51,28 +39,28 @@ class FlexAttentionWrapper(torch.nn.Module):
         # q, k, v are [B, H, S, D] tensors expected by torch.flex_attention.
         return cast(
             Tensor,
-            FlexAttentionWrapper._compiled_flex_attention(
+            dense_compiled_flex_attention(
                 q,
                 k,
                 v,
                 block_mask=block_mask,
                 scale=scale,
                 enable_gqa=enable_gqa,
-                kernel_options=FlexAttentionWrapper._kernel_options,
             ),
         )
 
 
-# Sequence-length churn can break the Inductor backend here. Keep this
-# on aot_eager instead.
-_compiled_create_block_mask = torch.compile(create_block_mask, backend="aot_eager")
+_compiled_create_block_mask = torch.compile(
+    create_block_mask,
+    backend="aot_eager",
+)
 
 
 def create_shared_prefix_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> SharedPrefixAttentionState:
-    """Build a block mask for ART shared-prefix packing.
+    """Build a compiled block mask for ART shared-prefix packing.
 
     Initialized on the device of the group_ids tensor.
 
@@ -103,11 +91,7 @@ def create_shared_prefix_attention_state(
         group_ids.shape[1],
         device=group_ids.device,
     )
-    return SharedPrefixAttentionState(
-        block_mask=block_mask,
-        group_ids=group_ids,
-        parent_ids=parent_ids,
-    )
+    return SharedPrefixAttentionState(block_mask=block_mask)
 
 
 class FlexDotProductAttention(torch.nn.Module):

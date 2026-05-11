@@ -165,40 +165,6 @@ class GdnParentStateTransferPlan(BaseModel):
     family_indices_tensor: torch.Tensor | None = None
 
 
-class GdnCpPeerTransfer(BaseModel):
-    """Token rows sent from one source rank to one destination rank."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    source_rank: int = Field(ge=0)
-    dest_rank: int = Field(ge=0)
-    token_count: int = Field(ge=0)
-    source_positions_tensor: torch.Tensor | None = None
-    dest_positions_tensor: torch.Tensor | None = None
-
-
-class GdnCpExchangePlan(BaseModel):
-    """Minimal exchange metadata for local GDN plans."""
-
-    model_config = ConfigDict(frozen=True)
-
-    cp_size: int = Field(ge=1)
-    source_token_counts_by_rank: tuple[int, ...]
-    dest_token_counts_by_rank: tuple[int, ...]
-    transfers: tuple[GdnCpPeerTransfer, ...]
-    cross_rank_token_count_override: int | None = Field(default=None, ge=0)
-
-    @property
-    def cross_rank_token_count(self) -> int:
-        if self.cross_rank_token_count_override is not None:
-            return int(self.cross_rank_token_count_override)
-        return sum(
-            int(transfer.token_count)
-            for transfer in self.transfers
-            if transfer.source_rank != transfer.dest_rank
-        )
-
-
 class GdnPlannerConfig(BaseModel):
     """Tunable cost coefficients for one packed-row GDN execution plan."""
 
@@ -211,7 +177,7 @@ class GdnPlannerConfig(BaseModel):
     cp_chain_min_prefix_only_tokens: int = Field(default=32768, ge=1)
     local_fork_launch_penalty_tokens: int = Field(default=256, ge=0)
     cp_collective_latency_tokens: int = Field(default=512, ge=0)
-    parent_state_exchange_penalty_tokens: int = Field(default=2048, ge=0)
+    parent_state_exchange_penalty_tokens: int = Field(default=16384, ge=0)
     layout_cross_rank_token_cost: float = Field(default=2.0, ge=0.0)
     rank_idle_token_cost: float = Field(default=1.0, ge=0.0)
     empty_rank_penalty_tokens: int = Field(default=65536, ge=0)
@@ -234,8 +200,6 @@ class GdnRankExecutionPlan(BaseModel):
     real_token_mask: torch.Tensor
     family_count: int = Field(ge=0)
     completion_count: int = Field(ge=0)
-    prefix_buckets: tuple[GdnSegmentBucketPlan, ...]
-    completion_buckets: tuple[GdnSegmentBucketPlan, ...]
     local_prefix_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
     local_completion_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
     ready_local_completion_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
@@ -253,7 +217,12 @@ class GdnRankExecutionPlan(BaseModel):
     parent_state_transfers: tuple[GdnParentStateTransferPlan, ...] = ()
     prefix_boundary_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
     prefix_tail_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
-    completion_warmup_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
+    completion_with_prefix_tail_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
+    remote_prefix_tail_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
+    remote_completion_with_prefix_tail_buckets: tuple[GdnSegmentBucketPlan, ...] = ()
+    remote_prefix_tail_exchange: Any | None = None
+    remote_prefix_tail_backward_exchange: Any | None = None
+    remote_prefix_tail_state_transfers: tuple[GdnParentStateTransferPlan, ...] = ()
 
     @property
     def attention_token_indices(self) -> tuple[int, ...]:
@@ -291,6 +260,21 @@ class _ExplicitBucketColumn(BaseModel):
     @property
     def length(self) -> int:
         return len(self.positions)
+
+
+def _explicit_bucket_column(
+    *,
+    row_index: int,
+    family_index: int,
+    positions: tuple[int, ...],
+    output_mask: tuple[bool, ...],
+) -> _ExplicitBucketColumn:
+    return _ExplicitBucketColumn.model_construct(
+        row_index=row_index,
+        family_index=family_index,
+        positions=positions,
+        output_mask=output_mask,
+    )
 
 
 class _AttentionLayoutIndex(BaseModel):
@@ -375,7 +359,7 @@ def build_gdn_rank_execution_plan(
     (
         prefix_boundary_buckets,
         prefix_tail_buckets,
-        completion_warmup_buckets,
+        completion_with_prefix_tail_buckets,
     ) = _build_chunk_aligned_cp1_bucket_plans(
         spec,
         device=device,
@@ -405,8 +389,6 @@ def build_gdn_rank_execution_plan(
         real_token_mask=positions.unsqueeze(0) < valid_lengths.unsqueeze(1),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
         local_prefix_buckets=(),
         local_completion_buckets=(),
         ready_local_completion_buckets=(),
@@ -420,7 +402,7 @@ def build_gdn_rank_execution_plan(
         gdn_token_count=spec.real_token_count,
         prefix_boundary_buckets=prefix_boundary_buckets,
         prefix_tail_buckets=prefix_tail_buckets,
-        completion_warmup_buckets=completion_warmup_buckets,
+        completion_with_prefix_tail_buckets=completion_with_prefix_tail_buckets,
     )
 
 
@@ -442,8 +424,6 @@ def move_gdn_rank_execution_plan_to_device(
         real_token_mask=_move_planner_tensor(plan.real_token_mask, device),
         family_count=plan.family_count,
         completion_count=plan.completion_count,
-        prefix_buckets=_move_bucket_plans(plan.prefix_buckets, device),
-        completion_buckets=_move_bucket_plans(plan.completion_buckets, device),
         local_prefix_buckets=_move_bucket_plans(plan.local_prefix_buckets, device),
         local_completion_buckets=_move_bucket_plans(
             plan.local_completion_buckets, device
@@ -473,8 +453,23 @@ def move_gdn_rank_execution_plan_to_device(
             plan.prefix_boundary_buckets, device
         ),
         prefix_tail_buckets=_move_bucket_plans(plan.prefix_tail_buckets, device),
-        completion_warmup_buckets=_move_bucket_plans(
-            plan.completion_warmup_buckets, device
+        completion_with_prefix_tail_buckets=_move_bucket_plans(
+            plan.completion_with_prefix_tail_buckets, device
+        ),
+        remote_prefix_tail_buckets=_move_bucket_plans(
+            plan.remote_prefix_tail_buckets, device
+        ),
+        remote_completion_with_prefix_tail_buckets=_move_bucket_plans(
+            plan.remote_completion_with_prefix_tail_buckets, device
+        ),
+        remote_prefix_tail_exchange=move_cp_exchange_plan_to_device(
+            plan.remote_prefix_tail_exchange, device
+        ),
+        remote_prefix_tail_backward_exchange=move_cp_exchange_plan_to_device(
+            plan.remote_prefix_tail_backward_exchange, device
+        ),
+        remote_prefix_tail_state_transfers=_move_parent_state_transfers(
+            plan.remote_prefix_tail_state_transfers, device
         ),
     )
 
@@ -556,6 +551,8 @@ def build_gdn_chain_only_rank_execution_plan(
         ):
             return None
 
+    from art.megatron.gdn.layout import GdnCpExchangePlan, GdnCpPeerTransfer
+
     local_tokens: list[int] = []
     prefix_segments: list[GdnSegmentSpec] = []
     completion_segments: list[GdnSegmentSpec] = []
@@ -625,8 +622,6 @@ def build_gdn_chain_only_rank_execution_plan(
         ),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
         local_prefix_buckets=(),
         local_completion_buckets=(),
         ready_local_completion_buckets=(),
@@ -771,8 +766,6 @@ def _build_chain_attention_layout_rank_execution_plan(
         ),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
         local_prefix_buckets=(),
         local_completion_buckets=(),
         ready_local_completion_buckets=(),
@@ -871,6 +864,10 @@ def _build_local_attention_layout_rank_execution_plan(
 
     local_prefix_segments: list[GdnSegmentSpec] = []
     local_completion_segments: list[GdnSegmentSpec] = []
+    prefix_segments_by_rank: list[list[GdnSegmentSpec]] = [[] for _ in range(cp_size)]
+    completion_segments_by_rank: list[list[GdnSegmentSpec]] = [
+        [] for _ in range(cp_size)
+    ]
     gdn_ranges_by_rank: list[list[tuple[int, int, int]]] = [[] for _ in range(cp_size)]
     rank_loads = [0] * cp_size
     parent_state_exchange_families: set[int] = set()
@@ -888,6 +885,7 @@ def _build_local_attention_layout_rank_execution_plan(
         prefix_owner = prefix_owner_by_family[family.family_index]
         if prefix_owner == cp_rank:
             local_prefix_segments.append(family.prefix)
+        prefix_segments_by_rank[prefix_owner].append(family.prefix)
         append_segment(prefix_owner, family.prefix)
         completion_owners = completion_owners_by_family[family.family_index]
         for completion, completion_owner in zip(
@@ -895,6 +893,7 @@ def _build_local_attention_layout_rank_execution_plan(
         ):
             if completion_owner == cp_rank:
                 local_completion_segments.append(completion)
+            completion_segments_by_rank[completion_owner].append(completion)
             append_segment(completion_owner, completion)
             if completion_owner != prefix_owner:
                 parent_state_exchange_families.add(family.family_index)
@@ -904,6 +903,49 @@ def _build_local_attention_layout_rank_execution_plan(
 
     local_token_ranges = tuple(gdn_ranges_by_rank[cp_rank])
     local_token_count = rank_loads[cp_rank]
+    schedule = GdnCpSegmentSchedule.model_construct(
+        gdn_token_counts_by_rank=tuple(rank_loads),
+        gdn_token_ranges_by_rank=tuple(tuple(ranges) for ranges in gdn_ranges_by_rank),
+        cross_rank_token_count=cross_rank_token_count,
+        chain_prefix_buckets=(),
+        chain_completion_buckets=(),
+        local_prefix_segments_by_rank=tuple(
+            tuple(segments) for segments in prefix_segments_by_rank
+        ),
+        local_completion_segments_by_rank=tuple(
+            tuple(segments) for segments in completion_segments_by_rank
+        ),
+        parent_state_exchange_family_indices=tuple(
+            sorted(parent_state_exchange_families)
+        ),
+        parent_state_transfers=_build_parent_state_transfer_plans(
+            parent_state_transfer_families
+        ),
+    )
+    if parent_state_transfer_families:
+        (
+            remote_prefix_tail_buckets,
+            remote_completion_with_prefix_tail_buckets,
+            remote_prefix_tail_exchange,
+            remote_prefix_tail_backward_exchange,
+            remote_prefix_tail_state_transfers,
+            remote_prefix_tail_families,
+        ) = _build_remote_prefix_tail_plans(
+            spec,
+            schedule,
+            cp_rank=cp_rank,
+            device=device,
+            planner_config=planner_config,
+        )
+    else:
+        (
+            remote_prefix_tail_buckets,
+            remote_completion_with_prefix_tail_buckets,
+            remote_prefix_tail_exchange,
+            remote_prefix_tail_backward_exchange,
+            remote_prefix_tail_state_transfers,
+            remote_prefix_tail_families,
+        ) = _empty_remote_prefix_tail_plans()
     attention_to_gdn = build_local_rank_cp_exchange_plan_from_dest_ranges(
         source_layout=source_layout,
         device=device,
@@ -929,6 +971,7 @@ def _build_local_attention_layout_rank_execution_plan(
         segment
         for segment in local_completion_segments
         if segment.family_index not in local_prefix_family_indices
+        and segment.family_index not in remote_prefix_tail_families
     )
     ready_completion_segments, remote_completion_segments = (
         _split_ready_and_remote_completion_segments(
@@ -965,7 +1008,7 @@ def _build_local_attention_layout_rank_execution_plan(
     (
         prefix_boundary_buckets,
         prefix_tail_buckets,
-        completion_warmup_buckets,
+        completion_with_prefix_tail_buckets,
     ) = _build_chunk_aligned_position_bucket_plans(
         tuple(local_prefix_segments),
         chunk_local_completion_segments,
@@ -986,8 +1029,6 @@ def _build_local_attention_layout_rank_execution_plan(
         ),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
         local_prefix_buckets=_build_position_bucket_plans(
             local_prefix_buckets,
             local_token_ranges,
@@ -1012,15 +1053,21 @@ def _build_local_attention_layout_rank_execution_plan(
         attention_token_count=source_layout.token_counts_by_rank[cp_rank],
         gdn_token_count=local_token_count,
         parent_state_exchange_family_indices=tuple(
-            sorted(parent_state_exchange_families)
+            sorted(parent_state_exchange_families - remote_prefix_tail_families)
         ),
-        parent_state_transfers=_transfer_plans_to_device(
+        parent_state_transfers=_filter_parent_state_transfers(
             _build_parent_state_transfer_plans(parent_state_transfer_families),
+            excluded_families=remote_prefix_tail_families,
             device=device,
         ),
         prefix_boundary_buckets=prefix_boundary_buckets,
         prefix_tail_buckets=prefix_tail_buckets,
-        completion_warmup_buckets=completion_warmup_buckets,
+        completion_with_prefix_tail_buckets=completion_with_prefix_tail_buckets,
+        remote_prefix_tail_buckets=remote_prefix_tail_buckets,
+        remote_completion_with_prefix_tail_buckets=remote_completion_with_prefix_tail_buckets,
+        remote_prefix_tail_exchange=remote_prefix_tail_exchange,
+        remote_prefix_tail_backward_exchange=remote_prefix_tail_backward_exchange,
+        remote_prefix_tail_state_transfers=remote_prefix_tail_state_transfers,
     )
 
 
@@ -1217,18 +1264,22 @@ def _build_chunk_aligned_cp1_bucket_plans(
             boundary_segments.append(
                 _segment_with_bounds(prefix, prefix.start, boundary_end)
             )
-        if boundary_end < prefix.end and not family.completions:
+        prefix_tail_positions = tuple(range(boundary_end, prefix.end))
+        if prefix_tail_positions and not family.completions:
             tail_segments.append(_segment_with_bounds(prefix, boundary_end, prefix.end))
-        warmup_positions = tuple(range(boundary_end, prefix.end))
-        for completion in family.completions:
-            warmup_mask = (completion.child_index == 0,) * len(warmup_positions)
-            completion_positions = tuple(range(completion.start, completion.end))
+        for child_offset, completion in enumerate(family.completions):
+            completion_positions = prefix_tail_positions + tuple(
+                range(completion.start, completion.end)
+            )
             completion_columns.append(
-                _ExplicitBucketColumn(
+                _explicit_bucket_column(
                     row_index=completion.row_index,
                     family_index=completion.family_index,
-                    positions=warmup_positions + completion_positions,
-                    output_mask=warmup_mask + (True,) * len(completion_positions),
+                    positions=completion_positions,
+                    output_mask=(
+                        ((child_offset == 0),) * len(prefix_tail_positions)
+                        + (True,) * completion.length
+                    ),
                 )
             )
     boundary_buckets = _batch_segments_by_padded_work(
@@ -1241,7 +1292,7 @@ def _build_chunk_aligned_cp1_bucket_plans(
         max_padding_ratio=planner_config.max_padding_ratio,
         max_segments_per_batch=planner_config.max_segments_per_batch,
     )
-    completion_buckets = _batch_explicit_bucket_columns(
+    completion_column_batches = _batch_explicit_bucket_columns(
         tuple(completion_columns),
         max_padding_ratio=planner_config.max_padding_ratio,
         max_segments_per_batch=planner_config.max_segments_per_batch,
@@ -1249,7 +1300,7 @@ def _build_chunk_aligned_cp1_bucket_plans(
     return (
         _build_segment_bucket_plans(boundary_buckets, device=device),
         _build_segment_bucket_plans(tail_buckets, device=device),
-        _build_explicit_bucket_plans(completion_buckets, device=device),
+        _build_explicit_bucket_plans(completion_column_batches, device=device),
     )
 
 
@@ -1267,6 +1318,10 @@ def _build_chunk_aligned_position_bucket_plans(
     tuple[GdnSegmentBucketPlan, ...],
 ]:
     local_range_ends = tuple(token_end for _, token_end, _ in local_token_ranges)
+    local_range_positions = {
+        (token_start, token_end): position_start
+        for token_start, token_end, position_start in local_token_ranges
+    }
     completions_by_family: dict[int, list[GdnSegmentSpec]] = {}
     for completion in completion_segments:
         completions_by_family.setdefault(completion.family_index, []).append(completion)
@@ -1279,23 +1334,19 @@ def _build_chunk_aligned_position_bucket_plans(
             boundary_segments.append(
                 _segment_with_bounds(prefix, prefix.start, boundary_end)
             )
-        family_completions = tuple(
-            sorted(
-                completions_by_family.get(prefix.family_index, ()),
-                key=lambda segment: segment.child_index or 0,
-            )
-        )
-        if boundary_end < prefix.end and not family_completions:
-            tail_segments.append(_segment_with_bounds(prefix, boundary_end, prefix.end))
-        warmup_positions = _local_positions_for_span(
+        family_completions = tuple(completions_by_family.get(prefix.family_index, ()))
+        prefix_tail_positions = _local_positions_for_span(
             prefix.row_index,
             boundary_end,
             prefix.end,
             sequence_length=sequence_length,
             local_token_ranges=local_token_ranges,
             local_range_ends=local_range_ends,
+            local_range_positions=local_range_positions,
         )
-        for completion in family_completions:
+        if prefix_tail_positions and not family_completions:
+            tail_segments.append(_segment_with_bounds(prefix, boundary_end, prefix.end))
+        for child_offset, completion in enumerate(family_completions):
             completion_positions = _local_positions_for_span(
                 completion.row_index,
                 completion.start,
@@ -1303,14 +1354,18 @@ def _build_chunk_aligned_position_bucket_plans(
                 sequence_length=sequence_length,
                 local_token_ranges=local_token_ranges,
                 local_range_ends=local_range_ends,
+                local_range_positions=local_range_positions,
             )
+            positions = prefix_tail_positions + completion_positions
             completion_columns.append(
-                _ExplicitBucketColumn(
+                _explicit_bucket_column(
                     row_index=0,
                     family_index=completion.family_index,
-                    positions=warmup_positions + completion_positions,
-                    output_mask=(completion.child_index == 0,) * len(warmup_positions)
-                    + (True,) * len(completion_positions),
+                    positions=positions,
+                    output_mask=(
+                        ((child_offset == 0),) * len(prefix_tail_positions)
+                        + (True,) * len(completion_positions)
+                    ),
                 )
             )
     boundary_buckets = _batch_segments_by_padded_work(
@@ -1323,7 +1378,7 @@ def _build_chunk_aligned_position_bucket_plans(
         max_padding_ratio=planner_config.max_padding_ratio,
         max_segments_per_batch=planner_config.max_segments_per_batch,
     )
-    completion_buckets = _batch_explicit_bucket_columns(
+    completion_column_batches = _batch_explicit_bucket_columns(
         tuple(completion_columns),
         max_padding_ratio=planner_config.max_padding_ratio,
         max_segments_per_batch=planner_config.max_segments_per_batch,
@@ -1341,7 +1396,220 @@ def _build_chunk_aligned_position_bucket_plans(
             sequence_length=sequence_length,
             device=device,
         ),
-        _build_explicit_bucket_plans(completion_buckets, device=device),
+        _build_explicit_bucket_plans(completion_column_batches, device=device),
+    )
+
+
+def _build_remote_prefix_tail_plans(
+    spec: GdnPackedExecutionSpec,
+    schedule: GdnCpSegmentSchedule,
+    *,
+    cp_rank: int,
+    device: torch.device | str,
+    planner_config: GdnPlannerConfig,
+) -> tuple[
+    tuple[GdnSegmentBucketPlan, ...],
+    tuple[GdnSegmentBucketPlan, ...],
+    Any | None,
+    Any | None,
+    tuple[GdnParentStateTransferPlan, ...],
+    frozenset[int],
+]:
+    from art.megatron.gdn.layout import (
+        GdnCpExchangePlan,
+        GdnCpPeerTransfer,
+        _reverse_exchange_plan,
+    )
+
+    family_by_index = {family.family_index: family for family in spec.families}
+    prefix_owner_by_family = _prefix_owner_by_family(schedule)
+    source_positions_by_pair: dict[tuple[int, int], list[int]] = {}
+    dest_positions_by_pair: dict[tuple[int, int], list[int]] = {}
+    dest_counts = [0 for _ in schedule.gdn_token_counts_by_rank]
+    state_transfer_families: dict[tuple[int, int], set[int]] = {}
+    remote_tail_family_indices: set[int] = set()
+    local_tail_columns: list[_ExplicitBucketColumn] = []
+    local_completion_columns: list[_ExplicitBucketColumn] = []
+    tail_positions_by_dest_family: dict[tuple[int, int], tuple[int, ...]] = {}
+    local_tail_column_families: set[int] = set()
+    rank_ranges = schedule.gdn_token_ranges_by_rank
+    rank_range_ends = tuple(
+        tuple(end for _, end, _ in ranges) for ranges in rank_ranges
+    )
+    rank_range_positions = tuple(
+        {
+            (token_start, token_end): position_start
+            for token_start, token_end, position_start in ranges
+        }
+        for ranges in rank_ranges
+    )
+
+    for dest_rank, completions in enumerate(schedule.local_completion_segments_by_rank):
+        for completion in completions:
+            source_rank = prefix_owner_by_family.get(completion.family_index)
+            if source_rank is None or source_rank == dest_rank:
+                continue
+            family = family_by_index[completion.family_index]
+            boundary_end = _prefix_chunk_boundary_end(family.prefix)
+            if boundary_end == family.prefix.end:
+                continue
+            dest_family = (dest_rank, family.family_index)
+            dest_positions = tail_positions_by_dest_family.get(dest_family)
+            if dest_positions is None:
+                source_positions = _local_positions_for_span(
+                    family.prefix.row_index,
+                    boundary_end,
+                    family.prefix.end,
+                    sequence_length=spec.sequence_length,
+                    local_token_ranges=rank_ranges[source_rank],
+                    local_range_ends=rank_range_ends[source_rank],
+                    local_range_positions=rank_range_positions[source_rank],
+                )
+                if len(source_positions) != family.prefix.end - boundary_end:
+                    raise ValueError(
+                        "remote prefix-tail exchange could not locate all source tokens "
+                        f"for family {family.family_index}"
+                    )
+                dest_start = dest_counts[dest_rank]
+                dest_positions = tuple(
+                    range(dest_start, dest_start + len(source_positions))
+                )
+                tail_positions_by_dest_family[dest_family] = dest_positions
+                dest_counts[dest_rank] += len(source_positions)
+                pair = (source_rank, dest_rank)
+                source_positions_by_pair.setdefault(pair, []).extend(source_positions)
+                dest_positions_by_pair.setdefault(pair, []).extend(dest_positions)
+                state_transfer_families.setdefault(pair, set()).add(family.family_index)
+                remote_tail_family_indices.add(family.family_index)
+
+            if dest_rank != cp_rank:
+                continue
+            completion_positions = _local_positions_for_span(
+                completion.row_index,
+                completion.start,
+                completion.end,
+                sequence_length=spec.sequence_length,
+                local_token_ranges=rank_ranges[dest_rank],
+                local_range_ends=rank_range_ends[dest_rank],
+                local_range_positions=rank_range_positions[dest_rank],
+            )
+            if len(completion_positions) != completion.length:
+                raise ValueError(
+                    "remote prefix-tail bucket could not locate all completion tokens "
+                    f"for family {family.family_index}"
+                )
+            remote_base = int(schedule.gdn_token_counts_by_rank[dest_rank])
+            if (
+                len(dest_positions) > 0
+                and family.family_index not in local_tail_column_families
+            ):
+                local_tail_column_families.add(family.family_index)
+                local_tail_columns.append(
+                    _explicit_bucket_column(
+                        row_index=0,
+                        family_index=family.family_index,
+                        positions=tuple(remote_base + pos for pos in dest_positions),
+                        output_mask=(False,) * len(dest_positions),
+                    )
+                )
+            local_completion_columns.append(
+                _explicit_bucket_column(
+                    row_index=0,
+                    family_index=family.family_index,
+                    positions=completion_positions,
+                    output_mask=(True,) * len(completion_positions),
+                )
+            )
+
+    if not source_positions_by_pair:
+        return (), (), None, None, (), frozenset()
+
+    transfers = tuple(
+        GdnCpPeerTransfer.model_construct(
+            source_rank=source_rank,
+            dest_rank=dest_rank,
+            token_count=len(source_positions),
+            source_positions_tensor=_move_planner_tensor(
+                torch.tensor(source_positions, dtype=torch.long), device
+            ),
+            dest_positions_tensor=_move_planner_tensor(
+                torch.tensor(
+                    dest_positions_by_pair[(source_rank, dest_rank)],
+                    dtype=torch.long,
+                ),
+                device,
+            ),
+        )
+        for (source_rank, dest_rank), source_positions in sorted(
+            source_positions_by_pair.items()
+        )
+    )
+    exchange = GdnCpExchangePlan.model_construct(
+        cp_size=len(schedule.gdn_token_counts_by_rank),
+        source_token_counts_by_rank=schedule.gdn_token_counts_by_rank,
+        dest_token_counts_by_rank=tuple(dest_counts),
+        transfers=transfers,
+        cross_rank_token_count_override=sum(dest_counts),
+    )
+    tail_column_batches = _batch_explicit_bucket_columns(
+        tuple(local_tail_columns),
+        max_padding_ratio=planner_config.max_padding_ratio,
+        max_segments_per_batch=planner_config.max_segments_per_batch,
+    )
+    completion_column_batches = _batch_explicit_bucket_columns(
+        tuple(local_completion_columns),
+        max_padding_ratio=planner_config.max_padding_ratio,
+        max_segments_per_batch=planner_config.max_segments_per_batch,
+    )
+    return (
+        _build_explicit_bucket_plans(tail_column_batches, device=device),
+        _build_explicit_bucket_plans(completion_column_batches, device=device),
+        exchange,
+        _reverse_exchange_plan(exchange),
+        _transfer_plans_to_device(
+            _build_parent_state_transfer_plans(state_transfer_families),
+            device=device,
+        ),
+        frozenset(remote_tail_family_indices),
+    )
+
+
+def _empty_remote_prefix_tail_plans() -> tuple[
+    tuple[GdnSegmentBucketPlan, ...],
+    tuple[GdnSegmentBucketPlan, ...],
+    Any | None,
+    Any | None,
+    tuple[GdnParentStateTransferPlan, ...],
+    frozenset[int],
+]:
+    return (), (), None, None, (), frozenset()
+
+
+def _prefix_owner_by_family(schedule: GdnCpSegmentSchedule) -> dict[int, int]:
+    owners: dict[int, int] = {}
+    for rank, segments in enumerate(schedule.local_prefix_segments_by_rank):
+        for segment in segments:
+            owners[segment.family_index] = rank
+    return owners
+
+
+def _filter_parent_state_transfers(
+    transfers: tuple[GdnParentStateTransferPlan, ...],
+    *,
+    excluded_families: frozenset[int],
+    device: torch.device | str,
+) -> tuple[GdnParentStateTransferPlan, ...]:
+    if not excluded_families:
+        return _transfer_plans_to_device(transfers, device=device)
+    kept: dict[tuple[int, int], set[int]] = {}
+    for transfer in transfers:
+        families = set(transfer.family_indices) - excluded_families
+        if families:
+            kept.setdefault((transfer.source_rank, transfer.dest_rank), set()).update(
+                families
+            )
+    return _transfer_plans_to_device(
+        _build_parent_state_transfer_plans(kept), device=device
     )
 
 
@@ -1353,9 +1621,22 @@ def _local_positions_for_span(
     sequence_length: int,
     local_token_ranges: tuple[tuple[int, int, int], ...],
     local_range_ends: tuple[int, ...],
+    local_range_positions: dict[tuple[int, int], int] | None = None,
 ) -> tuple[int, ...]:
     if start == end:
         return ()
+    token_start = row_index * sequence_length + start
+    token_end = row_index * sequence_length + end
+    if local_range_positions is not None:
+        position_start = local_range_positions.get((token_start, token_end))
+        if position_start is not None:
+            return tuple(range(position_start, position_start + end - start))
+    range_index = bisect_left(local_range_ends, token_start + 1)
+    if range_index < len(local_token_ranges):
+        range_start, range_end, position_start = local_token_ranges[range_index]
+        if range_start <= token_start and token_end <= range_end:
+            local_start = position_start + token_start - range_start
+            return tuple(range(local_start, local_start + end - start))
     segment = _trusted_pydantic_construct(
         GdnSegmentSpec,
         _GDN_SEGMENT_SPEC_FIELDS,
@@ -1456,21 +1737,30 @@ def _build_explicit_bucket_plan(
     device: torch.device | str,
 ) -> GdnSegmentBucketPlan:
     max_length = max(column.length for column in columns)
-    lengths_cpu = torch.tensor([column.length for column in columns], dtype=torch.long)
+    column_count = len(columns)
+    lengths = [column.length for column in columns]
+    lengths_cpu = torch.tensor(lengths, dtype=torch.long)
     offsets_cpu = torch.arange(max_length, dtype=torch.long).unsqueeze(1)
     real_mask_cpu = offsets_cpu < lengths_cpu.unsqueeze(0)
-    row_indices_cpu = torch.zeros(max_length, len(columns), dtype=torch.long)
-    position_indices_cpu = torch.zeros(max_length, len(columns), dtype=torch.long)
-    output_mask_cpu = torch.zeros(max_length, len(columns), dtype=torch.bool)
+    padded_element_count = max_length * column_count
+    row_indices = [0] * padded_element_count
+    position_indices = [0] * padded_element_count
+    output_mask = [False] * padded_element_count
     for column_index, column in enumerate(columns):
         length = column.length
-        row_indices_cpu[:length, column_index] = column.row_index
-        position_indices_cpu[:length, column_index] = torch.tensor(
-            column.positions, dtype=torch.long
-        )
-        output_mask_cpu[:length, column_index] = torch.tensor(
-            column.output_mask, dtype=torch.bool
-        )
+        column_slice = slice(column_index, length * column_count, column_count)
+        row_indices[column_slice] = [column.row_index] * length
+        position_indices[column_slice] = column.positions
+        output_mask[column_slice] = column.output_mask
+    row_indices_cpu = torch.tensor(row_indices, dtype=torch.long).reshape(
+        max_length, column_count
+    )
+    position_indices_cpu = torch.tensor(position_indices, dtype=torch.long).reshape(
+        max_length, column_count
+    )
+    output_mask_cpu = torch.tensor(output_mask, dtype=torch.bool).reshape(
+        max_length, column_count
+    )
     family_indices_cpu = torch.tensor(
         [column.family_index for column in columns], dtype=torch.long
     )
@@ -1542,6 +1832,11 @@ def _build_cp_rank_execution_plan(
             f"{_layout_cp_size(attention_token_layout_index)} and {cp_size}"
         )
 
+    from art.megatron.gdn.layout import (
+        _reverse_exchange_plan,
+        build_local_rank_cp_exchange_plan_from_dest_ranges,
+    )
+
     has_explicit_attention_layout = attention_token_layout_index is not None
     if cp_segment_schedule is None and not has_explicit_attention_layout:
         chain_only_plan = build_gdn_chain_only_rank_execution_plan(
@@ -1584,11 +1879,6 @@ def _build_cp_rank_execution_plan(
         if local_layout_plan is not None:
             return local_layout_plan
 
-    from art.megatron.gdn.layout import (
-        _reverse_exchange_plan,
-        build_local_rank_cp_exchange_plan_from_dest_ranges,
-    )
-
     source_layout = _attention_source_layout(
         spec,
         cp_size=cp_size,
@@ -1622,6 +1912,30 @@ def _build_cp_rank_execution_plan(
     gdn_to_attention = _reverse_exchange_plan(attention_to_gdn)
     local_token_ranges = schedule.gdn_token_ranges_by_rank[cp_rank]
     local_gdn_token_count = schedule.gdn_token_counts_by_rank[cp_rank]
+    if schedule.parent_state_exchange_family_indices:
+        (
+            remote_prefix_tail_buckets,
+            remote_completion_with_prefix_tail_buckets,
+            remote_prefix_tail_exchange,
+            remote_prefix_tail_backward_exchange,
+            remote_prefix_tail_state_transfers,
+            remote_prefix_tail_families,
+        ) = _build_remote_prefix_tail_plans(
+            spec,
+            schedule,
+            cp_rank=cp_rank,
+            device=device,
+            planner_config=planner_config,
+        )
+    else:
+        (
+            remote_prefix_tail_buckets,
+            remote_completion_with_prefix_tail_buckets,
+            remote_prefix_tail_exchange,
+            remote_prefix_tail_backward_exchange,
+            remote_prefix_tail_state_transfers,
+            remote_prefix_tail_families,
+        ) = _empty_remote_prefix_tail_plans()
 
     chain_prefix_buckets = tuple(
         bucket for bucket in schedule.chain_prefix_buckets if bucket
@@ -1650,6 +1964,7 @@ def _build_cp_rank_execution_plan(
         segment
         for segment in local_completion_segments
         if segment.family_index not in local_prefix_family_indices
+        and segment.family_index not in remote_prefix_tail_families
     )
     ready_completion_segments, remote_completion_segments = (
         _split_ready_and_remote_completion_segments(
@@ -1682,7 +1997,7 @@ def _build_cp_rank_execution_plan(
     (
         prefix_boundary_buckets,
         prefix_tail_buckets,
-        completion_warmup_buckets,
+        completion_with_prefix_tail_buckets,
     ) = _build_chunk_aligned_position_bucket_plans(
         local_prefix_segments,
         chunk_local_completion_segments,
@@ -1703,8 +2018,6 @@ def _build_cp_rank_execution_plan(
         ),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
         local_prefix_buckets=_build_position_bucket_plans(
             local_prefix_buckets,
             local_token_ranges,
@@ -1752,14 +2065,25 @@ def _build_cp_rank_execution_plan(
         attention_token_count=source_layout.token_counts_by_rank[cp_rank],
         gdn_token_count=local_gdn_token_count,
         parent_state_exchange_family_indices=(
-            schedule.parent_state_exchange_family_indices
+            tuple(
+                family_index
+                for family_index in schedule.parent_state_exchange_family_indices
+                if family_index not in remote_prefix_tail_families
+            )
         ),
-        parent_state_transfers=_transfer_plans_to_device(
-            schedule.parent_state_transfers, device=device
+        parent_state_transfers=_filter_parent_state_transfers(
+            schedule.parent_state_transfers,
+            excluded_families=remote_prefix_tail_families,
+            device=device,
         ),
         prefix_boundary_buckets=prefix_boundary_buckets,
         prefix_tail_buckets=prefix_tail_buckets,
-        completion_warmup_buckets=completion_warmup_buckets,
+        completion_with_prefix_tail_buckets=completion_with_prefix_tail_buckets,
+        remote_prefix_tail_buckets=remote_prefix_tail_buckets,
+        remote_completion_with_prefix_tail_buckets=remote_completion_with_prefix_tail_buckets,
+        remote_prefix_tail_exchange=remote_prefix_tail_exchange,
+        remote_prefix_tail_backward_exchange=remote_prefix_tail_backward_exchange,
+        remote_prefix_tail_state_transfers=remote_prefix_tail_state_transfers,
     )
 
 
@@ -2112,82 +2436,138 @@ def _build_local_family_rank_execution_plan(
     target_rank_load = spec.real_token_count / cp_size
     loads = [0] * cp_size
     prefix_owner_by_family: list[int] = []
-    completion_owner_by_family: list[int] = []
+    completion_owners_by_family: list[tuple[int, ...]] = []
     for family in spec.families:
         if _can_chain_family(family, cp_size=cp_size, planner_config=planner_config):
             return None
-        if (
-            family.prefix.length
-            > planner_config.max_zero_exchange_load_imbalance * target_rank_load
-        ):
+        prefix_locality_limit = max(
+            planner_config.max_zero_exchange_load_imbalance * target_rank_load,
+            min(64.0, float(spec.real_token_count)),
+        )
+        if family.prefix.length > prefix_locality_limit:
             return None
         owner = _least_loaded_rank(loads)
         prefix_owner_by_family.append(owner)
-        completion_owner_by_family.append(owner)
+        completion_owners_by_family.append(tuple(owner for _ in family.completions))
         loads[owner] += family.token_count
 
     if max(loads, default=0) > (
         planner_config.local_completion_rebalance_min_imbalance * target_rank_load
     ):
-        completion_owner_by_family = list(
-            _rebalance_local_completion_bundles(
+        completion_owners_by_family = list(
+            _rebalance_local_completion_segments(
                 spec,
                 prefix_owner_by_family=tuple(prefix_owner_by_family),
-                completion_owner_by_family=tuple(completion_owner_by_family),
+                completion_owners_by_family=tuple(completion_owners_by_family),
                 initial_loads=tuple(loads),
                 planner_config=planner_config,
             )
         )
-    local_tokens, prefix_segments, completion_segments = (
-        _materialize_local_family_rank_assignment(
-            spec,
-            cp_rank=cp_rank,
-            prefix_owner_by_family=tuple(prefix_owner_by_family),
-            completion_owner_by_family=tuple(completion_owner_by_family),
-        )
+    rank_assignments = _materialize_local_family_rank_assignments(
+        spec,
+        cp_size=cp_size,
+        prefix_owner_by_family=tuple(prefix_owner_by_family),
+        completion_owners_by_family=tuple(completion_owners_by_family),
+    )
+    local_token_count, local_token_ranges, prefix_segments, completion_segments = (
+        rank_assignments[cp_rank]
     )
     parent_state_transfer_families: dict[tuple[int, int], set[int]] = {}
     for family in spec.families:
         prefix_owner = prefix_owner_by_family[family.family_index]
-        completion_owner = completion_owner_by_family[family.family_index]
-        if completion_owner != prefix_owner and family.completions:
+        completion_owners = completion_owners_by_family[family.family_index]
+        for completion_owner in sorted(set(completion_owners)):
+            if completion_owner == prefix_owner:
+                continue
             parent_state_transfer_families.setdefault(
                 (prefix_owner, completion_owner), set()
             ).add(family.family_index)
 
-    token_indices_by_rank = tuple(
-        local_tokens if rank == cp_rank else () for rank in range(cp_size)
-    )
+    from art.megatron.gdn.layout import GdnCpExchangePlan, GdnCpPeerTransfer
+
+    token_counts_by_rank = tuple(assignment[0] for assignment in rank_assignments)
     identity_exchange = GdnCpExchangePlan.model_construct(
         cp_size=cp_size,
-        source_token_counts_by_rank=tuple(
-            len(tokens) for tokens in token_indices_by_rank
-        ),
-        dest_token_counts_by_rank=tuple(
-            len(tokens) for tokens in token_indices_by_rank
-        ),
+        source_token_counts_by_rank=token_counts_by_rank,
+        dest_token_counts_by_rank=token_counts_by_rank,
         transfers=tuple(
             GdnCpPeerTransfer.model_construct(
                 source_rank=rank,
                 dest_rank=rank,
-                token_count=len(tokens),
+                token_count=token_count,
                 source_positions_tensor=None,
                 dest_positions_tensor=None,
             )
-            for rank, tokens in enumerate(token_indices_by_rank)
-            if tokens
+            for rank, token_count in enumerate(token_counts_by_rank)
+            if token_count
         ),
     )
-    local_token_ranges = _local_token_ranges(local_tokens)
-    prefix_buckets = _batch_segments_by_padded_work(
-        prefix_segments,
-        max_padding_ratio=planner_config.max_padding_ratio,
-        max_segments_per_batch=planner_config.max_segments_per_batch,
+    parent_state_exchange_family_indices = tuple(
+        sorted(
+            family_index
+            for family_indices in parent_state_transfer_families.values()
+            for family_index in family_indices
+        )
+    )
+    schedule = GdnCpSegmentSchedule.model_construct(
+        gdn_token_counts_by_rank=token_counts_by_rank,
+        gdn_token_ranges_by_rank=tuple(
+            assignment[1] for assignment in rank_assignments
+        ),
+        cross_rank_token_count=0,
+        chain_prefix_buckets=(),
+        chain_completion_buckets=(),
+        local_prefix_segments_by_rank=tuple(
+            assignment[2] for assignment in rank_assignments
+        ),
+        local_completion_segments_by_rank=tuple(
+            assignment[3] for assignment in rank_assignments
+        ),
+        parent_state_exchange_family_indices=parent_state_exchange_family_indices,
+        parent_state_transfers=_build_parent_state_transfer_plans(
+            parent_state_transfer_families
+        ),
+    )
+    if parent_state_exchange_family_indices:
+        (
+            remote_prefix_tail_buckets,
+            remote_completion_with_prefix_tail_buckets,
+            remote_prefix_tail_exchange,
+            remote_prefix_tail_backward_exchange,
+            remote_prefix_tail_state_transfers,
+            remote_prefix_tail_families,
+        ) = _build_remote_prefix_tail_plans(
+            spec,
+            schedule,
+            cp_rank=cp_rank,
+            device=device,
+            planner_config=planner_config,
+        )
+    else:
+        (
+            remote_prefix_tail_buckets,
+            remote_completion_with_prefix_tail_buckets,
+            remote_prefix_tail_exchange,
+            remote_prefix_tail_backward_exchange,
+            remote_prefix_tail_state_transfers,
+            remote_prefix_tail_families,
+        ) = _empty_remote_prefix_tail_plans()
+    local_prefix_family_indices = {segment.family_index for segment in prefix_segments}
+    chunk_local_completion_segments = tuple(
+        segment
+        for segment in completion_segments
+        if segment.family_index in local_prefix_family_indices
+    )
+    suffix_only_completion_segments = tuple(
+        segment
+        for segment in completion_segments
+        if segment.family_index not in local_prefix_family_indices
+        and segment.family_index not in remote_prefix_tail_families
     )
     ready_completion_segments, remote_completion_segments = (
         _split_ready_and_remote_completion_segments(
-            completion_segments,
-            local_prefix_segments=prefix_segments,
+            suffix_only_completion_segments,
+            local_prefix_segments=(),
             chain_prefix_buckets=(),
         )
     )
@@ -2200,16 +2580,6 @@ def _build_local_family_rank_execution_plan(
         remote_completion_segments,
         max_padding_ratio=planner_config.max_padding_ratio,
         max_segments_per_batch=planner_config.max_segments_per_batch,
-    )
-    completion_buckets = ready_completion_buckets + remote_completion_buckets
-    prefix_family_order = tuple(
-        segment.family_index for bucket in prefix_buckets for segment in bucket
-    )
-    local_prefix_bucket_plans = _build_position_bucket_plans(
-        prefix_buckets,
-        local_token_ranges,
-        sequence_length=spec.sequence_length,
-        device=device,
     )
     ready_completion_bucket_plans = _build_position_bucket_plans(
         ready_completion_buckets,
@@ -2229,10 +2599,10 @@ def _build_local_family_rank_execution_plan(
     (
         prefix_boundary_buckets,
         prefix_tail_buckets,
-        completion_warmup_buckets,
+        completion_with_prefix_tail_buckets,
     ) = _build_chunk_aligned_position_bucket_plans(
         prefix_segments,
-        completion_segments,
+        chunk_local_completion_segments,
         local_token_ranges,
         sequence_length=spec.sequence_length,
         device=device,
@@ -2242,129 +2612,230 @@ def _build_local_family_rank_execution_plan(
         cp_rank=cp_rank,
         cp_size=cp_size,
         batch_size=1,
-        sequence_length=len(local_tokens),
+        sequence_length=local_token_count,
         packed_batch_size=spec.batch_size,
         packed_sequence_length=spec.sequence_length,
         real_token_mask=torch.ones(
-            1, len(local_tokens), device=device, dtype=torch.bool
+            1, local_token_count, device=device, dtype=torch.bool
         ),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
-        local_prefix_buckets=local_prefix_bucket_plans,
+        local_prefix_buckets=(),
         local_completion_buckets=local_completion_bucket_plans,
         ready_local_completion_buckets=ready_completion_bucket_plans,
         remote_local_completion_buckets=remote_completion_bucket_plans,
         chain_prefix_buckets=(),
         chain_completion_buckets=(),
         prefix_table_is_dense_ordered=(
-            prefix_family_order == tuple(range(spec.family_count))
+            tuple(segment.family_index for segment in prefix_segments)
+            == tuple(range(spec.family_count))
         ),
         attention_to_gdn=identity_exchange,
         gdn_to_attention=identity_exchange,
         attention_token_ranges=local_token_ranges,
         gdn_token_ranges=local_token_ranges,
-        attention_token_count=len(local_tokens),
-        gdn_token_count=len(local_tokens),
+        attention_token_count=local_token_count,
+        gdn_token_count=local_token_count,
         parent_state_exchange_family_indices=tuple(
-            sorted(
-                family.family_index
-                for family in spec.families
-                if completion_owner_by_family[family.family_index]
-                != prefix_owner_by_family[family.family_index]
-                and family.completions
-            )
+            family_index
+            for family_index in parent_state_exchange_family_indices
+            if family_index not in remote_prefix_tail_families
         ),
-        parent_state_transfers=_transfer_plans_to_device(
+        parent_state_transfers=_filter_parent_state_transfers(
             _build_parent_state_transfer_plans(parent_state_transfer_families),
+            excluded_families=remote_prefix_tail_families,
             device=device,
         ),
         prefix_boundary_buckets=prefix_boundary_buckets,
         prefix_tail_buckets=prefix_tail_buckets,
-        completion_warmup_buckets=completion_warmup_buckets,
+        completion_with_prefix_tail_buckets=completion_with_prefix_tail_buckets,
+        remote_prefix_tail_buckets=remote_prefix_tail_buckets,
+        remote_completion_with_prefix_tail_buckets=remote_completion_with_prefix_tail_buckets,
+        remote_prefix_tail_exchange=remote_prefix_tail_exchange,
+        remote_prefix_tail_backward_exchange=remote_prefix_tail_backward_exchange,
+        remote_prefix_tail_state_transfers=remote_prefix_tail_state_transfers,
     )
 
 
-def _rebalance_local_completion_bundles(
+def _rebalance_local_completion_segments(
     spec: GdnPackedExecutionSpec,
     *,
     prefix_owner_by_family: tuple[int, ...],
-    completion_owner_by_family: tuple[int, ...],
+    completion_owners_by_family: tuple[tuple[int, ...], ...],
     initial_loads: tuple[int, ...],
     planner_config: GdnPlannerConfig,
-) -> tuple[int, ...]:
-    owners = list(completion_owner_by_family)
+) -> tuple[tuple[int, ...], ...]:
+    owners = [list(family_owners) for family_owners in completion_owners_by_family]
     loads = list(initial_loads)
+    remote_owners_by_family = [
+        {
+            owner
+            for owner in family_owners
+            if owner != prefix_owner_by_family[family_index]
+        }
+        for family_index, family_owners in enumerate(owners)
+    ]
+    transfer_count = sum(
+        len(remote_owners) for remote_owners in remote_owners_by_family
+    )
 
-    def score(candidate_loads: list[int], candidate_owners: list[int]) -> float:
+    def score(candidate_loads: list[int], candidate_transfer_count: int) -> float:
         max_load = max(candidate_loads, default=0)
         idle_tokens = sum(max_load - load for load in candidate_loads)
-        transfer_count = sum(
-            1
-            for index, owner in enumerate(candidate_owners)
-            if owner != prefix_owner_by_family[index]
-            and spec.families[index].completions
-        )
         return (
             max_load
             + planner_config.rank_idle_token_cost * idle_tokens
-            + planner_config.parent_state_exchange_penalty_tokens * transfer_count
+            + planner_config.parent_state_exchange_penalty_tokens
+            * candidate_transfer_count
         )
 
-    best_score = score(loads, owners)
+    best_score = score(loads, transfer_count)
     while True:
-        best_move: tuple[int, int, list[int], list[int], float] | None = None
+        best_move: (
+            tuple[int, int, int, tuple[int, ...], list[int], int, float] | None
+        ) = None
         for family in spec.families:
-            completion_tokens = sum(segment.length for segment in family.completions)
-            if completion_tokens <= 0:
-                continue
-            source = owners[family.family_index]
-            for dest in range(len(loads)):
-                if dest == source:
-                    continue
-                candidate_loads = list(loads)
-                candidate_owners = list(owners)
-                candidate_loads[source] -= completion_tokens
-                candidate_loads[dest] += completion_tokens
-                candidate_owners[family.family_index] = dest
-                candidate_score = score(candidate_loads, candidate_owners)
-                if candidate_score >= best_score:
-                    continue
-                if best_move is None or candidate_score < best_move[4]:
-                    best_move = (
-                        family.family_index,
-                        dest,
-                        candidate_loads,
-                        candidate_owners,
-                        candidate_score,
-                    )
+            family_owners = owners[family.family_index]
+            prefix_owner = prefix_owner_by_family[family.family_index]
+            original_remote_owners = remote_owners_by_family[family.family_index]
+            for source in sorted(set(family_owners)):
+                source_children = [
+                    child_index
+                    for child_index, owner in enumerate(family_owners)
+                    if owner == source
+                ]
+                ordered_children = sorted(
+                    source_children,
+                    key=lambda child_index: family.completions[child_index].length,
+                    reverse=True,
+                )
+                for dest in range(len(loads)):
+                    if dest == source:
+                        continue
+                    moved_tokens = 0
+                    moved_children = []
+                    for child_index in ordered_children:
+                        moved_tokens += family.completions[child_index].length
+                        moved_children.append(child_index)
+                        candidate_loads = list(loads)
+                        candidate_loads[source] -= moved_tokens
+                        candidate_loads[dest] += moved_tokens
+                        candidate_remote_owners = set(original_remote_owners)
+                        if source != prefix_owner and len(moved_children) == len(
+                            source_children
+                        ):
+                            candidate_remote_owners.discard(source)
+                        if dest != prefix_owner:
+                            candidate_remote_owners.add(dest)
+                        candidate_transfer_count = (
+                            transfer_count
+                            - len(original_remote_owners)
+                            + len(candidate_remote_owners)
+                        )
+                        candidate_score = score(
+                            candidate_loads, candidate_transfer_count
+                        )
+                        if candidate_score >= best_score:
+                            continue
+                        if best_move is None or candidate_score < best_move[-1]:
+                            best_move = (
+                                family.family_index,
+                                source,
+                                dest,
+                                tuple(moved_children),
+                                candidate_loads,
+                                candidate_transfer_count,
+                                candidate_score,
+                            )
         if best_move is None:
-            return tuple(owners)
-        _, _, loads, owners, best_score = best_move
+            return tuple(tuple(item) for item in owners)
+        (
+            family_index,
+            _source,
+            dest,
+            moved_children,
+            loads,
+            transfer_count,
+            best_score,
+        ) = best_move
+        for child_index in moved_children:
+            owners[family_index][child_index] = dest
+        prefix_owner = prefix_owner_by_family[family_index]
+        remote_owners_by_family[family_index] = {
+            owner for owner in set(owners[family_index]) if owner != prefix_owner
+        }
 
 
-def _materialize_local_family_rank_assignment(
+def _materialize_local_family_rank_assignments(
     spec: GdnPackedExecutionSpec,
     *,
-    cp_rank: int,
+    cp_size: int,
     prefix_owner_by_family: tuple[int, ...],
-    completion_owner_by_family: tuple[int, ...],
-) -> tuple[tuple[int, ...], tuple[GdnSegmentSpec, ...], tuple[GdnSegmentSpec, ...]]:
-    token_indices: list[int] = []
-    prefix_segments: list[GdnSegmentSpec] = []
-    completion_segments: list[GdnSegmentSpec] = []
+    completion_owners_by_family: tuple[tuple[int, ...], ...],
+) -> tuple[
+    tuple[
+        int,
+        tuple[tuple[int, int, int], ...],
+        tuple[GdnSegmentSpec, ...],
+        tuple[GdnSegmentSpec, ...],
+    ],
+    ...,
+]:
+    token_ranges_by_rank: list[list[tuple[int, int, int]]] = [
+        [] for _ in range(cp_size)
+    ]
+    token_counts_by_rank = [0] * cp_size
+    prefix_segments_by_rank: list[list[GdnSegmentSpec]] = [[] for _ in range(cp_size)]
+    completion_segments_by_rank: list[list[GdnSegmentSpec]] = [
+        [] for _ in range(cp_size)
+    ]
+    sequence_length = spec.sequence_length
     for family in spec.families:
         prefix_owner = prefix_owner_by_family[family.family_index]
-        completion_owner = completion_owner_by_family[family.family_index]
-        if prefix_owner == cp_rank:
-            prefix_segments.append(family.prefix)
-            token_indices.extend(family.prefix.linear_indices(spec.sequence_length))
-        for completion in family.completions:
-            if completion_owner == cp_rank:
-                completion_segments.append(completion)
-                token_indices.extend(completion.linear_indices(spec.sequence_length))
-    return tuple(token_indices), tuple(prefix_segments), tuple(completion_segments)
+        prefix_segments_by_rank[prefix_owner].append(family.prefix)
+        prefix_token_start = (
+            family.prefix.row_index * sequence_length + family.prefix.start
+        )
+        prefix_position_start = token_counts_by_rank[prefix_owner]
+        token_ranges_by_rank[prefix_owner].append(
+            (
+                prefix_token_start,
+                prefix_token_start + family.prefix.length,
+                prefix_position_start,
+            )
+        )
+        token_counts_by_rank[prefix_owner] = (
+            prefix_position_start + family.prefix.length
+        )
+        for completion, completion_owner in zip(
+            family.completions,
+            completion_owners_by_family[family.family_index],
+            strict=True,
+        ):
+            completion_segments_by_rank[completion_owner].append(completion)
+            completion_token_start = (
+                completion.row_index * sequence_length + completion.start
+            )
+            completion_position_start = token_counts_by_rank[completion_owner]
+            token_ranges_by_rank[completion_owner].append(
+                (
+                    completion_token_start,
+                    completion_token_start + completion.length,
+                    completion_position_start,
+                )
+            )
+            token_counts_by_rank[completion_owner] = (
+                completion_position_start + completion.length
+            )
+    return tuple(
+        (
+            token_counts_by_rank[rank],
+            tuple(token_ranges_by_rank[rank]),
+            tuple(prefix_segments_by_rank[rank]),
+            tuple(completion_segments_by_rank[rank]),
+        )
+        for rank in range(cp_size)
+    )
 
 
 def _empty_local_family_rank_execution_plan(
@@ -2374,6 +2845,8 @@ def _empty_local_family_rank_execution_plan(
     cp_rank: int,
     cp_size: int,
 ) -> GdnRankExecutionPlan:
+    from art.megatron.gdn.layout import GdnCpExchangePlan
+
     identity_exchange = GdnCpExchangePlan.model_construct(
         cp_size=cp_size,
         source_token_counts_by_rank=tuple(0 for _ in range(cp_size)),
@@ -2390,8 +2863,6 @@ def _empty_local_family_rank_execution_plan(
         real_token_mask=torch.ones(1, 0, device=device, dtype=torch.bool),
         family_count=spec.family_count,
         completion_count=spec.completion_count,
-        prefix_buckets=(),
-        completion_buckets=(),
         local_prefix_buckets=(),
         local_completion_buckets=(),
         ready_local_completion_buckets=(),
@@ -2417,6 +2888,8 @@ def _can_chain_segment(
     planner_config: GdnPlannerConfig,
 ) -> bool:
     if segment.length < cp_size:
+        return False
+    if segment.length // FLA_CHUNK_SIZE < cp_size:
         return False
     per_rank = segment.length / cp_size
     if per_rank < planner_config.cp_chain_min_tokens_per_rank:
@@ -2501,6 +2974,8 @@ def _can_chain_prefix_segment(
 ) -> bool:
     if segment.length < cp_size:
         return False
+    if segment.length // FLA_CHUNK_SIZE < cp_size:
+        return False
     per_rank = segment.length / cp_size
     if per_rank < planner_config.cp_chain_min_tokens_per_rank:
         return False
@@ -2556,13 +3031,14 @@ def _score_cp_segment_schedule(
     max_load = max(rank_loads, default=0)
     idle_tokens = sum(max_load - load for load in rank_loads)
     empty_rank_count = sum(1 for load in rank_loads if load == 0)
+    empty_rank_penalty = min(planner_config.empty_rank_penalty_tokens, max_load)
     local_launches = sum(
         1 for segments in schedule.local_prefix_segments_by_rank if segments
     ) + sum(1 for segments in schedule.local_completion_segments_by_rank if segments)
     return (
         max_load
         + planner_config.rank_idle_token_cost * idle_tokens
-        + planner_config.empty_rank_penalty_tokens * empty_rank_count
+        + empty_rank_penalty * empty_rank_count
         + planner_config.local_fork_launch_penalty_tokens * local_launches
         + planner_config.layout_cross_rank_token_cost * schedule.cross_rank_token_count
         + planner_config.parent_state_exchange_penalty_tokens
@@ -2795,10 +3271,7 @@ def _append_chain_segment(
             rank_loads[rank] += len(shard)
         return 0
     cross_rank_tokens = 0
-    shard_lengths = tuple(
-        (segment.length * (rank + 1)) // cp_size - (segment.length * rank) // cp_size
-        for rank in range(cp_size)
-    )
+    shard_lengths = _fla_aligned_chain_shard_lengths(segment.length, cp_size=cp_size)
     start = 0
     for rank, shard_length in enumerate(shard_lengths):
         end = start + shard_length
@@ -2833,8 +3306,9 @@ def _chain_rank_token_indices(
     cp_size: int,
 ) -> range:
     token_start = _segment_token_start(segment, spec.sequence_length)
-    start = (segment.length * cp_rank) // cp_size
-    end = (segment.length * (cp_rank + 1)) // cp_size
+    lengths = _fla_aligned_chain_shard_lengths(segment.length, cp_size=cp_size)
+    start = sum(lengths[:cp_rank])
+    end = start + lengths[cp_rank]
     if start >= end:
         raise ValueError(
             "CP chain planning requires non-empty shards; "
@@ -2842,6 +3316,23 @@ def _chain_rank_token_indices(
             f"length={segment.length} cp_size={cp_size}"
         )
     return range(token_start + start, token_start + end)
+
+
+def _fla_aligned_chain_shard_lengths(length: int, *, cp_size: int) -> tuple[int, ...]:
+    full_chunks = int(length) // FLA_CHUNK_SIZE
+    if full_chunks < int(cp_size):
+        raise ValueError(
+            "CP chain planning requires at least one full FLA chunk per rank; "
+            f"length={length} cp_size={cp_size}"
+        )
+    base_chunks = full_chunks // int(cp_size)
+    extra_chunks = full_chunks % int(cp_size)
+    chunk_counts = tuple(
+        base_chunks + (1 if rank < extra_chunks else 0) for rank in range(int(cp_size))
+    )
+    lengths = [count * FLA_CHUNK_SIZE for count in chunk_counts]
+    lengths[-1] += int(length) - full_chunks * FLA_CHUNK_SIZE
+    return tuple(lengths)
 
 
 def _attention_contiguous_chain_shards(
@@ -2871,6 +3362,8 @@ def _attention_contiguous_chain_shards(
         shards.append(range(start, end))
         cursor = end
     if cursor != segment_end:
+        return None
+    if any(len(shard) % FLA_CHUNK_SIZE != 0 for shard in shards[:-1]):
         return None
     return tuple(shards)
 

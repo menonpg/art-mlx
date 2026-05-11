@@ -20,16 +20,25 @@ from .forward_trace import ForwardTraceCapture
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_correctness")
+LIVE_TRAINING_LOG_PATH = REPO_ROOT / ".local" / "live_training.log"
 ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
 
 REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
+ORACLE_BASE_MODEL_ENV = "ART_ORACLE_BASE_MODEL"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
 SensitivityMutation = str
+FlexBackend = Literal[
+    "FLASH",
+    "TRITON",
+    "TRITON_LEGACY",
+    "TRITON_LEGACY_INNER_FP32",
+    "TRITON_LEGACY_FULL_FP32",
+]
 
 DEFAULT_SENSITIVITY_MUTATION = "skip_finalize"
 SHARED_SENSITIVITY_MUTATIONS = (
@@ -66,12 +75,24 @@ REQUIRED_PACKED_TENSOR_FILES = (
     "weights.pt",
 )
 NON_FINITE_METRIC_VALUE = 1e30
+MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
+MEAN_ABS_PCT_OUTLIER_TRIM_K = 3
+MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL = 32
+ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = 1.0
+FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT = 3e-4
+FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
+ABS_PCT_EXACT_ZERO_PHASES = frozenset({"forward", "grads", "deltas"})
+ORACLE_EXACT_ZERO_ABS_PCT_LIMIT = 10
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\."
 )
 LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
+FORWARD_TRACE_LAYER_OUTPUT_RE = re.compile(
+    r"\.decoder\.layers\.(?:\d+|__layer_avg__)\.call_\d+$"
+)
+FORWARD_TRACE_ROUTER_RE = re.compile(r"\.mlp\.router\.call_\d+$")
 PHASE_PRINT_ORDER = {
     "forward": 0,
     "router_scores": 1,
@@ -81,6 +102,10 @@ PHASE_PRINT_ORDER = {
     "grads": 5,
     "deltas": 6,
 }
+
+
+def _format_elapsed(seconds: float) -> str:
+    return f"{seconds:.1f}s"
 
 
 def oracle_output_slug(
@@ -99,20 +124,16 @@ def supported_sensitivity_mutations_for_objective(
     *,
     is_moe: bool = True,
 ) -> tuple[SensitivityMutation, ...]:
-    del is_moe
+    if not is_moe:
+        return (DEFAULT_SENSITIVITY_MUTATION,)
     return OBJECTIVE_SENSITIVITY_MUTATIONS[objective]
 
 
 def objective_supports_sensitivity_mutation(
     objective: OracleObjective,
     mutation: SensitivityMutation,
-    *,
-    is_moe: bool = True,
 ) -> bool:
-    return mutation in supported_sensitivity_mutations_for_objective(
-        objective,
-        is_moe=is_moe,
-    )
+    return mutation in supported_sensitivity_mutations_for_objective(objective)
 
 
 def selected_oracle_objectives() -> list[OracleObjective]:
@@ -176,24 +197,20 @@ class Topology(BaseModel):
 
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
-    Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
+    Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
+    Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
+    Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
 ]
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
 DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
 DENSE_SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
-DENSE_DP_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=1, etp=1, dp=2, sp=False)
 SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
     mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
 }
@@ -210,23 +227,15 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
 }
 
 
-def oracle_topology(*, is_moe: bool = True) -> Topology:
-    return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
-
-
-def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
-    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
-
-
 class PackedTensorConfig(BaseModel):
     """Controls synthetic packed tensor generation used by oracle harness runs."""
 
     num_sequences: int = 4
-    sequence_length: int = 256
-    prefill_tokens: int = 64
+    sequence_length: int = 1024
+    prefill_tokens: int = 256
     completion_branches_per_prefix: int = Field(default=2, ge=1)
     decode_tokens_jitter: int = Field(default=32, ge=0)
-    decode_tokens: int = 64
+    decode_tokens: int = 128
     packing_mode: Literal["stop_early", "truncate"] = "stop_early"
     vocab_high: int = 8192
 
@@ -287,7 +296,6 @@ class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
     base_model: str
-    is_moe: bool = True
     precision: Literal["bf16", "fp32"] = "fp32"
     num_layers: int = 4
     seed: int = 20260304
@@ -298,7 +306,12 @@ class OracleCaseConfig(BaseModel):
     loss_scale: float = 1
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
-    allow_unvalidated_arch: bool = False
+
+    @property
+    def is_moe(self) -> bool:
+        from art.megatron.model_support import get_model_support_handler
+
+        return bool(get_model_support_handler(self.base_model).is_moe)
 
 
 class DiskPackedTensorsSpec(BaseModel):
@@ -334,6 +347,7 @@ class WorkerRunRequest(BaseModel):
     moe_routing_replay_path: str | None = None
     moe_routing_replay_strict: bool = True
     capture_moe_routing_bundle_path: str | None = None
+    flex_backend: FlexBackend | None = None
 
 
 class StepTrace(BaseModel):
@@ -342,6 +356,9 @@ class StepTrace(BaseModel):
     step_index: int
     loss: float
     probs_corr: float
+    micro_sample_indices: list[int | None] = Field(default_factory=list)
+    micro_losses: list[float] = Field(default_factory=list)
+    debug_files: dict[str, str] = Field(default_factory=dict)
     output_file: str
     grads_file: str
     deltas_file: str
@@ -378,6 +395,8 @@ class MetricRow(BaseModel):
     relative_l2: float
     typical_abs_scale: float
     mean_abs_pct: float
+    abs_pct_source_numel: float = 0.0
+    abs_pct_trimmed_numel: float = 0.0
     topk_mismatch_fraction: float | None = None
     top1_mismatch_fraction: float | None = None
     pass_signal: bool = True
@@ -388,7 +407,7 @@ class VariantSpec(BaseModel):
     """Declares how to execute and evaluate one candidate variant against the oracle."""
 
     name: str
-    objective: OracleObjective
+    objective: OracleObjective = "rl"
     topology: Topology
     pass_fn_by_phase: dict[str, PhasePassFn] = Field(
         default_factory=dict,
@@ -400,6 +419,7 @@ class VariantSpec(BaseModel):
     mutation: SensitivityMutation | None = None
     expected_signal: Literal["pass", "fail"] = "pass"
     force_regenerate: bool = True
+    flex_backend: FlexBackend | None = None
 
     def resolved_output_slug(self) -> str:
         """Resolves the artifact slug for this run, including mutation suffix when present."""
@@ -429,6 +449,32 @@ class VariantReport(BaseModel):
     metrics: list[MetricRow] = Field(repr=False)
 
 
+def _abs_pct_outlier_trim_count(numel: int, trim_k: int) -> int:
+    """Returns how many largest elementwise percentage terms to trim."""
+    if trim_k <= 0 or numel < MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL:
+        return 0
+    return min(trim_k, max(numel - 1, 0))
+
+
+def _mean_abs_pct_from_values(
+    abs_pct_values: torch.Tensor,
+    *,
+    trim_k: int = MEAN_ABS_PCT_OUTLIER_TRIM_K,
+) -> tuple[float, int, int]:
+    """Computes mean_abs_pct from elementwise ratios with explicit top-k trimming."""
+    values = abs_pct_values.detach().float().reshape(-1)
+    source_numel = int(values.numel())
+    trim_count = _abs_pct_outlier_trim_count(source_numel, trim_k)
+    if source_numel == 0:
+        return 0.0, 0, 0
+    total = values.sum()
+    if trim_count > 0:
+        total = total - torch.topk(values, trim_count).values.sum()
+    kept_numel = source_numel - trim_count
+    mean_abs_pct = (float(total.item()) / kept_numel) * 100.0
+    return _finite_metric(mean_abs_pct), source_numel, trim_count
+
+
 class DiffAccumulator:
     """Accumulates diff statistics across tensors and router-id mismatch counters."""
 
@@ -439,12 +485,37 @@ class DiffAccumulator:
         self.ref_sq_sum = 0.0
         self.ref_abs_sum = 0.0
         self.candidate_abs_sum = 0.0
+        self.abs_pct_sum = 0.0
+        self.abs_pct_numel = 0
+        self.abs_pct_top_values: list[float] = []
         self.router_topk_total = 0
         self.router_topk_mismatch = 0
         self.router_top1_total = 0
         self.router_top1_mismatch = 0
 
-    def update(self, reference, candidate) -> None:  # type: ignore[no-untyped-def]
+    def _record_abs_pct_values(self, values: torch.Tensor) -> None:
+        """Tracks the row-level top-k percentage terms without storing all values."""
+        flat = values.detach().float().reshape(-1)
+        if flat.numel() == 0:
+            return
+        self.abs_pct_numel += int(flat.numel())
+        self.abs_pct_sum += float(flat.sum().item())
+        top_count = min(MEAN_ABS_PCT_OUTLIER_TRIM_K, int(flat.numel()))
+        if top_count == 0:
+            return
+        top_values = torch.topk(flat, top_count).values.tolist()
+        self.abs_pct_top_values.extend(float(value) for value in top_values)
+        self.abs_pct_top_values = sorted(self.abs_pct_top_values, reverse=True)[
+            :MEAN_ABS_PCT_OUTLIER_TRIM_K
+        ]
+
+    def update(  # type: ignore[no-untyped-def]
+        self,
+        reference,
+        candidate,
+        *,
+        exclude_reference_exact_zeros_from_abs_pct: bool = False,
+    ) -> None:
         """Adds one tensor pair into the accumulator."""
         ref = reference.detach().float()
         cand = candidate.detach().float()
@@ -457,14 +528,29 @@ class DiffAccumulator:
         self.ref_sq_sum += float(ref.square().sum().item())
         self.ref_abs_sum += float(ref.abs().sum().item())
         self.candidate_abs_sum += float(cand.abs().sum().item())
+        abs_pct_ref = ref
+        abs_pct_diff = diff
+        if exclude_reference_exact_zeros_from_abs_pct:
+            abs_pct_mask = ref != 0
+            abs_pct_ref = ref[abs_pct_mask]
+            abs_pct_diff = diff[abs_pct_mask]
+        if abs_pct_diff.numel() > 0:
+            self._record_abs_pct_values(
+                abs_pct_diff / abs_pct_ref.abs().clamp_min(MEAN_ABS_PCT_DENOMINATOR_EPS)
+            )
 
     @staticmethod
-    def layer_averaged_summary(reference_stack, candidate_stack) -> dict[str, float]:  # type: ignore[no-untyped-def]
+    def layer_averaged_summary(  # type: ignore[no-untyped-def]
+        reference_stack,
+        candidate_stack,
+        *,
+        exclude_reference_exact_zeros_from_abs_pct: bool = False,
+    ) -> dict[str, float]:
         """Computes normal per-layer summaries, then averages those summaries."""
         ref = reference_stack.detach().float()
         cand = candidate_stack.detach().float()
         layer_count = int(ref.shape[0])
-        metrics = {
+        averaged_metrics = {
             k: 0.0
             for k in [
                 "numel",
@@ -472,15 +558,46 @@ class DiffAccumulator:
                 "relative_l2",
                 "typical_abs_scale",
                 "candidate_abs_scale",
-                "mean_abs_pct",
             ]
         }
+        abs_pct_ratio = (cand - ref).abs() / ref.abs().clamp_min(
+            MEAN_ABS_PCT_DENOMINATOR_EPS
+        )
+        if exclude_reference_exact_zeros_from_abs_pct:
+            abs_pct_ratio = torch.where(
+                ref != 0, abs_pct_ratio, torch.full_like(abs_pct_ratio, torch.nan)
+            )
+        layer_abs_pct = torch.nanmean(abs_pct_ratio, dim=0).reshape(-1)
+        layer_abs_pct = layer_abs_pct[~torch.isnan(layer_abs_pct)]
+        mean_abs_pct, abs_pct_source_numel, abs_pct_trimmed_numel = (
+            _mean_abs_pct_from_values(layer_abs_pct)
+        )
         for layer_index in range(layer_count):
             layer_accumulator = DiffAccumulator()
-            layer_accumulator.update(ref[layer_index], cand[layer_index])
+            layer_accumulator.update(
+                ref[layer_index],
+                cand[layer_index],
+                exclude_reference_exact_zeros_from_abs_pct=(
+                    exclude_reference_exact_zeros_from_abs_pct
+                ),
+            )
             layer_summary = layer_accumulator.as_summary()
-            metrics = {k: metrics[k] + layer_summary[k] for k in metrics.keys()}
-        return {k: _finite_metric(metrics[k] / layer_count) for k in metrics.keys()}
+            averaged_metrics = {
+                k: averaged_metrics[k] + layer_summary[k]
+                for k in averaged_metrics.keys()
+            }
+        summary = {
+            k: _finite_metric(averaged_metrics[k] / layer_count)
+            for k in averaged_metrics.keys()
+        }
+        summary["mean_abs_pct"] = mean_abs_pct
+        summary["abs_pct_source_numel"] = _finite_metric(
+            float(abs_pct_source_numel), default=0.0
+        )
+        summary["abs_pct_trimmed_numel"] = _finite_metric(
+            float(abs_pct_trimmed_numel), default=0.0
+        )
+        return summary
 
     def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
         """Adds router top-k id mismatch counts into the accumulator."""
@@ -516,13 +633,26 @@ class DiffAccumulator:
                 "typical_abs_scale": 0.0,
                 "candidate_abs_scale": 0.0,
                 "mean_abs_pct": 0.0,
+                "abs_pct_source_numel": 0.0,
+                "abs_pct_trimmed_numel": 0.0,
                 "topk_mismatch_fraction": topk_fraction,
                 "top1_mismatch_fraction": top1_fraction,
             }
         mean_abs = self.abs_sum / self.numel
         typical_abs = self.ref_abs_sum / self.numel
         candidate_abs = self.candidate_abs_sum / self.numel
-        mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
+        trim_count = _abs_pct_outlier_trim_count(
+            self.abs_pct_numel, MEAN_ABS_PCT_OUTLIER_TRIM_K
+        )
+        trimmed_abs_pct_sum = self.abs_pct_sum - sum(
+            self.abs_pct_top_values[:trim_count]
+        )
+        kept_abs_pct_numel = self.abs_pct_numel - trim_count
+        mean_abs_pct = (
+            (trimmed_abs_pct_sum / kept_abs_pct_numel) * 100.0
+            if kept_abs_pct_numel > 0
+            else 0.0
+        )
         return {
             "numel": _finite_metric(float(self.numel), default=0.0),
             "mean_abs_diff": _finite_metric(mean_abs),
@@ -532,6 +662,10 @@ class DiffAccumulator:
             "typical_abs_scale": _finite_metric(typical_abs, default=0.0),
             "candidate_abs_scale": _finite_metric(candidate_abs, default=0.0),
             "mean_abs_pct": _finite_metric(mean_abs_pct),
+            "abs_pct_source_numel": _finite_metric(
+                float(self.abs_pct_numel), default=0.0
+            ),
+            "abs_pct_trimmed_numel": _finite_metric(float(trim_count), default=0.0),
             "topk_mismatch_fraction": _finite_metric(topk_fraction, default=1.0),
             "top1_mismatch_fraction": _finite_metric(top1_fraction, default=1.0),
         }
@@ -589,24 +723,12 @@ def selected_sensitivity_mutations_for_objective(
     mutations: list[SensitivityMutation],
     *,
     is_moe: bool = True,
-    max_world_size: int | None = None,
 ) -> list[SensitivityMutation]:
     return [
         mutation
         for mutation in mutations
-        if objective_supports_sensitivity_mutation(
-            objective,
-            mutation,
-            is_moe=is_moe,
-        )
-        and (
-            max_world_size is None
-            or sensitivity_topology_for_mutation(
-                mutation,
-                is_moe=is_moe,
-            ).world_size()
-            <= max_world_size
-        )
+        if mutation
+        in supported_sensitivity_mutations_for_objective(objective, is_moe=is_moe)
     ]
 
 
@@ -617,12 +739,6 @@ def sensitivity_topology_for_mutation(
 ) -> Topology:
     """Returns the sensitivity topology required for one mutation."""
     if not is_moe:
-        if mutation in {
-            "dp_grad_accumulation_seqs",
-            "dp_local_token_normalization",
-            "sft_local_token_normalization",
-        }:
-            return DENSE_DP_SENSITIVITY_TOPOLOGY
         return DENSE_SENSITIVITY_TOPOLOGY
     return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
 
@@ -633,8 +749,6 @@ def sensitivity_required_world_size(
     is_moe: bool = True,
 ) -> int:
     """Returns the max world-size required by a selected mutation set."""
-    if not mutations:
-        return 0
     return max(
         sensitivity_topology_for_mutation(mutation, is_moe=is_moe).world_size()
         for mutation in mutations
@@ -651,11 +765,15 @@ def keep_topology_artifacts() -> bool:
     return _truthy(os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV))
 
 
-def case_config(
-    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
-) -> OracleCaseConfig:
+DEFAULT_ORACLE_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+
+def case_config(base_model: str | None = None) -> OracleCaseConfig:
     """Builds the deterministic default oracle case config."""
-    return OracleCaseConfig(base_model=base_model)
+    return OracleCaseConfig(
+        base_model=base_model
+        or os.environ.get(ORACLE_BASE_MODEL_ENV, DEFAULT_ORACLE_BASE_MODEL)
+    )
 
 
 def available_gpu_count() -> int:
@@ -663,6 +781,16 @@ def available_gpu_count() -> int:
     import torch
 
     return int(torch.cuda.device_count())
+
+
+def oracle_topology(*, is_moe: bool = True) -> Topology:
+    """Returns the canonical single-rank oracle topology for a model family."""
+    return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
+
+
+def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
+    """Returns the correctness topology list for a model family."""
+    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
@@ -868,7 +996,10 @@ def _build_packed_tensors(
                 )
                 weights[sequence_index, cursor:completion_end] = 1.0
                 cursor = completion_end
+                if completion_take < completion_length:
+                    break
 
+    # Ensure paired cross-DP rows are never token-identical across valid tokens.
     half = config.num_sequences // 2
     if half > 0 and config.num_sequences % 2 == 0:
         valid_lengths = (group_ids != -1).sum(dim=1)
@@ -1039,6 +1170,13 @@ def _expert_agnostic_param_key(param: str) -> str:
     return f"{param[:start]}__expert_avg__{param[end:]}"
 
 
+def _is_forward_expert_lora_trace(param: str) -> bool:
+    """Returns whether one forward-trace row is an expert LoRA internal."""
+    return ".mlp.experts." in param and (
+        ".lora." in param or ".gate_lora." in param or ".up_lora." in param
+    )
+
+
 def _stacked_layers(
     pairs: list[tuple[str, Any, Any]],
 ) -> list[tuple[str, Any, Any]]:
@@ -1078,14 +1216,105 @@ def _stacked_layers(
     return stacked_pairs
 
 
+def _is_forward_trace_layer_output_param(param: str) -> bool:
+    """Returns whether one flattened forward-trace key is a decoder layer output."""
+    return FORWARD_TRACE_LAYER_OUTPUT_RE.search(param) is not None
+
+
+def _is_abs_pct_exact_zero_exclusion_param(phase: str, param: str) -> bool:
+    """Returns whether exact oracle zeros are excluded from mean_abs_pct."""
+    if phase == "forward":
+        return FORWARD_TRACE_ROUTER_RE.search(param) is None
+    return phase in {"grads", "deltas"}
+
+
+def _abs_pct_exact_zero_exclusion_count(
+    phase: str,
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+) -> int:
+    """Counts exact-zero oracle entries guarded by the mean_abs_pct exclusion."""
+    zero_count = 0
+    for key, value in reference.items():
+        zero_count += _abs_pct_exact_zero_exclusion_count_for_pair(
+            phase, key, value, candidate[key]
+        )
+    return zero_count
+
+
+def _abs_pct_exact_zero_exclusion_count_for_pair(
+    phase: str,
+    param: str,
+    reference: Any,
+    candidate: Any,
+) -> int:
+    if not _is_abs_pct_exact_zero_exclusion_param(phase, param):
+        return 0
+    if not isinstance(reference, torch.Tensor) or not isinstance(
+        candidate, torch.Tensor
+    ):
+        return 0
+    if tuple(reference.shape) != tuple(candidate.shape):
+        return 0
+    zero_mask = reference.detach() == 0
+    # MoE maps naturally contain exact-zero inactive paths. Matching zeros do not
+    # hide a diff; only candidate-nonzero zero-denominator entries can.
+    zero_mask = zero_mask & (candidate.detach() != 0)
+    return int(zero_mask.sum().item())
+
+
+def _abs_pct_exact_zero_exclusion_count_for_pairs(
+    phase: str, pairs: list[tuple[str, Any, Any]]
+) -> int:
+    zero_count = 0
+    for param, reference, candidate in pairs:
+        aligned_candidate = _align_sequence_parallel(reference, candidate)
+        if aligned_candidate is None:
+            continue
+        zero_count += _abs_pct_exact_zero_exclusion_count_for_pair(
+            phase, param, reference, aligned_candidate
+        )
+    return zero_count
+
+
+def _assert_abs_pct_oracle_exact_zero_count(
+    phase: str,
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    """Guards the narrow exact-zero mean_abs_pct exclusion."""
+    zero_count = _abs_pct_exact_zero_exclusion_count(phase, reference, candidate)
+    if zero_count > ORACLE_EXACT_ZERO_ABS_PCT_LIMIT:
+        raise RuntimeError(
+            f"{phase} oracle contains too many exact-zero elements excluded "
+            "from mean_abs_pct: "
+            f"{zero_count} > {ORACLE_EXACT_ZERO_ABS_PCT_LIMIT}"
+        )
+
+
+def _assert_abs_pct_oracle_exact_zero_count_for_pairs(
+    phase: str, pairs: list[tuple[str, Any, Any]]
+) -> None:
+    """Guards exact-zero exclusion after topology-aware tensor alignment."""
+    zero_count = _abs_pct_exact_zero_exclusion_count_for_pairs(phase, pairs)
+    if zero_count > ORACLE_EXACT_ZERO_ABS_PCT_LIMIT:
+        raise RuntimeError(
+            f"{phase} oracle contains too many exact-zero elements excluded "
+            "from mean_abs_pct: "
+            f"{zero_count} > {ORACLE_EXACT_ZERO_ABS_PCT_LIMIT}"
+        )
+
+
 class VariantRunner:
     """Runs oracle/candidate variants and emits row-level comparison reports."""
 
     def __init__(
         self,
         *,
-        objective: OracleObjective,
+        objective: OracleObjective = "rl",
         case_config: OracleCaseConfig,
+        oracle_flex_backend: FlexBackend | None = None,
+        variant_flex_backend: FlexBackend | None = None,
         console: Console | None = None,
     ) -> None:
         self.objective = objective
@@ -1093,16 +1322,164 @@ class VariantRunner:
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
-        self.oracle_topology = oracle_topology(is_moe=case_config.is_moe)
-        self.oracle_slug = oracle_output_slug(objective, self.oracle_topology)
+        self.oracle_slug = oracle_output_slug(objective, ORACLE_TOPOLOGY)
         self.oracle_dir = self.case_dir / self.oracle_slug
         self.oracle_routing_bundle_dir = (
             self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
         )
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
+        self.oracle_flex_backend = oracle_flex_backend
+        self.variant_flex_backend = variant_flex_backend
         self.console = console or Console(width=140)
         self._oracle_initialized = False
         self._oracle_regenerated = False
+        self._sample_valid_lengths_cache: tuple[int, ...] | None = None
+
+    def _sample_valid_lengths(self) -> tuple[int, ...]:
+        if self._sample_valid_lengths_cache is not None:
+            return self._sample_valid_lengths_cache
+        from art.megatron.context_parallel.builder import (
+            build_shared_prefix_attention_spec,
+        )
+        from art.preprocessing.pack import packed_tensors_from_dir
+
+        packed_tensors = packed_tensors_from_dir(
+            **self.case_artifacts.packed_tensors.model_dump(exclude_none=True)
+        )
+        group_ids = packed_tensors["group_ids"]
+        parent_ids = packed_tensors["parent_ids"]
+        self._sample_valid_lengths_cache = tuple(
+            int(
+                build_shared_prefix_attention_spec(
+                    group_ids=group_ids[row_index : row_index + 1],
+                    parent_ids=parent_ids[row_index : row_index + 1],
+                )
+                .rows[0]
+                .valid_tokens
+            )
+            for row_index in range(int(group_ids.shape[0]))
+        )
+        return self._sample_valid_lengths_cache
+
+    def _step_micro_sample_indices(self, step: StepTrace) -> list[int | None]:
+        base_sample_index = (
+            step.step_index * self.case_config.grad_accumulation_sequences
+        )
+        expected = [
+            sample_index
+            if sample_index < self.case_artifacts.packed_tensors.num_sequences
+            else None
+            for sample_index in range(
+                base_sample_index,
+                base_sample_index + self.case_config.grad_accumulation_sequences,
+            )
+        ]
+        if step.micro_sample_indices and len(step.micro_sample_indices) == len(
+            expected
+        ):
+            return list(step.micro_sample_indices)
+        return expected
+
+    def _load_output_tensor_map(
+        self,
+        topology_dir: Path,
+        step: StepTrace,
+    ) -> dict[str, torch.Tensor]:
+        tensor = _load_output_tensor(topology_dir, step)
+        if isinstance(tensor, list):
+            outputs = tensor
+        elif isinstance(tensor, torch.Tensor) and tensor.ndim >= 1:
+            outputs = [tensor[index] for index in range(int(tensor.shape[0]))]
+        else:
+            return {"logprobs": tensor}
+
+        sample_indices = self._step_micro_sample_indices(step)
+        valid_lengths = self._sample_valid_lengths()
+        output_map: dict[str, torch.Tensor] = {}
+        for output_index, output in enumerate(outputs):
+            key = f"logprobs.micro_{output_index:03d}"
+            if not isinstance(output, torch.Tensor):
+                output_map[key] = output
+                continue
+            if output_index < len(sample_indices):
+                sample_index = sample_indices[output_index]
+                if isinstance(sample_index, int):
+                    valid_length = int(valid_lengths[sample_index])
+                    target_length = max(valid_length - 1, 0)
+                    if output.ndim > 0 and int(output.shape[-1]) > target_length:
+                        output = output[..., :target_length].contiguous()
+            output_map[key] = output
+        return output_map
+
+    @staticmethod
+    def _load_loss_tensor_map(step: StepTrace) -> dict[str, torch.Tensor]:
+        return {"loss": torch.tensor([step.loss], dtype=torch.float32)}
+
+    def _trim_trace_padding(
+        self,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        valid_lengths = self._sample_valid_lengths()
+        sequence_length = int(self.case_config.packed_tensors.sequence_length)
+        if sequence_length <= 0:
+            return trace
+
+        for calls in trace.values():
+            for call in calls:
+                sample_index = call.get("micro_sample_index")
+                if not isinstance(sample_index, int):
+                    continue
+                valid_length = int(valid_lengths[sample_index])
+                if valid_length >= sequence_length:
+                    continue
+                row_token_uids = call.get("row_token_uids")
+                if (
+                    isinstance(row_token_uids, torch.Tensor)
+                    and row_token_uids.ndim == 1
+                ):
+                    local_token_uids = torch.remainder(row_token_uids, sequence_length)
+                    keep_rows = torch.nonzero(
+                        (row_token_uids >= 0) & (local_token_uids < valid_length),
+                        as_tuple=False,
+                    ).reshape(-1)
+                    if int(keep_rows.numel()) > 0 and int(keep_rows.numel()) < int(
+                        row_token_uids.numel()
+                    ):
+                        call["row_token_uids"] = row_token_uids.index_select(
+                            0, keep_rows
+                        ).contiguous()
+                        for key in (
+                            "primary_output",
+                            "router_topk_scores",
+                            "router_topk_ids",
+                        ):
+                            tensor = call.get(key)
+                            if (
+                                isinstance(tensor, torch.Tensor)
+                                and tensor.ndim > 0
+                                and int(tensor.shape[0]) == int(row_token_uids.numel())
+                            ):
+                                call[key] = tensor.index_select(
+                                    0, keep_rows
+                                ).contiguous()
+                        continue
+                for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
+                    tensor = call.get(key)
+                    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                        continue
+                    leading_dim = int(tensor.shape[0])
+                    if leading_dim <= valid_length:
+                        continue
+                    if leading_dim % sequence_length == 0:
+                        row_multiplier = leading_dim // sequence_length
+                        target_rows = valid_length * row_multiplier
+                    elif leading_dim <= sequence_length:
+                        target_rows = valid_length
+                    else:
+                        continue
+                    if 0 < target_rows < leading_dim:
+                        call[key] = tensor[:target_rows].contiguous()
+        return trace
 
     def _run_topology(
         self,
@@ -1113,6 +1490,7 @@ class VariantRunner:
         replay_bundle_dir: Path | None,
         capture_bundle_dir: Path | None,
         regenerate: bool,
+        flex_backend: FlexBackend | None = None,
     ) -> Path:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
@@ -1137,6 +1515,7 @@ class VariantRunner:
             capture_moe_routing_bundle_path=(
                 None if capture_bundle_dir is None else str(capture_bundle_dir)
             ),
+            flex_backend=flex_backend,
         )
         from .oracle_worker import run_worker_subprocess
 
@@ -1159,26 +1538,21 @@ class VariantRunner:
         )
         run_oracle_topology = partial(
             self._run_topology,
-            topology=self.oracle_topology,
+            topology=ORACLE_TOPOLOGY,
             mutation=None,
+            flex_backend=self.oracle_flex_backend,
             regenerate=True,
         )
-        if self.case_config.is_moe and need_capture:
+        if need_capture:
             run_oracle_topology(
                 output_slug=f"{self.oracle_slug}__oracle_capture",
                 replay_bundle_dir=None,
                 capture_bundle_dir=self.oracle_routing_bundle_dir,
             )
-        if (
-            regenerate
-            or not oracle_manifest.exists()
-            or not self.shared_init_path.exists()
-        ):
+        if regenerate or not oracle_manifest.exists():
             run_oracle_topology(
                 output_slug=self.oracle_slug,
-                replay_bundle_dir=(
-                    self.oracle_routing_bundle_dir if self.case_config.is_moe else None
-                ),
+                replay_bundle_dir=self.oracle_routing_bundle_dir,
                 capture_bundle_dir=None,
             )
         self._oracle_initialized = True
@@ -1198,9 +1572,8 @@ class VariantRunner:
             topology=variant.topology,
             output_slug=output_slug,
             mutation=variant.mutation,
-            replay_bundle_dir=(
-                self.oracle_routing_bundle_dir if self.case_config.is_moe else None
-            ),
+            flex_backend=variant.flex_backend or self.variant_flex_backend,
+            replay_bundle_dir=self.oracle_routing_bundle_dir,
             capture_bundle_dir=None,
             regenerate=variant.force_regenerate,
         )
@@ -1242,6 +1615,8 @@ class VariantRunner:
             "typical_abs_scale": 0.0,
             "candidate_abs_scale": 0.0,
             "mean_abs_pct": NON_FINITE_METRIC_VALUE,
+            "abs_pct_source_numel": 0.0,
+            "abs_pct_trimmed_numel": 0.0,
             "topk_mismatch_fraction": 1.0,
             "top1_mismatch_fraction": 1.0,
         }
@@ -1270,6 +1645,8 @@ class VariantRunner:
             relative_l2=summary["relative_l2"],
             typical_abs_scale=summary["typical_abs_scale"],
             mean_abs_pct=summary["mean_abs_pct"],
+            abs_pct_source_numel=summary.get("abs_pct_source_numel", 0.0),
+            abs_pct_trimmed_numel=summary.get("abs_pct_trimmed_numel", 0.0),
             topk_mismatch_fraction=summary.get("topk_mismatch_fraction"),
             top1_mismatch_fraction=summary.get("top1_mismatch_fraction"),
         )
@@ -1296,10 +1673,15 @@ class VariantRunner:
         pairs: list[tuple[str, Any, Any]],
         router_ids: bool = False,
         layer_averaged: bool = False,
+        exclude_reference_exact_zeros_from_abs_pct: bool = False,
     ) -> list[MetricRow]:
         """Builds rows from named tensor pairs with one shared diff path."""
         rows: list[MetricRow] = []
         for name, reference, candidate in pairs:
+            exclude_reference_zeros = (
+                exclude_reference_exact_zeros_from_abs_pct
+                and _is_abs_pct_exact_zero_exclusion_param(phase, name)
+            )
             reference_aligned = reference
             candidate_aligned = candidate
             aligned_candidate = _align_sequence_parallel(
@@ -1324,11 +1706,21 @@ class VariantRunner:
                 summary = accumulator.as_summary()
             elif layer_averaged:
                 summary = DiffAccumulator.layer_averaged_summary(
-                    reference_aligned, aligned_candidate
+                    reference_aligned,
+                    aligned_candidate,
+                    exclude_reference_exact_zeros_from_abs_pct=(
+                        exclude_reference_zeros
+                    ),
                 )
             else:
                 accumulator = DiffAccumulator()
-                accumulator.update(reference_aligned, aligned_candidate)
+                accumulator.update(
+                    reference_aligned,
+                    aligned_candidate,
+                    exclude_reference_exact_zeros_from_abs_pct=(
+                        exclude_reference_zeros
+                    ),
+                )
                 summary = accumulator.as_summary()
             rows.append(
                 self._build_metric_row(
@@ -1383,12 +1775,15 @@ class VariantRunner:
         )
         if not matching:
             return rows if rows is not None else []
+        exclude_reference_exact_zeros = phase in ABS_PCT_EXACT_ZERO_PHASES
         pairs = [
             (key, reference[key], candidate[key])
             for key in sorted(set(reference.keys()))
         ]
         if phase in {"forward", "grads", "deltas"}:
             pairs = _stacked_layers(pairs)
+        if exclude_reference_exact_zeros:
+            _assert_abs_pct_oracle_exact_zero_count_for_pairs(phase, pairs)
         rows = self._build_metric_rows_from_tensor_pairs(
             variant=variant,
             step_index=step_index,
@@ -1396,6 +1791,7 @@ class VariantRunner:
             pairs=pairs,
             router_ids=router_ids,
             layer_averaged=phase in {"forward", "grads", "deltas"},
+            exclude_reference_exact_zeros_from_abs_pct=exclude_reference_exact_zeros,
         )
         if phase in {"grads", "deltas"}:
             rows.extend(
@@ -1416,6 +1812,9 @@ class VariantRunner:
                     ),
                     router_ids=router_ids,
                     layer_averaged=True,
+                    exclude_reference_exact_zeros_from_abs_pct=(
+                        exclude_reference_exact_zeros
+                    ),
                 )
             )
         return rows
@@ -1429,6 +1828,63 @@ class VariantRunner:
             phase_entry = cast(dict[str, Any], step_entry.setdefault(row.phase, {}))
             phase_entry[row.param] = row.model_dump(mode="json")
         return step_summaries
+
+    @staticmethod
+    def _step_phase_rows(
+        rows: list[MetricRow], step_index: int, phase: str
+    ) -> list[MetricRow]:
+        return [
+            row for row in rows if row.step_index == step_index and row.phase == phase
+        ]
+
+    @classmethod
+    def _outputs_for_step_pass(cls, rows: list[MetricRow], step_index: int) -> bool:
+        output_rows = cls._step_phase_rows(rows, step_index, "outputs")
+        return bool(output_rows) and all(row.pass_signal for row in output_rows)
+
+    @classmethod
+    def _router_scores_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
+        router_rows = cls._step_phase_rows(rows, step_index, "router_scores")
+        return bool(router_rows) and all(
+            row.pass_signal and row.relative_l2 == 0.0 and row.mean_abs_pct == 0.0
+            for row in router_rows
+        )
+
+    @classmethod
+    def _router_topk_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
+        topk_rows = cls._step_phase_rows(rows, step_index, "router_topk_ids")
+        return bool(topk_rows) and all(
+            row.pass_signal
+            and row.topk_mismatch_fraction == 0.0
+            and row.top1_mismatch_fraction == 0.0
+            for row in topk_rows
+        )
+
+    @classmethod
+    def _apply_forward_expert_lora_trace_noise_passes(
+        cls, rows: list[MetricRow]
+    ) -> None:
+        """Reclassifies proven near-null expert LoRA forward trace noise only."""
+        steps = {row.step_index for row in rows}
+        gate_by_step = {
+            step: (
+                cls._outputs_for_step_pass(rows, step)
+                and cls._router_scores_exact(rows, step)
+                and cls._router_topk_exact(rows, step)
+            )
+            for step in steps
+        }
+        for row in rows:
+            if row.pass_signal:
+                continue
+            if row.phase != "forward" or not _is_forward_expert_lora_trace(row.param):
+                continue
+            if not gate_by_step.get(row.step_index, False):
+                continue
+            if row.relative_l2 > FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT:
+                continue
+            row.pass_signal = True
+            row.failure_reasons = [FORWARD_EXPERT_LORA_TRACE_NOISE_REASON]
 
     def compare_variant(self, variant: VariantSpec) -> VariantReport:
         """Compares one candidate variant against its reference topology."""
@@ -1488,19 +1944,23 @@ class VariantRunner:
             reference_manifest.steps, topology_manifest.steps
         ):
             step_index = reference_step.step_index
-            reference_trace = _load_forward_trace(reference_dir, step_index)
-            topology_trace = _load_forward_trace(topology_dir, step_index)
+            reference_trace = self._trim_trace_padding(
+                _load_forward_trace(reference_dir, step_index)
+            )
+            topology_trace = self._trim_trace_padding(
+                _load_forward_trace(topology_dir, step_index)
+            )
             map_phase_inputs = [
                 (
                     "outputs",
-                    {"logprobs": _load_output_tensor(reference_dir, reference_step)},
-                    {"logprobs": _load_output_tensor(topology_dir, topology_step)},
+                    self._load_output_tensor_map(reference_dir, reference_step),
+                    self._load_output_tensor_map(topology_dir, topology_step),
                     False,
                 ),
                 (
                     "losses",
-                    {"loss": torch.tensor([reference_step.loss], dtype=torch.float32)},
-                    {"loss": torch.tensor([topology_step.loss], dtype=torch.float32)},
+                    self._load_loss_tensor_map(reference_step),
+                    self._load_loss_tensor_map(topology_step),
                     False,
                 ),
                 (
@@ -1546,6 +2006,7 @@ class VariantRunner:
                         router_ids=router_ids,
                     )
                 )
+        self._apply_forward_expert_lora_trace_noise_passes(rows)
         pass_count = sum(1 for row in rows if row.pass_signal)
         fail_count = len(rows) - pass_count
         signal: Literal["pass", "fail"] = "pass" if fail_count == 0 else "fail"
@@ -1617,6 +2078,7 @@ class VariantRunner:
         detail_table.add_column("Status")
         detail_table.add_column("relative_l2", justify="right")
         detail_table.add_column("mean_abs_pct", justify="right")
+        detail_table.add_column("pct_trim", justify="right")
         detail_table.add_column("typical_abs", justify="right")
         detail_table.add_column("mean_abs_diff", justify="right")
         detail_table.add_column("Failure")
@@ -1641,6 +2103,7 @@ class VariantRunner:
                 status_text,
                 f"{row.relative_l2:.6g}",
                 f"{row.mean_abs_pct:.6g}%",
+                f"{row.abs_pct_trimmed_numel:.0f}/{row.abs_pct_source_numel:.0f}",
                 f"{row.typical_abs_scale:.6g}",
                 f"{row.mean_abs_diff:.6g}",
                 failure_text,
@@ -1687,17 +2150,19 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out = MetricThresholdRule(
-        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
-        minimums=non_zero_scales,
+    fwd_out_loss = MetricThresholdRule(
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT}
     )
-    loss = MetricThresholdRule(
-        limits={"relative_l2": 2e-2, "mean_abs_pct": 2.0},
+    fwd_out = MetricThresholdRule(
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT},
         minimums=non_zero_scales,
     )
     grads_deltas = MetricThresholdRule(
-        limits={"mean_abs_pct": 3.0},
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT},
         minimums=non_zero_scales,
+    )
+    router_scores_rule = MetricThresholdRule(
+        limits={"relative_l2": 0.0, "mean_abs_pct": 0.0}
     )
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay
@@ -1707,13 +2172,10 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
             }
         )
     )
-    return {
-        "forward": fwd_out,
-        "outputs": fwd_out,
-        "losses": loss,
-    } | {
+    return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
         "grads": grads_deltas,
         "deltas": grads_deltas,
+        "router_scores": router_scores_rule,
         "router_topk_ids": router_topk_rule,
     }
 
@@ -1721,8 +2183,9 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
 def _suite_variants(
     objective: OracleObjective,
     *,
-    is_moe: bool,
+    is_moe: bool = True,
     max_world_size: int | None = None,
+    variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
@@ -1736,6 +2199,7 @@ def _suite_variants(
                 objective=objective,
                 topology=topology,
                 pass_fn_by_phase=phase_pass,
+                flex_backend=variant_flex_backend,
             )
         )
     return variants
@@ -1745,17 +2209,25 @@ def run_suite(
     *,
     case_config: OracleCaseConfig,
     max_world_size: int | None = None,
+    oracle_flex_backend: FlexBackend | None = None,
+    variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
     for objective in selected_oracle_objectives():
-        runner = VariantRunner(objective=objective, case_config=case_config)
+        runner = VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            variant_flex_backend=variant_flex_backend,
+        )
         reports.extend(
             runner.run_suite(
                 _suite_variants(
                     objective,
                     is_moe=case_config.is_moe,
                     max_world_size=max_world_size,
+                    variant_flex_backend=variant_flex_backend,
                 )
             )
         )
@@ -1767,57 +2239,58 @@ def run_sensitivity_suite(
     case_config: OracleCaseConfig,
     mutations: list[SensitivityMutation],
     max_world_size: int | None = None,
+    oracle_flex_backend: FlexBackend | None = None,
+    variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantReport]:
     """Runs a list of sensitivity mutations and expects each to fail."""
     phase_pass = _default_phase_pass_fns()
     reports: list[VariantReport] = []
     ran_any_variants = False
-    matched_any_objective = False
     for objective in selected_oracle_objectives():
-        runner = VariantRunner(objective=objective, case_config=case_config)
-        objective_supported_mutations = selected_sensitivity_mutations_for_objective(
-            objective,
-            mutations,
-            is_moe=case_config.is_moe,
-        )
-        matched_any_objective = matched_any_objective or bool(
-            objective_supported_mutations
+        runner = VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            variant_flex_backend=variant_flex_backend,
         )
         objective_mutations = selected_sensitivity_mutations_for_objective(
             objective,
             mutations,
             is_moe=case_config.is_moe,
-            max_world_size=max_world_size,
         )
         if not objective_mutations:
             continue
-        variants = [
-            VariantSpec(
-                name=f"{objective}_sensitivity_{mutation}",
-                objective=objective,
-                topology=sensitivity_topology_for_mutation(
-                    mutation,
-                    is_moe=case_config.is_moe,
-                ),
-                mutation=mutation,
-                expected_signal="fail",
-                pass_fn_by_phase=phase_pass,
+        variants = []
+        for mutation in objective_mutations:
+            topology = sensitivity_topology_for_mutation(
+                mutation,
+                is_moe=case_config.is_moe,
             )
-            for mutation in objective_mutations
-        ]
+            if max_world_size is not None and topology.world_size() > max_world_size:
+                continue
+            variants.append(
+                VariantSpec(
+                    name=f"{objective}_sensitivity_{mutation}",
+                    objective=objective,
+                    topology=topology,
+                    mutation=mutation,
+                    expected_signal="fail",
+                    pass_fn_by_phase=phase_pass,
+                    flex_backend=variant_flex_backend,
+                )
+            )
+        if not variants:
+            continue
         ran_any_variants = True
         reports.extend(runner.run_suite(variants))
-    if ran_any_variants or (max_world_size is not None and matched_any_objective):
+    if ran_any_variants:
         return reports
     requested = ", ".join(mutations)
-    supported_by_objective = []
-    for objective in selected_oracle_objectives():
-        objective_supported = supported_sensitivity_mutations_for_objective(
-            objective,
-            is_moe=case_config.is_moe,
-        )
-        supported_by_objective.append(f"{objective}: {', '.join(objective_supported)}")
-    supported = ", ".join(supported_by_objective)
+    supported = ", ".join(
+        f"{objective}: "
+        f"{', '.join(supported_sensitivity_mutations_for_objective(objective, is_moe=case_config.is_moe))}"
+        for objective in selected_oracle_objectives()
+    )
     raise ValueError(
         "No sensitivity variants matched the selected objectives. "
         f"Requested mutations: {requested}. Supported by objective: {supported}."

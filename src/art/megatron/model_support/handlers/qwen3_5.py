@@ -7,22 +7,27 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 import torch
 
+from art.megatron.training.model_chunks import ModelChunks
 from art.megatron.model_support.handlers.default_dense import (
     DefaultDenseHandler,
+    _compile_workaround_flags_for_provider,
     _require_dense_mlp,
     _require_moe_experts,
+)
+from art.megatron.model_support.handlers.qwen3_common import (
+    _context_parallel_world_size,
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     LayerFamilyInstance,
 )
-from art.megatron.provider_common import patch_layer_spec_tree
-from art.megatron.training.model_chunks import ModelChunks
 
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
+    "deepep_dispatch_combine",
     "deepep_permute_restore",
+    "te_triton_permute_with_mask_map",
 )
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
@@ -38,6 +43,7 @@ _VLLM_MOE_KEY_RE = re.compile(
 
 class Qwen35BaseHandler(DefaultDenseHandler):
     key = "qwen3_5_base"
+    build_gdn_execution_spec = True
     native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
@@ -111,7 +117,24 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                         position_ids.shape[0],
                         position_ids.shape[1],
                     )
-                preproc_output = list(_preprocess(*args, **kwargs))
+                rotary_pos_emb = getattr(gpt_module, "rotary_pos_emb", None)
+                rotary_cp_group = getattr(rotary_pos_emb, "cp_group", None)
+                dispatched_local_cp_positions = (
+                    isinstance(position_ids, torch.Tensor)
+                    and position_ids.ndim == 2
+                    and _context_parallel_world_size(
+                        getattr(gpt_module, "config", None)
+                    )
+                    > 1
+                    and rotary_cp_group is not None
+                )
+                if dispatched_local_cp_positions:
+                    setattr(rotary_pos_emb, "cp_group", None)
+                try:
+                    preproc_output = list(_preprocess(*args, **kwargs))
+                finally:
+                    if dispatched_local_cp_positions:
+                        setattr(rotary_pos_emb, "cp_group", rotary_cp_group)
                 decoder_input = cast(torch.Tensor, preproc_output[0])
                 if not decoder_input.requires_grad and decoder_input.is_leaf:
                     decoder_input.requires_grad_(True)
@@ -163,7 +186,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
             patch_standard_attention_specs,
             transformer_block_spec_factory,
         ) = _require_qwen35_provider_symbols()
-        from art.megatron.flex_attention import FlexDotProductAttention
+        from art.megatron.provider_common import patch_art_flex_attention
 
         matched_provider_type = next(
             provider_type
@@ -171,14 +194,14 @@ class Qwen35BaseHandler(DefaultDenseHandler):
             if isinstance(provider, provider_type)
         )
 
-        def _patch_qwen35_block_spec(block_spec: object) -> None:
+        def _patch_qwen35_block_spec(block_spec: object, config: Any) -> None:
             patch_standard_attention_specs(block_spec, qwen3_vl_self_attention)
             for layer_spec in getattr(block_spec, "layer_specs", ()):
-                patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
+                patch_art_flex_attention(layer_spec, config)
 
         def _qwen35_layer_spec(config: Any, vp_stage: int | None = None) -> object:
             block_spec = transformer_block_spec_factory(config, vp_stage=vp_stage)
-            _patch_qwen35_block_spec(block_spec)
+            _patch_qwen35_block_spec(block_spec, config)
             return block_spec
 
         def _provide_qwen35_with_flex_attention(
@@ -265,12 +288,12 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        from art.megatron.lora import _is_language_transformer_layer_name
         from art.megatron.weights.adapter_export import (
             add_gated_delta_net_adapter_weights,
             add_standard_self_attention_adapter_weights,
             layer_base_prefix,
         )
+        from art.megatron.lora import _is_language_transformer_layer_name
 
         _ensure_bridge_qwen35_adapter_name_map()
         adapter_weights_by_base: dict[str, list[Any]] = {}
@@ -454,7 +477,10 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
                 disable_compile=True,
             )
         return CompileWorkaroundConfig(
-            flags=_QWEN35_MOE_COMPILE_WORKAROUND_FLAGS,
+            flags=_compile_workaround_flags_for_provider(
+                provider,
+                _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS,
+            ),
             shared_expert_state="shared_experts",
             disable_compile=False,
         )
@@ -612,7 +638,7 @@ def _to_vllm_lora_tensors(
             dim=0,
         ).contiguous()
         transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = _pack_vllm_3d_lora_b(
-            gate_up_b
+            gate_up_b,
         )
         transformed[f"{vllm_prefix}.lora_A.weight"] = torch.cat(
             down_a,

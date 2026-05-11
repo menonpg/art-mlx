@@ -44,6 +44,10 @@ def _normalize_step_index(step_index: int) -> str:
     return f"{step_index:06d}"
 
 
+def _normalize_router_module_name(module_name: str) -> str:
+    return module_name.replace("._orig_mod", "")
+
+
 def _build_tensor_key(router_key: str, call_index: int, field_name: str) -> str:
     return f"{router_key}/call_{call_index}/{field_name}"
 
@@ -57,14 +61,22 @@ def _flatten_router_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.reshape(-1, num_experts).contiguous()
 
 
-def _extract_router_output_tensors(output: Any) -> tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(output, (list, tuple)) and len(output) >= 2:
-        probs, routing_map = output[0], output[1]
-    elif isinstance(output, dict):
-        probs = output.get("probs")
-        routing_map = output.get("routing_map")
+def _extract_router_output_tensors(
+    call_entry: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    probs = None
+    routing_map = None
+    if isinstance(call_entry, dict):
+        output = call_entry.get("output")
+        if isinstance(output, (list, tuple)) and len(output) >= 2:
+            probs, routing_map = output[0], output[1]
+        elif isinstance(output, dict):
+            probs = output.get("probs")
+            routing_map = output.get("routing_map")
+    elif isinstance(call_entry, (list, tuple)) and len(call_entry) >= 2:
+        probs, routing_map = call_entry[0], call_entry[1]
     else:
-        raise RuntimeError(f"Unsupported router output type: {type(output)}")
+        raise RuntimeError(f"Unsupported router output type: {type(call_entry)}")
 
     if not isinstance(probs, torch.Tensor):
         raise RuntimeError(f"Expected probs tensor, got {type(probs)}")
@@ -115,8 +127,40 @@ def _trace_call_route_metadata(
     return None, micro_order * dp_world_size + dp_rank
 
 
+def _dedupe_checkpoint_router_calls(
+    call_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    previous_call_key: tuple[int | None, int | None, int] | None = None
+    previous_route: RouterCallRoute | None = None
+    for call_entry in call_entries:
+        probs_2d, routing_map_2d = _extract_router_output_tensors(call_entry)
+        compact_route = _compact_route_from_dense(probs_2d, routing_map_2d)
+        sample_index, micro_slot = _trace_call_route_metadata(call_entry)
+        call_key = (
+            sample_index,
+            micro_slot,
+            int(call_entry.get("micro_order", 0)),
+        )
+        is_checkpoint_duplicate = (
+            previous_call_key == call_key
+            and previous_route is not None
+            and torch.equal(compact_route.expert_indices, previous_route.expert_indices)
+            and torch.equal(compact_route.expert_probs, previous_route.expert_probs)
+            and torch.equal(compact_route.expert_mask, previous_route.expert_mask)
+        )
+        if is_checkpoint_duplicate:
+            continue
+        deduped.append(call_entry)
+        previous_call_key = call_key
+        previous_route = compact_route
+    return deduped
+
+
 def build_router_key_from_module_name(*, chunk_index: int, module_name: str) -> str:
-    canonical_name = canonical_art_param_name(module_name)
+    canonical_name = canonical_art_param_name(
+        _normalize_router_module_name(module_name)
+    )
     match = _ROUTER_LAYER_PATTERN.search(canonical_name)
     if match is None:
         raise RuntimeError(
@@ -256,12 +300,12 @@ class StepRoutes(BaseModel):
         expected_tokens = int(self.global_token_uids.numel())
         for router_key, step_router in self.routers.items():
             for call_index, route in step_router.calls.items():
-                if route.num_global_tokens != expected_tokens:
+                if route.num_global_tokens > expected_tokens:
                     raise RuntimeError(
                         "Route token count mismatch for "
                         f"router='{router_key}' call={call_index}: "
                         f"route_tokens={route.num_global_tokens}, "
-                        f"expected_tokens={expected_tokens}"
+                        f"expected_tokens<={expected_tokens}"
                     )
         return self
 
@@ -557,16 +601,26 @@ def _dispatcher_local_token_uids(
     step_routes = controller._active_step_routes
     if step_routes is None:
         raise RuntimeError("Routing replay dispatcher used without an active step")
-    local_uids = controller.local_token_indexer.build_local_token_uids(
-        global_token_uids=step_routes.global_token_uids,
-        num_local_tokens=num_local_tokens,
-        sequence_parallel=bool(
-            getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
-        ),
-        context_parallel_size=int(
-            getattr(getattr(dispatcher, "config", None), "context_parallel_size", 1)
-        ),
-    )
+    explicit_local_uids = controller._explicit_local_input_token_uids
+    if explicit_local_uids is not None:
+        local_uids = _resolve_explicit_local_uids(
+            explicit_local_uids,
+            num_local_tokens=num_local_tokens,
+            sequence_parallel=bool(
+                getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
+            ),
+        )
+    else:
+        local_uids = controller.local_token_indexer.build_local_token_uids(
+            global_token_uids=step_routes.global_token_uids,
+            num_local_tokens=num_local_tokens,
+            sequence_parallel=bool(
+                getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
+            ),
+            context_parallel_size=int(
+                getattr(getattr(dispatcher, "config", None), "context_parallel_size", 1)
+            ),
+        )
     if int(local_uids.numel()) != num_local_tokens:
         raise RuntimeError(
             "Local routing replay uid count mismatch: "
@@ -576,6 +630,42 @@ def _dispatcher_local_token_uids(
     uid_span = int(step_routes.global_token_uids.numel())
     if isinstance(sample_index, int) and sample_index >= 0 and uid_span > 0:
         local_uids = local_uids + sample_index * uid_span
+    return local_uids
+
+
+def _resolve_explicit_local_uids(
+    explicit_local_uids: torch.Tensor,
+    *,
+    num_local_tokens: int,
+    sequence_parallel: bool,
+) -> torch.Tensor:
+    local_uids = explicit_local_uids.clone().reshape(-1)
+    if int(local_uids.numel()) == num_local_tokens:
+        return local_uids
+    if not sequence_parallel:
+        raise RuntimeError(
+            "Explicit routing replay uid count mismatch: "
+            f"expected={num_local_tokens}, got={int(local_uids.numel())}"
+        )
+
+    from megatron.core import parallel_state as ps
+
+    tp_size = int(ps.get_tensor_model_parallel_world_size())
+    tp_rank = int(ps.get_tensor_model_parallel_rank()) if tp_size > 1 else 0
+    if tp_size <= 1 or int(local_uids.numel()) % tp_size != 0:
+        raise RuntimeError(
+            "Explicit routing replay uid count mismatch after sequence-parallel "
+            f"resolution: expected={num_local_tokens}, got={int(local_uids.numel())}, "
+            f"tp_size={tp_size}"
+        )
+    tokens_per_tp_rank = int(local_uids.numel()) // tp_size
+    start = tp_rank * tokens_per_tp_rank
+    local_uids = local_uids[start : start + tokens_per_tp_rank].contiguous()
+    if int(local_uids.numel()) != num_local_tokens:
+        raise RuntimeError(
+            "Explicit routing replay uid count mismatch after sequence-parallel "
+            f"resolution: expected={num_local_tokens}, got={int(local_uids.numel())}"
+        )
     return local_uids
 
 
@@ -600,43 +690,6 @@ def _attach_trace_row_uids(
         row_token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
     )
     setattr(target, TRACE_UID_SPAN_ATTR, uid_span)
-
-
-@torch._dynamo.disable
-def _propagate_grouped_mlp_trace_row_uids(source: Any, linear_fc2: Any) -> None:
-    row_token_uids, uid_span = _trace_row_uids_from_source(source)
-    if row_token_uids is None:
-        return
-    _attach_trace_row_uids(
-        linear_fc2,
-        row_token_uids=row_token_uids,
-        uid_span=uid_span,
-    )
-
-
-@torch._dynamo.disable
-def _propagate_fc2_trace_row_uids(
-    *,
-    x: Any,
-    module: Any,
-    linear_fc2: Any,
-    lora: Any,
-) -> None:
-    row_token_uids, uid_span = _trace_row_uids_from_source(x)
-    if row_token_uids is None:
-        row_token_uids, uid_span = _trace_row_uids_from_source(module)
-    if row_token_uids is None:
-        return
-    _attach_trace_row_uids(
-        linear_fc2,
-        row_token_uids=row_token_uids,
-        uid_span=uid_span,
-    )
-    _attach_trace_row_uids(
-        lora,
-        row_token_uids=row_token_uids,
-        uid_span=uid_span,
-    )
 
 
 def _canonicalize_expert_token_order(
@@ -744,56 +797,6 @@ def _canonical_trace_row_uids(
     if not row_uid_chunks:
         return expert_token_uids.new_empty((0,), dtype=torch.int64), row_uid_span
     return torch.cat(row_uid_chunks, dim=0).contiguous(), row_uid_span
-
-
-@torch._dynamo.disable
-def _build_dispatch_postprocess_trace(
-    *,
-    dispatcher: Any,
-    controller: Any,
-    global_input_token_uids: torch.Tensor,
-    expert_inputs: torch.Tensor,
-    expert_probs: torch.Tensor,
-    tokens_per_expert: torch.Tensor | list[int],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    expert_token_uids = global_input_token_uids
-    if dispatcher.num_local_experts > 1:
-        sorted_token_uids = sort_chunks_by_idxs(
-            expert_token_uids.unsqueeze(-1),
-            dispatcher.num_global_tokens_per_local_expert.ravel(),
-            dispatcher.sort_input_by_local_experts,
-            fused=False,
-        )[0]
-        expert_token_uids = sorted_token_uids.reshape(-1).contiguous()
-
-    (
-        expert_inputs,
-        expert_probs,
-        canonical_expert_token_uids,
-        inverse_order_cpu,
-    ) = _canonicalize_expert_token_order(
-        expert_inputs,
-        expert_probs,
-        expert_token_uids,
-        tokens_per_expert=tokens_per_expert,
-    )
-    active_step_routes = controller._active_step_routes
-    if active_step_routes is None:
-        raise RuntimeError("MoE replay dispatcher preprocess called before set_step")
-    trace_row_uids, trace_uid_span = _canonical_trace_row_uids(
-        canonical_expert_token_uids,
-        tokens_per_expert=tokens_per_expert,
-        local_expert_indices=getattr(dispatcher, "local_expert_indices", None),
-        sample_uid_span=int(active_step_routes.global_token_uids.numel()),
-        num_experts=int(getattr(dispatcher, "num_experts", 1)),
-    )
-    return (
-        expert_inputs,
-        expert_probs,
-        inverse_order_cpu,
-        trace_row_uids,
-        trace_uid_span,
-    )
 
 
 def _patch_alltoall_dispatcher_preprocess() -> None:
@@ -927,21 +930,40 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
         if controller is None or global_input_token_uids is None or self.drop_and_pad:
             return expert_inputs, tokens_per_expert, expert_probs
 
+        expert_token_uids = global_input_token_uids
+        if self.num_local_experts > 1:
+            sorted_token_uids, _ = sort_chunks_by_idxs(
+                expert_token_uids.unsqueeze(-1),
+                self.num_global_tokens_per_local_expert.ravel(),
+                self.sort_input_by_local_experts,
+                fused=False,
+            )
+            expert_token_uids = sorted_token_uids.reshape(-1).contiguous()
+
         (
             expert_inputs,
             expert_probs,
+            canonical_expert_token_uids,
             inverse_order_cpu,
-            trace_row_uids,
-            trace_uid_span,
-        ) = _build_dispatch_postprocess_trace(
-            dispatcher=self,
-            controller=controller,
-            global_input_token_uids=global_input_token_uids,
-            expert_inputs=expert_inputs,
-            expert_probs=expert_probs,
+        ) = _canonicalize_expert_token_order(
+            expert_inputs,
+            expert_probs,
+            expert_token_uids,
             tokens_per_expert=tokens_per_expert,
         )
         self._art_replay_expert_input_inverse_permutation = inverse_order_cpu
+        active_step_routes = controller._active_step_routes
+        if active_step_routes is None:
+            raise RuntimeError(
+                "MoE replay dispatcher preprocess called before set_step"
+            )
+        trace_row_uids, trace_uid_span = _canonical_trace_row_uids(
+            canonical_expert_token_uids,
+            tokens_per_expert=tokens_per_expert,
+            local_expert_indices=getattr(self, "local_expert_indices", None),
+            sample_uid_span=int(active_step_routes.global_token_uids.numel()),
+            num_experts=int(getattr(self, "num_experts", 1)),
+        )
         _attach_trace_row_uids(
             expert_inputs,
             row_token_uids=trace_row_uids,
@@ -967,10 +989,20 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ):
-        _propagate_grouped_mlp_trace_row_uids(
-            permuted_local_hidden_states,
-            self.linear_fc2,
+        row_token_uids, uid_span = _trace_row_uids_from_source(
+            permuted_local_hidden_states
         )
+        if row_token_uids is not None:
+            _attach_trace_row_uids(
+                self,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
+            _attach_trace_row_uids(
+                self.linear_fc2,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
         return original_te_grouped_mlp_forward(
             self,
             permuted_local_hidden_states,
@@ -983,33 +1015,60 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
         x: torch.Tensor,
         tokens_per_expert: list[int] | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        _propagate_fc2_trace_row_uids(
-            x=x,
-            module=self,
-            linear_fc2=self.linear_fc2,
-            lora=self.lora,
-        )
+        row_token_uids, uid_span = _trace_row_uids_from_source(x)
+        if row_token_uids is None:
+            row_token_uids, uid_span = _trace_row_uids_from_source(self)
+        if row_token_uids is not None:
+            _attach_trace_row_uids(
+                self,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
+            _attach_trace_row_uids(
+                self.linear_fc2,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
+            _attach_trace_row_uids(
+                self.lora,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
         return original_fc2_forward(self, x, tokens_per_expert)
 
-    setattr(MoEAlltoAllTokenDispatcher, "preprocess", patched_preprocess)
+    setattr(
+        MoEAlltoAllTokenDispatcher,
+        "preprocess",
+        torch.compiler.disable(patched_preprocess),
+    )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "dispatch_preprocess",
-        patched_dispatch_preprocess,
+        torch.compiler.disable(patched_dispatch_preprocess),
     )
-    setattr(MoEAlltoAllTokenDispatcher, "token_dispatch", patched_token_dispatch)
+    setattr(
+        MoEAlltoAllTokenDispatcher,
+        "token_dispatch",
+        torch.compiler.disable(patched_token_dispatch),
+    )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "dispatch_postprocess",
-        patched_dispatch_postprocess,
+        torch.compiler.disable(patched_dispatch_postprocess),
     )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "combine_preprocess",
-        patched_combine_preprocess,
+        torch.compiler.disable(patched_combine_preprocess),
     )
-    setattr(TEGroupedMLP, "forward", patched_te_grouped_mlp_forward)
-    setattr(MLPExpertsLinearFC2LoRA, "forward", patched_fc2_forward)
+    setattr(
+        TEGroupedMLP, "forward", torch.compiler.disable(patched_te_grouped_mlp_forward)
+    )
+    setattr(
+        MLPExpertsLinearFC2LoRA,
+        "forward",
+        torch.compiler.disable(patched_fc2_forward),
+    )
     setattr(MoEAlltoAllTokenDispatcher, "_art_router_replay_preprocess_patched", True)
 
 
@@ -1033,6 +1092,7 @@ class MoeRoutingReplayController:
         self._active_sample_index: int | None = None
         self._active_step_routes: StepRoutes | None = None
         self._router_call_cursors: dict[str, int] = {}
+        self._router_preview_call_cursors: dict[str, int] = {}
         self._router_call_sequences: dict[str, list[int]] = {}
         self._router_last_call_indices: dict[str, int] = {}
         self._router_last_call_keys: dict[str, tuple[str, int] | None] = {}
@@ -1040,6 +1100,8 @@ class MoeRoutingReplayController:
         self._global_uid_to_row_index: dict[int, int] = {}
         self._local_router_keys: set[str] = set()
         self._active_micro_order: int | None = None
+        self._explicit_local_input_token_uids: torch.Tensor | None = None
+        self._last_router_local_input_token_uids: torch.Tensor | None = None
 
         self._patched_router_modules: list[dict[str, Any]] = []
 
@@ -1080,11 +1142,12 @@ class MoeRoutingReplayController:
                     logits: torch.Tensor,
                     *args: Any,
                     _router_key: str = router_key,
+                    _original_routing: Any = original_routing,
                     _sequence_parallel: bool = sequence_parallel,
                     _context_parallel_size: int = context_parallel_size,
                     **kwargs: Any,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-                    live_probs, live_routing_map = original_routing(
+                    live_probs, live_routing_map = _original_routing(
                         logits, *args, **kwargs
                     )
                     replay_probs, replay_routing_map = self.get_route_for_router(
@@ -1093,6 +1156,13 @@ class MoeRoutingReplayController:
                         sequence_parallel=_sequence_parallel,
                         context_parallel_size=_context_parallel_size,
                     )
+                    trace_uids = getattr(
+                        self, "_last_router_local_input_token_uids", None
+                    )
+                    if isinstance(trace_uids, torch.Tensor):
+                        _attach_trace_row_uids(
+                            _module, row_token_uids=trace_uids, uid_span=None
+                        )
                     # same result, but autograd goes through
                     probs = (
                         live_probs
@@ -1137,6 +1207,17 @@ class MoeRoutingReplayController:
         self._active_sample_index = sample_index
         self._active_micro_order = micro_order
 
+    def set_local_input_token_uids(
+        self,
+        local_token_uids: torch.Tensor | None,
+    ) -> None:
+        if local_token_uids is None:
+            self._explicit_local_input_token_uids = None
+            return
+        self._explicit_local_input_token_uids = _to_tensor_cpu_contiguous(
+            local_token_uids, dtype=torch.int64
+        ).reshape(-1)
+
     def set_step(
         self,
         *,
@@ -1161,6 +1242,7 @@ class MoeRoutingReplayController:
         else:
             self._active_sample_index = sample_index
         self._active_micro_order = None
+        self._explicit_local_input_token_uids = None
         self._active_step_routes = step_routes
         for local_router_key in sorted(self._local_router_keys):
             if local_router_key not in step_routes.routers:
@@ -1169,6 +1251,7 @@ class MoeRoutingReplayController:
                     f"step={step_index}, router='{local_router_key}'"
                 )
         self._router_call_cursors = {}
+        self._router_preview_call_cursors = {}
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
@@ -1207,6 +1290,7 @@ class MoeRoutingReplayController:
                     total_calls=len(router_calls),
                 )
             self._router_call_cursors[router_key] = 0
+            self._router_preview_call_cursors[router_key] = 0
             self._router_call_sequences[router_key] = call_sequence
         self._global_uid_to_row_index = {
             int(uid.item()): row_index
@@ -1352,15 +1436,19 @@ class MoeRoutingReplayController:
         self._active_sample_index = None
         self._active_step_routes = None
         self._router_call_cursors = {}
+        self._router_preview_call_cursors = {}
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
         self._router_reuse_counts = {}
         self._global_uid_to_row_index = {}
         self._active_micro_order = None
+        self._explicit_local_input_token_uids = None
+        self._last_router_local_input_token_uids = None
         if _ACTIVE_ROUTING_REPLAY_CONTROLLER is self:
             _ACTIVE_ROUTING_REPLAY_CONTROLLER = None
 
+    @torch.compiler.disable
     def get_route_for_router(
         self,
         *,
@@ -1374,7 +1462,13 @@ class MoeRoutingReplayController:
             raise RuntimeError(
                 "Routing replay get_route_for_router called before set_step"
             )
-        call_cursor = self._router_call_cursors.get(router_key, 0)
+        consume_call = torch.is_grad_enabled()
+        cursor_dict = (
+            self._router_call_cursors
+            if consume_call
+            else self._router_preview_call_cursors
+        )
+        call_cursor = cursor_dict.get(router_key, 0)
         call_sequence = self._router_call_sequences.get(router_key)
         if call_sequence is None:
             raise RuntimeError(
@@ -1382,31 +1476,43 @@ class MoeRoutingReplayController:
                 f"step={self._active_step_index}, router='{router_key}'"
             )
         router_calls = step_routes.routers[router_key].calls
-        active_call_key = self._active_router_call_key()
-        last_call_index = self._router_last_call_indices.get(router_key)
-        last_call_key = self._router_last_call_keys.get(router_key)
-        next_call_key = None
-        if call_cursor < len(call_sequence):
-            next_call_key = self._router_call_key(
-                router_calls[call_sequence[call_cursor]]
-            )
-
-        if (
-            active_call_key is not None
-            and last_call_index is not None
-            and last_call_key == active_call_key
-            and next_call_key != active_call_key
-        ):
-            if not self.allow_recompute_reuse:
-                raise RuntimeError(
-                    "Routing replay recompute reuse is disabled: "
-                    f"step={self._active_step_index}, router='{router_key}', "
-                    f"call_key={active_call_key}"
+        if consume_call:
+            active_call_key = self._active_router_call_key()
+            last_call_index = self._router_last_call_indices.get(router_key)
+            last_call_key = self._router_last_call_keys.get(router_key)
+            next_call_key = None
+            if call_cursor < len(call_sequence):
+                next_call_key = self._router_call_key(
+                    router_calls[call_sequence[call_cursor]]
                 )
-            route = router_calls[last_call_index]
-            self._router_reuse_counts[router_key] = (
-                self._router_reuse_counts.get(router_key, 0) + 1
-            )
+            if (
+                active_call_key is not None
+                and last_call_index is not None
+                and last_call_key == active_call_key
+                and next_call_key != active_call_key
+            ):
+                if not self.allow_recompute_reuse:
+                    raise RuntimeError(
+                        "Routing replay recompute reuse is disabled: "
+                        f"step={self._active_step_index}, router='{router_key}', "
+                        f"call_key={active_call_key}"
+                    )
+                route = router_calls[last_call_index]
+                self._router_reuse_counts[router_key] = (
+                    self._router_reuse_counts.get(router_key, 0) + 1
+                )
+            else:
+                if call_cursor >= len(call_sequence):
+                    raise RuntimeError(
+                        "Routing replay call cursor exceeded local call sequence: "
+                        f"step={self._active_step_index}, router='{router_key}', "
+                        f"call_cursor={call_cursor}, sequence_length={len(call_sequence)}"
+                    )
+                route_call_index = call_sequence[call_cursor]
+                route = router_calls[route_call_index]
+                cursor_dict[router_key] = call_cursor + 1
+                self._router_last_call_indices[router_key] = route_call_index
+                self._router_last_call_keys[router_key] = self._router_call_key(route)
         else:
             if call_cursor >= len(call_sequence):
                 raise RuntimeError(
@@ -1414,29 +1520,30 @@ class MoeRoutingReplayController:
                     f"step={self._active_step_index}, router='{router_key}', "
                     f"call_cursor={call_cursor}, sequence_length={len(call_sequence)}"
                 )
-            route_call_index = call_sequence[call_cursor]
-            route = router_calls[route_call_index]
-            self._router_call_cursors[router_key] = call_cursor + 1
-            self._router_last_call_indices[router_key] = route_call_index
-            self._router_last_call_keys[router_key] = self._router_call_key(route)
+            route = router_calls[call_sequence[call_cursor]]
+            cursor_dict[router_key] = call_cursor + 1
 
         num_local_tokens = int(logits.shape[0])
         num_experts = int(logits.shape[1])
 
-        local_uids = self.local_token_indexer.build_local_token_uids(
-            global_token_uids=step_routes.global_token_uids,
-            num_local_tokens=num_local_tokens,
-            sequence_parallel=sequence_parallel,
-            context_parallel_size=context_parallel_size,
+        explicit_local_uids = self._explicit_local_input_token_uids
+        using_explicit_local_uids = explicit_local_uids is not None
+        if explicit_local_uids is not None:
+            local_uids = _resolve_explicit_local_uids(
+                explicit_local_uids,
+                num_local_tokens=num_local_tokens,
+                sequence_parallel=sequence_parallel,
+            )
+        else:
+            local_uids = self.local_token_indexer.build_local_token_uids(
+                global_token_uids=step_routes.global_token_uids,
+                num_local_tokens=num_local_tokens,
+                sequence_parallel=sequence_parallel,
+                context_parallel_size=context_parallel_size,
+            )
+        self._last_router_local_input_token_uids = local_uids.detach().to(
+            device="cpu", dtype=torch.int64
         )
-        row_index_tensor = torch.tensor(
-            [self._global_uid_to_row_index[int(uid)] for uid in local_uids.tolist()],
-            dtype=torch.int64,
-        )
-
-        local_indices = route.expert_indices.index_select(0, row_index_tensor)
-        local_probs = route.expert_probs.index_select(0, row_index_tensor)
-        local_mask = route.expert_mask.index_select(0, row_index_tensor)
 
         probs = torch.zeros(
             (num_local_tokens, num_experts),
@@ -1449,12 +1556,23 @@ class MoeRoutingReplayController:
             device=logits.device,
         )
 
-        if local_indices.numel() > 0:
+        valid_positions_cpu = torch.nonzero(local_uids >= 0, as_tuple=False).reshape(-1)
+        if int(valid_positions_cpu.numel()) > 0:
+            row_index_tensor = torch.tensor(
+                [
+                    self._global_uid_to_row_index[int(uid)]
+                    for uid in local_uids[valid_positions_cpu].tolist()
+                ],
+                dtype=torch.int64,
+            )
+            local_indices = route.expert_indices.index_select(0, row_index_tensor)
+            local_probs = route.expert_probs.index_select(0, row_index_tensor)
+            local_mask = route.expert_mask.index_select(0, row_index_tensor)
             indices_device = local_indices.to(device=logits.device, dtype=torch.long)
             probs_device = local_probs.to(device=logits.device, dtype=logits.dtype)
             mask_device = local_mask.to(device=logits.device, dtype=torch.bool)
             row_index_device = (
-                torch.arange(num_local_tokens, device=logits.device)
+                valid_positions_cpu.to(device=logits.device, dtype=torch.long)
                 .unsqueeze(1)
                 .expand_as(indices_device)
             )
@@ -1464,6 +1582,30 @@ class MoeRoutingReplayController:
             selected_probs = probs_device[mask_device]
 
             if selected_rows.numel() > 0:
+                if bool(
+                    ((selected_rows < 0) | (selected_rows >= num_local_tokens))
+                    .any()
+                    .item()
+                ):
+                    raise RuntimeError(
+                        "Routing replay row index out of bounds: "
+                        f"min={int(selected_rows.min().item())}, "
+                        f"max={int(selected_rows.max().item())}, "
+                        f"num_local_tokens={num_local_tokens}, "
+                        f"local_uid_count={int(local_uids.numel())}, "
+                        f"using_explicit_local_uids={using_explicit_local_uids}"
+                    )
+                if bool(
+                    ((selected_cols < 0) | (selected_cols >= num_experts)).any().item()
+                ):
+                    raise RuntimeError(
+                        "Routing replay expert index out of bounds: "
+                        f"min={int(selected_cols.min().item())}, "
+                        f"max={int(selected_cols.max().item())}, "
+                        f"num_experts={num_experts}, "
+                        f"local_uid_count={int(local_uids.numel())}, "
+                        f"using_explicit_local_uids={using_explicit_local_uids}"
+                    )
                 probs[selected_rows, selected_cols] = selected_probs
                 routing_map[selected_rows, selected_cols] = True
 
@@ -1541,9 +1683,11 @@ def build_bundle_from_forward_trace_dir(
                 continue
             router_key = build_router_key_from_trace_name(module_name)
             router_calls: dict[int, RouterCallRoute] = {}
-            for call_index, call_entry in enumerate(step_trace[module_name]):
-                output = call_entry.get("output")
-                probs_2d, routing_map_2d = _extract_router_output_tensors(output)
+            deduped_router_calls = _dedupe_checkpoint_router_calls(
+                step_trace[module_name]
+            )
+            for call_index, call_entry in enumerate(deduped_router_calls):
+                probs_2d, routing_map_2d = _extract_router_output_tensors(call_entry)
                 compact_route = _compact_route_from_dense(probs_2d, routing_map_2d)
                 sample_index, micro_slot = _trace_call_route_metadata(call_entry)
                 compact_route.sample_index = sample_index

@@ -27,15 +27,18 @@ CAPTURE_NAME_TOKENS = (
     ".mlp.experts.linear_fc1.up_lora",
     ".mlp.experts.linear_fc2",
     ".mlp.experts.linear_fc2.lora",
-    ".mlp.linear_fc1",
-    ".mlp.linear_fc1.gate_lora",
-    ".mlp.linear_fc1.up_lora",
-    ".mlp.linear_fc2",
-    ".mlp.linear_fc2.row_parallel_lora",
-    ".mlp.linear_fc2.row_parallel_lora.lora",
 )
 ROUTER_NAME_TOKEN = ".mlp.router"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
+
+
+def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
+    return torch.compiler.disable(fn)
+
+
+def _normalize_trace_module_name(module_name: str) -> str:
+    """Strips compile-wrapper path segments from trace module names."""
+    return module_name.replace("._orig_mod", "")
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -69,6 +72,8 @@ def _rank_metadata() -> dict[str, int]:
         "world_size": world_size,
         "tp_rank": _safe_ps_stat("get_tensor_model_parallel_rank", 0),
         "tp_world_size": _safe_ps_stat("get_tensor_model_parallel_world_size", 1),
+        "cp_rank": _safe_ps_stat("get_context_parallel_rank", 0),
+        "cp_world_size": _safe_ps_stat("get_context_parallel_world_size", 1),
         "ep_rank": _safe_ps_stat("get_expert_model_parallel_rank", 0),
         "ep_world_size": _safe_ps_stat("get_expert_model_parallel_world_size", 1),
         "etp_rank": _safe_ps_stat("get_expert_tensor_parallel_rank", 0),
@@ -180,18 +185,6 @@ def _materialize_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().cpu()
 
 
-def _materialize_trace_value(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return _materialize_tensor(value)
-    if isinstance(value, dict):
-        return {key: _materialize_trace_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_materialize_trace_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_materialize_trace_value(item) for item in value)
-    return value
-
-
 def _extract_tensor_attr(value: Any, attr_name: str) -> Any:
     if isinstance(value, torch.Tensor):
         return getattr(value, attr_name, None)
@@ -208,8 +201,9 @@ def _extract_tensor_attr(value: Any, attr_name: str) -> Any:
     return None
 
 
-@torch._dynamo.disable
-def _extract_router_topk(output: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
+def _extract_router_topk(
+    output: Any, *, topk_hint: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not isinstance(output, tuple) or len(output) < 2:
         return None
     probs = output[0]
@@ -218,7 +212,10 @@ def _extract_router_topk(output: Any) -> tuple[torch.Tensor, torch.Tensor] | Non
         return None
     probs = _materialize_tensor(probs.float())
     routing_map = _materialize_tensor(routing_map)
-    topk = int(routing_map.sum(dim=-1).max().item())
+    if int(routing_map.shape[0]) == 0:
+        topk = int(topk_hint or 0)
+    else:
+        topk = int(routing_map.sum(dim=-1).max().item())
     if topk < 0:
         raise RuntimeError(f"Invalid router topk={topk}")
     if topk == 0:
@@ -229,6 +226,19 @@ def _extract_router_topk(output: Any) -> tuple[torch.Tensor, torch.Tensor] | Non
     return topk_ids.contiguous(), topk_scores.contiguous()
 
 
+def _extract_router_output(output: Any) -> dict[str, torch.Tensor] | None:
+    if not isinstance(output, tuple) or len(output) < 2:
+        return None
+    probs = output[0]
+    routing_map = output[1]
+    if not isinstance(probs, torch.Tensor) or not isinstance(routing_map, torch.Tensor):
+        return None
+    return {
+        "probs": _materialize_tensor(probs.float()),
+        "routing_map": _materialize_tensor(routing_map.bool()),
+    }
+
+
 class ForwardTraceCapture:
     def __init__(
         self,
@@ -237,12 +247,10 @@ class ForwardTraceCapture:
         enabled: bool,
         capture_name_tokens: tuple[str, ...] = CAPTURE_NAME_TOKENS,
         micro_start_callback: Callable[[int | None, int], None] | None = None,
-        strict_output_match: bool = True,
     ) -> None:
         self.enabled = enabled
         self.capture_name_tokens = capture_name_tokens
         self.micro_start_callback = micro_start_callback
-        self.strict_output_match = strict_output_match
         self.current_step_index: int | None = None
         self.current_step_trace: dict[str, list[dict[str, Any]]] = {}
         self.current_micro_sample_index: int | None = None
@@ -250,10 +258,11 @@ class ForwardTraceCapture:
         self.current_micro_module_call_counts: dict[str, int] = {}
         self.current_step_sample_indices: list[int | None] = []
         self.current_step_outputs: list[
-            tuple[int | None, int, int | None, torch.Tensor]
+            tuple[int | None, int, int | None, torch.Tensor, torch.Tensor | None]
         ] = []
         self._trace_metadata_by_name: dict[str, dict[str, Any]] = {}
         self._next_micro_order = 0
+        self._inside_root_forward = False
         self._hook_handles: list[Any] = []
         if not enabled:
             return
@@ -264,16 +273,18 @@ class ForwardTraceCapture:
             raise RuntimeError("Expected at least one model chunk for forward tracing")
         root_module = model_chunks[0]
         self._hook_handles.append(
-            root_module.register_forward_pre_hook(self._root_pre_hook)
+            root_module.register_forward_pre_hook(_trace_hook(self._root_pre_hook))
         )
         self._hook_handles.append(
-            root_module.register_forward_hook(self._root_post_hook)
+            root_module.register_forward_hook(_trace_hook(self._root_post_hook))
         )
         for chunk_index, chunk in enumerate(model_chunks):
             named_modules = list(chunk.named_modules())
             module_by_name = dict(named_modules)
             for module_name, module in named_modules:
-                trace_module_name = f"chunk{chunk_index}.{module_name}"
+                trace_module_name = _normalize_trace_module_name(
+                    f"chunk{chunk_index}.{module_name}"
+                )
                 metadata = self._build_module_trace_metadata(
                     module_name=module_name,
                     module=module,
@@ -291,7 +302,7 @@ class ForwardTraceCapture:
                     continue
                 self._hook_handles.append(
                     module.register_forward_hook(
-                        self._make_hook(trace_module_name, module)
+                        _trace_hook(self._make_hook(trace_module_name, module))
                     )
                 )
 
@@ -304,14 +315,10 @@ class ForwardTraceCapture:
         module_by_name: dict[str, Any],
     ) -> dict[str, Any]:
         if module_name.endswith(".self_attention.in_proj"):
-            return {
-                "component_sizes": cls._gdn_in_proj_component_sizes(module),
-            }
+            return {"component_sizes": cls._gdn_in_proj_component_sizes(module)}
         if module_name.endswith(".self_attention.in_proj.in_proj"):
             parent_module = module_by_name[module_name.rsplit(".", 1)[0]]
-            return {
-                "component_sizes": cls._gdn_in_proj_component_sizes(parent_module),
-            }
+            return {"component_sizes": cls._gdn_in_proj_component_sizes(parent_module)}
         if module_name.endswith(".self_attention.out_norm"):
             gdn_module = module_by_name[module_name.removesuffix(".out_norm")]
             return {
@@ -439,28 +446,6 @@ class ForwardTraceCapture:
                 return {"op": "sum"}
             return {"op": "concat", "dim": 0}
 
-        if ".mlp.linear_fc1" in name and ".lora" not in name:
-            tp_world_size = _safe_ps_stat("get_tensor_model_parallel_world_size", 1)
-            if tp_world_size > 1:
-                return {
-                    "op": "concat",
-                    "dim": -1,
-                    "layout": "gate_up_rank_interleaved",
-                    "world_size_key": "tp_world_size",
-                }
-            return {"op": "concat", "dim": -1}
-        if ".mlp.linear_fc2.row_parallel_lora" in name and ".lora" not in name:
-            if self._sequence_parallel_enabled(module):
-                return {"op": "concat", "dim": 0}
-            return None
-        if ".mlp.linear_fc2" in name and ".lora" not in name:
-            row_parallel_lora = getattr(module, "row_parallel_lora", None)
-            if row_parallel_lora is not None and self._sequence_parallel_enabled(
-                row_parallel_lora
-            ):
-                return {"op": "concat", "dim": 0}
-            return None
-
         gather_output = getattr(module, "gather_output", None)
         if isinstance(gather_output, bool) and not gather_output:
             return {"op": "concat", "dim": -1}
@@ -475,6 +460,17 @@ class ForwardTraceCapture:
             return {"op": "concat", "dim": 0}
         if name.endswith(".self_attention") and self._sequence_parallel_enabled(module):
             return {"op": "concat", "dim": 0}
+
+        if ".mlp.linear_fc1" in name and ".lora" not in name:
+            tp_world_size = _safe_ps_stat("get_tensor_model_parallel_world_size", 1)
+            if tp_world_size > 1:
+                return {
+                    "op": "concat",
+                    "dim": -1,
+                    "layout": "gate_up_rank_interleaved",
+                    "world_size_key": "tp_world_size",
+                }
+            return {"op": "concat", "dim": -1}
 
         if ".mlp.experts." in name:
             return {"op": "concat", "dim": 0}
@@ -499,46 +495,70 @@ class ForwardTraceCapture:
             hints["router_topk_scores"] = concat_dim0
         return hints
 
-    @torch._dynamo.disable
-    def _record_module_hook(
-        self, name: str, module: Any, inputs: Any, output: Any
-    ) -> None:
-        if self.current_step_index is None:
-            return
-        micro_call_index = self.current_micro_module_call_counts.get(name, 0)
-        self.current_micro_module_call_counts[name] = micro_call_index + 1
-        trace_item: dict[str, Any] = {
-            "micro_call_index": micro_call_index,
-            "micro_order": self.current_micro_order,
-            "micro_sample_index": self.current_micro_sample_index,
-            "module_type": module.__class__.__name__,
-            "rank_meta": _rank_metadata(),
-            "merge_hints": self._build_merge_hints(name, module),
-            "inputs": _materialize_trace_value(inputs),
-            "output": _materialize_trace_value(output),
-            "primary_input": self.guess_primary_tensor(inputs),
-            "primary_output": self.guess_primary_tensor(output),
-        }
-        if ROUTER_NAME_TOKEN in name:
-            router_topk = _extract_router_topk(output)
-            if router_topk is not None:
-                topk_ids, topk_scores = router_topk
-                trace_item["router_topk_ids"] = topk_ids
-                trace_item["router_topk_scores"] = topk_scores
-        trace_items = self._split_expert_trace_items(
-            module_name=name,
-            module=module,
-            inputs=inputs,
-            trace_item=trace_item,
-        )
-        trace_calls = self.current_step_trace.setdefault(name, [])
-        for split_item in trace_items:
-            split_item["call_index"] = len(trace_calls)
-            trace_calls.append(split_item)
-
     def _make_hook(self, name: str, module: Any):
         def _hook(_module: Any, inputs: Any, output: Any) -> None:
-            self._record_module_hook(name, module, inputs, output)
+            if self.current_step_index is None or not self._inside_root_forward:
+                return
+            micro_call_index = self.current_micro_module_call_counts.get(name, 0)
+            self.current_micro_module_call_counts[name] = micro_call_index + 1
+            trace_item: dict[str, Any] = {
+                "micro_call_index": micro_call_index,
+                "micro_order": self.current_micro_order,
+                "micro_sample_index": self.current_micro_sample_index,
+                "module_type": module.__class__.__name__,
+                "rank_meta": _rank_metadata(),
+                "merge_hints": self._build_merge_hints(name, module),
+                # Keep live trace capture passive. Recursively materializing full
+                # hook inputs/outputs here performs large device-to-host copies and
+                # previously perturbed correctness in the real training forward.
+                "primary_output": self.guess_primary_tensor(output),
+            }
+            if ROUTER_NAME_TOKEN in name:
+                router_output = _extract_router_output(output)
+                if router_output is not None:
+                    trace_item["output"] = router_output
+                topk_hint = getattr(
+                    getattr(module, "config", None), "moe_router_topk", None
+                )
+                router_topk = _extract_router_topk(
+                    output,
+                    topk_hint=int(topk_hint) if topk_hint is not None else None,
+                )
+                if router_topk is not None:
+                    topk_ids, topk_scores = router_topk
+                    trace_item["router_topk_ids"] = topk_ids
+                    trace_item["router_topk_scores"] = topk_scores
+            primary_output = trace_item.get("primary_output")
+            primary_row_count = (
+                int(primary_output.shape[0])
+                if isinstance(primary_output, torch.Tensor) and primary_output.ndim > 0
+                else None
+            )
+            row_token_uids, _uid_span = self._row_token_uids_for_trace(
+                inputs=inputs,
+                output=output,
+                module=module,
+                row_count=primary_row_count,
+            )
+            if (
+                isinstance(primary_output, torch.Tensor)
+                and primary_output.ndim > 0
+                and isinstance(row_token_uids, torch.Tensor)
+                and int(row_token_uids.numel()) == int(primary_output.shape[0])
+            ):
+                trace_item["row_token_uids"] = row_token_uids
+                if isinstance(_uid_span, int) and _uid_span > 0:
+                    trace_item["row_uid_span"] = int(_uid_span)
+            trace_items = self._split_expert_trace_items(
+                module_name=name,
+                module=module,
+                inputs=inputs,
+                trace_item=trace_item,
+            )
+            trace_calls = self.current_step_trace.setdefault(name, [])
+            for split_item in trace_items:
+                split_item["call_index"] = len(trace_calls)
+                trace_calls.append(split_item)
 
         return _hook
 
@@ -554,15 +574,14 @@ class ForwardTraceCapture:
             return self.current_step_sample_indices[micro_order]
         return None
 
-    @torch._dynamo.disable
     def _root_pre_hook(self, _module: Any, _args: Any) -> None:
         if self.current_step_index is None:
             return
+        self._inside_root_forward = True
         micro_order = self._next_micro_order
         sample_index = self._sample_index_for_micro(micro_order)
         self.begin_micro(sample_index=sample_index, micro_order=micro_order)
 
-    @torch._dynamo.disable
     def _root_post_hook(self, _module: Any, _inputs: Any, output: Any) -> None:
         if self.current_step_index is None:
             return
@@ -581,9 +600,11 @@ class ForwardTraceCapture:
                 if sample_index is not None
                 else _local_dummy_micro_slot(micro_order),
                 output_tensor.float(),
+                getattr(_module, "_art_root_output_token_uids", None),
             )
         )
         self._next_micro_order = micro_order + 1
+        self._inside_root_forward = False
 
     def set_step(
         self,
@@ -598,6 +619,7 @@ class ForwardTraceCapture:
         self.current_micro_order = 0
         self.current_micro_module_call_counts = {}
         self._next_micro_order = 0
+        self._inside_root_forward = False
 
     def begin_micro(self, sample_index: int | None, micro_order: int) -> None:
         self.current_micro_sample_index = sample_index
@@ -610,20 +632,57 @@ class ForwardTraceCapture:
     def _row_token_uids_for_trace(
         *,
         inputs: Any,
+        output: Any = None,
         module: Any,
+        row_count: int | None = None,
+        prefer_uid_span: bool = False,
     ) -> tuple[torch.Tensor | None, int | None]:
-        row_token_uids = _extract_tensor_attr(inputs, "_art_trace_row_token_uids")
-        if row_token_uids is None:
-            row_token_uids = getattr(module, "_art_trace_row_token_uids", None)
-        if not isinstance(row_token_uids, torch.Tensor):
+        candidates = (
+            (
+                _extract_tensor_attr(output, "_art_trace_row_token_uids"),
+                _extract_tensor_attr(output, "_art_trace_uid_span"),
+            ),
+            (
+                getattr(module, "_art_trace_row_token_uids", None),
+                getattr(module, "_art_trace_uid_span", None),
+            ),
+            (
+                _extract_tensor_attr(inputs, "_art_trace_row_token_uids"),
+                _extract_tensor_attr(inputs, "_art_trace_uid_span"),
+            ),
+        )
+        row_count_matches: list[tuple[torch.Tensor, Any]] = []
+        tensor_candidates: list[tuple[torch.Tensor, Any]] = []
+        for row_token_uids, uid_span in candidates:
+            if not isinstance(row_token_uids, torch.Tensor):
+                continue
+            tensor_candidates.append((row_token_uids, uid_span))
+            if row_count is None or int(row_token_uids.numel()) == int(row_count):
+                row_count_matches.append((row_token_uids, uid_span))
+        if not tensor_candidates:
             return None, None
 
-        uid_span = _extract_tensor_attr(inputs, "_art_trace_uid_span")
-        if uid_span is None:
-            uid_span = getattr(module, "_art_trace_uid_span", None)
+        def _select_candidate(
+            options: list[tuple[torch.Tensor, Any]],
+        ) -> tuple[torch.Tensor, Any] | None:
+            if prefer_uid_span:
+                for row_token_uids, uid_span in options:
+                    if isinstance(uid_span, int) and uid_span > 0:
+                        return row_token_uids, uid_span
+            if options:
+                return options[0]
+            return None
+
+        selected = _select_candidate(row_count_matches) or _select_candidate(
+            tensor_candidates
+        )
+        if selected is None:
+            return None, None
+        selected_uids, selected_span = selected
+        uid_span = selected_span
         uid_span_int = uid_span if isinstance(uid_span, int) and uid_span > 0 else None
         return (
-            row_token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
+            selected_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
             uid_span_int,
         )
 
@@ -687,6 +746,8 @@ class ForwardTraceCapture:
         row_token_uids, uid_span = cls._row_token_uids_for_trace(
             inputs=inputs,
             module=module,
+            row_count=int(primary_output.shape[0]),
+            prefer_uid_span=True,
         )
         if row_token_uids is None:
             return [trace_item]
@@ -698,6 +759,7 @@ class ForwardTraceCapture:
         trace_item["row_token_uids"] = row_token_uids
         if uid_span is None:
             return [trace_item]
+        trace_item["row_uid_span"] = int(uid_span)
 
         sample_ids = torch.div(row_token_uids, uid_span, rounding_mode="floor")
         ordered_sample_ids: list[int] = []
@@ -710,7 +772,9 @@ class ForwardTraceCapture:
             ordered_sample_ids.append(sample_id_int)
 
         if len(ordered_sample_ids) <= 1:
-            if ordered_sample_ids:
+            if ordered_sample_ids and not isinstance(
+                trace_item.get("micro_sample_index"), int
+            ):
                 trace_item["micro_sample_index"] = ordered_sample_ids[0]
             return [trace_item]
 
@@ -728,6 +792,7 @@ class ForwardTraceCapture:
             }
             split_item["micro_sample_index"] = sample_id
             split_item["row_token_uids"] = row_token_uids.index_select(0, row_indices)
+            split_item["row_uid_span"] = int(uid_span)
             split_items.append(split_item)
         return split_items
 
@@ -911,30 +976,112 @@ class ForwardTraceCapture:
         )
 
     @classmethod
-    def _canonicalize_moe_expert_row_order(
+    def _canonicalize_row_aligned_value(
         cls,
+        value: Any,
         *,
-        module_name: str,
-        tensor: torch.Tensor,
-        call: dict[str, Any],
-    ) -> torch.Tensor:
-        """Canonicalizes MoE expert rows using dispatch-time UID identities."""
-        if not cls._is_moe_expert_forward_module(module_name):
-            return tensor
-        if tensor.ndim != 2:
-            return tensor
-        primary_hint = cls._primary_output_merge_hint(call)
-        if isinstance(primary_hint, dict) and (
-            primary_hint.get("op") != "concat" or primary_hint.get("dim") != 0
-        ):
-            return tensor
+        order: torch.Tensor,
+        total_rows: int,
+    ) -> Any:
+        """Applies one row-token ordering to every row-aligned tensor value."""
+        if isinstance(value, torch.Tensor):
+            if value.ndim > 0 and int(value.shape[0]) == total_rows:
+                return value.index_select(0, order).contiguous()
+            return value
+        if isinstance(value, dict):
+            return {
+                key: cls._canonicalize_row_aligned_value(
+                    item,
+                    order=order,
+                    total_rows=total_rows,
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                cls._canonicalize_row_aligned_value(
+                    item,
+                    order=order,
+                    total_rows=total_rows,
+                )
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                cls._canonicalize_row_aligned_value(
+                    item,
+                    order=order,
+                    total_rows=total_rows,
+                )
+                for item in value
+            )
+        return value
+
+    @classmethod
+    def _canonicalize_call_row_token_order(cls, call: dict[str, Any]) -> None:
+        """Canonicalizes all row-aligned call tensors to global token order."""
+        cls._align_exact_zero_padding_row_token_uids(call)
         row_token_uids = call.get("row_token_uids")
-        if not isinstance(row_token_uids, torch.Tensor):
-            return tensor
-        if int(row_token_uids.numel()) != int(tensor.shape[0]):
-            return tensor
+        if not isinstance(row_token_uids, torch.Tensor) or row_token_uids.ndim != 1:
+            return
+        total_rows = int(row_token_uids.numel())
+        if total_rows <= 1:
+            return
         order = torch.argsort(row_token_uids, stable=True)
-        return tensor.index_select(0, order)
+        if bool(torch.equal(order, torch.arange(order.numel(), dtype=order.dtype))):
+            return
+        original_call = dict(call)
+        for key, value in original_call.items():
+            if key == "row_token_uids":
+                continue
+            call[key] = cls._canonicalize_row_aligned_value(
+                value,
+                order=order,
+                total_rows=total_rows,
+            )
+        call["row_token_uids"] = row_token_uids.index_select(0, order).contiguous()
+
+    @staticmethod
+    def _align_exact_zero_padding_row_token_uids(call: dict[str, Any]) -> None:
+        """Moves padding UID markers onto exact-zero sequence-parallel pad rows."""
+        row_token_uids = call.get("row_token_uids")
+        tensor = call.get("primary_output")
+        if (
+            not isinstance(row_token_uids, torch.Tensor)
+            or row_token_uids.ndim != 1
+            or not isinstance(tensor, torch.Tensor)
+            or tensor.ndim == 0
+            or int(tensor.shape[0]) != int(row_token_uids.numel())
+        ):
+            return
+        row_count = int(row_token_uids.numel())
+        if row_count <= 1 or not bool((row_token_uids < 0).any().item()):
+            return
+        flat = tensor.detach().reshape(row_count, -1)
+        zero_rows = torch.nonzero(
+            (flat == 0).all(dim=1) & (row_token_uids >= 0),
+            as_tuple=False,
+        ).reshape(-1)
+        negative_rows = torch.nonzero(
+            (row_token_uids < 0) & ~(flat == 0).all(dim=1),
+            as_tuple=False,
+        ).reshape(-1)
+        if int(zero_rows.numel()) == 0 or int(zero_rows.numel()) != int(
+            negative_rows.numel()
+        ):
+            return
+        aligned = row_token_uids.clone()
+        for zero_pos, negative_pos in zip(
+            zero_rows.tolist(), negative_rows.tolist(), strict=True
+        ):
+            zero_pos = int(zero_pos)
+            negative_pos = int(negative_pos)
+            if zero_pos >= negative_pos:
+                return
+            shifted = aligned[zero_pos:negative_pos].clone()
+            aligned[zero_pos] = -1
+            aligned[zero_pos + 1 : negative_pos + 1] = shifted
+        call["row_token_uids"] = aligned
 
     @classmethod
     def _canonicalize_primary_output_tensor(
@@ -960,11 +1107,52 @@ class ForwardTraceCapture:
             tensor=tensor,
             call=call,
         )
-        return cls._canonicalize_moe_expert_row_order(
-            module_name=module_name,
-            tensor=tensor,
-            call=call,
+        return tensor
+
+    @staticmethod
+    def _decoder_layer_trace_key(
+        module_name: str,
+        call: dict[str, Any],
+    ) -> tuple[str, int, int, int] | None:
+        module_name = _normalize_trace_module_name(module_name)
+        if ".decoder.layers." not in module_name:
+            return None
+        tensor = call.get("primary_output")
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+            return None
+        return (
+            module_name.split(".self_attention", 1)[0].split(".mlp", 1)[0],
+            _safe_int(call.get("micro_sample_index"), -1),
+            _safe_int(call.get("micro_order"), -1),
+            int(tensor.shape[0]),
         )
+
+    @classmethod
+    def _propagate_decoder_row_token_uids(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        row_uids_by_key: dict[tuple[str, int, int, int], torch.Tensor] = {}
+        for module_name in sorted(trace.keys()):
+            for call in trace[module_name]:
+                row_token_uids = call.get("row_token_uids")
+                if not isinstance(row_token_uids, torch.Tensor):
+                    continue
+                key = cls._decoder_layer_trace_key(module_name, call)
+                if key is None or key in row_uids_by_key:
+                    continue
+                row_uids_by_key[key] = row_token_uids
+        for module_name in sorted(trace.keys()):
+            for call in trace[module_name]:
+                if isinstance(call.get("row_token_uids"), torch.Tensor):
+                    continue
+                key = cls._decoder_layer_trace_key(module_name, call)
+                if key is None:
+                    continue
+                row_token_uids = row_uids_by_key.get(key)
+                if row_token_uids is None:
+                    continue
+                call["row_token_uids"] = row_token_uids
 
     @classmethod
     def canonicalize_trace(
@@ -972,6 +1160,7 @@ class ForwardTraceCapture:
         trace: dict[str, list[dict[str, Any]]],
     ) -> dict[str, list[dict[str, Any]]]:
         """Canonicalizes topology-dependent trace outputs in place."""
+        cls._propagate_decoder_row_token_uids(trace)
         for module_name in sorted(trace.keys()):
             calls = trace[module_name]
             for call_offset, call in enumerate(calls):
@@ -985,6 +1174,7 @@ class ForwardTraceCapture:
                         tensor=tensor,
                         call=call,
                     )
+                cls._canonicalize_call_row_token_order(call)
                 call[PRIMARY_OUTPUT_CANONICAL_KEY] = True
         return trace
 
@@ -1005,7 +1195,9 @@ class ForwardTraceCapture:
                 if tensor is None:
                     continue
                 call_index = call.get("call_index", call_offset)
-                flattened[f"{module_name}.call_{call_index}"] = tensor
+                flattened[
+                    f"{_normalize_trace_module_name(module_name)}.call_{call_index}"
+                ] = tensor
         return flattened
 
     @classmethod
@@ -1077,9 +1269,86 @@ class ForwardTraceCapture:
             return values_by_rank[0]
         return values_by_rank
 
+    @staticmethod
+    def _expert_parallel_group_key(entry: dict[str, Any]) -> tuple[int, int] | None:
+        """Returns the expert-data/expert-parallel group for one rank call."""
+        rank_meta = entry.get("rank_meta")
+        if not isinstance(rank_meta, dict):
+            return None
+        return (
+            _safe_int(rank_meta.get("expert_dp_rank"), 0),
+            _safe_int(rank_meta.get("ep_rank"), 0),
+        )
+
+    @classmethod
+    def _merge_expert_tensor_parallel_values(
+        cls,
+        *,
+        module_name: str,
+        key: str,
+        rank_call_entries: list[dict[str, Any]],
+        preferred_cat_dim: int | None,
+        preferred_reduce: str | None,
+    ) -> Any | None:
+        """Merges ETP shards before concatenating independent expert rows."""
+        if not cls._is_moe_expert_forward_module(module_name):
+            return None
+        if preferred_cat_dim != -1 and preferred_reduce != "sum":
+            return None
+        entry_values = [
+            (entry, entry[key]) for entry in rank_call_entries if key in entry
+        ]
+        if not entry_values or not all(
+            isinstance(value, torch.Tensor) for _, value in entry_values
+        ):
+            return None
+
+        grouped: dict[tuple[int, int], list[tuple[dict[str, Any], torch.Tensor]]] = {}
+        for entry, value in entry_values:
+            group_key = cls._expert_parallel_group_key(entry)
+            if group_key is None:
+                return None
+            grouped.setdefault(group_key, []).append((entry, cast(torch.Tensor, value)))
+
+        merged_groups: list[torch.Tensor] = []
+        for group_key in sorted(grouped):
+            group_values = [value for _, value in grouped[group_key]]
+            if key == "row_token_uids":
+                first = group_values[0]
+                if not all(
+                    first.shape == value.shape and torch.equal(first, value)
+                    for value in group_values[1:]
+                ):
+                    raise RuntimeError(
+                        "Expert tensor-parallel trace row UIDs diverged within "
+                        f"group={group_key} module={module_name}"
+                    )
+                merged_groups.append(first)
+                continue
+            if preferred_reduce == "sum":
+                merged = cls._merge_rank_values(
+                    group_values,
+                    preferred_reduce="sum",
+                )
+            else:
+                merged = cls._merge_rank_values(
+                    group_values,
+                    preferred_cat_dim=preferred_cat_dim,
+                )
+            if not isinstance(merged, torch.Tensor):
+                return None
+            merged_groups.append(merged)
+
+        if len(merged_groups) == 1:
+            return merged_groups[0]
+        if cls._can_cat_along_dim(merged_groups, dim=0):
+            return torch.cat(merged_groups, dim=0)
+        return None
+
     @classmethod
     def _merge_rank_call_entries(
         cls,
+        module_name: str,
         rank_call_entries: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Merges one module call across ranks using per-field merge hints."""
@@ -1089,6 +1358,40 @@ class ForwardTraceCapture:
             values = [entry[key] for entry in rank_call_entries if key in entry]
             if key == "rank_meta":
                 merged_call[key] = values
+                continue
+            if key == "row_token_uids":
+                primary_hint = next(
+                    (
+                        cls._primary_output_merge_hint(entry)
+                        for entry in rank_call_entries
+                        if cls._primary_output_merge_hint(entry) is not None
+                    ),
+                    None,
+                )
+                preferred_cat_dim = None
+                preferred_reduce = None
+                if isinstance(primary_hint, dict):
+                    if primary_hint.get("op") == "sum":
+                        preferred_reduce = "sum"
+                    elif primary_hint.get("op") == "concat" and isinstance(
+                        primary_hint.get("dim"), int
+                    ):
+                        preferred_cat_dim = int(primary_hint["dim"])
+                expert_merged = cls._merge_expert_tensor_parallel_values(
+                    module_name=module_name,
+                    key=key,
+                    rank_call_entries=rank_call_entries,
+                    preferred_cat_dim=preferred_cat_dim,
+                    preferred_reduce=preferred_reduce,
+                )
+                merged_call[key] = (
+                    expert_merged
+                    if expert_merged is not None
+                    else cls._merge_row_token_uids(
+                        values_by_rank=values,
+                        rank_call_entries=rank_call_entries,
+                    )
+                )
                 continue
             preferred_cat_dim: int | None = None
             preferred_reduce: str | None = None
@@ -1120,12 +1423,125 @@ class ForwardTraceCapture:
                     merged_call[f"{key}__row_splits"] = [
                         int(cast(torch.Tensor, value).shape[0]) for value in values
                     ]
-            merged_call[key] = cls._merge_rank_values(
-                values,
+            expert_merged = cls._merge_expert_tensor_parallel_values(
+                module_name=module_name,
+                key=key,
+                rank_call_entries=rank_call_entries,
                 preferred_cat_dim=preferred_cat_dim,
                 preferred_reduce=preferred_reduce,
             )
+            merged_call[key] = (
+                expert_merged
+                if expert_merged is not None
+                else cls._merge_rank_values_with_cp_groups(
+                    values_by_rank=values,
+                    rank_call_entries=rank_call_entries,
+                    preferred_cat_dim=preferred_cat_dim,
+                    preferred_reduce=preferred_reduce,
+                )
+            )
         return merged_call
+
+    @classmethod
+    def _merge_row_token_uids(
+        cls,
+        *,
+        values_by_rank: list[Any],
+        rank_call_entries: list[dict[str, Any]],
+    ) -> Any:
+        """Preserves row identities across feature-sharded ranks."""
+        if not all(isinstance(value, torch.Tensor) for value in values_by_rank):
+            return cls._merge_rank_values(values_by_rank, preferred_cat_dim=0)
+
+        tensors = cast(list[torch.Tensor], values_by_rank)
+        grouped_indices: dict[int, list[int]] = {}
+        for index, entry in enumerate(rank_call_entries):
+            rank_meta = entry.get("rank_meta")
+            if not isinstance(rank_meta, dict):
+                return cls._merge_rank_values(values_by_rank, preferred_cat_dim=0)
+            cp_rank = _safe_int(rank_meta.get("cp_rank"), 0)
+            grouped_indices.setdefault(cp_rank, []).append(index)
+
+        merged_by_cp: list[torch.Tensor] = []
+        for cp_rank in sorted(grouped_indices):
+            group_tensors = [tensors[index] for index in grouped_indices[cp_rank]]
+            first = group_tensors[0]
+            if all(
+                first.shape == tensor.shape and torch.equal(first, tensor)
+                for tensor in group_tensors[1:]
+            ):
+                merged_by_cp.append(first)
+                continue
+            merged = cls._merge_rank_values(group_tensors, preferred_cat_dim=0)
+            if not isinstance(merged, torch.Tensor):
+                return merged
+            merged_by_cp.append(merged)
+
+        if len(merged_by_cp) == 1:
+            return merged_by_cp[0]
+        if cls._can_cat_along_dim(merged_by_cp, dim=0):
+            return torch.cat(merged_by_cp, dim=0)
+        return merged_by_cp
+
+    @classmethod
+    def _merge_rank_values_with_cp_groups(
+        cls,
+        *,
+        values_by_rank: list[Any],
+        rank_call_entries: list[dict[str, Any]],
+        preferred_cat_dim: int | None,
+        preferred_reduce: str | None,
+    ) -> Any:
+        """Merges rank values, preserving CP row shards when features are also sharded."""
+        cp_world_sizes: set[int] = set()
+        for entry in rank_call_entries:
+            rank_meta = entry.get("rank_meta")
+            if isinstance(rank_meta, dict):
+                cp_world_sizes.add(_safe_int(rank_meta.get("cp_world_size"), 1))
+        if len(cp_world_sizes) != 1 or next(iter(cp_world_sizes), 1) <= 1:
+            return cls._merge_rank_values(
+                values_by_rank,
+                preferred_cat_dim=preferred_cat_dim,
+                preferred_reduce=preferred_reduce,
+            )
+        if preferred_cat_dim != -1 and preferred_reduce != "sum":
+            return cls._merge_rank_values(
+                values_by_rank,
+                preferred_cat_dim=preferred_cat_dim,
+                preferred_reduce=preferred_reduce,
+            )
+
+        grouped_indices: dict[int, list[int]] = {}
+        for index, entry in enumerate(rank_call_entries):
+            rank_meta = entry.get("rank_meta")
+            if not isinstance(rank_meta, dict):
+                return cls._merge_rank_values(
+                    values_by_rank,
+                    preferred_cat_dim=preferred_cat_dim,
+                    preferred_reduce=preferred_reduce,
+                )
+            cp_rank = _safe_int(rank_meta.get("cp_rank"), 0)
+            grouped_indices.setdefault(cp_rank, []).append(index)
+        if len(grouped_indices) <= 1:
+            return cls._merge_rank_values(
+                values_by_rank,
+                preferred_cat_dim=preferred_cat_dim,
+                preferred_reduce=preferred_reduce,
+            )
+
+        merged_by_cp = [
+            cls._merge_rank_values(
+                [values_by_rank[index] for index in grouped_indices[cp_rank]],
+                preferred_cat_dim=preferred_cat_dim,
+                preferred_reduce=preferred_reduce,
+            )
+            for cp_rank in sorted(grouped_indices)
+        ]
+        if all(isinstance(value, torch.Tensor) for value in merged_by_cp):
+            tensors = cast(list[torch.Tensor], merged_by_cp)
+            if cls._can_cat_along_dim(tensors, dim=0):
+                return torch.cat(tensors, dim=0)
+        return merged_by_cp
 
     @staticmethod
     def _can_cat_along_dim(tensors: list[torch.Tensor], dim: int) -> bool:
@@ -1173,7 +1589,10 @@ class ForwardTraceCapture:
                     )
                     grouped_calls.setdefault(merge_key, []).append(call)
             for merged_index, merge_key in enumerate(sorted(grouped_calls)):
-                merged_call = cls._merge_rank_call_entries(grouped_calls[merge_key])
+                merged_call = cls._merge_rank_call_entries(
+                    module_name,
+                    grouped_calls[merge_key],
+                )
                 merged_call["call_index"] = merged_index
                 module_calls.append(merged_call)
             merged[module_name] = module_calls
@@ -1198,63 +1617,173 @@ class ForwardTraceCapture:
 
     @staticmethod
     def _merge_group_tensor(
-        tensors: list[torch.Tensor], *, strict: bool = True
+        tensors: list[tuple[torch.Tensor, torch.Tensor | None]],
     ) -> torch.Tensor:
         if len(tensors) == 1:
-            return tensors[0]
-        first = tensors[0]
-        if all(tensor.shape == first.shape for tensor in tensors[1:]) and all(
-            torch.equal(first, tensor) for tensor in tensors[1:]
+            return tensors[0][0]
+
+        tensor_values = [tensor for tensor, _ in tensors]
+        first = tensor_values[0]
+        if all(tensor.shape == first.shape for tensor in tensor_values[1:]) and all(
+            torch.equal(first, tensor) for tensor in tensor_values[1:]
         ):
             return first
-        if not strict:
-            return first
-        raise RuntimeError(
-            "Mismatched output captures for the same micro output across non-DP ranks"
-        )
+
+        uid_values = [uids for _, uids in tensors]
+        if any(uids is None for uids in uid_values):
+            raise RuntimeError(
+                "Mismatched output captures for the same micro output across non-DP ranks"
+            )
+
+        typed_uid_values = cast(list[torch.Tensor], uid_values)
+        typed_tensors = [(tensor, cast(torch.Tensor, uids)) for tensor, uids in tensors]
+        if any(tensor.ndim != 2 for tensor in tensor_values) or any(
+            uids.ndim != 2 for uids in typed_uid_values
+        ):
+            raise RuntimeError(
+                "Root output UID merge currently requires rank-local 2D tensors"
+            )
+        if any(tensor.shape != uids.shape for tensor, uids in typed_tensors):
+            raise RuntimeError(
+                "Root output tensor/token UID shape mismatch during CP merge"
+            )
+
+        batch_size = int(first.shape[0])
+        max_row_length = 1
+        for uids in typed_uid_values:
+            valid_uids = uids[uids >= 0]
+            if int(valid_uids.numel()) > 0:
+                max_row_length = max(
+                    max_row_length,
+                    int(valid_uids.max().item()) + 1,
+                )
+
+        merged = first.new_zeros((batch_size, max_row_length))
+        filled = torch.zeros((batch_size, max_row_length), dtype=torch.bool)
+        for tensor, uids in typed_tensors:
+            for row_index in range(batch_size):
+                row_uids = uids[row_index]
+                valid_mask = row_uids >= 0
+                if not bool(valid_mask.any()):
+                    continue
+                row_positions = row_uids[valid_mask].to(dtype=torch.long)
+                row_values = tensor[row_index, valid_mask]
+                existing_mask = filled[row_index].index_select(0, row_positions)
+                if bool(existing_mask.any()):
+                    existing_values = merged[row_index].index_select(0, row_positions)
+                    if not torch.equal(existing_values, row_values):
+                        raise RuntimeError(
+                            "Conflicting CP output values for the same token UID"
+                        )
+                merged[row_index].index_copy_(0, row_positions, row_values)
+                filled[row_index].index_fill_(0, row_positions, True)
+
+        for row_index in range(batch_size):
+            row_filled = filled[row_index]
+            present = torch.nonzero(row_filled, as_tuple=False).reshape(-1)
+            if int(present.numel()) == 0:
+                continue
+            expected = torch.arange(int(present.numel()), dtype=torch.long)
+            if not torch.equal(present, expected):
+                raise RuntimeError(
+                    "CP output token UIDs did not form a contiguous row-major prefix"
+                )
+        return merged
 
     @staticmethod
     def _gather_rank_outputs(
-        local_outputs: list[tuple[int | None, int, int | None, torch.Tensor]],
-    ) -> list[list[tuple[int | None, int, int | None, torch.Tensor]]] | None:
+        local_outputs: list[
+            tuple[int | None, int, int | None, torch.Tensor, torch.Tensor | None]
+        ],
+    ) -> (
+        list[
+            list[
+                tuple[
+                    int | None,
+                    int,
+                    int | None,
+                    torch.Tensor,
+                    torch.Tensor | None,
+                ]
+            ]
+        ]
+        | None
+    ):
         if (
             not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
             or torch.distributed.get_world_size() == 1  # ty: ignore[possibly-missing-attribute]
         ):
             return [local_outputs]
         gathered: list[
-            list[tuple[int | None, int, int | None, torch.Tensor]] | None
+            list[
+                tuple[
+                    int | None,
+                    int,
+                    int | None,
+                    torch.Tensor,
+                    torch.Tensor | None,
+                ]
+            ]
+            | None
         ] = [None] * torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
         torch.distributed.all_gather_object(gathered, local_outputs)  # ty: ignore[possibly-missing-attribute]
         if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
             return None
         return cast(
-            list[list[tuple[int | None, int, int | None, torch.Tensor]]],
+            list[
+                list[
+                    tuple[
+                        int | None,
+                        int,
+                        int | None,
+                        torch.Tensor,
+                        torch.Tensor | None,
+                    ]
+                ]
+            ],
             gathered,
         )
 
     def ordered_step_outputs(self) -> list[torch.Tensor] | None:
+        ordered = self.ordered_step_outputs_with_sample_indices()
+        if ordered is None:
+            return None
+        _, outputs = ordered
+        return outputs
+
+    def ordered_step_outputs_with_sample_indices(
+        self,
+    ) -> tuple[list[int | None], list[torch.Tensor]] | None:
         if not self.enabled:
             return None
         gathered_outputs = self._gather_rank_outputs(self.current_step_outputs)
         if gathered_outputs is None:
             return None
-        grouped: dict[tuple[int | None, int | None, int], list[torch.Tensor]] = {}
+        grouped: dict[
+            tuple[int | None, int | None, int],
+            list[tuple[torch.Tensor, torch.Tensor | None]],
+        ] = {}
         for rank_outputs in gathered_outputs:
-            for sample_index, micro_order, micro_slot, tensor in rank_outputs:
+            for (
+                sample_index,
+                micro_order,
+                micro_slot,
+                tensor,
+                token_uids,
+            ) in rank_outputs:
                 group_key = (sample_index, micro_slot, micro_order)
-                grouped.setdefault(group_key, []).append(tensor)
+                grouped.setdefault(group_key, []).append((tensor, token_uids))
         ordered_group_keys = sorted(
             grouped,
             key=lambda item: _captured_output_sort_key(item[0], item[2], item[1]),
         )
-        return [
-            self._merge_group_tensor(
-                grouped[group_key],
-                strict=self.strict_output_match,
-            )
-            for group_key in ordered_group_keys
-        ]
+        return (
+            [sample_index for sample_index, _, _ in ordered_group_keys],
+            [
+                self._merge_group_tensor(grouped[group_key])
+                for group_key in ordered_group_keys
+            ],
+        )
 
     def save_current_step(self, traces_dir: Path) -> Path | None:
         if not self.enabled or self.current_step_index is None:

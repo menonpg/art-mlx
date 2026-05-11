@@ -5,6 +5,7 @@ from typing import Callable
 import pytest
 
 from .oracle_harness import (
+    LIVE_TRAINING_LOG_PATH,
     ORACLE_TOPOLOGY,
     SENSITIVITY_MUTATION_ENV,
     available_gpu_count,
@@ -13,11 +14,13 @@ from .oracle_harness import (
     run_suite,
     sensitivity_enabled,
     sensitivity_mutations,
+    sensitivity_required_world_size,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CORRECTNESS_LOG_PATH = REPO_ROOT / ".local" / "correctness.log"
 SENSITIVITY_LOG_PATH = REPO_ROOT / ".local" / "sensitivity.log"
+TEST_FLEX_BACKEND = "TRITON_LEGACY"
 
 
 def _run_suite_with_log(
@@ -26,6 +29,8 @@ def _run_suite_with_log(
     run: Callable[[], object],
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_TRAINING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_TRAINING_LOG_PATH.write_text("", encoding="utf-8")
     with log_path.open("w", encoding="utf-8") as log_file:
         with redirect_stdout(log_file), redirect_stderr(log_file):
             run()
@@ -38,13 +43,9 @@ def _announce_report_log(
 ) -> None:
     with capsys.disabled():
         print(f"\nMegatron LoRA oracle report log: {log_path}", flush=True)
-
-
-def _require_gpus_for(topology_world_size: int) -> None:
-    gpu_count = available_gpu_count()
-    if gpu_count < topology_world_size:
-        pytest.skip(
-            f"Need {topology_world_size} GPUs for topology run, only found {gpu_count}"
+        print(
+            f"Megatron LoRA live training log: {LIVE_TRAINING_LOG_PATH}",
+            flush=True,
         )
 
 
@@ -63,12 +64,16 @@ def test_megatron_lora_topology_suite(capsys: pytest.CaptureFixture[str]) -> Non
             ),
             encoding="utf-8",
         )
-    _require_gpus_for(ORACLE_TOPOLOGY.world_size())
+        pytest.skip(
+            f"Need {ORACLE_TOPOLOGY.world_size()} GPUs for topology run, only found {gpu_count}"
+        )
     _run_suite_with_log(
         log_path=CORRECTNESS_LOG_PATH,
         run=lambda: run_suite(
             case_config=case_config(),
             max_world_size=gpu_count,
+            oracle_flex_backend=TEST_FLEX_BACKEND,
+            variant_flex_backend=TEST_FLEX_BACKEND,
         ),
     )
 
@@ -95,22 +100,26 @@ def test_megatron_lora_diff_sensitivity(capsys: pytest.CaptureFixture[str]) -> N
         )
     mutations = sensitivity_mutations()
     assert mutations
+    sensitivity_world_size = sensitivity_required_world_size(mutations)
     gpu_count = available_gpu_count()
-    if gpu_count < ORACLE_TOPOLOGY.world_size():
+    if gpu_count < sensitivity_world_size:
         SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         SENSITIVITY_LOG_PATH.write_text(
             (
                 "Sensitivity suite skipped. "
-                f"Need {ORACLE_TOPOLOGY.world_size()} GPUs, found {gpu_count}.\n"
+                f"Need {sensitivity_world_size} GPUs, found {gpu_count}.\n"
             ),
             encoding="utf-8",
         )
-    _require_gpus_for(ORACLE_TOPOLOGY.world_size())
+        pytest.skip(
+            f"Need {sensitivity_world_size} GPUs for topology run, only found {gpu_count}"
+        )
     _run_suite_with_log(
         log_path=SENSITIVITY_LOG_PATH,
         run=lambda: run_sensitivity_suite(
             case_config=case_config(),
             mutations=mutations,
-            max_world_size=gpu_count,
+            oracle_flex_backend=TEST_FLEX_BACKEND,
+            variant_flex_backend=TEST_FLEX_BACKEND,
         ),
     )

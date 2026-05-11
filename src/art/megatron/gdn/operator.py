@@ -2,21 +2,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-import importlib
 from types import MethodType
 from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
-from causal_conv1d import causal_conv1d_fn
-from fla.modules.l2norm import l2norm
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-from megatron.core.transformer.transformer_layer import TransformerLayer
-from pydantic import BaseModel, ConfigDict
 import torch
 from torch import Tensor
+import torch.distributed as dist
 import torch.nn.functional as F
 
-from .conv_gelu import gdn_varlen_causal_conv_gelu, packed_varlen_causal_conv
+from .conv_gelu import packed_varlen_causal_conv
+from .fla_cp import chunk_gated_delta_rule_native_cp
 from .gdn_shared_prefix import (
     GdnPackedExecutionSpec,
     GdnParentStateTransferPlan,
@@ -36,26 +31,21 @@ from .segment_layout import (
 )
 
 _NVTX_ENABLED: ContextVar[bool] = ContextVar("art_gdn_nvtx_enabled", default=False)
-
-
-class _BucketFlatLayout(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    padded_indices: Tensor
-    padded_mask: Tensor
-    real_indices: Tensor
-    output_indices: Tensor
-    output_selector: Tensor | None
+_TRACE_ROW_TOKEN_UIDS_ATTR = "_art_trace_row_token_uids"
+_TRACE_UID_SPAN_ATTR = "_art_trace_uid_span"
+_GDN_ATTENTION_ORIGINAL_SHAPE_ATTR = "_art_gdn_attention_original_shape"
+_GDN_CP_LAYOUT_ATTR = "_art_gdn_cp_layout"
 
 
 def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
     """Patch Megatron GatedDeltaNet modules to honor ART shared-prefix packing."""
 
+    gated_delta_net_type = _optional_gated_delta_net_type()
+    if gated_delta_net_type is None:
+        return
     for chunk in model_chunks:
-        if not hasattr(chunk, "modules"):
-            continue
         for module in chunk.modules():
-            if not isinstance(module, GatedDeltaNet):
+            if not isinstance(module, gated_delta_net_type):
                 continue
             if getattr(module, "_art_shared_prefix_gdn_hooked", False):
                 continue
@@ -68,18 +58,21 @@ def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
 def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
     """Hoist CP layout conversion across consecutive Transformer GDN layers."""
 
+    gated_delta_net_type = _optional_gated_delta_net_type()
+    transformer_layer_type = _optional_transformer_layer_type()
+    if gated_delta_net_type is None or transformer_layer_type is None:
+        return
+
     for chunk in model_chunks:
-        if not hasattr(chunk, "modules"):
-            continue
         _install_empty_safe_norm_hooks(chunk)
         layers = [
             module
             for module in chunk.modules()
-            if isinstance(module, TransformerLayer)
+            if isinstance(module, transformer_layer_type)
             and hasattr(module, "self_attention")
         ]
         layer_is_gdn = [
-            isinstance(layer.self_attention, GatedDeltaNet) for layer in layers
+            isinstance(layer.self_attention, gated_delta_net_type) for layer in layers
         ]
         for index, layer in enumerate(layers):
             is_gdn = layer_is_gdn[index]
@@ -93,6 +86,22 @@ def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
             layer._art_gdn_island_physical_forward = layer.forward
             layer.forward = MethodType(_gdn_island_layer_forward, layer)
             layer._art_gdn_island_hooked = True
+
+
+def _optional_gated_delta_net_type() -> type[Any] | None:
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return None
+    return GatedDeltaNet
+
+
+def _optional_transformer_layer_type() -> type[Any] | None:
+    try:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+    except ImportError:
+        return None
+    return TransformerLayer
 
 
 def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -109,30 +118,73 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     is_gdn = bool(getattr(self, "_art_gdn_island_is_gdn", False))
     if not is_gdn:
         if getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn":
-            _mark_attention_layout_active(attention_bias)
+            active_gdn = getattr(attention_bias, "gdn_active_module", None)
+            actual_layout = _infer_cp_hidden_layout(hidden_states, plan, gdn=active_gdn)
+            if actual_layout == "attention":
+                _mark_attention_layout_active(
+                    attention_bias, hidden_states, gdn=active_gdn
+                )
+                return original_forward(*args, **kwargs)
+            if (
+                actual_layout == "gdn"
+                and _is_megatron_checkpoint_recompute()
+                and active_gdn is not None
+            ):
+                hidden_states = _leave_gdn_island_layout(
+                    hidden_states,
+                    attention_bias,
+                    gdn=active_gdn,
+                )
+                args, kwargs = _replace_layer_hidden_states(args, kwargs, hidden_states)
+                return original_forward(*args, **kwargs)
+            if _is_megatron_checkpoint_recompute() and active_gdn is not None:
+                raise RuntimeError(
+                    "checkpoint recompute reached a non-GDN TransformerLayer with "
+                    "stale GDN-layout metadata, but the hidden_states tensor layout "
+                    "could not be inferred safely"
+                )
+            raise RuntimeError(
+                "non-GDN TransformerLayer received GDN-layout hidden states; "
+                "the preceding GDN island did not close back to attention layout"
+            )
         return original_forward(*args, **kwargs)
 
     prev_is_gdn = bool(getattr(self, "_art_gdn_island_prev_is_gdn", False))
     next_is_gdn = bool(getattr(self, "_art_gdn_island_next_is_gdn", False))
     if prev_is_gdn:
-        _mark_gdn_layout_active(attention_bias, hidden_states)
+        original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
+        if original_shape is not None:
+            attention_bias.gdn_attention_original_shape = original_shape
+        _mark_gdn_layout_active(attention_bias, hidden_states, gdn=self.self_attention)
     else:
         hidden_states = _enter_gdn_island_layout(
-            hidden_states, attention_bias, force=True
+            hidden_states,
+            attention_bias,
+            gdn=self.self_attention,
+            force=True,
         )
         args, kwargs = _replace_layer_hidden_states(args, kwargs, hidden_states)
+    previous_input_layout = getattr(attention_bias, "gdn_input_layout", None)
+    previous_output_layout = getattr(attention_bias, "gdn_output_layout", None)
+    attention_bias.gdn_input_layout = "gdn"
+    attention_bias.gdn_output_layout = "gdn"
 
-    output = (
-        _empty_gdn_island_layer_forward(self, hidden_states, kwargs)
-        if int(hidden_states.shape[0]) == 0
-        else original_forward(*args, **kwargs)
-    )
+    try:
+        output = original_forward(*args, **kwargs)
+    finally:
+        attention_bias.gdn_input_layout = previous_input_layout
+        attention_bias.gdn_output_layout = previous_output_layout
     if next_is_gdn:
-        _mark_gdn_layout_active(attention_bias, _layer_output_hidden_states(output))
-        return output
-
+        hidden_out = _attach_gdn_attention_original_shape(
+            _layer_output_hidden_states(output),
+            getattr(attention_bias, "gdn_attention_original_shape", None),
+        )
+        _mark_gdn_layout_active(attention_bias, hidden_out, gdn=self.self_attention)
+        return _replace_layer_output_hidden_states(output, hidden_out)
     hidden_out = _leave_gdn_island_layout(
-        _layer_output_hidden_states(output), attention_bias
+        _layer_output_hidden_states(output),
+        attention_bias,
+        gdn=self.self_attention,
     )
     return _replace_layer_output_hidden_states(output, hidden_out)
 
@@ -172,6 +224,14 @@ def _replace_layer_output_hidden_states(output: Any, hidden_states: Tensor) -> A
     if isinstance(output, tuple):
         return (hidden_states, *output[1:])
     return hidden_states
+
+
+def _is_megatron_checkpoint_recompute() -> bool:
+    try:
+        from megatron.core.tensor_parallel.random import is_checkpointing
+    except ImportError:
+        return False
+    return bool(is_checkpointing()) and torch.is_grad_enabled()
 
 
 def _install_empty_safe_norm_hooks(root: Any) -> None:
@@ -214,33 +274,6 @@ def _empty_safe_norm_forward(
     return original_forward(input_, *args, **kwargs)
 
 
-def _empty_gdn_island_layer_forward(
-    layer: Any, hidden_states: Tensor, kwargs: dict[str, Any]
-) -> tuple[Tensor, Tensor | None]:
-    with _nvtx_range("art_gdn_empty_island_layer", hidden_states):
-        attention_output = layer.self_attention(
-            hidden_states,
-            attention_mask=kwargs.get("attention_mask"),
-            inference_context=kwargs.get(
-                "inference_context", kwargs.get("inference_params")
-            ),
-            rotary_pos_emb=kwargs.get("rotary_pos_emb"),
-            rotary_pos_cos=kwargs.get("rotary_pos_cos"),
-            rotary_pos_sin=kwargs.get("rotary_pos_sin"),
-            rotary_pos_cos_sin=kwargs.get("rotary_pos_cos_sin"),
-            attention_bias=kwargs.get("attention_bias"),
-            packed_seq_params=kwargs.get("packed_seq_params"),
-            sequence_len_offset=kwargs.get("sequence_len_offset"),
-        )
-    context = kwargs.get("context")
-    if isinstance(attention_output, dict) and "context" in attention_output:
-        context = attention_output["context"]
-    attention_hidden = (
-        attention_output[0] if isinstance(attention_output, tuple) else attention_output
-    )
-    return hidden_states + cast(Tensor, attention_hidden), context
-
-
 def _shared_prefix_forward(
     self: Any,
     hidden_states: Tensor,
@@ -281,25 +314,39 @@ def _shared_prefix_forward(
         raise NotImplementedError(
             "PackedSeqParams is not used in ART shared-prefix GDN."
         )
-    return gdn_shared_prefix_forward(
+    current_layout = _normalize_cp_layout(
+        getattr(attention_bias, "gdn_hidden_layout", "attention")
+    )
+    input_layout = _normalize_cp_layout(
+        getattr(attention_bias, "gdn_input_layout", None) or current_layout
+    )
+    output_layout = _normalize_cp_layout(
+        getattr(attention_bias, "gdn_output_layout", None) or current_layout
+    )
+    mark_layout = execution_plan is not None and int(execution_plan.cp_size) > 1
+    if mark_layout:
+        _mark_cp_layout_active(
+            attention_bias, hidden_states, gdn=self, layout=input_layout
+        )
+    output = gdn_shared_prefix_forward(
         self,
         hidden_states,
         group_ids=cast(Tensor, group_ids),
         parent_ids=cast(Tensor, parent_ids),
         execution_spec=cast(GdnPackedExecutionSpec | None, execution_spec),
         execution_plan=cast(GdnRankExecutionPlan | None, execution_plan),
-        input_layout=(
-            "gdn"
-            if getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn"
-            else "attention"
-        ),
-        output_layout=(
-            "gdn"
-            if getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn"
-            else "attention"
-        ),
-        require_prebuilt_plan=False,
+        input_layout=input_layout,
+        output_layout=output_layout,
+        require_prebuilt_plan=True,
     )
+    if mark_layout:
+        _mark_cp_layout_active(
+            attention_bias,
+            _layer_output_hidden_states(output),
+            gdn=self,
+            layout=output_layout,
+        )
+    return output
 
 
 @torch.compiler.disable
@@ -355,7 +402,9 @@ def run_gdn_layer(
         )
     seq_len, batch_size, _ = hidden_states.shape
     requested_cp_size = (
-        execution_plan.cp_size if execution_plan is not None else _default_cp_size()
+        execution_plan.cp_size
+        if execution_plan is not None
+        else int(getattr(gdn, "sp_size", 1))
     )
     cp_rank = (
         execution_plan.cp_rank
@@ -373,7 +422,8 @@ def run_gdn_layer(
         raise ValueError(
             "shared-prefix GDN group_ids shape must match the logical sequence "
             "processed by Megatron GDN after sequence-parallel input gather, got "
-            f"hidden={tuple(hidden_states.shape)} group_ids={tuple(group_ids.shape)} "
+            f"hidden={tuple(hidden_states.shape)} "
+            f"group_ids={tuple(group_ids.shape)} "
             f"expected_group_shape={(batch_size, expected_group_seq_len)}"
         )
 
@@ -416,11 +466,12 @@ def run_gdn_layer(
             )
     elif execution_plan.cp_size == 1 and (
         execution_plan.batch_size != batch_size
-        or execution_plan.sequence_length != seq_len
+        or execution_plan.sequence_length != expected_group_seq_len
     ):
         raise ValueError(
             "GDN execution plan shape must match hidden_states, got "
             f"plan={(execution_plan.batch_size, execution_plan.sequence_length)} "
+            f"expected={(batch_size, expected_group_seq_len)} "
             f"hidden={(batch_size, seq_len)}"
         )
     if execution_plan.cp_size != 1:
@@ -454,7 +505,7 @@ def _has_chunk_aligned_local_plan(plan: GdnRankExecutionPlan) -> bool:
     return bool(
         plan.prefix_boundary_buckets
         or plan.prefix_tail_buckets
-        or plan.completion_warmup_buckets
+        or plan.completion_with_prefix_tail_buckets
     )
 
 
@@ -473,7 +524,7 @@ def _run_chunk_aligned_prefixes_and_completions(
 
     for bucket in plan.prefix_boundary_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            prefix_qkv, prefix_beta, prefix_g = _gather_compact_bucket_streams(
+            prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
         zero_conv = _zero_conv_state(
@@ -519,7 +570,7 @@ def _run_chunk_aligned_prefixes_and_completions(
     tail_rec_chunks: list[Tensor] = []
     for bucket in plan.prefix_tail_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            tail_qkv, tail_beta, tail_g = _gather_compact_bucket_streams(
+            tail_qkv, tail_beta, tail_g = _gather_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
         with _nvtx_range("art_gdn_state_fanout", tail_qkv):
@@ -553,15 +604,15 @@ def _run_chunk_aligned_prefixes_and_completions(
         state_chunks=tail_rec_chunks,
     )
 
-    for bucket in plan.completion_warmup_buckets:
+    for bucket in plan.completion_with_prefix_tail_buckets:
         with _nvtx_range("art_gdn_state_fanout", hidden_states):
             completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
             completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
-            completion_qkv, completion_beta, completion_g = (
-                _gather_compact_bucket_streams(qkv, beta, recurrent_g, bucket)
+            completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
+                qkv, beta, recurrent_g, bucket
             )
-        with _nvtx_range("art_gdn_completion_warmup_segment", completion_qkv):
+        with _nvtx_range("art_gdn_completion_with_prefix_tail_segment", completion_qkv):
             completion_out, _, _ = run_gdn_bucket(
                 bucket,
                 (completion_qkv, completion_beta, completion_g),
@@ -572,54 +623,7 @@ def _run_chunk_aligned_prefixes_and_completions(
         recurrent_output = _scatter_bucket_recurrent_output(
             recurrent_output, bucket, completion_out
         )
-
     return _project_gdn_output(gdn, recurrent_output, gate, plan)
-
-
-def _iter_prepared_bucket_columns(
-    bucket: GdnSegmentBucketPlan,
-    qkv: Tensor,
-    beta: Tensor,
-    recurrent_g: Tensor,
-    conv_initial: Tensor,
-    recurrent_initial: Tensor,
-) -> Iterator[tuple[GdnSegmentBucketPlan, Tensor, Tensor, Tensor, Tensor, Tensor]]:
-    for column in range(int(bucket.lengths.numel())):
-        length = int(bucket.lengths[column].item())
-        if length == 0:
-            continue
-        column_bucket = _slice_bucket_column(bucket, column=column, length=length)
-        yield (
-            column_bucket,
-            qkv[column : column + 1, :, :length],
-            beta[column : column + 1, :length],
-            recurrent_g[column : column + 1, :length],
-            conv_initial[column : column + 1],
-            recurrent_initial[column : column + 1],
-        )
-
-
-def _slice_bucket_column(
-    bucket: GdnSegmentBucketPlan, *, column: int, length: int
-) -> GdnSegmentBucketPlan:
-    lengths = bucket.lengths[column : column + 1]
-    cu_seqlens = torch.stack((lengths.new_zeros(()), lengths[0]))
-    output_mask = (
-        None
-        if bucket.output_mask is None
-        else bucket.output_mask[:length, column : column + 1]
-    )
-    return GdnSegmentBucketPlan.model_construct(
-        length=length,
-        lengths=lengths,
-        real_mask=bucket.real_mask[:length, column : column + 1],
-        cu_seqlens=cu_seqlens,
-        row_indices=bucket.row_indices[:length, column : column + 1],
-        position_indices=bucket.position_indices[:length, column : column + 1],
-        family_indices=bucket.family_indices[column : column + 1],
-        real_token_count_static=length,
-        output_mask=output_mask,
-    )
 
 
 def _run_cp_planned_prefixes_and_completions(
@@ -640,46 +644,65 @@ def _run_cp_planned_prefixes_and_completions(
         raise ValueError(
             f"unsupported GDN CP layouts: {input_layout=} {output_layout=}"
         )
-    run_gdn_prepared_varlen_native_fla_cp = importlib.import_module(
-        "art.megatron.gdn.cp_runtime"
-    ).run_gdn_prepared_varlen_native_fla_cp
-
+    if (
+        plan.sequence_length == 0
+        and plan.remote_prefix_tail_exchange is None
+        and not plan.remote_prefix_tail_state_transfers
+    ):
+        return _run_empty_cp_rank(gdn, hidden_states, plan, group), None
     if input_layout == "attention":
-        gdn_hidden, original_shape = gdn_cp_attention_to_gdn_layout(
-            hidden_states, plan, group
+        gdn_hidden, _original_shape = gdn_cp_attention_to_gdn_layout(
+            hidden_states,
+            plan,
+            group,
+            gdn=gdn,
         )
     else:
-        gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan)
-        original_shape = _attention_original_shape_from_plan(hidden_states, plan)
+        gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
     with _nvtx_range("art_gdn_in_proj", gdn_hidden):
         qkv, gate, beta, recurrent_g = _project_gdn_inputs(gdn, gdn_hidden)
+    cp_dependency = _empty_autograd_dependency(qkv)
+    qkv_with_remote_tail = qkv
+    beta_with_remote_tail = beta
+    recurrent_g_with_remote_tail = recurrent_g
+    if plan.remote_prefix_tail_exchange is not None:
+        with _nvtx_range("art_gdn_remote_prefix_tail_exchange", qkv):
+            remote_qkv, remote_beta, remote_g = _exchange_remote_prefix_tail_streams(
+                qkv,
+                beta,
+                recurrent_g,
+                plan=plan,
+                group=group,
+            )
+        qkv_with_remote_tail = torch.cat([qkv, remote_qkv.unsqueeze(0)], dim=1)
+        beta_with_remote_tail = torch.cat([beta, remote_beta.unsqueeze(0)], dim=1)
+        recurrent_g_with_remote_tail = torch.cat(
+            [recurrent_g, remote_g.unsqueeze(0)], dim=1
+        )
+        cp_dependency = cp_dependency + _make_zero_autograd_dependency(
+            remote_qkv, remote_beta, remote_g
+        )
     gate = gate.clone()
     recurrent_output = torch.zeros_like(gate)
     prefix_family_chunks: list[Tensor] = []
     prefix_conv_chunks: list[Tensor] = []
     prefix_rec_chunks: list[Tensor] = []
-    cp_dependency = _empty_autograd_dependency(qkv)
 
     for bucket in plan.chain_prefix_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
             prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
-        zero_conv = _zero_conv_state(gdn, gdn_hidden, batch_size=prefix_qkv.shape[0])
-        zero_rec = _zero_recurrent_state(
-            gdn, gdn_hidden, batch_size=prefix_qkv.shape[0]
-        )
+        zero_conv = _zero_conv_state(gdn, qkv, batch_size=bucket.segment_count)
+        zero_rec = _zero_recurrent_state(gdn, qkv, batch_size=bucket.segment_count)
         with _nvtx_range("art_gdn_cp_prefix_segment", prefix_qkv):
-            prefix_out, prefix_conv, prefix_rec = run_gdn_prepared_varlen_native_fla_cp(
-                gdn,
-                prefix_qkv,
-                beta=prefix_beta,
-                recurrent_g=prefix_g,
-                lengths=bucket.lengths,
-                cu_seqlens=bucket.cu_seqlens,
-                conv_initial=zero_conv,
-                recurrent_initial=zero_rec,
+            prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
+                bucket,
+                (prefix_qkv, prefix_beta, prefix_g),
+                (zero_conv, zero_rec),
+                gdn=gdn,
                 group=group,
+                recurrent_cp=True,
                 output_final_state=True,
             )
         if prefix_conv is None or prefix_rec is None:
@@ -703,19 +726,14 @@ def _run_cp_planned_prefixes_and_completions(
             prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
-        zero_conv = _zero_conv_state(gdn, gdn_hidden, batch_size=prefix_qkv.shape[0])
-        zero_rec = _zero_recurrent_state(
-            gdn, gdn_hidden, batch_size=prefix_qkv.shape[0]
-        )
+        zero_conv = _zero_conv_state(gdn, qkv, batch_size=bucket.segment_count)
+        zero_rec = _zero_recurrent_state(gdn, qkv, batch_size=bucket.segment_count)
         with _nvtx_range("art_gdn_local_prefix_segment", prefix_qkv):
-            prefix_out, prefix_conv, prefix_rec = _run_gdn_prepared_varlen_batch(
-                gdn,
-                prefix_qkv,
-                beta=prefix_beta,
-                recurrent_g=prefix_g,
-                bucket=bucket,
-                conv_initial=zero_conv,
-                recurrent_initial=zero_rec,
+            prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
+                bucket,
+                (prefix_qkv, prefix_beta, prefix_g),
+                (zero_conv, zero_rec),
+                gdn=gdn,
                 output_final_state=True,
             )
         if prefix_conv is None or prefix_rec is None:
@@ -733,21 +751,40 @@ def _run_cp_planned_prefixes_and_completions(
         prefix_conv_chunks.append(prefix_conv)
         prefix_rec_chunks.append(prefix_rec)
 
-    if plan.prefix_tail_buckets or plan.completion_warmup_buckets:
+    if (
+        plan.prefix_tail_buckets
+        or plan.remote_prefix_tail_buckets
+        or plan.completion_with_prefix_tail_buckets
+        or plan.remote_completion_with_prefix_tail_buckets
+        or plan.remote_prefix_tail_state_transfers
+    ):
         boundary_conv_table = _materialize_indexed_family_state_table(
             plan=plan,
             family_chunks=boundary_family_chunks,
             state_chunks=boundary_conv_chunks,
-            zero_state=_zero_conv_state(gdn, gdn_hidden, batch_size=plan.family_count),
+            zero_state=_zero_conv_state(gdn, qkv, batch_size=plan.family_count),
         )
         boundary_rec_table = _materialize_indexed_family_state_table(
             plan=plan,
             family_chunks=boundary_family_chunks,
             state_chunks=boundary_rec_chunks,
-            zero_state=_zero_recurrent_state(
-                gdn, gdn_hidden, batch_size=plan.family_count
-            ),
+            zero_state=_zero_recurrent_state(gdn, qkv, batch_size=plan.family_count),
         )
+        remote_boundary_conv_table = boundary_conv_table
+        remote_boundary_rec_table = boundary_rec_table
+        if plan.remote_prefix_tail_state_transfers:
+            with _nvtx_range("art_gdn_cp_remote_prefix_tail_state_exchange", qkv):
+                (
+                    remote_boundary_conv_table,
+                    remote_boundary_rec_table,
+                    remote_boundary_dependency,
+                ) = _exchange_parent_state_rows(
+                    boundary_conv_table,
+                    boundary_rec_table,
+                    transfers=plan.remote_prefix_tail_state_transfers,
+                    group=group,
+                )
+            cp_dependency = cp_dependency + remote_boundary_dependency
         tail_family_chunks: list[Tensor] = []
         tail_conv_chunks: list[Tensor] = []
         tail_rec_chunks: list[Tensor] = []
@@ -759,14 +796,11 @@ def _run_cp_planned_prefixes_and_completions(
             tail_conv = boundary_conv_table.index_select(0, bucket.family_indices)
             tail_rec = boundary_rec_table.index_select(0, bucket.family_indices)
             with _nvtx_range("art_gdn_local_prefix_segment", tail_qkv):
-                tail_out, tail_conv, tail_rec = _run_gdn_prepared_varlen_batch(
-                    gdn,
-                    tail_qkv,
-                    beta=tail_beta,
-                    recurrent_g=tail_g,
-                    bucket=bucket,
-                    conv_initial=tail_conv,
-                    recurrent_initial=tail_rec,
+                tail_out, tail_conv, tail_rec = run_gdn_bucket(
+                    bucket,
+                    (tail_qkv, tail_beta, tail_g),
+                    (tail_conv, tail_rec),
+                    gdn=gdn,
                     output_final_state=True,
                 )
             if tail_conv is None or tail_rec is None:
@@ -783,6 +817,39 @@ def _run_cp_planned_prefixes_and_completions(
             prefix_family_chunks.append(bucket.family_indices)
             prefix_conv_chunks.append(tail_conv)
             prefix_rec_chunks.append(tail_rec)
+        for bucket in plan.remote_prefix_tail_buckets:
+            with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
+                tail_qkv, tail_beta, tail_g = _gather_bucket_streams(
+                    qkv_with_remote_tail,
+                    beta_with_remote_tail,
+                    recurrent_g_with_remote_tail,
+                    bucket,
+                )
+            tail_conv = remote_boundary_conv_table.index_select(
+                0, bucket.family_indices
+            )
+            tail_rec = remote_boundary_rec_table.index_select(0, bucket.family_indices)
+            with _nvtx_range("art_gdn_remote_prefix_tail_segment", tail_qkv):
+                tail_out, tail_conv, tail_rec = run_gdn_bucket(
+                    bucket,
+                    (tail_qkv, tail_beta, tail_g),
+                    (tail_conv, tail_rec),
+                    gdn=gdn,
+                    output_final_state=True,
+                )
+            if tail_conv is None or tail_rec is None:
+                raise RuntimeError(
+                    "remote prefix tail GDN execution must return states"
+                )
+            tail_out = _add_autograd_dependency(tail_out, cp_dependency)
+            tail_conv = _add_autograd_dependency(tail_conv, cp_dependency)
+            tail_rec = _add_autograd_dependency(tail_rec, cp_dependency)
+            tail_family_chunks.append(bucket.family_indices)
+            tail_conv_chunks.append(tail_conv)
+            tail_rec_chunks.append(tail_rec)
+            prefix_family_chunks.append(bucket.family_indices)
+            prefix_conv_chunks.append(tail_conv)
+            prefix_rec_chunks.append(tail_rec)
         prefix_conv_table = _replace_indexed_family_states(
             boundary_conv_table,
             family_chunks=tail_family_chunks,
@@ -793,7 +860,7 @@ def _run_cp_planned_prefixes_and_completions(
             family_chunks=tail_family_chunks,
             state_chunks=tail_rec_chunks,
         )
-        for bucket in plan.completion_warmup_buckets:
+        for bucket in plan.completion_with_prefix_tail_buckets:
             completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
             completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
             completion_conv, completion_rec = _couple_parent_states(
@@ -803,55 +870,57 @@ def _run_cp_planned_prefixes_and_completions(
                 completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
                     qkv, beta, recurrent_g, bucket
                 )
-            for (
-                column_bucket,
-                qkv_col,
-                beta_col,
-                g_col,
-                conv_col,
-                rec_col,
-            ) in _iter_prepared_bucket_columns(
-                bucket,
-                completion_qkv,
-                completion_beta,
-                completion_g,
-                completion_conv,
-                completion_rec,
-            ):
-                with _nvtx_range("art_gdn_local_completion_segment", qkv_col):
-                    completion_out, _, _ = _run_gdn_prepared_varlen_batch(
-                        gdn,
-                        qkv_col,
-                        beta=beta_col,
-                        recurrent_g=g_col,
-                        bucket=column_bucket,
-                        conv_initial=conv_col,
-                        recurrent_initial=rec_col,
-                        output_final_state=False,
-                    )
-                completion_out = _add_autograd_dependency(completion_out, cp_dependency)
-                recurrent_output = _scatter_bucket_recurrent_output(
-                    recurrent_output, column_bucket, completion_out
+            with _nvtx_range("art_gdn_local_completion_segment", completion_qkv):
+                completion_out, _, _ = run_gdn_bucket(
+                    bucket,
+                    (completion_qkv, completion_beta, completion_g),
+                    (completion_conv, completion_rec),
+                    gdn=gdn,
+                    output_final_state=False,
                 )
+            completion_out = _add_autograd_dependency(completion_out, cp_dependency)
+            recurrent_output = _scatter_bucket_recurrent_output(
+                recurrent_output, bucket, completion_out
+            )
+        for bucket in plan.remote_completion_with_prefix_tail_buckets:
+            completion_conv = prefix_conv_table.index_select(0, bucket.family_indices)
+            completion_rec = prefix_rec_table.index_select(0, bucket.family_indices)
+            completion_conv, completion_rec = _couple_parent_states(
+                completion_conv, completion_rec
+            )
+            with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
+                completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
+                    qkv,
+                    beta,
+                    recurrent_g,
+                    bucket,
+                )
+            with _nvtx_range("art_gdn_remote_completion_segment", completion_qkv):
+                completion_out, _, _ = run_gdn_bucket(
+                    bucket,
+                    (completion_qkv, completion_beta, completion_g),
+                    (completion_conv, completion_rec),
+                    gdn=gdn,
+                    output_final_state=False,
+                )
+            completion_out = _add_autograd_dependency(completion_out, cp_dependency)
+            recurrent_output = _scatter_bucket_recurrent_output(
+                recurrent_output, bucket, completion_out
+            )
 
     for bucket in plan.local_prefix_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
             prefix_qkv, prefix_beta, prefix_g = _gather_bucket_streams(
                 qkv, beta, recurrent_g, bucket
             )
-        zero_conv = _zero_conv_state(gdn, gdn_hidden, batch_size=prefix_qkv.shape[0])
-        zero_rec = _zero_recurrent_state(
-            gdn, gdn_hidden, batch_size=prefix_qkv.shape[0]
-        )
+        zero_conv = _zero_conv_state(gdn, qkv, batch_size=bucket.segment_count)
+        zero_rec = _zero_recurrent_state(gdn, qkv, batch_size=bucket.segment_count)
         with _nvtx_range("art_gdn_local_prefix_segment", prefix_qkv):
-            prefix_out, prefix_conv, prefix_rec = _run_gdn_prepared_varlen_batch(
-                gdn,
-                prefix_qkv,
-                beta=prefix_beta,
-                recurrent_g=prefix_g,
-                bucket=bucket,
-                conv_initial=zero_conv,
-                recurrent_initial=zero_rec,
+            prefix_out, prefix_conv, prefix_rec = run_gdn_bucket(
+                bucket,
+                (prefix_qkv, prefix_beta, prefix_g),
+                (zero_conv, zero_rec),
+                gdn=gdn,
                 output_final_state=True,
             )
         if prefix_conv is None or prefix_rec is None:
@@ -867,20 +936,26 @@ def _run_cp_planned_prefixes_and_completions(
         prefix_rec_chunks.append(prefix_rec)
 
     if not prefix_conv_chunks and not plan.parent_state_exchange_family_indices:
-        projected, out_bias = _project_gdn_output(gdn, recurrent_output, gate, plan)
-        if output_layout == "gdn":
-            return projected, out_bias
-        return _cp_output_to_attention(projected, plan, original_shape, group), out_bias
+        projected, out_bias = _project_cp_gdn_output(
+            gdn,
+            recurrent_output,
+            gate,
+            plan,
+            group=group,
+            output_layout=output_layout,
+        )
+        projected = _add_autograd_dependency(projected, cp_dependency)
+        return projected, out_bias
 
     prefix_conv_table = _materialize_ordered_family_state_table(
         family_chunks=prefix_family_chunks,
         state_chunks=prefix_conv_chunks,
-        zero_state=_zero_conv_state(gdn, gdn_hidden, batch_size=plan.family_count),
+        zero_state=_zero_conv_state(gdn, qkv, batch_size=plan.family_count),
     )
     prefix_rec_table = _materialize_ordered_family_state_table(
         family_chunks=prefix_family_chunks,
         state_chunks=prefix_rec_chunks,
-        zero_state=_zero_recurrent_state(gdn, gdn_hidden, batch_size=plan.family_count),
+        zero_state=_zero_recurrent_state(gdn, qkv, batch_size=plan.family_count),
     )
     for bucket in plan.chain_completion_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
@@ -895,16 +970,13 @@ def _run_cp_planned_prefixes_and_completions(
         completion_conv = _scale_state_gradient(completion_conv, 1.0 / plan.cp_size)
         completion_rec = _scale_state_gradient(completion_rec, 1.0 / plan.cp_size)
         with _nvtx_range("art_gdn_cp_completion_segment", completion_qkv):
-            completion_out, _, _ = run_gdn_prepared_varlen_native_fla_cp(
-                gdn,
-                completion_qkv,
-                beta=completion_beta,
-                recurrent_g=completion_g,
-                lengths=bucket.lengths,
-                cu_seqlens=bucket.cu_seqlens,
-                conv_initial=completion_conv,
-                recurrent_initial=completion_rec,
+            completion_out, _, _ = run_gdn_bucket(
+                bucket,
+                (completion_qkv, completion_beta, completion_g),
+                (completion_conv, completion_rec),
+                gdn=gdn,
                 group=group,
+                recurrent_cp=True,
                 output_final_state=False,
             )
         completion_out = _add_autograd_dependency(completion_out, cp_dependency)
@@ -929,14 +1001,11 @@ def _run_cp_planned_prefixes_and_completions(
             completion_conv, completion_rec
         )
         with _nvtx_range("art_gdn_local_completion_segment", completion_qkv):
-            completion_out, _, _ = _run_gdn_prepared_varlen_batch(
-                gdn,
-                completion_qkv,
-                beta=completion_beta,
-                recurrent_g=completion_g,
-                bucket=bucket,
-                conv_initial=completion_conv,
-                recurrent_initial=completion_rec,
+            completion_out, _, _ = run_gdn_bucket(
+                bucket,
+                (completion_qkv, completion_beta, completion_g),
+                (completion_conv, completion_rec),
+                gdn=gdn,
                 output_final_state=False,
             )
         completion_out = _add_autograd_dependency(completion_out, cp_dependency)
@@ -969,14 +1038,11 @@ def _run_cp_planned_prefixes_and_completions(
             completion_conv, completion_rec
         )
         with _nvtx_range("art_gdn_local_completion_segment", completion_qkv):
-            completion_out, _, _ = _run_gdn_prepared_varlen_batch(
-                gdn,
-                completion_qkv,
-                beta=completion_beta,
-                recurrent_g=completion_g,
-                bucket=bucket,
-                conv_initial=completion_conv,
-                recurrent_initial=completion_rec,
+            completion_out, _, _ = run_gdn_bucket(
+                bucket,
+                (completion_qkv, completion_beta, completion_g),
+                (completion_conv, completion_rec),
+                gdn=gdn,
                 output_final_state=False,
             )
         completion_out = _add_autograd_dependency(completion_out, cp_dependency)
@@ -984,11 +1050,16 @@ def _run_cp_planned_prefixes_and_completions(
             recurrent_output, bucket, completion_out
         )
 
-    projected, out_bias = _project_gdn_output(gdn, recurrent_output, gate, plan)
+    projected, out_bias = _project_cp_gdn_output(
+        gdn,
+        recurrent_output,
+        gate,
+        plan,
+        group=group,
+        output_layout=output_layout,
+    )
     projected = _add_autograd_dependency(projected, cp_dependency)
-    if output_layout == "gdn":
-        return projected, out_bias
-    return _cp_output_to_attention(projected, plan, original_shape, group), out_bias
+    return projected, out_bias
 
 
 @torch.compiler.disable
@@ -996,21 +1067,55 @@ def gdn_cp_attention_to_gdn_layout(
     hidden_states: Tensor,
     plan: GdnRankExecutionPlan,
     group: Any,
+    gdn: Any | None = None,
 ) -> tuple[Tensor, tuple[int, int, int]]:
     from .layout import exchange_rank_tensor_all_to_all
 
     if plan.attention_to_gdn is None or plan.gdn_to_attention is None:
         raise ValueError("CP GDN layout conversion requires prebuilt exchange plans")
-    attention_flat, original_shape = _flatten_hidden_for_cp_plan(hidden_states, plan)
+    exchange_plan, backward_plan, rank, group = _hidden_layout_exchange_context(
+        plan,
+        gdn=gdn,
+        group=group,
+        forward_plan=plan.attention_to_gdn,
+        backward_plan=plan.gdn_to_attention,
+    )
+    attention_flat, original_shape = _flatten_hidden_for_exchange_plan(
+        hidden_states, exchange_plan, rank=rank
+    )
     with _nvtx_range("art_gdn_cp_attention_to_gdn_exchange", attention_flat):
         gdn_flat = exchange_rank_tensor_all_to_all(
             attention_flat,
-            plan.attention_to_gdn,
-            rank=plan.cp_rank,
+            exchange_plan,
+            rank=rank,
             group=group,
-            backward_plan=plan.gdn_to_attention,
+            backward_plan=backward_plan,
         )
     return gdn_flat.unsqueeze(1).contiguous(), original_shape
+
+
+def _run_empty_cp_rank(
+    gdn: Any,
+    hidden_states: Tensor,
+    plan: GdnRankExecutionPlan,
+    group: Any,
+) -> Tensor:
+    if not plan.parent_state_exchange_family_indices:
+        return hidden_states * 0
+    if not plan.parent_state_transfers:
+        raise ValueError("CP parent-state exchange requires planned transfers")
+    conv_table = _zero_conv_state(gdn, hidden_states, batch_size=plan.family_count)
+    rec_table = _zero_recurrent_state(gdn, hidden_states, batch_size=plan.family_count)
+    conv_table = conv_table.detach().requires_grad_(True)
+    rec_table = rec_table.detach().requires_grad_(True)
+    with _nvtx_range("art_gdn_cp_parent_state_exchange", conv_table):
+        _, _, dependency = _exchange_parent_state_rows(
+            conv_table,
+            rec_table,
+            transfers=plan.parent_state_transfers,
+            group=group,
+        )
+    return hidden_states * 0 + dependency.to(dtype=hidden_states.dtype)
 
 
 @torch.compiler.disable
@@ -1019,55 +1124,135 @@ def gdn_cp_gdn_to_attention_layout(
     plan: GdnRankExecutionPlan,
     original_shape: tuple[int, int, int] | None,
     group: Any,
+    gdn: Any | None = None,
 ) -> Tensor:
-    original_shape = original_shape or _attention_original_shape_from_plan(
-        gdn_hidden, plan
-    )
-    return _cp_output_to_attention(gdn_hidden, plan, original_shape, group)
+    return _cp_output_to_attention(gdn_hidden, plan, original_shape, group, gdn=gdn)
+
+
+def _normalize_cp_layout(value: Any) -> Literal["attention", "gdn"]:
+    if value in ("attention", "gdn"):
+        return cast(Literal["attention", "gdn"], value)
+    raise ValueError(f"unsupported GDN CP layout {value!r}")
 
 
 def _enter_gdn_island_layout(
-    hidden_states: Tensor, attention_bias: Any, *, force: bool = False
+    hidden_states: Tensor,
+    attention_bias: Any,
+    *,
+    gdn: Any | None = None,
+    force: bool = False,
 ) -> Tensor:
     plan = _require_gdn_cp_plan(attention_bias)
     if not force and getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn":
-        return _validate_gdn_hidden_for_cp_plan(hidden_states, plan)
+        return _attach_cp_layout(
+            _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn), "gdn"
+        )
     gdn_hidden, original_shape = gdn_cp_attention_to_gdn_layout(
         hidden_states,
         plan,
         _default_cp_group(plan.cp_size),
+        gdn=gdn,
     )
     attention_bias.gdn_hidden_layout = "gdn"
     attention_bias.gdn_attention_original_shape = original_shape
-    return gdn_hidden
+    if gdn is not None:
+        attention_bias.gdn_active_module = gdn
+    token_uids = _local_layout_token_uids(
+        plan, "gdn", hidden_states=gdn_hidden, gdn=gdn
+    )
+    _set_active_routing_replay_token_uids(token_uids)
+    return _attach_cp_layout(
+        _attach_gdn_attention_original_shape(
+            _attach_trace_token_uids(gdn_hidden, token_uids),
+            original_shape,
+        ),
+        "gdn",
+    )
 
 
-def _mark_attention_layout_active(attention_bias: Any) -> None:
+def _mark_cp_layout_active(
+    attention_bias: Any,
+    hidden_states: Tensor | None,
+    *,
+    gdn: Any | None,
+    layout: Literal["attention", "gdn"],
+) -> None:
+    if layout == "gdn":
+        _mark_gdn_layout_active(attention_bias, hidden_states, gdn=gdn)
+    else:
+        _mark_attention_layout_active(attention_bias, hidden_states, gdn=gdn)
+
+
+def _mark_attention_layout_active(
+    attention_bias: Any,
+    hidden_states: Tensor | None = None,
+    *,
+    gdn: Any | None = None,
+) -> None:
     attention_bias.gdn_hidden_layout = "attention"
     attention_bias.gdn_attention_original_shape = None
-
-
-def _leave_gdn_island_layout(hidden_states: Tensor, attention_bias: Any) -> Tensor:
+    attention_bias.gdn_attention_token_uids = None
+    attention_bias.gdn_active_module = None
+    if hidden_states is None:
+        return
     plan = _require_gdn_cp_plan(attention_bias)
-    gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan)
+    token_uids = _local_layout_token_uids(
+        plan, "attention", hidden_states=hidden_states, gdn=gdn
+    )
+    _set_active_routing_replay_token_uids(token_uids)
+    _attach_trace_token_uids(hidden_states, token_uids)
+    _attach_cp_layout(hidden_states, "attention")
+
+
+def _mark_gdn_layout_active(
+    attention_bias: Any,
+    hidden_states: Tensor | None,
+    *,
+    gdn: Any | None = None,
+) -> None:
+    plan = _require_gdn_cp_plan(attention_bias)
+    attention_bias.gdn_hidden_layout = "gdn"
+    if gdn is not None:
+        attention_bias.gdn_active_module = gdn
+    if hidden_states is None:
+        return
+    original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
+    if original_shape is not None:
+        attention_bias.gdn_attention_original_shape = original_shape
+    gdn_token_uids = _local_layout_token_uids(
+        plan, "gdn", hidden_states=hidden_states, gdn=gdn
+    )
+    _set_active_routing_replay_token_uids(gdn_token_uids)
+    _attach_trace_token_uids(hidden_states, gdn_token_uids)
+    _attach_cp_layout(hidden_states, "gdn")
+
+
+def _leave_gdn_island_layout(
+    hidden_states: Tensor,
+    attention_bias: Any,
+    *,
+    gdn: Any | None = None,
+) -> Tensor:
+    plan = _require_gdn_cp_plan(attention_bias)
+    gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
+    original_shape = getattr(attention_bias, "gdn_attention_original_shape", None)
+    if original_shape is None:
+        original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
     attention_hidden = gdn_cp_gdn_to_attention_layout(
         gdn_hidden,
         plan,
-        getattr(attention_bias, "gdn_attention_original_shape", None),
+        original_shape,
         _default_cp_group(plan.cp_size),
+        gdn=gdn,
     )
     _mark_attention_layout_active(attention_bias)
-    return attention_hidden
-
-
-def _mark_gdn_layout_active(attention_bias: Any, hidden_states: Tensor) -> None:
-    plan = _require_gdn_cp_plan(attention_bias)
-    _validate_gdn_hidden_for_cp_plan(hidden_states, plan)
-    attention_bias.gdn_hidden_layout = "gdn"
-    if getattr(attention_bias, "gdn_attention_original_shape", None) is None:
-        attention_bias.gdn_attention_original_shape = (
-            _attention_original_shape_from_plan(hidden_states, plan)
-        )
+    token_uids = _local_layout_token_uids(
+        plan, "attention", hidden_states=attention_hidden, gdn=gdn
+    )
+    _set_active_routing_replay_token_uids(token_uids)
+    return _attach_cp_layout(
+        _attach_trace_token_uids(attention_hidden, token_uids), "attention"
+    )
 
 
 def _require_gdn_cp_plan(attention_bias: Any) -> GdnRankExecutionPlan:
@@ -1082,41 +1267,320 @@ def _cp_output_to_attention(
     plan: GdnRankExecutionPlan,
     original_shape: tuple[int, int, int],
     group: Any,
+    *,
+    gdn: Any | None = None,
 ) -> Tensor:
     from .layout import exchange_rank_tensor_all_to_all
 
     if plan.gdn_to_attention is None:
         raise ValueError("CP GDN execution requires a GDN-to-attention exchange plan")
-    gdn_flat = gdn_output.squeeze(1).contiguous()
+    if plan.attention_to_gdn is None:
+        raise ValueError("CP GDN execution requires an attention-to-GDN backward plan")
+    exchange_plan, backward_plan, rank, group = _hidden_layout_exchange_context(
+        plan,
+        gdn=gdn,
+        group=group,
+        forward_plan=plan.gdn_to_attention,
+        backward_plan=plan.attention_to_gdn,
+    )
+    gdn_flat, _ = _flatten_hidden_for_exchange_plan(
+        gdn_output, exchange_plan, rank=rank
+    )
     with _nvtx_range("art_gdn_cp_gdn_to_attention_exchange", gdn_flat):
         attention_flat = exchange_rank_tensor_all_to_all(
             gdn_flat,
-            plan.gdn_to_attention,
-            rank=plan.cp_rank,
+            exchange_plan,
+            rank=rank,
             group=group,
-            backward_plan=plan.attention_to_gdn,
+            backward_plan=backward_plan,
+        )
+    if original_shape is None:
+        original_shape = (
+            int(attention_flat.shape[0]),
+            1,
+            int(attention_flat.shape[-1]),
         )
     return _restore_hidden_from_cp_flat(attention_flat, original_shape)
 
 
-def _flatten_hidden_for_cp_plan(
-    hidden_states: Tensor, plan: GdnRankExecutionPlan
+def _hidden_layout_exchange_context(
+    plan: GdnRankExecutionPlan,
+    *,
+    gdn: Any | None,
+    group: Any,
+    forward_plan: Any,
+    backward_plan: Any,
+) -> tuple[Any, Any, int, Any]:
+    projection = _gdn_output_projection(gdn) or _gdn_input_projection(gdn)
+    if projection is None or not _uses_sequence_parallel(projection):
+        return forward_plan, backward_plan, int(plan.cp_rank), group
+    from .layout import shard_cp_exchange_plan_for_sequence_parallel
+
+    tp_size = _tp_world_size(projection)
+    tp_rank = _tp_rank(projection)
+    tp_cp_group = _default_tp_cp_group(plan.cp_size, tp_size)
+    tp_cp_rank = _group_rank(tp_cp_group)
+    sharded_forward = shard_cp_exchange_plan_for_sequence_parallel(
+        forward_plan,
+        cp_rank=int(plan.cp_rank),
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        tp_cp_rank=tp_cp_rank,
+        device=_exchange_plan_device(forward_plan),
+    )
+    sharded_backward = shard_cp_exchange_plan_for_sequence_parallel(
+        backward_plan,
+        cp_rank=int(plan.cp_rank),
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        tp_cp_rank=tp_cp_rank,
+        device=_exchange_plan_device(backward_plan),
+    )
+    return (
+        sharded_forward.plan,
+        sharded_backward.plan,
+        sharded_forward.rank,
+        tp_cp_group,
+    )
+
+
+def _flatten_hidden_for_exchange_plan(
+    hidden_states: Tensor, plan: Any, *, rank: int
 ) -> tuple[Tensor, tuple[int, int, int]]:
     seq_len, batch_size, hidden_size = hidden_states.shape
     flat = hidden_states.transpose(0, 1).reshape(seq_len * batch_size, hidden_size)
-    expected = int(plan.attention_token_count)
-    if int(flat.shape[0]) != expected:
+    expected = int(plan.source_token_counts_by_rank[rank])
+    if int(flat.shape[0]) < expected:
         raise ValueError(
-            "CP GDN hidden token count must match the rank-local attention plan, "
+            "CP GDN hidden token count must match the exchange source layout, "
             f"got {int(flat.shape[0])} tokens and expected {expected}"
         )
-    return flat.contiguous(), (seq_len, batch_size, hidden_size)
+    return flat[:expected].contiguous(), (seq_len, batch_size, hidden_size)
+
+
+def _exchange_plan_device(plan: Any) -> torch.device | str | None:
+    for transfer in getattr(plan, "transfers", ()):
+        for tensor in (
+            getattr(transfer, "source_positions_tensor", None),
+            getattr(transfer, "dest_positions_tensor", None),
+        ):
+            if isinstance(tensor, Tensor):
+                return tensor.device
+    return None
+
+
+def _hidden_token_count(hidden_states: Tensor) -> int:
+    if hidden_states.ndim < 2:
+        return 0
+    return int(hidden_states.shape[0]) * int(hidden_states.shape[1])
+
+
+def _layout_token_uids(
+    plan: GdnRankExecutionPlan, layout: Literal["attention", "gdn"]
+) -> Tensor:
+    indices = (
+        plan.gdn_token_indices if layout == "gdn" else plan.attention_token_indices
+    )
+    return torch.tensor(indices, dtype=torch.int64)
+
+
+def _local_layout_token_uids(
+    plan: GdnRankExecutionPlan,
+    layout: Literal["attention", "gdn"],
+    *,
+    hidden_states: Tensor,
+    gdn: Any | None,
+) -> Tensor:
+    token_uids = _layout_token_uids(plan, layout)
+    token_count = _hidden_token_count(hidden_states)
+    if token_count == int(token_uids.numel()):
+        return token_uids
+    if token_count <= 0:
+        return token_uids.new_empty((0,))
+    projection = _gdn_output_projection(gdn)
+    tp_rank = _tp_rank(projection) if projection is not None else 0
+    start = tp_rank * token_count
+    end = min(start + token_count, int(token_uids.numel()))
+    local_uids = token_uids.new_full((token_count,), -1)
+    if start >= int(token_uids.numel()):
+        return local_uids
+    real_uids = token_uids[start:end]
+    local_uids[: int(real_uids.numel())] = real_uids
+    return local_uids
+
+
+def _attach_trace_token_uids(tensor: Tensor, token_uids: Tensor | None) -> Tensor:
+    if token_uids is None:
+        return tensor
+    setattr(
+        tensor,
+        _TRACE_ROW_TOKEN_UIDS_ATTR,
+        token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
+    )
+    setattr(tensor, _TRACE_UID_SPAN_ATTR, None)
+    return tensor
+
+
+def _attach_cp_layout(tensor: Tensor, layout: Literal["attention", "gdn"]) -> Tensor:
+    setattr(tensor, _GDN_CP_LAYOUT_ATTR, layout)
+    return tensor
+
+
+def _cp_layout_from_tensor(tensor: Tensor) -> Literal["attention", "gdn"] | None:
+    layout = getattr(tensor, _GDN_CP_LAYOUT_ATTR, None)
+    if layout in ("attention", "gdn"):
+        return cast(Literal["attention", "gdn"], layout)
+    return None
+
+
+def _infer_cp_hidden_layout(
+    hidden_states: Tensor,
+    plan: GdnRankExecutionPlan,
+    *,
+    gdn: Any | None,
+) -> Literal["attention", "gdn"] | None:
+    explicit = _cp_layout_from_tensor(hidden_states)
+    if explicit is not None:
+        return explicit
+    if hidden_states.ndim != 3 or int(hidden_states.shape[1]) != 1:
+        return None
+    token_count = int(hidden_states.shape[0])
+    attention_count = _local_layout_token_count_for_hidden(
+        plan, "attention", hidden_states=hidden_states, gdn=gdn
+    )
+    gdn_count = _local_layout_token_count_for_hidden(
+        plan, "gdn", hidden_states=hidden_states, gdn=gdn
+    )
+    if token_count == attention_count and token_count != gdn_count:
+        return "attention"
+    if token_count == gdn_count and token_count != attention_count:
+        return "gdn"
+    if (
+        token_count == gdn_count
+        and _gdn_attention_original_shape_from_tensor(hidden_states) is not None
+    ):
+        return "gdn"
+    return None
+
+
+def _trace_token_uids_from_tensor(tensor: Tensor) -> Tensor | None:
+    token_uids = getattr(tensor, _TRACE_ROW_TOKEN_UIDS_ATTR, None)
+    if not isinstance(token_uids, Tensor):
+        return None
+    return token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+
+
+def _prepare_in_proj_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
+    token_uids = _trace_token_uids_from_tensor(hidden_states)
+    if token_uids is None:
+        return
+    projection = _gdn_input_projection(gdn)
+    if projection is None:
+        return
+    output_uids = _column_parallel_input_token_uids(
+        token_uids,
+        hidden_states,
+        projection,
+    )
+    in_proj = getattr(gdn, "in_proj", None)
+    _set_module_trace_token_uids(in_proj, output_uids)
+    _set_module_trace_token_uids(projection, output_uids)
+    _set_module_trace_token_uids(getattr(in_proj, "qkv_lora", None), output_uids)
+    _set_module_trace_token_uids(getattr(in_proj, "z_lora", None), output_uids)
+
+
+@torch.compiler.disable
+def _column_parallel_input_token_uids(
+    token_uids: Tensor, hidden_states: Tensor, projection: Any
+) -> Tensor:
+    if not _uses_sequence_parallel(projection):
+        return token_uids.to(dtype=torch.int64).reshape(-1)
+    seq_len, batch_size, _hidden_size = hidden_states.shape
+    expected = int(seq_len) * int(batch_size)
+    if int(token_uids.numel()) != expected:
+        return token_uids.to(dtype=torch.int64).reshape(-1)
+    uid_tensor = (
+        token_uids.to(device=hidden_states.device, dtype=torch.int64)
+        .reshape(batch_size, seq_len)
+        .transpose(0, 1)
+        .contiguous()
+        .unsqueeze(-1)
+    )
+    gathered = _column_parallel_input(uid_tensor, projection)
+    return (
+        gathered.squeeze(-1)
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(-1)
+        .detach()
+        .to(device="cpu", dtype=torch.int64)
+    )
+
+
+def _set_module_trace_token_uids(module: Any, token_uids: Tensor | None) -> None:
+    if module is None or token_uids is None:
+        return
+    setattr(
+        module,
+        _TRACE_ROW_TOKEN_UIDS_ATTR,
+        token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
+    )
+    if hasattr(module, _TRACE_UID_SPAN_ATTR):
+        delattr(module, _TRACE_UID_SPAN_ATTR)
+
+
+def _set_out_proj_lora_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
+    token_uids = _trace_token_uids_from_tensor(hidden_states)
+    if token_uids is None:
+        return
+    _set_module_trace_token_uids(
+        getattr(getattr(gdn, "out_proj", None), "lora", None),
+        token_uids,
+    )
+
+
+def _attach_gdn_attention_original_shape(
+    tensor: Tensor, original_shape: tuple[int, int, int] | None
+) -> Tensor:
+    if original_shape is not None:
+        setattr(
+            tensor,
+            _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR,
+            tuple(int(dim) for dim in original_shape),
+        )
+    return tensor
+
+
+def _gdn_attention_original_shape_from_tensor(
+    tensor: Tensor,
+) -> tuple[int, int, int] | None:
+    original_shape = getattr(tensor, _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR, None)
+    if original_shape is None:
+        return None
+    if not isinstance(original_shape, tuple) or len(original_shape) != 3:
+        return None
+    return tuple(int(dim) for dim in original_shape)
+
+
+def _set_active_routing_replay_token_uids(token_uids: Tensor | None) -> Tensor | None:
+    try:
+        from art.megatron.routing_replay import _active_routing_replay_controller
+    except ImportError:
+        return None
+    controller = _active_routing_replay_controller()
+    if controller is None or not hasattr(controller, "set_local_input_token_uids"):
+        return None
+    previous = getattr(controller, "_explicit_local_input_token_uids", None)
+    controller.set_local_input_token_uids(token_uids)
+    return previous
 
 
 def _validate_gdn_hidden_for_cp_plan(
-    hidden_states: Tensor, plan: GdnRankExecutionPlan
+    hidden_states: Tensor, plan: GdnRankExecutionPlan, *, gdn: Any | None = None
 ) -> Tensor:
-    expected = int(plan.gdn_token_count)
+    expected = _local_layout_token_count_for_hidden(
+        plan, "gdn", hidden_states=hidden_states, gdn=gdn
+    )
     if hidden_states.ndim != 3 or int(hidden_states.shape[0]) != expected:
         raise ValueError(
             "CP GDN-layout hidden_states must be [rank_gdn_tokens, 1, D], "
@@ -1130,6 +1594,25 @@ def _validate_gdn_hidden_for_cp_plan(
     return hidden_states.contiguous()
 
 
+def _local_layout_token_count_for_hidden(
+    plan: GdnRankExecutionPlan,
+    layout: Literal["attention", "gdn"],
+    *,
+    hidden_states: Tensor,
+    gdn: Any | None,
+) -> int:
+    del hidden_states
+    real_count = (
+        int(plan.gdn_token_count)
+        if layout == "gdn"
+        else int(plan.attention_token_count)
+    )
+    projection = _gdn_output_projection(gdn) or _gdn_input_projection(gdn)
+    if projection is None or not _uses_sequence_parallel(projection):
+        return real_count
+    return (real_count + _tp_world_size(projection) - 1) // _tp_world_size(projection)
+
+
 def _attention_original_shape_from_plan(
     hidden_states: Tensor, plan: GdnRankExecutionPlan
 ) -> tuple[int, int, int]:
@@ -1140,11 +1623,17 @@ def _restore_hidden_from_cp_flat(
     flat: Tensor, original_shape: tuple[int, int, int]
 ) -> Tensor:
     seq_len, batch_size, hidden_size = original_shape
-    if int(flat.shape[0]) != seq_len * batch_size:
+    token_count = seq_len * batch_size
+    if int(flat.shape[0]) > token_count:
         raise ValueError(
             "CP GDN output token count changed across layout exchange, got "
             f"{int(flat.shape[0])} for original shape {original_shape}"
         )
+    if int(flat.shape[0]) < token_count:
+        padded = flat.new_zeros((token_count, hidden_size))
+        if int(flat.shape[0]) > 0:
+            padded[: int(flat.shape[0])] = flat
+        flat = padded
     return flat.reshape(batch_size, seq_len, hidden_size).transpose(0, 1).contiguous()
 
 
@@ -1161,6 +1650,15 @@ def _make_autograd_dependency(*tensors: Tensor | None) -> Tensor:
         dependency = piece if dependency is None else dependency + piece
     if dependency is None:
         raise ValueError("at least one non-empty tensor is required")
+    return dependency
+
+
+def _make_zero_autograd_dependency(*tensors: Tensor) -> Tensor:
+    if not tensors:
+        raise ValueError("at least one tensor is required")
+    dependency = tensors[0].sum() * 0
+    for tensor in tensors[1:]:
+        dependency = dependency + tensor.sum() * 0
     return dependency
 
 
@@ -1209,198 +1707,26 @@ class _ScaleStateGradient(torch.autograd.Function):
         return grad_output * ctx.scale, None
 
 
-def _gather_flat_bucket_streams(
-    qkv_flat: Tensor,
-    beta_flat: Tensor,
-    recurrent_g_flat: Tensor,
-    *,
-    layout: _BucketFlatLayout,
-    length: int,
-    segment_count: int,
-) -> tuple[Tensor, Tensor, Tensor]:
-    return _FlatBucketStreamGather.apply(
-        qkv_flat,
-        beta_flat,
-        recurrent_g_flat,
-        layout.padded_indices,
-        layout.padded_mask,
-        length,
-        segment_count,
-    )
-
-
-def _gather_compact_bucket_streams(
-    qkv: Tensor,
-    beta: Tensor,
-    recurrent_g: Tensor,
-    bucket: GdnSegmentBucketPlan,
-) -> tuple[Tensor, Tensor, Tensor]:
-    return _gather_bucket_streams_compact_fused(
-        qkv.reshape(-1, int(qkv.shape[-1])),
-        beta.reshape(-1, int(beta.shape[-1])),
-        recurrent_g.reshape(-1, int(recurrent_g.shape[-1])),
-        bucket.row_indices,
-        bucket.position_indices,
-        bucket.cu_seqlens,
-        token_count=int(bucket.real_token_count),
-        segment_count=int(bucket.segment_count),
-        sequence_length=int(qkv.shape[1]),
-    )
-
-
-class _FlatBucketStreamGather(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        qkv_flat: Tensor,
-        beta_flat: Tensor,
-        recurrent_g_flat: Tensor,
-        padded_indices: Tensor,
-        padded_mask: Tensor,
-        length: int,
-        segment_count: int,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        flat_indices = padded_indices.reshape(-1)
-        flat_mask = padded_mask.reshape(-1)
-        safe_indices = torch.where(
-            flat_mask,
-            flat_indices,
-            torch.zeros((), device=flat_indices.device, dtype=flat_indices.dtype),
-        )
-        qkv = qkv_flat.index_select(0, safe_indices).reshape(
-            length, segment_count, int(qkv_flat.shape[-1])
-        )
-        beta = beta_flat.index_select(0, safe_indices).reshape(
-            length, segment_count, int(beta_flat.shape[-1])
-        )
-        recurrent_g = recurrent_g_flat.index_select(0, safe_indices).reshape(
-            length, segment_count, int(recurrent_g_flat.shape[-1])
-        )
-        qkv = qkv.masked_fill(~padded_mask.unsqueeze(-1), 0)
-        beta = beta.masked_fill(~padded_mask.unsqueeze(-1), 0)
-        recurrent_g = recurrent_g.masked_fill(~padded_mask.unsqueeze(-1), 0)
-        ctx.save_for_backward(safe_indices, flat_mask)
-        ctx.qkv_flat_count = int(qkv_flat.shape[0])
-        ctx.beta_flat_count = int(beta_flat.shape[0])
-        ctx.recurrent_g_flat_count = int(recurrent_g_flat.shape[0])
-        return (
-            qkv.permute(1, 2, 0).contiguous(),
-            beta.transpose(0, 1).contiguous(),
-            recurrent_g.transpose(0, 1).contiguous(),
-        )
-
-    @staticmethod
-    def backward(
-        ctx: Any, *grad_outputs: Tensor | None
-    ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None, None, None]:
-        grad_qkv_bucket, grad_beta_bucket, grad_g_bucket = grad_outputs
-        safe_indices, flat_mask = ctx.saved_tensors
-        grad_qkv = (
-            _bucket_stream_grad_to_flat(
-                grad_qkv_bucket.permute(2, 0, 1).contiguous()
-                if grad_qkv_bucket is not None
-                else None,
-                safe_indices,
-                flat_mask,
-                ctx.qkv_flat_count,
-            )
-            if ctx.needs_input_grad[0]
-            else None
-        )
-        grad_beta = (
-            _bucket_stream_grad_to_flat(
-                grad_beta_bucket.transpose(0, 1).contiguous()
-                if grad_beta_bucket is not None
-                else None,
-                safe_indices,
-                flat_mask,
-                ctx.beta_flat_count,
-            )
-            if ctx.needs_input_grad[1]
-            else None
-        )
-        grad_g = (
-            _bucket_stream_grad_to_flat(
-                grad_g_bucket.transpose(0, 1).contiguous()
-                if grad_g_bucket is not None
-                else None,
-                safe_indices,
-                flat_mask,
-                ctx.recurrent_g_flat_count,
-            )
-            if ctx.needs_input_grad[2]
-            else None
-        )
-        return grad_qkv, grad_beta, grad_g, None, None, None, None
-
-
-def _bucket_stream_grad_to_flat(
-    grad: Tensor | None,
-    safe_indices: Tensor,
-    flat_mask: Tensor,
-    flat_count: int,
-) -> Tensor | None:
-    if grad is None:
-        return None
-    grad_flat_values = grad.reshape(int(safe_indices.numel()), int(grad.shape[-1]))
-    grad_flat_values = grad_flat_values.masked_fill(~flat_mask.unsqueeze(-1), 0)
-    grad_flat = grad.new_zeros(flat_count, int(grad.shape[-1]))
-    return grad_flat.index_add(0, safe_indices, grad_flat_values)
-
-
-def _scatter_compact_hidden(
-    compact: Tensor,
-    indices: Tensor,
-    *,
-    batch_size: int,
-    sequence_length: int,
-) -> Tensor:
-    return _CompactHiddenScatter.apply(compact, indices, batch_size, sequence_length)
-
-
-class _CompactHiddenScatter(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        compact: Tensor,
-        indices: Tensor,
-        batch_size: int,
-        sequence_length: int,
-    ) -> Tensor:
-        hidden_size = int(compact.shape[-1])
-        flat = compact.new_zeros(batch_size * sequence_length, hidden_size)
-        if int(indices.numel()):
-            flat = flat.index_copy(0, indices, compact.reshape(-1, hidden_size))
-        ctx.save_for_backward(indices)
-        ctx.batch_size = batch_size
-        ctx.sequence_length = sequence_length
-        return (
-            flat.reshape(batch_size, sequence_length, hidden_size)
-            .transpose(0, 1)
-            .contiguous()
-        )
-
-    @staticmethod
-    def backward(
-        ctx: Any, *grad_outputs: Any
-    ) -> tuple[Tensor | None, None, None, None]:
-        (grad_output,) = grad_outputs
-        if grad_output is None:
-            return None, None, None, None
-        (indices,) = ctx.saved_tensors
-        flat_grad = grad_output.transpose(0, 1).reshape(
-            ctx.batch_size * ctx.sequence_length, int(grad_output.shape[-1])
-        )
-        return flat_grad.index_select(0, indices), None, None, None
-
-
 def _project_gdn_inputs(
-    gdn: Any, hidden_states: Tensor
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    sequence_parallel_input: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     seq_len, batch_size, _ = hidden_states.shape
-    seq_len *= int(getattr(gdn, "sp_size", 1))
-    qkvzba, _ = _in_proj(gdn, hidden_states)
+    if sequence_parallel_input:
+        seq_len *= int(getattr(gdn, "sp_size", 1))
+    qkvzba, _ = _in_proj(
+        gdn,
+        hidden_states,
+        sequence_parallel_input=sequence_parallel_input,
+    )
     qkvzba = qkvzba.transpose(0, 1)
+    if int(qkvzba.shape[0]) != batch_size:
+        raise ValueError(
+            "GDN input projection changed the packed batch dimension, "
+            f"got {int(qkvzba.shape[0])} and expected {batch_size}"
+        )
     qkv, gate, beta, alpha = torch.split(
         qkvzba,
         [
@@ -1423,7 +1749,14 @@ def _project_gdn_inputs(
     return qkv.contiguous(), gate, beta, recurrent_g
 
 
-def _in_proj(gdn: Any, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
+def _in_proj(
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    sequence_parallel_input: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    del sequence_parallel_input
+    _prepare_in_proj_trace_token_uids(gdn, hidden_states)
     return gdn.in_proj(hidden_states)
 
 
@@ -1433,40 +1766,16 @@ def _gather_bucket_streams(
     recurrent_g: Tensor,
     bucket: GdnSegmentBucketPlan,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    layout = _bucket_flat_layout(
-        bucket,
-        sequence_length=int(qkv.shape[1]),
-    )
-    return _gather_flat_bucket_streams(
+    return _gather_bucket_streams_compact_fused(
         qkv.reshape(-1, int(qkv.shape[-1])),
         beta.reshape(-1, int(beta.shape[-1])),
         recurrent_g.reshape(-1, int(recurrent_g.shape[-1])),
-        layout=layout,
-        length=int(bucket.length),
+        bucket.row_indices,
+        bucket.position_indices,
+        bucket.cu_seqlens,
+        token_count=int(bucket.real_token_count),
         segment_count=int(bucket.segment_count),
-    )
-
-
-def _bucket_flat_layout(
-    bucket: GdnSegmentBucketPlan, *, sequence_length: int
-) -> _BucketFlatLayout:
-    positions = bucket.position_indices.clamp_max(sequence_length - 1)
-    padded_indices = (bucket.row_indices * sequence_length + positions).contiguous()
-    padded_mask = bucket.real_mask.contiguous()
-    segment_major_indices = padded_indices.transpose(0, 1).contiguous()
-    segment_major_mask = padded_mask.transpose(0, 1).contiguous()
-    real_indices = segment_major_indices[segment_major_mask].contiguous()
-    output_mask = _bucket_output_mask(bucket).transpose(0, 1).contiguous()
-    output_indices = segment_major_indices[output_mask].contiguous()
-    output_selector = None
-    if bucket.output_mask is not None:
-        output_selector = output_mask[segment_major_mask].contiguous()
-    return _BucketFlatLayout(
-        padded_indices=padded_indices,
-        padded_mask=padded_mask,
-        real_indices=real_indices,
-        output_indices=output_indices,
-        output_selector=output_selector,
+        sequence_length=int(qkv.shape[1]),
     )
 
 
@@ -1475,17 +1784,26 @@ def _project_gdn_output(
     recurrent_output: Tensor,
     gate: Tensor,
     plan: GdnRankExecutionPlan,
+    *,
+    sequence_parallel_output: bool = True,
+    reduce_tensor_parallel_output: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     batch_size, seq_len, _, _ = recurrent_output.shape
     with _nvtx_range("art_gdn_output_norm_gate", recurrent_output):
         norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
         norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
         norm_out = norm_out.transpose(0, 1).contiguous()
+        _attach_trace_token_uids(
+            norm_out,
+            _local_layout_token_uids(plan, "gdn", hidden_states=norm_out, gdn=gdn),
+        )
     with _nvtx_range("art_gdn_out_proj", norm_out):
-        if plan.cp_size > 1:
-            out, out_bias = _out_proj_cp_full_shape(gdn, norm_out, plan)
-        else:
-            out, out_bias = _out_proj(gdn, norm_out)
+        out, out_bias = _out_proj(
+            gdn,
+            norm_out,
+            sequence_parallel_output=sequence_parallel_output,
+            reduce_tensor_parallel_output=reduce_tensor_parallel_output,
+        )
     return _mask_gdn_output(gdn, out, plan), out_bias
 
 
@@ -1505,7 +1823,8 @@ def _mask_gdn_output(gdn: Any, out: Tensor, plan: GdnRankExecutionPlan) -> Tenso
     full_mask = full_flat.reshape(full_batch, full_seq).transpose(0, 1).unsqueeze(-1)
     if tuple(full_mask.shape[:2]) == tuple(out.shape[:2]):
         return out.masked_fill(~full_mask, 0)
-    rank = _tp_rank(getattr(gdn.out_proj, "linear_proj", gdn.out_proj))
+    projection = _gdn_output_projection(gdn)
+    rank = _tp_rank(projection) if projection is not None else 0
     start = rank * int(out.shape[0])
     end = start + int(out.shape[0])
     if end <= int(full_mask.shape[0]) and int(full_mask.shape[1]) == int(out.shape[1]):
@@ -1517,60 +1836,194 @@ def _mask_gdn_output(gdn: Any, out: Tensor, plan: GdnRankExecutionPlan) -> Tenso
     )
 
 
-def _out_proj_cp_full_shape(
-    gdn: Any, hidden_states: Tensor, plan: GdnRankExecutionPlan
+def _project_cp_gdn_output(
+    gdn: Any,
+    recurrent_output: Tensor,
+    gate: Tensor,
+    plan: GdnRankExecutionPlan,
+    *,
+    group: Any,
+    output_layout: Literal["attention", "gdn"],
 ) -> tuple[Tensor, Tensor | None]:
-    full_batch = int(plan.packed_batch_size or plan.batch_size)
-    full_seq = int(plan.packed_sequence_length or plan.sequence_length)
-    full_count = full_batch * full_seq
-    if full_count == int(hidden_states.shape[0]):
-        return _out_proj(gdn, hidden_states)
-    if int(hidden_states.shape[1]) != 1:
-        raise ValueError(
-            "CP GDN full-shape output projection expects flattened local batch, got "
-            f"{tuple(hidden_states.shape)}"
+    batch_size, seq_len, _, _ = recurrent_output.shape
+    with _nvtx_range("art_gdn_output_norm_gate", recurrent_output):
+        norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
+        norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
+        norm_out = norm_out.transpose(0, 1).contiguous()
+    if output_layout == "attention":
+        norm_out = _exchange_cp_sequence_stream(
+            norm_out,
+            plan=plan,
+            group=group,
+            source_layout="gdn",
+            dest_layout="attention",
         )
-    local_indices = torch.tensor(
-        plan.gdn_token_indices, device=hidden_states.device, dtype=torch.long
-    )
-    if int(local_indices.numel()) != int(hidden_states.shape[0]):
-        raise ValueError(
-            "CP GDN token index count must match local projection input, got "
-            f"{int(local_indices.numel())} indices for {tuple(hidden_states.shape)}"
+    norm_out = _pad_sequence_parallel_output_stream(gdn, norm_out)
+    with _nvtx_range("art_gdn_out_proj", norm_out):
+        return _out_proj(gdn, norm_out)
+
+
+def _pad_sequence_parallel_output_stream(gdn: Any, stream: Tensor) -> Tensor:
+    projection = _gdn_output_projection(gdn)
+    if projection is None or not _uses_sequence_parallel(projection):
+        return stream
+    tp_size = _tp_world_size(projection)
+    remainder = int(stream.shape[0]) % tp_size
+    if remainder == 0:
+        return stream
+    padding = stream.new_zeros((tp_size - remainder, *stream.shape[1:]))
+    return torch.cat((stream, padding), dim=0).contiguous()
+
+
+def _exchange_cp_sequence_stream(
+    stream: Tensor,
+    *,
+    plan: GdnRankExecutionPlan,
+    group: Any,
+    source_layout: Literal["attention", "gdn"],
+    dest_layout: Literal["attention", "gdn"],
+) -> Tensor:
+    return (
+        _exchange_cp_batch_stream(
+            stream.transpose(0, 1).contiguous(),
+            plan=plan,
+            group=group,
+            source_layout=source_layout,
+            dest_layout=dest_layout,
         )
-    if int(local_indices.numel()) and int(local_indices.max().item()) >= full_count:
-        raise ValueError(
-            "CP GDN token index exceeds packed output shape, got "
-            f"max_index={int(local_indices.max().item())} full_count={full_count}"
-        )
-    full_flat = hidden_states.new_zeros(full_count, int(hidden_states.shape[-1]))
-    if int(local_indices.numel()):
-        full_flat = full_flat.index_copy(0, local_indices, hidden_states.squeeze(1))
-    full_hidden = (
-        full_flat.reshape(full_batch, full_seq, int(hidden_states.shape[-1]))
         .transpose(0, 1)
         .contiguous()
     )
-    full_out, out_bias = _out_proj(gdn, full_hidden)
-    local_out = (
-        full_out.transpose(0, 1)
-        .reshape(full_count, int(full_out.shape[-1]))
-        .index_select(0, local_indices)
-        .unsqueeze(1)
-        .contiguous()
+
+
+def _exchange_cp_batch_stream(
+    stream: Tensor,
+    *,
+    plan: GdnRankExecutionPlan,
+    group: Any,
+    source_layout: Literal["attention", "gdn"],
+    dest_layout: Literal["attention", "gdn"],
+) -> Tensor:
+    from .layout import exchange_rank_tensor_all_to_all
+
+    if source_layout == dest_layout:
+        return stream
+    exchange_plan = (
+        plan.attention_to_gdn if source_layout == "attention" else plan.gdn_to_attention
     )
-    return local_out, out_bias
+    backward_plan = (
+        plan.gdn_to_attention if source_layout == "attention" else plan.attention_to_gdn
+    )
+    if exchange_plan is None or backward_plan is None:
+        raise ValueError("CP GDN stream exchange requires prebuilt exchange plans")
+    source_tokens = (
+        int(plan.attention_token_count)
+        if source_layout == "attention"
+        else int(plan.gdn_token_count)
+    )
+    dest_tokens = (
+        int(plan.attention_token_count)
+        if dest_layout == "attention"
+        else int(plan.gdn_token_count)
+    )
+    feature_shape = tuple(stream.shape[2:])
+    flat = stream.reshape(-1, *feature_shape)
+    if int(flat.shape[0]) < source_tokens:
+        raise ValueError(
+            "CP GDN stream token count is smaller than the exchange source layout, "
+            f"got {int(flat.shape[0])} and expected at least {source_tokens}"
+        )
+    with _nvtx_range(f"art_gdn_cp_{source_layout}_to_{dest_layout}_exchange", flat):
+        exchanged = exchange_rank_tensor_all_to_all(
+            flat[:source_tokens].contiguous(),
+            exchange_plan,
+            rank=plan.cp_rank,
+            group=group,
+            backward_plan=backward_plan,
+        )
+    return exchanged.reshape(1, dest_tokens, *feature_shape).contiguous()
 
 
 def _apply_gated_rms_norm(gdn: Any, x: Tensor, gate: Tensor) -> Tensor:
+    if x.dtype != torch.float32 and int(x.numel()) != 0:
+        return gdn._apply_gated_norm(x, gate)
     x_dtype = x.dtype
-    hidden = gdn.out_norm(x.reshape(-1, int(x.shape[-1])))
+    hidden = _apply_explicit_norm(
+        gdn.out_norm,
+        x.reshape(-1, int(x.shape[-1])),
+        config=getattr(gdn, "config", None),
+        weight_name="weight",
+        bias_name="bias",
+    )
     gate = gate.reshape(-1, int(gate.shape[-1]))
     return (hidden * gdn.act_fn(gate.float())).to(x_dtype)
 
 
-def _out_proj(gdn: Any, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
-    return gdn.out_proj(hidden_states)
+def _out_proj(
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    force_explicit: bool = False,
+    sequence_parallel_output: bool = True,
+    reduce_tensor_parallel_output: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    projection = gdn.out_proj
+    if (
+        int(hidden_states.numel()) != 0
+        and not force_explicit
+        and reduce_tensor_parallel_output
+        and hidden_states.dtype != torch.float32
+    ):
+        return projection(hidden_states)
+    return _explicit_out_proj(
+        gdn,
+        hidden_states,
+        sequence_parallel_output=sequence_parallel_output,
+        reduce_tensor_parallel_output=reduce_tensor_parallel_output,
+    )
+
+
+def _explicit_out_proj(
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    sequence_parallel_output: bool = True,
+    reduce_tensor_parallel_output: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    projection = gdn.out_proj
+    base_projection = getattr(projection, "linear_proj", projection)
+    bias = _linear_bias(base_projection)
+    out = _stable_fp32_linear(hidden_states, base_projection.weight, None)
+    if reduce_tensor_parallel_output:
+        out = _row_parallel_output(
+            out, base_projection, sequence_parallel_output=sequence_parallel_output
+        )
+    if bias is not None and not _returns_bias(base_projection):
+        out = out + bias
+    if hasattr(projection, "lora"):
+        _set_out_proj_lora_trace_token_uids(gdn, hidden_states)
+        lora_output = projection.lora(hidden_states)
+        if reduce_tensor_parallel_output and bool(
+            getattr(projection, "reduce_output", True)
+        ):
+            lora_output = _row_parallel_output(
+                lora_output,
+                base_projection,
+                sequence_parallel_output=sequence_parallel_output,
+            )
+        out = out + lora_output
+    return out, bias if _returns_bias(base_projection) else None
+
+
+def _stable_fp32_linear(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+    if x.dtype != torch.float32:
+        return F.linear(x, weight, bias)
+    out = F.linear(
+        x.to(dtype=torch.float64),
+        weight.to(dtype=torch.float64),
+        None if bias is None else bias.to(dtype=torch.float64),
+    )
+    return out.to(dtype=torch.float32)
 
 
 def _apply_explicit_norm(
@@ -1581,31 +2034,93 @@ def _apply_explicit_norm(
     weight_name: str,
     bias_name: str,
 ) -> Tensor:
-    del config
+    weight = getattr(module, weight_name, None)
+    if not isinstance(weight, Tensor):
+        return x
     x_dtype = x.dtype
     x_float = x.float()
-    normalization = str(module.normalization)
+    eps = float(getattr(module, "eps", getattr(config, "layernorm_epsilon", 1e-5)))
+    normalization = getattr(module, "normalization", None)
+    if normalization is None and config is not None:
+        normalization = getattr(config, "normalization", None)
+    if normalization is None:
+        module_name = type(module).__name__
+        normalization = "LayerNorm" if module_name == "LayerNorm" else "RMSNorm"
+    normalization = str(normalization)
     if normalization == "RMSNorm":
         normed = x_float * torch.rsqrt(
-            x_float.square().mean(dim=-1, keepdim=True) + float(module.eps)
+            x_float.square().mean(dim=-1, keepdim=True) + eps
         )
-        bias = None
     elif normalization == "LayerNorm":
         centered = x_float - x_float.mean(dim=-1, keepdim=True)
         normed = centered * torch.rsqrt(
-            centered.square().mean(dim=-1, keepdim=True) + float(module.eps)
+            centered.square().mean(dim=-1, keepdim=True) + eps
         )
-        bias = getattr(module, bias_name)
     else:
         raise ValueError(f"unsupported GDN normalization '{normalization}'")
-
-    scale = getattr(module, weight_name).float()
-    if bool(module.zero_centered_gamma):
+    scale = weight.float()
+    if bool(getattr(module, "zero_centered_gamma", False)):
         scale = scale + 1.0
     normed = normed * scale
+    bias = getattr(module, bias_name, None)
     if isinstance(bias, Tensor):
         normed = normed + bias.float()
     return normed.to(dtype=x_dtype)
+
+
+def _gdn_uses_sequence_parallel(gdn: Any | None) -> bool:
+    return any(
+        projection is not None and _uses_sequence_parallel(projection)
+        for projection in (_gdn_input_projection(gdn), _gdn_output_projection(gdn))
+    )
+
+
+def _gdn_input_projection(gdn: Any | None) -> Any | None:
+    if gdn is None:
+        return None
+    projection = getattr(gdn, "in_proj", None)
+    if projection is None:
+        return None
+    return getattr(projection, "in_proj", projection)
+
+
+def _gdn_output_projection(gdn: Any | None) -> Any | None:
+    if gdn is None:
+        return None
+    projection = getattr(gdn, "out_proj", None)
+    if projection is None:
+        return None
+    return getattr(projection, "linear_proj", projection)
+
+
+def _column_parallel_input(x: Tensor, projection: Any) -> Tensor:
+    if not _uses_sequence_parallel(projection):
+        return x
+    from megatron.core.tensor_parallel.mappings import (
+        gather_from_sequence_parallel_region,
+    )
+
+    return gather_from_sequence_parallel_region(x, group=_tp_group(projection))
+
+
+def _row_parallel_output(
+    x: Tensor, projection: Any, *, sequence_parallel_output: bool = True
+) -> Tensor:
+    if _tp_world_size(projection) <= 1:
+        return x
+    if _uses_sequence_parallel(projection) and sequence_parallel_output:
+        from megatron.core.tensor_parallel.mappings import (
+            reduce_scatter_to_sequence_parallel_region,
+        )
+
+        return reduce_scatter_to_sequence_parallel_region(
+            x, group=_tp_group(projection)
+        )
+    from megatron.core.tensor_parallel.mappings import (
+        reduce_from_tensor_model_parallel_region,
+    )
+
+    return reduce_from_tensor_model_parallel_region(x, group=_tp_group(projection))
 
 
 def _uses_sequence_parallel(projection: Any) -> bool:
@@ -1614,24 +2129,37 @@ def _uses_sequence_parallel(projection: Any) -> bool:
     )
 
 
-def _gdn_uses_sequence_parallel(gdn: Any) -> bool:
-    projection = getattr(gdn, "in_proj", None)
-    base_projection = getattr(projection, "in_proj", projection)
-    return _uses_sequence_parallel(base_projection)
-
-
 def _tp_world_size(projection: Any) -> int:
-    del projection
-    from megatron.core import parallel_state as ps
-
-    return int(ps.get_tensor_model_parallel_world_size())
+    group = _tp_group(projection)
+    if group is not None and dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return int(dist.get_world_size(group))  # ty: ignore[possibly-missing-attribute]
+    return int(getattr(projection, "tp_size", 1))
 
 
 def _tp_rank(projection: Any) -> int:
-    del projection
-    from megatron.core import parallel_state as ps
+    group = _tp_group(projection)
+    if group is not None and dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return int(dist.get_rank(group))  # ty: ignore[possibly-missing-attribute]
+    for name in ("tp_rank", "tensor_model_parallel_rank"):
+        value = getattr(projection, name, None)
+        if isinstance(value, int):
+            return value
+    return 0
 
-    return int(ps.get_tensor_model_parallel_rank())
+
+def _tp_group(projection: Any) -> Any | None:
+    return getattr(projection, "_tp_group", getattr(projection, "tp_group", None))
+
+
+def _linear_bias(projection: Any) -> Tensor | None:
+    bias = getattr(projection, "bias", None)
+    if not isinstance(bias, Tensor) or int(bias.numel()) == 0:
+        return None
+    return bias
+
+
+def _returns_bias(projection: Any) -> bool:
+    return bool(getattr(projection, "te_return_bias", False))
 
 
 def _local_key_heads(gdn: Any) -> int:
@@ -1721,6 +2249,40 @@ def _exchange_parent_state_rows(
         conv_table, rec_table, transfers, group
     )
     return conv_table, rec_table, _make_autograd_dependency(conv_table, rec_table)
+
+
+def _exchange_remote_prefix_tail_streams(
+    qkv: Tensor,
+    beta: Tensor,
+    recurrent_g: Tensor,
+    *,
+    plan: GdnRankExecutionPlan,
+    group: Any,
+) -> tuple[Tensor, Tensor, Tensor]:
+    from .layout import exchange_rank_tensor_all_to_all
+
+    if plan.remote_prefix_tail_exchange is None:
+        return (
+            qkv.new_empty((0, int(qkv.shape[-1]))),
+            beta.new_empty((0, int(beta.shape[-1]))),
+            recurrent_g.new_empty((0, int(recurrent_g.shape[-1]))),
+        )
+    if plan.remote_prefix_tail_backward_exchange is None:
+        raise ValueError("remote prefix-tail exchange requires a backward plan")
+    qkv_flat = qkv.reshape(-1, int(qkv.shape[-1]))
+    beta_flat = beta.reshape(-1, int(beta.shape[-1]))
+    g_flat = recurrent_g.reshape(-1, int(recurrent_g.shape[-1]))
+    kwargs = {
+        "plan": plan.remote_prefix_tail_exchange,
+        "rank": plan.cp_rank,
+        "group": group,
+        "backward_plan": plan.remote_prefix_tail_backward_exchange,
+    }
+    return (
+        exchange_rank_tensor_all_to_all(qkv_flat, **kwargs),
+        exchange_rank_tensor_all_to_all(beta_flat, **kwargs),
+        exchange_rank_tensor_all_to_all(g_flat, **kwargs),
+    )
 
 
 class _ParentStateExchange(torch.autograd.Function):
@@ -1998,24 +2560,37 @@ def _run_gdn_segment(
     return out, out_bias, conv_final, recurrent_final
 
 
-def _run_gdn_prepared_varlen_batch(
-    gdn: Any,
-    qkv: Tensor,
-    *,
-    beta: Tensor,
-    recurrent_g: Tensor,
+def run_gdn_bucket(
     bucket: GdnSegmentBucketPlan,
-    conv_initial: Tensor,
-    recurrent_initial: Tensor,
+    projected_streams: tuple[Tensor, Tensor, Tensor],
+    parent_states: tuple[Tensor, Tensor],
+    *,
+    gdn: Any,
+    group: Any | None = None,
+    recurrent_cp: bool = False,
     output_final_state: bool = True,
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
     _disable_reentrant_te_linear_transpose_cache(gdn)
-    batch_size, _, max_len = qkv.shape
-    if int(bucket.length) != max_len or int(bucket.segment_count) != batch_size:
+    qkv, beta, recurrent_g = projected_streams
+    conv_initial, recurrent_initial = parent_states
+    token_count = int(qkv.shape[0]) if qkv.ndim == 2 else -1
+    batch_size = int(bucket.segment_count)
+    if qkv.ndim != 2:
         raise ValueError(
-            "GDN prepared varlen bucket shape mismatch, got "
-            f"qkv={tuple(qkv.shape)} bucket_len={bucket.length} "
-            f"segments={bucket.segment_count}"
+            "GDN bucket execution requires compact projected streams; "
+            f"got qkv shape {tuple(qkv.shape)}"
+        )
+    if token_count != int(bucket.real_token_count):
+        raise ValueError(
+            "GDN packed varlen token count mismatch, got "
+            f"qkv={tuple(qkv.shape)} and bucket tokens={bucket.real_token_count}"
+        )
+    if tuple(beta.shape[:1]) != (token_count,) or tuple(recurrent_g.shape) != tuple(
+        beta.shape
+    ):
+        raise ValueError(
+            "packed beta/recurrent_g must be [tokens, heads], got "
+            f"{tuple(beta.shape)} and {tuple(recurrent_g.shape)}"
         )
     if int(conv_initial.shape[0]) != batch_size:
         raise ValueError(
@@ -2028,241 +2603,224 @@ def _run_gdn_prepared_varlen_batch(
             f"{tuple(recurrent_initial.shape)} for {batch_size} segments"
         )
 
+    conv_output_final_state = output_final_state
+    chain_conv_final: Tensor | None = None
+    if recurrent_cp:
+        conv_initial, chain_conv_final = _chain_conv_initial_and_final(
+            qkv,
+            bucket.cu_seqlens,
+            conv_initial,
+            group=group,
+            output_final_state=output_final_state,
+        )
+        conv_output_final_state = False
+
     with _nvtx_range("art_gdn_causal_conv_forward", qkv):
-        qkv, conv_final = _causal_conv1d_varlen_with_state(
+        qkv, conv_final = _causal_conv1d_packed_varlen_with_state(
             gdn,
             qkv,
             conv_initial,
-            bucket.lengths,
-            output_final_state=output_final_state,
+            bucket.cu_seqlens,
+            output_final_state=conv_output_final_state,
         )
-        qkv = qkv.transpose(1, 2)
+    if recurrent_cp:
+        conv_final = chain_conv_final
 
     with _nvtx_range("art_gdn_qkv_head_prepare", qkv):
-        query, key, value = torch.split(
+        query, key, value, beta, recurrent_g = _prepare_packed_recurrent_inputs_fused(
             qkv,
-            [
-                gdn.qk_dim // gdn.tp_size,
-                gdn.qk_dim // gdn.tp_size,
-                gdn.v_dim // gdn.tp_size,
-            ],
-            dim=-1,
+            beta,
+            recurrent_g,
+            key_heads=_local_key_heads(gdn),
+            value_heads=_local_value_heads(gdn),
+            key_dim=int(gdn.key_head_dim),
+            value_dim=int(gdn.value_head_dim),
         )
-        key_heads = _local_key_heads(gdn)
-        value_heads = _local_value_heads(gdn)
-        query = query.reshape(batch_size, max_len, key_heads, gdn.key_head_dim)
-        key = key.reshape(batch_size, max_len, key_heads, gdn.key_head_dim)
-        value = value.reshape(batch_size, max_len, value_heads, gdn.value_head_dim)
         if gdn.use_qk_l2norm:
             query = _l2norm(query.contiguous())
             key = _l2norm(key.contiguous())
-        if gdn.num_value_heads // gdn.num_key_heads > 1:
-            repeat = gdn.num_value_heads // gdn.num_key_heads
-            query = query.repeat_interleave(repeat, dim=2)
-            key = key.repeat_interleave(repeat, dim=2)
 
-    real_mask = bucket.real_mask.transpose(0, 1)
-    query = query[real_mask].unsqueeze(0).contiguous()
-    key = key[real_mask].unsqueeze(0).contiguous()
-    value = value[real_mask].unsqueeze(0).contiguous()
-    beta = beta[real_mask].unsqueeze(0).contiguous()
-    recurrent_g = recurrent_g[real_mask].unsqueeze(0).contiguous()
-
-    with _nvtx_range("art_gdn_recurrent_forward", query):
-        recurrent_out, recurrent_final = _chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=recurrent_g,
-            beta=beta,
-            initial_state=recurrent_initial,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=bucket.cu_seqlens,
-        )
+    recurrent_range = (
+        "art_gdn_cp_recurrent_summary_scan"
+        if recurrent_cp
+        else "art_gdn_recurrent_forward"
+    )
+    with _nvtx_range(recurrent_range, query):
+        if recurrent_cp:
+            if group is None:
+                raise ValueError("CP recurrent GDN bucket requires a process group")
+            recurrent_out, recurrent_final = chunk_gated_delta_rule_native_cp(
+                query,
+                key,
+                value,
+                g=recurrent_g,
+                beta=beta,
+                initial_state=recurrent_initial,
+                group=group,
+                output_final_state=output_final_state,
+                cu_seqlens=bucket.cu_seqlens,
+            )
+        else:
+            recurrent_out, recurrent_final = _chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=recurrent_g,
+                beta=beta,
+                initial_state=recurrent_initial,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=bucket.cu_seqlens,
+            )
     return recurrent_out, conv_final, recurrent_final
 
 
-def _run_gdn_varlen_batch(
-    gdn: Any,
-    hidden_states: Tensor,
-    *,
-    bucket: GdnSegmentBucketPlan,
-    conv_initial: Tensor,
-    recurrent_initial: Tensor,
-    output_final_state: bool = True,
-) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
-    _disable_reentrant_te_linear_transpose_cache(gdn)
-    max_len, batch_size, _ = hidden_states.shape
-    if int(bucket.length) != max_len or int(bucket.segment_count) != batch_size:
-        raise ValueError(
-            "GDN varlen bucket shape mismatch, got "
-            f"hidden={tuple(hidden_states.shape)} bucket_len={bucket.length} "
-            f"segments={bucket.segment_count}"
-        )
-    if int(conv_initial.shape[0]) != batch_size:
-        raise ValueError(
-            "conv_initial batch must match bucket segment count, got "
-            f"{tuple(conv_initial.shape)} for {batch_size} segments"
-        )
-    if int(recurrent_initial.shape[0]) != batch_size:
-        raise ValueError(
-            "recurrent_initial batch must match bucket segment count, got "
-            f"{tuple(recurrent_initial.shape)} for {batch_size} segments"
-        )
-
-    with _nvtx_range("art_gdn_in_proj", hidden_states):
-        qkvzba, _ = _in_proj(gdn, hidden_states)
-        qkvzba = qkvzba.transpose(0, 1)
-
-    with _nvtx_range("art_gdn_qkv_gate_beta_alpha_split_reshape", qkvzba):
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (gdn.qk_dim * 2 + gdn.v_dim) // gdn.tp_size,
-                gdn.v_dim // gdn.tp_size,
-                gdn.num_value_heads // gdn.tp_size,
-                gdn.num_value_heads // gdn.tp_size,
-            ],
-            dim=-1,
-        )
-        key_heads = _local_key_heads(gdn)
-        value_heads = _local_value_heads(gdn)
-        gate = gate.reshape(batch_size, max_len, value_heads, gdn.value_head_dim)
-        beta = beta.reshape(batch_size, max_len, value_heads)
-        alpha = alpha.reshape(batch_size, max_len, value_heads)
-
-    with _nvtx_range("art_gdn_causal_conv_forward", qkv):
-        qkv = qkv.transpose(1, 2).contiguous()
-        qkv, conv_final = _causal_conv1d_varlen_with_state(
-            gdn,
-            qkv,
-            conv_initial,
-            bucket.lengths,
-            output_final_state=output_final_state,
-        )
-        qkv = qkv.transpose(1, 2)
-
-    with _nvtx_range("art_gdn_qkv_head_prepare", qkv):
-        query, key, value = torch.split(
-            qkv,
-            [
-                gdn.qk_dim // gdn.tp_size,
-                gdn.qk_dim // gdn.tp_size,
-                gdn.v_dim // gdn.tp_size,
-            ],
-            dim=-1,
-        )
-        query = query.reshape(batch_size, max_len, key_heads, gdn.key_head_dim)
-        key = key.reshape(batch_size, max_len, key_heads, gdn.key_head_dim)
-        value = value.reshape(batch_size, max_len, value_heads, gdn.value_head_dim)
-        if gdn.use_qk_l2norm:
-            query = _l2norm(query.contiguous())
-            key = _l2norm(key.contiguous())
-        if gdn.num_value_heads // gdn.num_key_heads > 1:
-            repeat = gdn.num_value_heads // gdn.num_key_heads
-            query = query.repeat_interleave(repeat, dim=2)
-            key = key.repeat_interleave(repeat, dim=2)
-
-    with _nvtx_range("art_gdn_recurrent_gate_prepare", alpha):
-        g = -gdn.A_log.exp() * F.softplus(alpha.float() + gdn.dt_bias)
-        beta = beta.sigmoid()
-
-    real_mask = bucket.real_mask.transpose(0, 1)
-    query = query[real_mask].unsqueeze(0).contiguous()
-    key = key[real_mask].unsqueeze(0).contiguous()
-    value = value[real_mask].unsqueeze(0).contiguous()
-    gate = gate[real_mask].unsqueeze(0).contiguous()
-    beta = beta[real_mask].unsqueeze(0).contiguous()
-    g = g[real_mask].unsqueeze(0).contiguous()
-
-    with _nvtx_range("art_gdn_recurrent_forward", query):
-        recurrent_out, recurrent_final = _chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=recurrent_initial,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=bucket.cu_seqlens,
-        )
-
-    with _nvtx_range("art_gdn_output_norm_gate", recurrent_out):
-        norm_out = _apply_gated_rms_norm(gdn, recurrent_out, gate)
-        if norm_out.ndim == 4:
-            norm_out = norm_out.flatten(2).transpose(0, 1).contiguous()
-        elif norm_out.ndim == 3:
-            norm_out = (
-                norm_out.transpose(0, 1).contiguous()
-                if int(norm_out.shape[0]) == 1
-                else norm_out.reshape(
-                    norm_out.shape[0], 1, _local_value_dim(gdn)
-                ).contiguous()
-            )
-        elif norm_out.ndim == 2:
-            norm_out = norm_out.reshape(
-                1, recurrent_out.shape[1], _local_value_dim(gdn)
-            )
-            norm_out = norm_out.transpose(0, 1).contiguous()
-        else:
-            raise RuntimeError(
-                f"unexpected GDN norm output shape {tuple(norm_out.shape)}"
-            )
-    with _nvtx_range("art_gdn_out_proj", norm_out):
-        out, out_bias = _out_proj(gdn, norm_out)
-    return out, out_bias, conv_final, recurrent_final
-
-
-def _conv_final_from_varlen_qkv(
-    qkv: Tensor, conv_initial: Tensor, lengths: Tensor
-) -> Tensor:
-    tail_width = int(conv_initial.shape[-1])
-    if tail_width == 0:
-        return conv_initial
-    batch_size, channel_count, max_len = qkv.shape
-    arange = torch.arange(batch_size, device=qkv.device)
-    pieces = []
-    for tail_offset in range(tail_width):
-        source = lengths - tail_width + tail_offset
-        from_qkv = source >= 0
-        qkv_index = source.clamp(min=0, max=max_len - 1)
-        init_index = (source + tail_width).clamp(min=0, max=tail_width - 1)
-        qkv_piece = qkv[arange, :, qkv_index]
-        init_piece = conv_initial[arange, :, init_index]
-        pieces.append(torch.where(from_qkv.unsqueeze(1), qkv_piece, init_piece))
-    return torch.stack(pieces, dim=-1).reshape(batch_size, channel_count, tail_width)
-
-
-def _causal_conv1d_varlen_with_state(
-    gdn: Any,
+def _chain_conv_initial_and_final(
     qkv: Tensor,
-    conv_initial: Tensor,
-    lengths: Tensor,
+    cu_seqlens: Tensor,
+    parent_initial: Tensor,
     *,
+    group: Any,
     output_final_state: bool,
 ) -> tuple[Tensor, Tensor | None]:
-    if str(getattr(gdn, "activation", "")) == "gelu":
-        return gdn_varlen_causal_conv_gelu(
-            gdn,
-            qkv,
-            conv_initial,
-            lengths,
-            output_final_state=output_final_state,
-        )
+    if group is None:
+        raise ValueError("CP chain conv state requires a process group")
+    if not dist.is_available() or not dist.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        raise RuntimeError("torch.distributed must be initialized for CP chain conv")
+    parent_initial = _AllReduceGradient.apply(parent_initial, group)
+    tail_width = int(parent_initial.shape[-1])
+    if tail_width <= 0:
+        return parent_initial, parent_initial if output_final_state else None
+    local_tail, local_tail_lengths = _local_packed_conv_tail(
+        qkv, cu_seqlens, tail_width
+    )
+    gathered_tails = _AllGatherReplicated.apply(local_tail, group)
+    gathered_lengths = _all_gather_chain_tail_lengths(local_tail_lengths, group=group)
+    rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
+    conv_initial = _scan_conv_tail_batch(
+        parent_initial,
+        gathered_tails,
+        gathered_lengths,
+        stop_rank=rank,
+    )
+    conv_initial = _add_autograd_dependency(
+        conv_initial, gathered_tails.reshape(-1)[:1].sum() * 0
+    )
     conv_final = (
-        _conv_final_from_varlen_qkv(qkv, conv_initial, lengths)
+        _scan_conv_tail_batch(
+            parent_initial,
+            gathered_tails,
+            gathered_lengths,
+            stop_rank=dist.get_world_size(group),  # ty: ignore[possibly-missing-attribute]
+        )
         if output_final_state
         else None
     )
-    out, _ = _causal_conv1d_with_state(
-        gdn,
-        qkv,
-        conv_initial,
-        output_final_state=False,
+    return conv_initial, conv_final
+
+
+def _local_packed_conv_tail(
+    qkv: Tensor, cu_seqlens: Tensor, tail_width: int
+) -> tuple[Tensor, Tensor]:
+    segment_count = int(cu_seqlens.numel()) - 1
+    channels = int(qkv.shape[1])
+    tails = qkv.new_zeros(segment_count, channels, tail_width)
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.long)
+    valid_lengths = torch.clamp(lengths, max=tail_width)
+    for segment in range(segment_count):
+        valid = int(valid_lengths[segment].item())
+        if valid <= 0:
+            continue
+        end = int(cu_seqlens[segment + 1].item())
+        tails[segment, :, :valid] = qkv[end - valid : end].transpose(0, 1)
+    return tails, valid_lengths
+
+
+def _all_gather_chain_tail_lengths(lengths: Tensor, *, group: Any) -> Tensor:
+    gathered = torch.empty(
+        dist.get_world_size(group),  # ty: ignore[possibly-missing-attribute]
+        int(lengths.numel()),
+        device=lengths.device,
+        dtype=torch.long,
     )
-    return out, conv_final
+    dist.all_gather_into_tensor(  # ty: ignore[possibly-missing-attribute]
+        gathered,
+        lengths.contiguous(),
+        group=group,
+    )
+    return gathered
+
+
+def _scan_conv_tail_batch(
+    parent_initial: Tensor,
+    tails_by_rank: Tensor,
+    lengths_by_rank: Tensor,
+    *,
+    stop_rank: int,
+) -> Tensor:
+    states = []
+    tail_width = int(parent_initial.shape[-1])
+    host_lengths = lengths_by_rank.detach().cpu().tolist()
+    for segment in range(int(parent_initial.shape[0])):
+        state = parent_initial[segment]
+        for peer in range(int(stop_rank)):
+            valid = int(host_lengths[peer][segment])
+            if valid <= 0:
+                continue
+            state = torch.cat([state, tails_by_rank[peer, segment, :, :valid]], dim=-1)[
+                :, -tail_width:
+            ]
+        states.append(state)
+    return torch.stack(states, dim=0)
+
+
+class _AllGatherReplicated(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, local_tensor: Tensor, group: Any) -> Tensor:
+        ctx.group = group
+        ctx.rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
+        gathered = torch.empty(
+            dist.get_world_size(group),  # ty: ignore[possibly-missing-attribute]
+            *local_tensor.shape,
+            device=local_tensor.device,
+            dtype=local_tensor.dtype,
+        )
+        dist.all_gather_into_tensor(  # ty: ignore[possibly-missing-attribute]
+            gathered,
+            local_tensor.contiguous(),
+            group=group,
+        )
+        return gathered
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor, None]:
+        (grad_output,) = grad_outputs
+        grad_input = torch.empty_like(grad_output[ctx.rank])
+        dist.reduce_scatter_tensor(  # ty: ignore[possibly-missing-attribute]
+            grad_input,
+            grad_output.contiguous(),
+            op=dist.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+            group=ctx.group,
+        )
+        return grad_input, None
+
+
+class _AllReduceGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, tensor: Tensor, group: Any) -> Tensor:
+        ctx.group = group
+        return tensor
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor, None]:
+        (grad_output,) = grad_outputs
+        grad_input = grad_output.contiguous()
+        dist.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            grad_input,
+            op=dist.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+            group=ctx.group,
+        )
+        return grad_input, None
 
 
 def _causal_conv1d_packed_varlen_with_state(
@@ -2273,12 +2831,14 @@ def _causal_conv1d_packed_varlen_with_state(
     *,
     output_final_state: bool,
 ) -> tuple[Tensor, Tensor | None]:
+    weight = gdn.conv1d.weight.squeeze(1)
+    bias = gdn.conv1d.bias
     return packed_varlen_causal_conv(
         qkv,
         cu_seqlens,
         conv_initial,
-        gdn.conv1d.weight.squeeze(1),
-        gdn.conv1d.bias,
+        weight,
+        bias,
         activation=str(getattr(gdn, "activation", "gelu")),
         output_final_state=output_final_state,
     )
@@ -2293,9 +2853,12 @@ def _causal_conv1d_with_state(
 ) -> tuple[Tensor, Tensor | None]:
     weight = gdn.conv1d.weight.squeeze(1)
     bias = gdn.conv1d.bias
-    if not bool(
-        getattr(gdn.config, "deterministic_mode", False)
-    ) and gdn.activation in ("silu", "swish"):
+    causal_conv1d_fn = _causal_conv1d_fn()
+    if (
+        causal_conv1d_fn is not None
+        and not bool(getattr(gdn.config, "deterministic_mode", False))
+        and gdn.activation in ("silu", "swish")
+    ):
         qkv_fast = _channel_last_conv1d_layout(qkv)
         conv_initial_fast = _channel_last_conv1d_layout(conv_initial)
         if qkv_fast is not None and conv_initial_fast is not None:
@@ -2314,7 +2877,9 @@ def _causal_conv1d_with_state(
             return out, final
 
     qkv_dtype = qkv.dtype
-    if not bool(getattr(gdn.config, "deterministic_mode", False)):
+    if causal_conv1d_fn is not None and not bool(
+        getattr(gdn.config, "deterministic_mode", False)
+    ):
         final = (
             _conv_final_from_dense_qkv(qkv, conv_initial, weight.shape[1])
             if output_final_state
@@ -2393,85 +2958,6 @@ def _disable_reentrant_te_linear_transpose_cache(gdn: Any) -> None:
     gdn._art_reentrant_te_linear_transpose_cache_disabled = True
 
 
-def run_gdn_bucket(
-    bucket: GdnSegmentBucketPlan,
-    projected_streams: tuple[Tensor, Tensor, Tensor],
-    parent_states: tuple[Tensor, Tensor],
-    *,
-    gdn: Any,
-    output_final_state: bool = True,
-) -> tuple[Tensor, Tensor | None, Tensor | None]:
-    _disable_reentrant_te_linear_transpose_cache(gdn)
-    qkv, beta, recurrent_g = projected_streams
-    conv_initial, recurrent_initial = parent_states
-    token_count = int(qkv.shape[0]) if qkv.ndim == 2 else -1
-    segment_count = int(bucket.segment_count)
-    if qkv.ndim != 2:
-        raise ValueError(
-            "GDN bucket execution requires compact projected streams; "
-            f"got qkv shape {tuple(qkv.shape)}"
-        )
-    if token_count != int(bucket.real_token_count):
-        raise ValueError(
-            "GDN packed varlen token count mismatch, got "
-            f"qkv={tuple(qkv.shape)} and bucket tokens={bucket.real_token_count}"
-        )
-    if tuple(beta.shape[:1]) != (token_count,) or tuple(recurrent_g.shape) != tuple(
-        beta.shape
-    ):
-        raise ValueError(
-            "packed beta/recurrent_g must be [tokens, heads], got "
-            f"{tuple(beta.shape)} and {tuple(recurrent_g.shape)}"
-        )
-    if int(conv_initial.shape[0]) != segment_count:
-        raise ValueError(
-            "conv_initial batch must match bucket segment count, got "
-            f"{tuple(conv_initial.shape)} for {segment_count} segments"
-        )
-    if int(recurrent_initial.shape[0]) != segment_count:
-        raise ValueError(
-            "recurrent_initial batch must match bucket segment count, got "
-            f"{tuple(recurrent_initial.shape)} for {segment_count} segments"
-        )
-
-    with _nvtx_range("art_gdn_causal_conv_forward", qkv):
-        qkv, conv_final = _causal_conv1d_packed_varlen_with_state(
-            gdn,
-            qkv,
-            conv_initial,
-            bucket.cu_seqlens,
-            output_final_state=output_final_state,
-        )
-
-    with _nvtx_range("art_gdn_qkv_head_prepare", qkv):
-        query, key, value, beta, recurrent_g = _prepare_packed_recurrent_inputs_fused(
-            qkv,
-            beta,
-            recurrent_g,
-            key_heads=_local_key_heads(gdn),
-            value_heads=_local_value_heads(gdn),
-            key_dim=int(gdn.key_head_dim),
-            value_dim=int(gdn.value_head_dim),
-        )
-        if gdn.use_qk_l2norm:
-            query = l2norm(query.contiguous())
-            key = l2norm(key.contiguous())
-
-    with _nvtx_range("art_gdn_recurrent_forward", query):
-        recurrent_out, recurrent_final = _chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=recurrent_g,
-            beta=beta,
-            initial_state=recurrent_initial,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=bucket.cu_seqlens,
-        )
-    return recurrent_out, conv_final, recurrent_final
-
-
 def _zero_conv_state(
     gdn: Any,
     hidden_states: Tensor,
@@ -2505,31 +2991,84 @@ def _zero_recurrent_state(
 
 
 def _default_cp_rank(cp_size: int) -> int:
-    del cp_size
-    from megatron.core import parallel_state as ps
+    if cp_size == 1:
+        return 0
+    try:
+        from megatron.core import parallel_state as ps
 
-    return int(ps.get_context_parallel_rank())
-
-
-def _default_cp_size() -> int:
-    from megatron.core import parallel_state as ps
-
-    return max(1, int(ps.get_context_parallel_world_size()))
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            return int(ps.get_context_parallel_rank())
+    except Exception:
+        pass
+    if torch.distributed.is_available() and torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return int(torch.distributed.get_rank())  # ty: ignore[possibly-missing-attribute]
+    return 0
 
 
 def _default_cp_group(cp_size: int) -> Any:
-    del cp_size
-    from megatron.core import parallel_state as ps
+    if cp_size == 1:
+        return None
+    try:
+        from megatron.core import parallel_state as ps
 
-    return ps.get_context_parallel_group()
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            return ps.get_context_parallel_group()
+    except Exception:
+        pass
+    if torch.distributed.is_available() and torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return torch.distributed.group.WORLD  # ty: ignore[possibly-missing-attribute]
+    raise RuntimeError("CP GDN execution requires torch.distributed initialization")
+
+
+def _default_tp_cp_group(cp_size: int, tp_size: int) -> Any:
+    if cp_size == 1 and tp_size == 1:
+        return None
+    try:
+        from megatron.core import parallel_state as ps
+
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            return ps.get_tensor_and_context_parallel_group()
+    except Exception:
+        pass
+    if torch.distributed.is_available() and torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return torch.distributed.group.WORLD  # ty: ignore[possibly-missing-attribute]
+    raise RuntimeError(
+        "CP GDN layout exchange requires torch.distributed initialization"
+    )
+
+
+def _group_rank(group: Any | None) -> int:
+    if group is None:
+        return 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        return int(torch.distributed.get_rank(group))  # ty: ignore[possibly-missing-attribute]
+    return 0
 
 
 def _l2norm(x: Tensor) -> Tensor:
+    try:
+        from fla.modules.l2norm import l2norm
+    except ImportError:
+        return F.normalize(x, p=2, dim=-1)
     return l2norm(x)
 
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    except ImportError as exc:
+        raise ImportError(
+            "FLA is required for ART shared-prefix GDN execution."
+        ) from exc
     return chunk_gated_delta_rule(*args, **kwargs)
+
+
+def _causal_conv1d_fn() -> Callable[..., Any] | None:
+    try:
+        from causal_conv1d import causal_conv1d_fn
+    except ImportError:
+        return None
+    return causal_conv1d_fn
 
 
 @contextmanager

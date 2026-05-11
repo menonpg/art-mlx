@@ -1,9 +1,49 @@
 from typing import Any, Sequence, cast
 
+from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_model import GPTModel
 import torch
 
 from art.megatron.training.model_chunks import ModelChunks
+
+
+def _context_parallel_world_size(config: Any) -> int:
+    if torch.distributed.is_initialized() and ps.model_parallel_is_initialized():
+        return int(ps.get_context_parallel_world_size())
+    return int(getattr(config, "context_parallel_size", 1) or 1)
+
+
+def _build_absolute_rotary_pos_emb(
+    module: Any,
+    *,
+    max_position: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    rotary_pos_emb = cast(Any, module.rotary_pos_emb)
+    cache = getattr(module, "_art_absolute_rotary_pos_emb_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(module, "_art_absolute_rotary_pos_emb_cache", cache)
+    cache_key = (str(device), max_position + 1)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    freqs = rotary_pos_emb.get_freqs_non_repeated(max_position + 1)
+    if not rotary_pos_emb.rotary_interleaved:
+        absolute_rotary_pos_emb = torch.cat((freqs, freqs), dim=-1)
+    else:
+        absolute_rotary_pos_emb = torch.stack(
+            (freqs.view(-1, 1), freqs.view(-1, 1)),
+            dim=-1,
+        ).view(freqs.shape[0], -1)
+    absolute_rotary_pos_emb = absolute_rotary_pos_emb[:, None, None, :].to(
+        device=device,
+        dtype=dtype,
+    )
+    cache[cache_key] = absolute_rotary_pos_emb
+    return absolute_rotary_pos_emb
 
 
 def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
@@ -19,15 +59,47 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
         preprocess = gpt_module._preprocess
 
         def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
-            preproc_output = list(_preprocess(*args, **kwargs))
+            position_ids = kwargs.get("position_ids")
+            rotary_pos_emb = getattr(gpt_module, "rotary_pos_emb", None)
+            rotary_cp_group = getattr(rotary_pos_emb, "cp_group", None)
+            config = getattr(gpt_module, "config", None)
+            cp_world_size = _context_parallel_world_size(config)
+            uses_dispatched_local_cp_positions = (
+                isinstance(position_ids, torch.Tensor)
+                and position_ids.ndim == 2
+                and cp_world_size > 1
+                and rotary_cp_group is not None
+            )
+            if uses_dispatched_local_cp_positions:
+                setattr(rotary_pos_emb, "cp_group", None)
+            try:
+                preproc_output = list(_preprocess(*args, **kwargs))
+            finally:
+                if uses_dispatched_local_cp_positions:
+                    setattr(rotary_pos_emb, "cp_group", rotary_cp_group)
             decoder_input = cast(torch.Tensor, preproc_output[0])
             if not decoder_input.requires_grad and decoder_input.is_leaf:
                 decoder_input.requires_grad_(True)
-            position_ids = cast(torch.Tensor, kwargs["position_ids"])
+            position_ids = cast(torch.Tensor, position_ids)
             table = cast(torch.Tensor, preproc_output[1])
+            if table is None:
+                return tuple(preproc_output)
             embedding_dim = int(table.shape[-1])
+            if (
+                rotary_pos_emb is not None
+                and getattr(gpt_module, "position_embedding_type", None) == "rope"
+                and cp_world_size > 1
+            ):
+                table_source = _build_absolute_rotary_pos_emb(
+                    gpt_module,
+                    max_position=int(position_ids.max().item()),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+            else:
+                table_source = table
             batch_size, sequence_length = position_ids.shape
-            gathered = table.view(table.shape[0], embedding_dim).index_select(
+            gathered = table_source.view(table_source.shape[0], embedding_dim).index_select(
                 0,
                 position_ids.reshape(-1),
             )
