@@ -3,9 +3,9 @@ from __future__ import annotations
 import random
 from typing import Any, cast
 
+from pydantic import BaseModel
 import pytest
 import torch
-from pydantic import BaseModel
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.gdn.operator import (

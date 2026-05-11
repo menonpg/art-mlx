@@ -371,6 +371,9 @@ def _optimized_load_weights_hf_to_megatron(
 def install_art_bridge_runtime_patches() -> None:
     from megatron.bridge.models import model_provider as model_provider_module
 
+    _patch_router_gating_linear_empty_input()
+    _patch_bias_swiglu_empty_input()
+    _patch_moe_unpermute_empty_input()
     if not getattr(
         model_provider_module.get_model, "__art_meta_materialization__", False
     ):
@@ -398,3 +401,132 @@ def install_art_bridge_runtime_patches() -> None:
             "load_weights_hf_to_megatron",
             _optimized_load_weights_hf_to_megatron,
         )
+
+
+def _patch_router_gating_linear_empty_input() -> None:
+    from megatron.core.transformer.moe import moe_utils, router
+
+    if getattr(moe_utils.router_gating_linear, "__art_empty_safe__", False):
+        return
+
+    original_router_gating_linear = moe_utils.router_gating_linear
+
+    def _router_gating_linear_empty_safe(
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        router_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if int(inp.numel()) != 0:
+            return original_router_gating_linear(inp, weight, bias, router_dtype)
+        zero = inp.to(router_dtype).sum() * 0.0 + weight.to(router_dtype).sum() * 0.0
+        if bias is not None:
+            zero = zero + bias.to(router_dtype).sum() * 0.0
+        return zero.expand(*inp.shape[:-1], int(weight.shape[0]))
+
+    setattr(_router_gating_linear_empty_safe, "__art_empty_safe__", True)
+    setattr(moe_utils, "router_gating_linear", _router_gating_linear_empty_safe)
+    setattr(router, "router_gating_linear", _router_gating_linear_empty_safe)
+
+
+def _patch_bias_swiglu_empty_input() -> None:
+    from megatron.core.fusions import fused_bias_swiglu
+    from megatron.core.transformer import mlp
+    from megatron.core.transformer.moe import experts, shared_experts
+
+    if getattr(fused_bias_swiglu.bias_swiglu_impl, "__art_empty_safe__", False):
+        return
+
+    original_bias_swiglu_impl = fused_bias_swiglu.bias_swiglu_impl
+    original_weighted_bias_swiglu_impl = fused_bias_swiglu.weighted_bias_swiglu_impl
+
+    def _empty_swiglu_output(
+        input: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output_shape = (*input.shape[:-1], int(input.shape[-1]) // 2)
+        zero = input.sum() * 0.0
+        if bias is not None:
+            zero = zero + bias.to(dtype=input.dtype).sum() * 0.0
+        if weights is not None:
+            zero = zero + weights.to(dtype=input.dtype).sum() * 0.0
+        return zero.expand(output_shape).clone()
+
+    def _bias_swiglu_empty_safe(
+        input: torch.Tensor,
+        bias: torch.Tensor | None,
+        fp8_input_store: bool = False,
+        cpu_offload_input: bool = False,
+    ) -> torch.Tensor:
+        if int(input.numel()) != 0:
+            return original_bias_swiglu_impl(
+                input, bias, fp8_input_store, cpu_offload_input
+            )
+        return _empty_swiglu_output(input, bias=bias)
+
+    def _weighted_bias_swiglu_empty_safe(
+        input: torch.Tensor,
+        bias: torch.Tensor | None,
+        weights: torch.Tensor,
+        fp8_input_store: bool = False,
+    ) -> torch.Tensor:
+        if int(input.numel()) != 0:
+            return original_weighted_bias_swiglu_impl(
+                input, bias, weights, fp8_input_store
+            )
+        return _empty_swiglu_output(input, bias=bias, weights=weights)
+
+    setattr(_bias_swiglu_empty_safe, "__art_empty_safe__", True)
+    setattr(_weighted_bias_swiglu_empty_safe, "__art_empty_safe__", True)
+    setattr(fused_bias_swiglu, "bias_swiglu_impl", _bias_swiglu_empty_safe)
+    setattr(
+        fused_bias_swiglu,
+        "weighted_bias_swiglu_impl",
+        _weighted_bias_swiglu_empty_safe,
+    )
+    setattr(mlp, "bias_swiglu_impl", _bias_swiglu_empty_safe)
+    setattr(mlp, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_empty_safe)
+    setattr(experts, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_empty_safe)
+    setattr(shared_experts, "bias_swiglu_impl", _bias_swiglu_empty_safe)
+
+
+def _patch_moe_unpermute_empty_input() -> None:
+    from megatron.core.transformer.moe import moe_utils, token_dispatcher
+
+    if getattr(moe_utils.unpermute, "__art_empty_safe__", False):
+        return
+
+    original_unpermute = moe_utils.unpermute
+
+    def _unpermute_empty_safe(
+        permuted_tokens: torch.Tensor,
+        sorted_indices: torch.Tensor,
+        restore_shape: torch.Size,
+        probs: torch.Tensor | None = None,
+        routing_map: torch.Tensor | None = None,
+        fused: bool = False,
+        drop_and_pad: bool = False,
+        pad_offsets: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if int(permuted_tokens.numel()) != 0:
+            return original_unpermute(
+                permuted_tokens,
+                sorted_indices,
+                restore_shape,
+                probs=probs,
+                routing_map=routing_map,
+                fused=fused,
+                drop_and_pad=drop_and_pad,
+                pad_offsets=pad_offsets,
+            )
+        zero = (
+            permuted_tokens.sum() * 0.0 + sorted_indices.sum().to(permuted_tokens) * 0.0
+        )
+        if probs is not None:
+            zero = zero + probs.to(dtype=permuted_tokens.dtype).sum() * 0.0
+        return zero.expand(tuple(int(dim) for dim in restore_shape)).clone()
+
+    setattr(_unpermute_empty_safe, "__art_empty_safe__", True)
+    setattr(moe_utils, "unpermute", _unpermute_empty_safe)
+    setattr(token_dispatcher, "unpermute", _unpermute_empty_safe)

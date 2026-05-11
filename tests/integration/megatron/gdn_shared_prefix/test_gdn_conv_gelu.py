@@ -20,7 +20,9 @@ from art.megatron.gdn.gdn_shared_prefix import (
     build_gdn_rank_execution_plan,
     parse_gdn_shared_prefix_segments,
 )
-from tests.integration.megatron.gdn_shared_prefix.benchmark_gdn import make_qwen35_gdn_pair
+from tests.integration.megatron.gdn_shared_prefix.benchmark_gdn import (
+    make_qwen35_gdn_pair,
+)
 from tests.integration.megatron.gdn_shared_prefix.cases import (
     GdnFamilyShape,
     GdnPackedRowShape,

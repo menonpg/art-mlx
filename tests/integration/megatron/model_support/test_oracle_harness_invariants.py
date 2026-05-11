@@ -3,12 +3,12 @@ import torch
 
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
+    FORWARD_EXPERT_LORA_TRACE_NOISE_REASON,
+    FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT,
     ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT,
     ORACLE_TOPOLOGY,
     TOPOLOGIES,
     DiffAccumulator,
-    FORWARD_EXPERT_LORA_TRACE_NOISE_REASON,
-    FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT,
     MetricRow,
     MetricThresholdRule,
     PackedTensorConfig,

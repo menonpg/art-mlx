@@ -15,10 +15,32 @@ class Loss(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     reduction: Literal["mean", "sum"]
     policy_loss: torch.Tensor
+    kl: torch.Tensor | None = None
     entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
     kl_policy_ref: torch.Tensor | None = None
+
+
+def compute_probs_corr(
+    old_logprobs: torch.Tensor,
+    new_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    old_logprobs_mask = ~torch.isnan(old_logprobs)
+    old_probs = torch.exp(old_logprobs[old_logprobs_mask])
+    new_probs = torch.exp(new_logprobs[old_logprobs_mask])
+    if old_probs.numel() < 2:
+        return new_logprobs.new_zeros(())
+    old_std = old_probs.std(unbiased=False)
+    new_std = new_probs.std(unbiased=False)
+    if (
+        not torch.isfinite(old_std).item()
+        or not torch.isfinite(new_std).item()
+        or old_std.item() == 0.0
+        or new_std.item() == 0.0
+    ):
+        return new_logprobs.new_zeros(())
+    return torch.corrcoef(torch.stack([old_probs, new_probs]))[0, 1]
 
 
 def loss_fn(
@@ -35,15 +57,7 @@ def loss_fn(
         new_logprobs.dtype
     )
     weights = shift_tensor(inputs["weights"], 0.0)
-    old_logprobs_mask = ~torch.isnan(old_logprobs)
-    probs_corr = torch.corrcoef(
-        torch.stack(
-            [
-                torch.exp(old_logprobs[old_logprobs_mask]),
-                torch.exp(new_logprobs[old_logprobs_mask]),
-            ]
-        )
-    )[0, 1]
+    probs_corr = compute_probs_corr(old_logprobs, new_logprobs)
     # Assume missing old logprobs were sampled under the current policy
     old_logprobs = torch.where(
         torch.isnan(old_logprobs),
