@@ -877,10 +877,31 @@ from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
 )
 
 
+def _select_qwen35_expert_weight(
+    hf_weights: Any,
+    *,
+    global_expert_number: int,
+    ep_size: int,
+) -> Any:
+    from art.megatron.runtime.bridge_runtime import ExpertTensorSlice
+
+    if isinstance(hf_weights, ExpertTensorSlice):
+        return hf_weights.get(global_expert_number)
+    if isinstance(hf_weights, torch.Tensor) and hf_weights.ndim >= 3:
+        if ep_size > 1:
+            raise RuntimeError(
+                "Qwen3.5 EP expert loading expected a sliced fused-expert "
+                "HF tensor, but received the full all-expert tensor for "
+                f"global expert {global_expert_number}."
+            )
+        return hf_weights[global_expert_number]
+    return hf_weights
+
+
 class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
     def hf_to_megatron(
         self,
-        hf_weights: torch.Tensor | dict[str, torch.Tensor],
+        hf_weights: Any,
         megatron_module: Any,
     ) -> torch.Tensor:
         from megatron.bridge.models.conversion.param_mapping import (
@@ -894,10 +915,10 @@ class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
         )
 
         global_expert_number = extract_expert_number_from_param(self.megatron_param)
-        expert_weight = (
-            hf_weights[global_expert_number]
-            if isinstance(hf_weights, torch.Tensor) and hf_weights.ndim >= 3
-            else hf_weights
+        expert_weight = _select_qwen35_expert_weight(
+            hf_weights,
+            global_expert_number=global_expert_number,
+            ep_size=int(self.ep_size),
         )
         normalized_param = self._normalize_expert_param_name(self.megatron_param)
         _, target_param = get_module_and_param_from_name(
@@ -942,7 +963,7 @@ class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
 class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
     def hf_to_megatron(
         self,
-        hf_weights: torch.Tensor,
+        hf_weights: Any,
         megatron_module: Any,
     ) -> torch.Tensor:
         from megatron.bridge.models.conversion.param_mapping import (
@@ -958,8 +979,10 @@ class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
         )
 
         global_expert_number = extract_expert_number_from_param(self.megatron_param)
-        expert_weight = (
-            hf_weights[global_expert_number] if hf_weights.ndim >= 3 else hf_weights
+        expert_weight = _select_qwen35_expert_weight(
+            hf_weights,
+            global_expert_number=global_expert_number,
+            ep_size=int(self.ep_size),
         )
         normalized_param = self._normalize_expert_param_name(self.megatron_param)
         _, target_param = get_module_and_param_from_name(

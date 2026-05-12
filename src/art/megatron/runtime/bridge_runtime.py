@@ -22,6 +22,31 @@ from megatron.core.utils import get_model_config
 import torch
 
 
+class ExpertTensorSlice:
+    __slots__ = ("global_start", "global_stop", "tensor")
+
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        *,
+        global_start: int,
+        global_stop: int,
+    ) -> None:
+        self.tensor = tensor
+        self.global_start = int(global_start)
+        self.global_stop = int(global_stop)
+
+    def get(self, global_expert: int) -> torch.Tensor:
+        global_expert = int(global_expert)
+        if not self.global_start <= global_expert < self.global_stop:
+            raise RuntimeError(
+                "expert slice cache miss for global expert "
+                f"{global_expert}; cached range is "
+                f"[{self.global_start}, {self.global_stop})"
+            )
+        return self.tensor[global_expert - self.global_start]
+
+
 def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type != "cpu" or not torch.cuda.is_available():
         return tensor
@@ -43,6 +68,8 @@ def _iter_hf_param_names(hf_param: Any) -> Iterable[str]:
 def _needs_local_hf_prefetch(task: Any) -> bool:
     if task is None or task.megatron_module is None:
         return False
+    if _needs_expert_slice_prefetch(task):
+        return False
     mapping = task.mapping
     tp_size = int(getattr(mapping, "tp_size", 1))
     if tp_size <= 1:
@@ -52,21 +79,91 @@ def _needs_local_hf_prefetch(task: Any) -> bool:
     return int(getattr(mapping, "tp_rank", 0)) == 0
 
 
+def _needs_expert_slice_prefetch(task: Any) -> bool:
+    mapping = task.mapping
+    return (
+        int(getattr(mapping, "ep_size", 1)) > 1
+        and bool(getattr(mapping, "is_expert", False))
+        and bool(getattr(mapping, "is_grouped_export", False))
+        and isinstance(getattr(mapping, "hf_param", None), str)
+    )
+
+
+def _expert_slice_range(task: Any) -> tuple[int, int]:
+    mapping = task.mapping
+    config = getattr(task.megatron_module, "config", None)
+    num_experts = int(getattr(config, "num_moe_experts", 0) or 0)
+    ep_size = int(getattr(mapping, "ep_size", 1))
+    ep_rank = int(getattr(mapping, "ep_rank", 0))
+    if num_experts <= 0 or ep_size <= 1 or num_experts % ep_size != 0:
+        raise RuntimeError(
+            "cannot slice fused expert HF weights with "
+            f"num_experts={num_experts}, ep_size={ep_size}"
+        )
+    experts_per_rank = num_experts // ep_size
+    start = ep_rank * experts_per_rank
+    return start, start + experts_per_rank
+
+
+def _load_hf_tensor_slice(
+    hf_state_dict: Mapping[str, torch.Tensor],
+    key: str,
+    *,
+    start: int,
+    stop: int,
+) -> torch.Tensor:
+    source = getattr(hf_state_dict, "source", None)
+    if source is None or not hasattr(source, "key_to_filename_map"):
+        raise RuntimeError(
+            "fused expert EP loading requires a safetensors-backed HF state "
+            f"dict for key {key!r}"
+        )
+    key_to_filename = source.key_to_filename_map
+    if key not in key_to_filename:
+        raise KeyError(f"HF tensor key {key!r} not found in safetensors index")
+    from safetensors import safe_open
+
+    file_path = source.path / key_to_filename[key]
+    with safe_open(file_path, framework="pt", device="cpu") as handle:
+        tensor_slice = handle.get_slice(key)
+        shape = tuple(int(dim) for dim in tensor_slice.get_shape())
+        if not shape or start < 0 or stop > shape[0] or start >= stop:
+            raise RuntimeError(
+                f"invalid expert slice [{start}, {stop}) for {key!r} with shape {shape}"
+            )
+        index = (slice(start, stop),) + (slice(None),) * (len(shape) - 1)
+        return tensor_slice[index]
+
+
 def load_unique_hf_keys_once(
     tasks: Iterable[Any],
     hf_state_dict: Mapping[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | ExpertTensorSlice]:
+    task_list = list(tasks)
     keys = sorted(
         {
             key
-            for task in tasks
+            for task in task_list
             if _needs_local_hf_prefetch(task)
             for key in _iter_hf_param_names(task.mapping.hf_param)
         }
     )
-    if not keys:
-        return {}
-    if hasattr(hf_state_dict, "__getitem__"):
+    expert_slice_ranges: dict[str, tuple[int, int]] = {}
+    for task in task_list:
+        if task is None or task.megatron_module is None:
+            continue
+        if not _needs_expert_slice_prefetch(task):
+            continue
+        start, stop = _expert_slice_range(task)
+        key = cast(str, task.mapping.hf_param)
+        previous = expert_slice_ranges.get(key)
+        expert_slice_ranges[key] = (
+            (start, stop)
+            if previous is None
+            else (min(previous[0], start), max(previous[1], stop))
+        )
+    cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
+    if keys and hasattr(hf_state_dict, "__getitem__"):
         hf_state_dict_getter = cast(Any, hf_state_dict)
         loaded = (
             hf_state_dict_getter[keys]
@@ -75,23 +172,39 @@ def load_unique_hf_keys_once(
         )
     else:
         loaded = {key: hf_state_dict[key] for key in keys}
-    return {
-        key: _pin_cpu_tensor(value)
-        for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
-    }
+    cache.update(
+        {
+            key: _pin_cpu_tensor(value)
+            for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
+        }
+    )
+    for key, (start, stop) in expert_slice_ranges.items():
+        cache[key] = ExpertTensorSlice(
+            _pin_cpu_tensor(
+                _load_hf_tensor_slice(
+                    hf_state_dict,
+                    key,
+                    start=start,
+                    stop=stop,
+                )
+            ),
+            global_start=start,
+            global_stop=stop,
+        )
+    return cache
 
 
-class _CachedStateLookup(Mapping[str, torch.Tensor]):
+class _CachedStateLookup(Mapping[str, torch.Tensor | ExpertTensorSlice]):
     def __init__(
         self,
         *,
-        cache: Mapping[str, torch.Tensor],
+        cache: Mapping[str, torch.Tensor | ExpertTensorSlice],
         source: Mapping[str, torch.Tensor],
     ) -> None:
         self._cache = cache
         self._source = source
 
-    def __getitem__(self, key: str) -> torch.Tensor:
+    def __getitem__(self, key: str) -> torch.Tensor | ExpertTensorSlice:
         if key in self._cache:
             return self._cache[key]
         return _pin_cpu_tensor(self._source[key])
