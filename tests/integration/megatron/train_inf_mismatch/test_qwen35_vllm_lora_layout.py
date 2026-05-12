@@ -193,6 +193,18 @@ def _config(base_model: str, *, rank: int) -> dict:
     }
 
 
+def _small_q_gate_config(*, rank: int) -> dict:
+    config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank)
+    config.update(
+        {
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 3,
+        }
+    )
+    return config
+
+
 def _sentinel(
     expert: int,
     module_id: int,
@@ -235,6 +247,99 @@ def _qwen35_art_moe_tensors(
                 (out_dim, rank),
             )
     return tensors
+
+
+def _q_proj_lora_b_to_vllm_expected(
+    tensor: torch.Tensor,
+    *,
+    num_heads: int,
+    num_groups: int,
+    head_dim: int,
+) -> torch.Tensor:
+    heads_per_group = num_heads // num_groups
+    grouped = tensor.reshape(num_groups, 2 * heads_per_group, head_dim, tensor.shape[1])
+    query = grouped[:, :heads_per_group]
+    gate = grouped[:, heads_per_group:]
+    return torch.cat((query, gate), dim=2).reshape(tensor.shape).contiguous()
+
+
+def test_qwen35_q_proj_lora_b_translates_grouped_gate_layout() -> None:
+    rank = 2
+    num_heads = 4
+    num_groups = 2
+    head_dim = 3
+    rows = num_groups * 2 * (num_heads // num_groups) * head_dim
+    art_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
+    vllm_key = (
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight"
+    )
+    art_tensor = torch.arange(rows * rank, dtype=torch.float32).reshape(rows, rank)
+    adapter_config = _small_q_gate_config(rank=rank)
+
+    vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        {art_key: art_tensor},
+        adapter_config=adapter_config,
+    )
+
+    assert vllm_config == adapter_config
+    assert torch.equal(
+        vllm_tensors[vllm_key],
+        _q_proj_lora_b_to_vllm_expected(
+            art_tensor,
+            num_heads=num_heads,
+            num_groups=num_groups,
+            head_dim=head_dim,
+        ),
+    )
+    roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=adapter_config,
+    )
+    assert torch.equal(roundtrip[art_key], art_tensor)
+
+
+def test_qwen35_moe_path_translates_q_proj_lora_b_before_rank_padding() -> None:
+    rank = 1
+    vllm_rank = 2
+    num_heads = 4
+    num_groups = 2
+    head_dim = 3
+    rows = num_groups * 2 * (num_heads // num_groups) * head_dim
+    art_prefix = "base_model.model.model.layers.0"
+    art_key = f"{art_prefix}.self_attn.q_proj.lora_B.weight"
+    vllm_key = (
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight"
+    )
+    art_tensor = torch.arange(rows * rank, dtype=torch.float32).reshape(rows, rank)
+    art_tensors = {
+        **_qwen35_art_moe_tensors(
+            art_prefix,
+            num_experts=1,
+            rank=rank,
+            hidden=3,
+            intermediate=4,
+        ),
+        art_key: art_tensor,
+    }
+
+    vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        art_tensors,
+        adapter_config=_small_q_gate_config(rank=rank),
+    )
+
+    expected = art_tensor.new_zeros((rows, vllm_rank))
+    expected[:, :rank] = _q_proj_lora_b_to_vllm_expected(
+        art_tensor,
+        num_heads=num_heads,
+        num_groups=num_groups,
+        head_dim=head_dim,
+    )
+    assert torch.equal(vllm_tensors[vllm_key], expected)
+    roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=vllm_config,
+    )
+    assert torch.equal(roundtrip[art_key], art_tensor)
 
 
 def _expected_vllm_stack(

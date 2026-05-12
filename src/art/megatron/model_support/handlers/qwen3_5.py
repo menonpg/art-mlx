@@ -1,4 +1,5 @@
 from copy import copy
+from functools import lru_cache
 import re
 from types import MethodType
 from typing import Any, Sequence, cast
@@ -65,8 +66,16 @@ class Qwen35BaseHandler(DefaultDenseHandler):
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         if _group_art_moe_tensors(tensors):
             raise TypeError("Dense Qwen3.5 handler received MoE LoRA tensors")
+        transformed: dict[str, torch.Tensor] = {}
+        for key, tensor in tensors.items():
+            vllm_key, tensor = _to_vllm_lora_tensor(
+                key,
+                tensor,
+                adapter_config=adapter_config,
+            )
+            transformed[vllm_key] = tensor
         return (
-            {_to_vllm_key(key): tensor for key, tensor in tensors.items()},
+            transformed,
             adapter_config,
         )
 
@@ -76,10 +85,17 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
-        del adapter_config
         if any(_VLLM_MOE_KEY_RE.match(key) for key in tensors):
             raise TypeError("Dense Qwen3.5 handler received MoE vLLM LoRA tensors")
-        return {_from_vllm_key(key): tensor for key, tensor in tensors.items()}
+        transformed: dict[str, torch.Tensor] = {}
+        for key, tensor in tensors.items():
+            art_key, tensor = _from_vllm_lora_tensor(
+                key,
+                tensor,
+                adapter_config=adapter_config,
+            )
+            transformed[art_key] = tensor
+        return transformed
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from art.megatron.gdn.operator import (
@@ -484,6 +500,112 @@ def _is_lora_weight_key(key: str) -> bool:
     return key.endswith((".lora_A.weight", ".lora_B.weight"))
 
 
+def _is_self_attn_q_proj_lora_b(key: str) -> bool:
+    return key.endswith(".self_attn.q_proj.lora_B.weight")
+
+
+@lru_cache(maxsize=8)
+def _qwen35_text_config(base_model_name_or_path: str) -> Any:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        base_model_name_or_path,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    return getattr(config, "text_config", config)
+
+
+def _qwen35_attention_dims(adapter_config: dict[str, Any]) -> tuple[int, int, int]:
+    num_heads = adapter_config.get("num_attention_heads")
+    num_groups = adapter_config.get("num_key_value_heads")
+    head_dim = adapter_config.get("head_dim")
+    hidden_size = adapter_config.get("hidden_size")
+    if num_heads is None:
+        base_model = adapter_config.get("base_model_name_or_path")
+        if not base_model:
+            raise RuntimeError("Qwen3.5 LoRA adapter config is missing base model path")
+        config = _qwen35_text_config(str(base_model))
+        num_heads = getattr(config, "num_attention_heads")
+        num_groups = getattr(config, "num_key_value_heads", num_heads)
+        head_dim = getattr(config, "head_dim", None)
+        hidden_size = getattr(config, "hidden_size", None)
+    num_heads = int(num_heads)
+    num_groups = int(num_groups if num_groups is not None else num_heads)
+    if head_dim is None:
+        if hidden_size is None:
+            raise RuntimeError("Qwen3.5 config is missing head_dim and hidden_size")
+        head_dim = int(hidden_size) // num_heads
+    head_dim = int(head_dim)
+    if num_heads % num_groups != 0:
+        raise RuntimeError(
+            f"Qwen3.5 attention heads {num_heads} are not divisible by "
+            f"query groups {num_groups}"
+        )
+    return num_heads, num_groups, head_dim
+
+
+def _qwen35_q_proj_lora_b_to_vllm(
+    tensor: torch.Tensor,
+    adapter_config: dict[str, Any],
+) -> torch.Tensor:
+    num_heads, num_groups, head_dim = _qwen35_attention_dims(adapter_config)
+    heads_per_group = num_heads // num_groups
+    expected_rows = num_groups * 2 * heads_per_group * head_dim
+    if tensor.shape[0] != expected_rows:
+        raise RuntimeError(
+            f"Qwen3.5 q_proj LoRA-B rows {tensor.shape[0]} do not match "
+            f"attention output rows {expected_rows}"
+        )
+    rank = tensor.shape[1]
+    grouped = tensor.reshape(num_groups, 2 * heads_per_group, head_dim, rank)
+    query = grouped[:, :heads_per_group]
+    gate = grouped[:, heads_per_group:]
+    return torch.cat((query, gate), dim=2).reshape(tensor.shape).contiguous()
+
+
+def _qwen35_q_proj_lora_b_from_vllm(
+    tensor: torch.Tensor,
+    adapter_config: dict[str, Any],
+) -> torch.Tensor:
+    num_heads, num_groups, head_dim = _qwen35_attention_dims(adapter_config)
+    heads_per_group = num_heads // num_groups
+    expected_rows = num_groups * heads_per_group * 2 * head_dim
+    if tensor.shape[0] != expected_rows:
+        raise RuntimeError(
+            f"Qwen3.5 q_proj LoRA-B rows {tensor.shape[0]} do not match "
+            f"attention output rows {expected_rows}"
+        )
+    rank = tensor.shape[1]
+    per_head = tensor.reshape(num_groups, heads_per_group, 2 * head_dim, rank)
+    query, gate = per_head.split(head_dim, dim=2)
+    return torch.cat((query, gate), dim=1).reshape(tensor.shape).contiguous()
+
+
+def _to_vllm_lora_tensor(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[str, torch.Tensor]:
+    vllm_key = _to_vllm_key(key)
+    if _is_self_attn_q_proj_lora_b(vllm_key):
+        tensor = _qwen35_q_proj_lora_b_to_vllm(tensor, adapter_config)
+    return vllm_key, tensor
+
+
+def _from_vllm_lora_tensor(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[str, torch.Tensor]:
+    art_key = _from_vllm_key(key)
+    if _is_self_attn_q_proj_lora_b(art_key):
+        tensor = _qwen35_q_proj_lora_b_from_vllm(tensor, adapter_config)
+    return art_key, tensor
+
+
 def _pad_a(tensor: torch.Tensor, rank: int) -> torch.Tensor:
     if tensor.shape[0] == rank:
         return tensor
@@ -571,9 +693,15 @@ def _to_vllm_lora_tensors(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
-        return {
-            _to_vllm_key(key): tensor for key, tensor in tensors.items()
-        }, adapter_config
+        transformed: dict[str, torch.Tensor] = {}
+        for key, tensor in tensors.items():
+            vllm_key, tensor = _to_vllm_lora_tensor(
+                key,
+                tensor,
+                adapter_config=adapter_config,
+            )
+            transformed[vllm_key] = tensor
+        return transformed, adapter_config
     rank = _rank_from_grouped_moe(grouped)
     vllm_rank = 2 * rank
     transformed: dict[str, torch.Tensor] = {}
@@ -622,7 +750,11 @@ def _to_vllm_lora_tensors(
     for key, tensor in tensors.items():
         if key in used_keys:
             continue
-        vllm_key = _to_vllm_key(key)
+        vllm_key, tensor = _to_vllm_lora_tensor(
+            key,
+            tensor,
+            adapter_config=adapter_config,
+        )
         if vllm_key.endswith(".lora_A.weight"):
             tensor = _pad_a(tensor, vllm_rank)
         elif vllm_key.endswith(".lora_B.weight"):
@@ -646,7 +778,15 @@ def _from_vllm_lora_tensors(
         )
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
     if not grouped:
-        return {_from_vllm_key(key): tensor for key, tensor in tensors.items()}
+        transformed: dict[str, torch.Tensor] = {}
+        for key, tensor in tensors.items():
+            art_key, tensor = _from_vllm_lora_tensor(
+                key,
+                tensor,
+                adapter_config=adapter_config,
+            )
+            transformed[art_key] = tensor
+        return transformed
 
     vllm_rank = int(adapter_config["r"])
     if vllm_rank % 2 != 0:
@@ -717,7 +857,11 @@ def _from_vllm_lora_tensors(
     for key, tensor in tensors.items():
         if key in used_keys:
             continue
-        art_key = _from_vllm_key(key)
+        art_key, tensor = _from_vllm_lora_tensor(
+            key,
+            tensor,
+            adapter_config=adapter_config,
+        )
         if art_key.endswith(".lora_A.weight"):
             tensor = _pad_a(tensor, rank)
         elif art_key.endswith(".lora_B.weight"):
