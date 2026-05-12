@@ -1,9 +1,12 @@
 from enum import Enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
+
+if TYPE_CHECKING:
+    from ..types import MegatronTopologyConfig
 
 RolloutWeightsMode = Literal["lora", "merged"]
 
@@ -127,6 +130,7 @@ class InternalModelConfig(TypedDict, total=False):
             - "lora": load LoRA adapters into vLLM directly
             - "merged": keep training LoRA adapters, but push merged weights
               into vLLM for inference
+        megatron_topology: Fixed Megatron parallel topology for this model.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -140,6 +144,7 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     rollout_weights_mode: "RolloutWeightsMode"
+    megatron_topology: "MegatronTopologyConfig | dict[str, int | None]"
     allow_unvalidated_arch: bool
 
 

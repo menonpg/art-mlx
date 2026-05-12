@@ -547,9 +547,10 @@ class MegatronService:
         *,
         lora_path: str,
         step: int,
+        megatron_topology: MegatronTopologyConfig | None = None,
     ) -> None:
         self._raise_if_child_failed()
-        await self._ensure_megatron_running()
+        await self._ensure_megatron_running(megatron_topology=megatron_topology)
         await self._init_merged_weight_transfer()
         self._clear_pending_jobs()
         job_path, log_path = self._create_megatron_job_paths()
@@ -779,6 +780,9 @@ class MegatronService:
                 await self._sync_dedicated_merged_weights(
                     lora_path=lora_path,
                     step=self._latest_step,
+                    megatron_topology=self._resolve_megatron_topology(
+                        self.config.get("megatron_topology")
+                    ),
                 )
         except BaseException:
             await self.aclose()
@@ -803,7 +807,7 @@ class MegatronService:
                     "MegatronService subprocess jobs must use moe_routing_replay_path."
                 )
             megatron_topology = self._resolve_megatron_topology(
-                _config.get("megatron_topology")
+                _config.get("megatron_topology", self.config.get("megatron_topology"))
             )
             if self.is_dedicated:
                 await self._ensure_megatron_running(megatron_topology=megatron_topology)
