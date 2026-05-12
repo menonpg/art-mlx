@@ -17,5 +17,7 @@ def test_qwen35_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
     assert config.flags == (
         "alltoall_dtoh",
         "alltoall_dispatch_preprocess",
+        "deepep_dispatch_combine",
         "deepep_permute_restore",
+        "te_triton_permute_with_mask_map",
     )

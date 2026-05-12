@@ -300,7 +300,7 @@ def test_get_provider_bundle_disables_recompute_from_env(
     assert resolved.recompute_granularity is None
     assert resolved.recompute_method is None
     assert resolved.recompute_num_layers is None
-    assert resolved.recompute_modules is None
+    assert resolved.recompute_modules == []
 
 
 def test_get_provider_bundle_honors_expert_parallel_env_overrides(

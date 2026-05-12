@@ -306,6 +306,7 @@ class OracleCaseConfig(BaseModel):
     loss_scale: float = 1
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
+    allow_unvalidated_arch: bool = False
 
     @property
     def is_moe(self) -> bool:
