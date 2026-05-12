@@ -265,7 +265,7 @@ dev = [
 torch = { index = "pytorch-cu128" }
 panza = { git = "https://github.com/corbt/panza.git" }
 apex = { git = "https://github.com/NVIDIA/apex.git", branch = "25.09" }
-megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "75f2c5ad4afb702b57b4781a00f5291a66bcf183" }
+megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
 transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.11", subdirectory = "transformer_engine/pytorch" }
 
 [[tool.uv.index]]
