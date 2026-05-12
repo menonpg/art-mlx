@@ -39,6 +39,7 @@ FlexBackend = Literal[
     "TRITON_LEGACY_INNER_FP32",
     "TRITON_LEGACY_FULL_FP32",
 ]
+TEST_DEFAULT_FLEX_BACKEND: FlexBackend = "TRITON"
 
 DEFAULT_SENSITIVITY_MUTATION = "skip_finalize"
 SHARED_SENSITIVITY_MUTATIONS = (
@@ -150,6 +151,17 @@ def selected_oracle_objectives() -> list[OracleObjective]:
         f"Unsupported {ORACLE_OBJECTIVE_ENV} value '{raw}'. "
         f"Supported values: {supported}."
     )
+
+
+def _resolve_test_flex_backend(
+    case_config: "OracleCaseConfig",
+    flex_backend: FlexBackend | None,
+) -> FlexBackend | None:
+    if flex_backend is not None:
+        return flex_backend
+    if case_config.precision == "fp32":
+        return TEST_DEFAULT_FLEX_BACKEND
+    return None
 
 
 class Topology(BaseModel):
@@ -1329,8 +1341,12 @@ class VariantRunner:
             self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
         )
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
-        self.oracle_flex_backend = oracle_flex_backend
-        self.variant_flex_backend = variant_flex_backend
+        self.oracle_flex_backend = _resolve_test_flex_backend(
+            case_config, oracle_flex_backend
+        )
+        self.variant_flex_backend = _resolve_test_flex_backend(
+            case_config, variant_flex_backend
+        )
         self.console = console or Console(width=140)
         self._oracle_initialized = False
         self._oracle_regenerated = False

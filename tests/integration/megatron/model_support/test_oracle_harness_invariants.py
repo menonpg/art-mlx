@@ -7,6 +7,7 @@ from .oracle_harness import (
     FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT,
     ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT,
     ORACLE_TOPOLOGY,
+    TEST_DEFAULT_FLEX_BACKEND,
     TOPOLOGIES,
     DiffAccumulator,
     MetricRow,
@@ -16,6 +17,7 @@ from .oracle_harness import (
     VariantRunner,
     _assert_abs_pct_oracle_exact_zero_count,
     _default_phase_pass_fns,
+    _resolve_test_flex_backend,
     _suite_variants,
     case_config,
 )
@@ -174,6 +176,26 @@ def test_context_parallel_seeded_accumulator_can_own_stage_storage() -> None:
 
     assert stage_out.tolist() == [[1.0, 2.0]]
     assert stage_lse.tolist() == [3.0]
+
+
+def test_fp32_oracle_defaults_to_test_triton_backend() -> None:
+    config = case_config().model_copy(update={"precision": "fp32"})
+
+    assert _resolve_test_flex_backend(config, None) == TEST_DEFAULT_FLEX_BACKEND
+    assert _resolve_test_flex_backend(config, "FLASH") == "FLASH"
+
+
+def test_bf16_oracle_preserves_production_flex_default() -> None:
+    config = case_config().model_copy(update={"precision": "bf16"})
+
+    assert _resolve_test_flex_backend(config, None) is None
+
+
+def test_production_compiled_flex_default_stays_flash() -> None:
+    from art.megatron import compiled_flex_attention
+
+    assert compiled_flex_attention._FORCED_FLEX_BACKEND == "FLASH"
+    assert compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}
 
 
 def test_forward_mean_abs_pct_excludes_reference_exact_zeros_only() -> None:

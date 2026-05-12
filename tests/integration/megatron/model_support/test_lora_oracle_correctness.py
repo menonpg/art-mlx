@@ -8,6 +8,7 @@ from .oracle_harness import (
     LIVE_TRAINING_LOG_PATH,
     ORACLE_TOPOLOGY,
     SENSITIVITY_MUTATION_ENV,
+    TEST_DEFAULT_FLEX_BACKEND,
     available_gpu_count,
     case_config,
     run_sensitivity_suite,
@@ -20,7 +21,7 @@ from .oracle_harness import (
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CORRECTNESS_LOG_PATH = REPO_ROOT / ".local" / "correctness.log"
 SENSITIVITY_LOG_PATH = REPO_ROOT / ".local" / "sensitivity.log"
-TEST_FLEX_BACKEND = "TRITON_LEGACY"
+TEST_FLEX_BACKEND = TEST_DEFAULT_FLEX_BACKEND
 
 
 def _run_suite_with_log(
