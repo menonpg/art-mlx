@@ -123,9 +123,11 @@ def test_runtime_project_localizes_ep_moe_lora_experts(artifact_dir: Path) -> No
                 "from art_vllm_runtime.patches import _ep_local_expert_global_indices, _slice_ep_local_experts; "
                 "expert_map = torch.tensor([1, -1, 0, -1], dtype=torch.int32); "
                 "weights = torch.arange(12, dtype=torch.float32).reshape(4, 3); "
+                "local_weights = torch.arange(6, dtype=torch.float32).reshape(2, 3); "
                 "indices = _ep_local_expert_global_indices(expert_map).tolist(); "
                 "local = _slice_ep_local_experts(weights, expert_map, 2).tolist(); "
-                "print(json.dumps({'indices': indices, 'local': local}))"
+                "already_local = _slice_ep_local_experts(local_weights, expert_map, 2).tolist(); "
+                "print(json.dumps({'indices': indices, 'local': local, 'already_local': already_local}))"
             ),
         ],
         cwd=ROOT,
@@ -139,6 +141,7 @@ def test_runtime_project_localizes_ep_moe_lora_experts(artifact_dir: Path) -> No
     assert payload == {
         "indices": [2, 0],
         "local": [[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]],
+        "already_local": [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
     }
 
 

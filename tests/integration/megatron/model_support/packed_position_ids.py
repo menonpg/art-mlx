@@ -14,8 +14,8 @@ from pydantic import BaseModel, Field
 import torch
 
 from art.megatron import train as megatron_train
-from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.model_support.discovery import inspect_architecture
+from art.megatron.shared_prefix_state import create_shared_prefix_state
 
 from .oracle_harness import (
     ORACLE_TOPOLOGY,
@@ -555,7 +555,7 @@ def _logits_equivalence_check(
             continue
         row_input_ids = input_ids[row_index : row_index + 1]
         row_position_ids = position_ids[row_index : row_index + 1]
-        packed_bias = create_shared_prefix_attention_state(
+        packed_bias = create_shared_prefix_state(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
         )
@@ -598,7 +598,7 @@ def _logits_equivalence_check(
                 )
                 reference_group_ids = torch.zeros_like(reference_input_ids)
                 reference_parent_ids = torch.zeros_like(reference_input_ids)
-                reference_bias = create_shared_prefix_attention_state(
+                reference_bias = create_shared_prefix_state(
                     group_ids=reference_group_ids,
                     parent_ids=reference_parent_ids,
                 )

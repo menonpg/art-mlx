@@ -64,6 +64,7 @@ from .serverless import ServerlessBackend
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import (
     LocalTrainResult,
+    MegatronTopologyConfig,
     Messages,
     MessagesAndChoices,
     ServerlessTrainResult,
@@ -85,6 +86,7 @@ __all__ = [
     "Backend",
     "LocalBackend",
     "LocalTrainResult",
+    "MegatronTopologyConfig",
     "ServerlessBackend",
     "ServerlessTrainResult",
     "Messages",

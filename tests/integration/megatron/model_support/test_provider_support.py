@@ -9,6 +9,8 @@ pytest.importorskip("megatron.bridge")
 
 from megatron.core.transformer.enums import AttnBackend
 
+from art.megatron import provider_common
+from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
 from art.megatron.flex_attention import FlexDotProductAttention
 from art.megatron.model_support.registry import UnsupportedModelArchitectureError
 import art.megatron.provider as provider_module
@@ -55,6 +57,25 @@ class _FakeHybridProvider(_FakeProvider):
             ),
         )
         return SimpleNamespace(layer_specs=[gdn_layer, attention_layer])
+
+
+class _FakeGdnCpProvider(_FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.experimental_attention_variant = "gated_delta_net"
+        self.context_parallel_size = 2
+        self.linear_attention_freq = 4
+        self.linear_conv_kernel_dim = 2
+        self.linear_key_head_dim = 8
+        self.linear_value_head_dim = 16
+        self.linear_num_key_heads = 2
+        self.linear_num_value_heads = 4
+        self.tensor_model_parallel_size = 1
+        self.variant_seen_by_finalize: str | None = None
+
+    def finalize(self) -> None:
+        self.variant_seen_by_finalize = self.experimental_attention_variant
+        self.finalized = True
 
 
 class _FakeBridge:
@@ -107,6 +128,16 @@ def test_get_provider_accepts_registry_supported_models(
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
     )
+
+
+def test_finalize_provider_bundle_allows_art_gdn_context_parallel() -> None:
+    provider = _FakeGdnCpProvider()
+
+    provider_module._finalize_provider_with_art_overrides(cast(Any, provider))
+
+    assert provider.finalized is True
+    assert provider.variant_seen_by_finalize is None
+    assert provider.experimental_attention_variant == "gated_delta_net"
 
 
 def test_qwen35_provider_uses_handler_shared_expert_runtime_default(
@@ -273,6 +304,101 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
+    )
+
+
+def test_get_provider_bundle_honors_context_parallel_env_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setenv("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "2")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "1")
+
+    bundle = provider_module.get_provider_bundle("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    resolved = bundle.provider
+
+    assert resolved.tensor_model_parallel_size == 1
+    assert resolved.context_parallel_size == 2
+    assert resolved.expert_model_parallel_size == 1
+    assert resolved.expert_tensor_parallel_size == 1
+    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
+    assert (
+        layer_spec.submodules.self_attention.submodules.core_attention
+        is ArtContextParallelCoreAttention
+    )
+
+
+def test_qwen35_handler_keeps_standard_attention_on_flex_under_cp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.model_support.handlers import qwen3_5 as qwen35_handler_module
+
+    provider = _FakeHybridProvider()
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setenv("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "2")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "1")
+    monkeypatch.setattr(
+        qwen35_handler_module,
+        "_qwen35_provider_types",
+        lambda: (_FakeHybridProvider,),
+    )
+    monkeypatch.setattr(
+        qwen35_handler_module,
+        "_require_qwen35_provider_symbols",
+        lambda: (
+            object(),
+            (_FakeHybridProvider,),
+            lambda block_spec, attention_module: None,
+            provider._base_layer_spec,
+        ),
+    )
+
+    resolved = provider_module.get_provider("Qwen/Qwen3.5-35B-A3B")
+    layer_spec = cast(Any, resolved).transformer_layer_spec(resolved, vp_stage=0)
+
+    gdn_layer, attention_layer = layer_spec.layer_specs
+    assert not hasattr(gdn_layer.submodules.self_attention.submodules, "core_attention")
+    assert (
+        attention_layer.submodules.self_attention.submodules.core_attention
+        is ArtContextParallelCoreAttention
+    )
+
+
+def test_art_flex_patch_uses_runtime_context_parallel_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer_spec = _FakeProvider()._base_layer_spec(SimpleNamespace())
+    config = SimpleNamespace(context_parallel_size=1)
+    monkeypatch.setattr(provider_common, "_runtime_context_parallel_size", lambda: 2)
+
+    provider_common.patch_art_flex_attention(layer_spec, config)
+
+    assert (
+        layer_spec.submodules.self_attention.submodules.core_attention
+        is ArtContextParallelCoreAttention
     )
 
 

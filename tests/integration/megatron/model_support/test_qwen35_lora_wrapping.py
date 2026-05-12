@@ -15,7 +15,14 @@ from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
     Qwen35VLMoEModelProvider,
 )
 from megatron.core import parallel_state as ps
+from megatron.core.extensions.transformer_engine import (
+    TELayerNormColumnParallelLinear,
+    TERowParallelLinear,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from torch.distributed import destroy_process_group, init_process_group, is_initialized
 
 from art.megatron.lora import (
@@ -27,6 +34,18 @@ from art.megatron.lora import (
 )
 from art.megatron.model_support import QWEN3_5_MOE_SPEC
 from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER
+
+
+class _DenseMLP(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        linear_fc1: TELayerNormColumnParallelLinear,
+        linear_fc2: TERowParallelLinear,
+    ) -> None:
+        super().__init__()
+        self.linear_fc1 = linear_fc1
+        self.linear_fc2 = linear_fc2
 
 
 def _make_qwen35_provider() -> Qwen35VLMoEModelProvider:
@@ -191,6 +210,37 @@ def test_apply_lora_adapters_wraps_qwen35_gdn_and_shared_experts() -> None:
             and prefix.endswith(".mlp.shared_expert.down_proj")
             for prefix in shared_fc2_prefixes
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="No CUDA available in this environment",
+)
+def test_apply_lora_adapters_accepts_layernorm_column_fc1_dense_path() -> None:
+    with _single_rank_model_parallel():
+        provider = _make_qwen35_provider()
+        model = provider.provide_language_model(pre_process=True, post_process=True)
+
+        target_layer = next(
+            module
+            for module in model.modules()
+            if isinstance(module, TransformerLayer)
+            and isinstance(module.self_attention, SelfAttention)
+            and isinstance(getattr(module.mlp, "shared_experts", None), SharedExpertMLP)
+        )
+        dense_fc1 = target_layer.self_attention.linear_qkv
+        dense_fc2 = target_layer.self_attention.linear_proj
+        assert isinstance(dense_fc1, TELayerNormColumnParallelLinear)
+        assert isinstance(dense_fc2, TERowParallelLinear)
+        target_layer.mlp = _DenseMLP(
+            linear_fc1=dense_fc1,
+            linear_fc2=dense_fc2,
+        )
+
+        apply_lora_adapters([model], provider)
+
+        assert isinstance(target_layer.mlp.linear_fc1, SharedExpertsLinearFC1LoRA)
+        assert isinstance(target_layer.mlp.linear_fc2, SharedExpertsLinearFC2LoRA)
 
 
 @pytest.mark.skipif(

@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from art.dev import TrainSFTConfig as DevTrainSFTConfig
     from art.model import TrainableModel
     from art.trajectories import Trajectory
-    from art.types import TrainSFTConfig
+    from art.types import MegatronTopologyConfig, TrainSFTConfig
 
 
 class SFTChunk(NamedTuple):
@@ -349,6 +349,7 @@ async def train_sft_from_file(
     warmup_ratio: float = 0.1,
     initial_step: int = 0,
     final_step: int | None = None,
+    megatron_topology: "MegatronTopologyConfig | None" = None,
     _config: "DevTrainSFTConfig | None" = None,
     verbose: bool = False,
     shuffle_buffer_size: int = 10000,
@@ -371,6 +372,7 @@ async def train_sft_from_file(
         initial_step: Starting step for resuming training. Default: 0
         final_step: Ending step (exclusive). If None, trains to end of dataset.
             Useful for breaking training into segments with benchmarks in between.
+        megatron_topology: Parallel topology for Megatron SFT training.
         _config: Experimental configuration. Use at your own risk.
         verbose: Whether to print verbose output. Default: False
         shuffle_buffer_size: Size of shuffle buffer. Default: 10000.
@@ -442,6 +444,7 @@ async def train_sft_from_file(
     config = TrainSFTConfig(
         learning_rate=learning_rates,
         batch_size=batch_size,
+        megatron_topology=megatron_topology,
     )
 
     await model.train_sft(

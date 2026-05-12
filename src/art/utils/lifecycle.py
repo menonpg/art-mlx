@@ -102,6 +102,11 @@ class ChildProcessSupervisor:
                 task.cancel()
         self._tasks.clear()
 
+    def unwatch(self, name: str) -> None:
+        task = self._tasks.pop(name, None)
+        if task is not None and task is not self._current_task():
+            task.cancel()
+
     def _watch(
         self,
         name: str,

@@ -18,6 +18,7 @@ from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
+from ..types import MegatronTopologyConfig
 from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
@@ -169,6 +170,7 @@ class MegatronService:
     _vllm_port: int = 0
     _vllm_api_key: str | None = None
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
+    _active_megatron_topology: MegatronTopologyConfig | None = None
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
         init=False,
@@ -232,6 +234,40 @@ class MegatronService:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("", 0))
             return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _resolve_megatron_topology(
+        raw_topology: dict[str, int | None] | MegatronTopologyConfig | None,
+    ) -> MegatronTopologyConfig | None:
+        if raw_topology is None:
+            return None
+        if isinstance(raw_topology, MegatronTopologyConfig):
+            return raw_topology
+        return MegatronTopologyConfig.model_validate(raw_topology)
+
+    @staticmethod
+    def _megatron_topology_env(topology: MegatronTopologyConfig) -> dict[str, str]:
+        env = {
+            "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(topology.tp),
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(topology.cp),
+            "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(topology.ep),
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE": str(topology.pp),
+            "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE": str(topology.etp),
+        }
+        if topology.vpp is not None:
+            env["ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"] = str(topology.vpp)
+        return env
+
+    @staticmethod
+    def _megatron_topology_env_names() -> tuple[str, ...]:
+        return (
+            "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE",
+            "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
+        )
 
     def _install_parent_signal_cleanup(self) -> None:
         self._lifecycle.install_parent_cleanup(self.close)
@@ -579,13 +615,20 @@ class MegatronService:
                 "training."
             ) from exc
 
-    async def _ensure_megatron_running(self) -> None:
+    async def _ensure_megatron_running(
+        self,
+        *,
+        megatron_topology: MegatronTopologyConfig | None = None,
+    ) -> None:
         """Lazily start Megatron training process if not running."""
         self._raise_if_child_failed()
         if self._megatron_process is not None:
             if self._megatron_process.returncode is None:
-                return
+                if self._active_megatron_topology == megatron_topology:
+                    return
+                self._stop_megatron_process()
             self._megatron_process = None
+            self._active_megatron_topology = None
 
         self._validate_megatron_dependencies()
 
@@ -613,6 +656,10 @@ class MegatronService:
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
+        if megatron_topology is not None:
+            for env_name in self._megatron_topology_env_names():
+                env.pop(env_name, None)
+            env.update(self._megatron_topology_env(megatron_topology))
 
         command = [
             sys.executable,
@@ -649,6 +696,7 @@ class MegatronService:
             self._megatron_process,
             log_path=megatron_log_path,
         )
+        self._active_megatron_topology = megatron_topology
 
     def _clear_pending_jobs(self) -> None:
         jobs_dir, _training_log_dir, _wake_lock_path = self._megatron_runtime_paths()
@@ -673,10 +721,14 @@ class MegatronService:
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
 
-    async def _prepare_for_training(self) -> str:
+    async def _prepare_for_training(
+        self,
+        *,
+        megatron_topology: MegatronTopologyConfig | None = None,
+    ) -> str:
         self._raise_if_child_failed()
         self._validate_megatron_dependencies()
-        await self._ensure_megatron_running()
+        await self._ensure_megatron_running(megatron_topology=megatron_topology)
         await self._sleep_runtime()
         gc_and_empty_cuda_cache()
 
@@ -751,8 +803,11 @@ class MegatronService:
                     "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
                     "MegatronService subprocess jobs must use moe_routing_replay_path."
                 )
+            megatron_topology = self._resolve_megatron_topology(
+                _config.get("megatron_topology")
+            )
             if self.is_dedicated:
-                await self._ensure_megatron_running()
+                await self._ensure_megatron_running(megatron_topology=megatron_topology)
                 lora_path = self._resolve_active_lora_path()
                 self._clear_pending_jobs()
                 next_step = self._latest_step + 1
@@ -819,7 +874,9 @@ class MegatronService:
                     await self._reload_adapter(new_checkpoint_dir, next_step)
                 return
 
-            lora_path = await self._prepare_for_training()
+            lora_path = await self._prepare_for_training(
+                megatron_topology=megatron_topology
+            )
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
                 lora_path=lora_path,
@@ -861,7 +918,9 @@ class MegatronService:
                 raise NotImplementedError(
                     "train_sft is not yet supported in dedicated mode"
                 )
-            lora_path = await self._prepare_for_training()
+            lora_path = await self._prepare_for_training(
+                megatron_topology=config.megatron_topology
+            )
             serialized_batches = materialize_sft_batches(batches)
             job_path, log_path = self._create_megatron_job_paths()
             grad_accumulation_sequences = (
@@ -910,14 +969,17 @@ class MegatronService:
         self._merged_weight_transfer_init_info = None
 
     def _stop_megatron_process(self) -> None:
+        self._child_processes.unwatch("Megatron worker")
         if self._megatron_process is None:
             if self._megatron_log_file is not None:
                 self._megatron_log_file.close()
                 self._megatron_log_file = None
             self._megatron_log_path = None
+            self._active_megatron_topology = None
             return
         terminate_asyncio_process_group(self._megatron_process)
         self._megatron_process = None
+        self._active_megatron_topology = None
         if self._megatron_log_file is not None:
             self._megatron_log_file.close()
             self._megatron_log_file = None
