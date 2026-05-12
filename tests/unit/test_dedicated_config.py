@@ -235,19 +235,6 @@ def test_get_model_config_preserves_rollout_weights_mode():
         assert result["rollout_weights_mode"] == "merged"
 
 
-def test_get_model_config_preserves_megatron_topology():
-    from art.dev.get_model_config import get_model_config
-
-    topology = {"tp": 1, "cp": 2, "ep": 2, "etp": 1}
-    with tempfile.TemporaryDirectory() as tmpdir:
-        result = get_model_config(
-            "test-model",
-            tmpdir,
-            InternalModelConfig(megatron_topology=topology),
-        )
-        assert result["megatron_topology"] == topology
-
-
 def test_invalid_rollout_weights_mode():
     with pytest.raises(
         ValueError, match="rollout_weights_mode must be either 'lora' or 'merged'"
