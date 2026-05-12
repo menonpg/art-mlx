@@ -624,9 +624,8 @@ class MegatronService:
         self._raise_if_child_failed()
         if self._megatron_process is not None:
             if self._megatron_process.returncode is None:
-                if self._active_megatron_topology == megatron_topology:
-                    return
-                self._stop_megatron_process()
+                assert self._active_megatron_topology == megatron_topology
+                return
             self._megatron_process = None
             self._active_megatron_topology = None
 
@@ -969,7 +968,6 @@ class MegatronService:
         self._merged_weight_transfer_init_info = None
 
     def _stop_megatron_process(self) -> None:
-        self._child_processes.unwatch("Megatron worker")
         if self._megatron_process is None:
             if self._megatron_log_file is not None:
                 self._megatron_log_file.close()
