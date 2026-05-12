@@ -127,6 +127,55 @@ print("ok")
     assert result.stdout.strip().splitlines()[-1] == "ok"
 
 
+def test_vllm_ep_moe_lora_patch_uses_base_layer_tp_metadata() -> None:
+    script = r"""
+from types import SimpleNamespace
+
+import torch
+
+from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+apply_vllm_runtime_patches()
+
+from vllm.lora.layers import fused_moe
+
+
+original_inject = fused_moe.FusedMoEWithLoRA._inject_lora_into_fused_moe
+try:
+    fused_moe.FusedMoEWithLoRA._inject_lora_into_fused_moe = lambda self: None
+    layer = fused_moe.FusedMoEWithLoRA(
+        SimpleNamespace(
+            tp_size=1,
+            tp_rank=0,
+            moe_config=SimpleNamespace(is_act_and_mul=True),
+            w2_weight=torch.empty(1),
+        )
+    )
+finally:
+    fused_moe.FusedMoEWithLoRA._inject_lora_into_fused_moe = original_inject
+
+assert layer.tp_size == 1
+assert layer.tp_rank == 0
+print("ok")
+"""
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            script,
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "ok"
+
+
 def _config(base_model: str, *, rank: int) -> dict:
     return {
         "base_model_name_or_path": base_model,

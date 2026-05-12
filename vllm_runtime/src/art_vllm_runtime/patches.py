@@ -369,8 +369,18 @@ def patch_fused_moe_ep_lora_support() -> None:
         def patched_init(self: Any, base_layer: Any) -> None:
             base.BaseLayerWithLoRA.__init__(self)
             self.base_layer = base_layer
-            self.tp_size = fused_moe.get_tensor_model_parallel_world_size()
-            self.tp_rank = fused_moe.get_tensor_model_parallel_rank()
+            tp_size = getattr(base_layer, "tp_size", None)
+            tp_rank = getattr(base_layer, "tp_rank", None)
+            self.tp_size = int(
+                tp_size
+                if tp_size is not None
+                else fused_moe.get_tensor_model_parallel_world_size()
+            )
+            self.tp_rank = int(
+                tp_rank
+                if tp_rank is not None
+                else fused_moe.get_tensor_model_parallel_rank()
+            )
             self.device = fused_moe._get_lora_device(base_layer)
             self._w13_slices = 2 if base_layer.moe_config.is_act_and_mul else 1
             self._inject_lora_into_fused_moe()
