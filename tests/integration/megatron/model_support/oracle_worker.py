@@ -1473,6 +1473,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 )
                 step_result = megatron_train.run_training_step(
                     model_chunks=model_chunks,
+                    provider=runtime.provider,
                     model_support_handler=runtime.model_support_handler,
                     optimizer=optimizer,
                     learning_rate=train_config.learning_rate,
@@ -1492,6 +1493,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 )
                 step_result = megatron_train.run_megatron_sft_step(
                     model_chunks=model_chunks,
+                    provider=runtime.provider,
                     model_support_handler=runtime.model_support_handler,
                     optimizer=optimizer,
                     learning_rate=train_config.learning_rate,

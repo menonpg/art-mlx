@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import subprocess
@@ -19,12 +20,19 @@ from art.megatron.shared_prefix_state import create_shared_prefix_state
 
 from .oracle_harness import (
     ORACLE_TOPOLOGY,
+    TEST_DEFAULT_FLEX_BACKEND,
     OracleCaseConfig,
     PackedTensorConfig,
     _read_json,
     _write_json,
 )
-from .oracle_worker import _configure_provider, provider_topology_env
+from .oracle_worker import (
+    _apply_requested_flex_backend_patch,
+    _apply_test_attention_full_fp32_patch,
+    _apply_test_flex_inner_fp32_patch,
+    _configure_provider,
+    provider_topology_env,
+)
 
 # Qwen3.5/3.6 hybrid MoE runs show small shape-dependent logit drift between
 # the single packed forward and many shorter reference forwards, even when the
@@ -558,6 +566,9 @@ def _logits_equivalence_check(
         packed_bias = create_shared_prefix_state(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
+            build_gdn_execution_spec=bool(
+                getattr(handler, "build_gdn_execution_spec", False)
+            ),
         )
         _debug_log(f"logits_check row={row_index} families={len(families)}")
         packed_logits = _time_block(
@@ -601,6 +612,9 @@ def _logits_equivalence_check(
                 reference_bias = create_shared_prefix_state(
                     group_ids=reference_group_ids,
                     parent_ids=reference_parent_ids,
+                    build_gdn_execution_spec=bool(
+                        getattr(handler, "build_gdn_execution_spec", False)
+                    ),
                 )
                 _debug_log(
                     "logits_check row="
@@ -775,6 +789,16 @@ def _run_packed_position_ids_worker(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     runtime: megatron_train.TrainingRuntime | None = None
+    flex_patch_stack = ExitStack()
+    flex_patch_stack.enter_context(
+        _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
+    flex_patch_stack.enter_context(
+        _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
+    flex_patch_stack.enter_context(
+        _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
     try:
         with provider_topology_env(ORACLE_TOPOLOGY):
             runtime = _time_block(
@@ -897,6 +921,7 @@ def _run_packed_position_ids_worker(
         torch.cuda.empty_cache()
         _debug_log("run complete; model deleted and cuda cache emptied")
     finally:
+        flex_patch_stack.close()
         del runtime
         torch.cuda.empty_cache()
         _cleanup_distributed_state()

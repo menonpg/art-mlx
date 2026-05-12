@@ -630,7 +630,7 @@ def _run_megatron_sft_step(
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     runtime = _build_megatron_runtime(request)
-    _assert_runtime_configuration(runtime.model, request.case_config)
+    _assert_runtime_configuration(runtime.model, request.case_config, ORACLE_TOPOLOGY)
     assert runtime.optimizer is not None
     if moe_routing_replay_bundle is not None:
         megatron_train.configure_moe_routing_replay(
@@ -679,7 +679,17 @@ def _run_megatron_sft_step(
         attention_mask = megatron_train._placeholder_attention_mask(device)
         forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
             runtime.model[0],
-            attention_bias=megatron_train._causal_attention_state(seq_len, device),
+            attention_bias=megatron_train._causal_attention_state(
+                seq_len,
+                device,
+                build_gdn_execution_spec=bool(
+                    getattr(
+                        runtime.model_support_handler,
+                        "build_gdn_execution_spec",
+                        False,
+                    )
+                ),
+            ),
         )
         per_token_loss = runtime.model[0](
             input_ids=input_ids,
