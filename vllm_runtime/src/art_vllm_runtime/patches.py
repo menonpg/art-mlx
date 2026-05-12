@@ -503,6 +503,126 @@ def patch_fused_moe_ep_lora_support() -> None:
             patched_stack_moe_lora_weights  # type: ignore[method-assign]
         )
 
+    original_create_dummy_lora = model_manager.LoRAModelManager.create_dummy_lora
+    if not getattr(original_create_dummy_lora, "__art_patched__", False):
+
+        def _dummy_stack_index(module: Any, index: int) -> int:
+            stack_len = len(module.lora_a_stacked)
+            assert stack_len > 0, "Expected LoRA stack to be initialized"
+            if index < stack_len:
+                return index
+            base_layer = getattr(module, "base_layer", None)
+            assert module.__class__.__name__ == "FusedMoEWithLoRA" and getattr(
+                base_layer, "use_ep", False
+            ), (
+                "Packed LoRA dummy warmup requested more replacement modules than "
+                f"runtime LoRA buffers for {module.__class__.__name__}: "
+                f"index={index} stack_len={stack_len}"
+            )
+            return index % stack_len
+
+        def patched_create_dummy_lora(
+            self: Any,
+            lora_id: int,
+            rank: int,
+            embedding_modules: dict[str, str] | None = None,
+        ) -> Any:
+            model = model_manager.LoRAModel(lora_id, rank, {})
+            for module_name, module in self.model.named_modules():
+                if (
+                    not self._match_target_modules(module_name)
+                    or not isinstance(module, model_manager.BaseLayerWithLoRA)
+                    or self._get_punica_wrapper(module_name) is None
+                ):
+                    continue
+                parts = module_name.split(".")
+                if module_name not in self.packed_modules:
+                    assert embedding_modules is not None
+                    if parts[-1] in embedding_modules:
+                        if parts[-1] == "lm_head":
+                            input_dim = module.lora_a_stacked[0].shape[-1]
+                            output_dim = module.lora_b_stacked[0].shape[-2]
+                        else:
+                            input_dim = (
+                                module.base_layer.org_vocab_size
+                                if hasattr(module.base_layer, "org_vocab_size")
+                                else module.base_layer.weight.shape[1]
+                            )
+                            output_dim = (
+                                module.base_layer.embedding_dim
+                                if hasattr(module.base_layer, "embedding_dim")
+                                else module.base_layer.weight.shape[0]
+                            )
+                        lora = model_manager.LoRALayerWeights.create_dummy_lora_weights(
+                            module_name,
+                            input_dim,
+                            output_dim,
+                            rank,
+                            module.lora_a_stacked[0].dtype,
+                            "cpu",
+                        )
+                        model.loras[module_name] = lora
+                    elif module.__class__.__name__ == "FusedMoE3DWithLoRA":
+                        lora = model_manager.LoRALayerWeights.create_dummy_lora_weights(
+                            module_name,
+                            module.w2_input_size,
+                            module.w2_output_size,
+                            rank * module.w2_lora_a_stacked[0].shape[1],
+                            module.w2_lora_a_stacked[0].dtype,
+                            "cpu",
+                        )
+                        model.loras[module_name] = lora
+                        lora = model_manager.LoRALayerWeights.create_dummy_lora_weights(
+                            module_name,
+                            module.w13_input_size,
+                            module.w13_output_size,
+                            rank * module.w13_lora_a_stacked[0].shape[1],
+                            module.w13_lora_a_stacked[0].dtype,
+                            "cpu",
+                        )
+                        model.loras[module_name + ".base_layer"] = lora
+                    else:
+                        lora = model_manager.LoRALayerWeights.create_dummy_lora_weights(
+                            module_name,
+                            module.lora_a_stacked[0].shape[-1],
+                            module.lora_b_stacked[0].shape[-2],
+                            rank,
+                            module.lora_a_stacked[0].dtype,
+                            "cpu",
+                        )
+                        model.loras[module_name] = lora
+                else:
+                    replacements = self.packed_modules_mapping[parts[-1]]
+                    subloras = []
+                    for index, replacement in enumerate(replacements):
+                        stack_index = _dummy_stack_index(module, index)
+                        lora = model_manager.LoRALayerWeights.create_dummy_lora_weights(
+                            module_name + "." + replacement,
+                            module.lora_a_stacked[stack_index].shape[-1],
+                            module.lora_b_stacked[stack_index].shape[-2],
+                            rank,
+                            module.lora_a_stacked[stack_index].dtype,
+                            "cpu",
+                        )
+                        subloras.append(lora)
+                    if module.__class__.__name__ == "FusedMoEWithLoRA":
+                        if self._is_non_gated_moe and len(subloras) > 0:
+                            subloras = self._pad_lora_pairs_to_triplets(subloras)
+                        lora = model_manager.PackedLoRALayerWeights.pack_moe(
+                            subloras,
+                            module_name,
+                            is_non_gated_moe=self._is_non_gated_moe,
+                        )
+                    else:
+                        lora = model_manager.PackedLoRALayerWeights.pack(subloras)
+                    model.loras[module_name] = lora
+            return model
+
+        patched_create_dummy_lora.__art_patched__ = True  # type: ignore[attr-defined]
+        model_manager.LoRAModelManager.create_dummy_lora = (  # type: ignore[method-assign]
+            patched_create_dummy_lora
+        )
+
 
 def subclass_chat_completion_request() -> None:
     from vllm.entrypoints.openai.chat_completion import protocol
