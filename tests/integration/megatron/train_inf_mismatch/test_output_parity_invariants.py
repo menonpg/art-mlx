@@ -12,6 +12,7 @@ from .output_parity import (
     WeightState,
     build_logical_token_map,
     compare_rollout,
+    config_from_env,
     sequence_mean_abs_pct,
 )
 
@@ -131,3 +132,16 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
     assert report.base.mean_abs_pct > 0
     assert report.lora.mean_abs_pct > 0
     assert report.delta.mean_abs_pct > 0
+
+
+def test_config_from_env_accepts_lora_target_module_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES",
+        "experts,in_proj_qkv,in_proj_z",
+    )
+
+    config = config_from_env()
+
+    assert config.lora_target_modules == ["experts", "in_proj_qkv", "in_proj_z"]

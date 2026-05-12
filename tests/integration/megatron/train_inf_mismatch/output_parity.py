@@ -80,6 +80,7 @@ class TrainInfOutputParityConfig(BaseModel):
     trainer_gpu_ids: list[int] = Field(default_factory=lambda: [0, 1])
     inference_gpu_ids: list[int] = Field(default_factory=lambda: [2, 3])
     allow_unvalidated_arch: bool = False
+    lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
 
@@ -211,6 +212,13 @@ def _parse_gpu_ids(value: str | None, default: list[int]) -> list[int]:
     return [int(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def _parse_str_list(value: str) -> list[str]:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("Expected at least one comma-separated value")
+    return parts
+
+
 @contextmanager
 def _provider_topology_env(topology: Topology) -> Any:
     names = topology.env()
@@ -256,6 +264,8 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.packed.prefill_tokens = int(raw_prefill)
     if raw_decode := os.environ.get("ART_TRAIN_INF_MISMATCH_DECODE_TOKENS"):
         config.packed.decode_tokens = int(raw_decode)
+    if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
+        config.lora_target_modules = _parse_str_list(raw_targets)
     return config
 
 
@@ -553,10 +563,22 @@ def _configure_provider(provider: Any, config: TrainInfOutputParityConfig) -> No
         provider.hidden_dropout = 0.0
 
 
-def _vllm_lora_target_modules(base_model: str) -> list[str]:
+def _lora_target_modules(config: TrainInfOutputParityConfig) -> list[str]:
     from art.dev.get_model_config import default_target_modules
 
-    return default_target_modules(base_model)
+    return list(config.lora_target_modules or default_target_modules(config.base_model))
+
+
+def _configure_lora_target_modules(
+    provider_bundle: Any, target_modules: list[str]
+) -> None:
+    if not target_modules:
+        raise ValueError("LoRA target module override cannot be empty")
+    spec = provider_bundle.spec.model_copy(
+        update={"default_target_modules": tuple(target_modules)}
+    )
+    provider_bundle.spec = spec
+    setattr(provider_bundle.provider, "_art_model_support_spec", spec)
 
 
 def _build_deterministic_nonzero_lora(
@@ -621,17 +643,16 @@ def _collect_full_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
     return _merge_sharded_lora([entry for entry in gathered if entry is not None])
 
 
-def _adapter_config(base_model: str) -> dict[str, Any]:
+def _adapter_config(config: TrainInfOutputParityConfig) -> dict[str, Any]:
     from peft.tuners.lora.config import LoraConfig
 
-    from art.dev.get_model_config import default_target_modules
     from art.megatron.lora import LORA_ALPHA, LORA_RANK
 
     return LoraConfig(
-        base_model_name_or_path=base_model,
+        base_model_name_or_path=config.base_model,
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
-        target_modules=default_target_modules(base_model),
+        target_modules=_lora_target_modules(config),
         bias="none",
     ).to_dict()
 
@@ -641,7 +662,7 @@ def _save_vllm_lora_adapter(
     lora_path: Path,
     state: dict[str, Any],
     runtime: Any,
-    base_model: str,
+    config: TrainInfOutputParityConfig,
 ) -> None:
     import torch
 
@@ -657,7 +678,7 @@ def _save_vllm_lora_adapter(
     ]
     if zero_keys:
         raise RuntimeError(f"Refusing zero LoRA tensors: {zero_keys[:5]}")
-    adapter_config = _adapter_config(base_model)
+    adapter_config = _adapter_config(config)
     tensors, adapter_config = runtime.model_support_handler.to_vllm_lora_tensors(
         state,
         adapter_config=adapter_config,
@@ -743,6 +764,16 @@ def _megatron_worker(request: MegatronWorkerRequest) -> None:
     runtime = megatron_train.build_training_runtime(
         model_identifier=request.config.base_model,
         provider_torch_dtype=torch.bfloat16,
+        provider_bundle_configure=(
+            lambda bundle: (
+                _configure_lora_target_modules(
+                    bundle,
+                    _lora_target_modules(request.config),
+                )
+                if request.config.lora_target_modules is not None
+                else None
+            )
+        ),
         provider_configure=lambda provider: _configure_provider(
             provider, request.config
         ),
@@ -774,7 +805,7 @@ def _megatron_worker(request: MegatronWorkerRequest) -> None:
                     lora_path=adapter_path,
                     state=initialized,
                     runtime=runtime,
-                    base_model=request.config.base_model,
+                    config=request.config,
                 )
             torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
             adapter_path = artifact_dir / "active_lora"
@@ -1052,9 +1083,7 @@ async def _score_vllm_base(
     }
     if rollout_mode == "native_lora":
         engine_args["enable_lora"] = True
-        engine_args["lora_target_modules"] = _vllm_lora_target_modules(
-            config.base_model
-        )
+        engine_args["lora_target_modules"] = _lora_target_modules(config)
     async with _direct_vllm_runtime(
         config=config,
         artifact_dir=artifact_dir,
@@ -1087,7 +1116,7 @@ async def _score_vllm_native_lora(
         "max_model_len": config.packed.sequence_length + 8,
         **config.engine_args,
     }
-    engine_args["lora_target_modules"] = _vllm_lora_target_modules(config.base_model)
+    engine_args["lora_target_modules"] = _lora_target_modules(config)
     async with _direct_vllm_runtime(
         config=config,
         artifact_dir=artifact_dir,
