@@ -176,6 +176,98 @@ print("ok")
     assert result.stdout.strip().splitlines()[-1] == "ok"
 
 
+def test_vllm_ep_lora_align_uses_global_expert_count() -> None:
+    script = r"""
+from types import SimpleNamespace
+
+import torch
+
+from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+apply_vllm_runtime_patches()
+
+from vllm.lora.punica_wrapper import punica_gpu
+
+captured = {}
+
+
+def fake_align(
+    topk_ids,
+    token_lora_mapping,
+    num_experts,
+    block_size,
+    max_loras,
+    max_num_tokens_padded,
+    max_num_m_blocks,
+    sorted_ids,
+    expert_ids,
+    num_tokens_post_pad,
+    adapter_enabled,
+    lora_ids,
+    expert_map,
+):
+    captured["num_experts"] = num_experts
+    captured["expert_map_size"] = expert_map.numel()
+
+
+class Meta:
+    def meta_args(self, num_tokens, specialize_active_lora):
+        return (
+            torch.ones(num_tokens, dtype=torch.int32),
+            None,
+            None,
+            None,
+            torch.tensor([1], dtype=torch.int32),
+            None,
+            None,
+        )
+
+
+wrapper = SimpleNamespace(
+    token_mapping_meta=Meta(),
+    lora_config=SimpleNamespace(specialize_active_lora=False),
+)
+topk_ids = torch.tensor([[130, 1]], dtype=torch.int32)
+expert_map = torch.full((256,), -1, dtype=torch.int32)
+expert_map[128:] = torch.arange(128, dtype=torch.int32)
+
+original = punica_gpu.ops.moe_lora_align_block_size
+try:
+    punica_gpu.ops.moe_lora_align_block_size = fake_align
+    punica_gpu.PunicaWrapperGPU.moe_lora_align_block_size(
+        wrapper,
+        topk_ids=topk_ids,
+        num_tokens=1,
+        block_size=16,
+        num_experts=128,
+        max_loras=2,
+        adapter_enabled=torch.tensor([0, 1, 0], dtype=torch.int32),
+        expert_map=expert_map,
+    )
+finally:
+    punica_gpu.ops.moe_lora_align_block_size = original
+
+assert captured == {"num_experts": 256, "expert_map_size": 256}
+print("ok")
+"""
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            script,
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "ok"
+
+
 def _config(base_model: str, *, rank: int) -> dict:
     return {
         "base_model_name_or_path": base_model,

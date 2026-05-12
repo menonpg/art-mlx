@@ -139,18 +139,23 @@ def patch_punica_ep_moe_lora_alignment() -> None:
         if expert_map is not None:
             expert_map = expert_map.to(topk_ids.device)
             naive_block_assignment = False
+        align_num_experts = (
+            int(expert_map.numel()) if expert_map is not None else num_experts
+        )
 
         if naive_block_assignment:
             expert_ids = topk_ids.reshape(-1)
             sorted_ids = None
             num_tokens_post_pad = None
         else:
-            max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+            max_num_tokens_padded = topk_ids.numel() + align_num_experts * (
+                block_size - 1
+            )
             if pad_sorted_ids:
                 max_num_tokens_padded = punica_gpu.round_up(
                     max_num_tokens_padded, block_size
                 )
-            if topk_ids.numel() < num_experts:
+            if topk_ids.numel() < align_num_experts:
                 max_num_tokens_padded = topk_ids.numel() * block_size
             sorted_ids = topk_ids.new_empty((max_loras * max_num_tokens_padded,))
             max_num_m_blocks = punica_gpu.triton.cdiv(max_num_tokens_padded, block_size)
@@ -165,7 +170,7 @@ def patch_punica_ep_moe_lora_alignment() -> None:
             punica_gpu.ops.moe_lora_align_block_size(
                 topk_ids,
                 token_lora_mapping,
-                num_experts,
+                align_num_experts,
                 block_size,
                 max_loras,
                 max_num_tokens_padded,
