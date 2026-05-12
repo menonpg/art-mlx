@@ -1,0 +1,1291 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+from collections import defaultdict
+from contextlib import asynccontextmanager, contextmanager
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import random
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from typing import Any, AsyncIterator, Literal, cast
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .artifacts import REPO_ROOT
+
+BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
+MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
+MEAN_ABS_PCT_OUTLIER_TRIM_K = 3
+MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL = 32
+TOP_K = 20
+
+RolloutMode = Literal["native_lora", "merged"]
+EngineSide = Literal["megatron", "vllm"]
+WeightState = Literal["base", "lora"]
+
+
+class Topology(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tp: int = 2
+    ep: int = 2
+    etp: int = 1
+    dp: int = 1
+    cp: int = 1
+    pp: int = 1
+
+    def world_size(self) -> int:
+        return self.tp * self.dp * self.cp * self.pp
+
+    def env(self) -> dict[str, str]:
+        return {
+            "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(self.tp),
+            "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(self.ep),
+            "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE": str(self.etp),
+        }
+
+    def slug(self) -> str:
+        return (
+            f"tp{self.tp}_ep{self.ep}_etp{self.etp}_dp{self.dp}_cp{self.cp}_pp{self.pp}"
+        )
+
+
+class ProbePackedConfig(BaseModel):
+    num_sequences: int = 4
+    sequence_length: int = 1024
+    prefill_tokens: int = 256
+    completion_branches_per_prefix: int = 2
+    decode_tokens: int = 128
+    decode_tokens_jitter: int = 32
+    vocab_high: int = 8192
+    packing_mode: Literal["stop_early", "truncate"] = "stop_early"
+
+
+class TrainInfOutputParityConfig(BaseModel):
+    base_model: str = "Qwen/Qwen3.5-35B-A3B"
+    seed: int = 20260512
+    topology: Topology = Field(default_factory=Topology)
+    packed: ProbePackedConfig = Field(default_factory=ProbePackedConfig)
+    rollout_modes: list[RolloutMode] = Field(
+        default_factory=lambda: ["native_lora", "merged"]
+    )
+    trainer_gpu_ids: list[int] = Field(default_factory=lambda: [0, 1])
+    inference_gpu_ids: list[int] = Field(default_factory=lambda: [2, 3])
+    allow_unvalidated_arch: bool = False
+    engine_args: dict[str, Any] = Field(default_factory=dict)
+    server_args: dict[str, Any] = Field(default_factory=dict)
+
+
+class LogicalPrompt(BaseModel):
+    prompt_id: int
+    sample_id: int
+    family_id: int
+    completion_id: int
+    token_ids: list[int]
+
+
+class LogicalToken(BaseModel):
+    token_id: int
+    sample_id: int
+    family_id: int
+    completion_id: int
+    prompt_id: int
+    art_packed_token_index: int
+    art_logit_index: int
+    vllm_prompt_token_index: int
+
+
+class LogicalTokenMap(BaseModel):
+    prompts: list[LogicalPrompt]
+    tokens: list[LogicalToken]
+
+
+class TokenTopK(BaseModel):
+    token_ids: list[int]
+    logprobs: list[float]
+
+
+class ScoreBundle(BaseModel):
+    side: EngineSide
+    weight_state: WeightState
+    rollout_mode: RolloutMode | None = None
+    target_logprobs: list[float]
+    topk: list[TokenTopK]
+
+
+class MeanAbsPctSummary(BaseModel):
+    mean_abs_pct: float
+    sequence_count: int
+    source_numel: int
+    trimmed_numel: int
+
+
+class PairComparison(BaseModel):
+    mean_abs_pct: float
+    sequence_count: int
+    source_numel: int
+    trimmed_numel: int
+    mae: float
+    max_abs: float
+    p50_abs: float
+    p95_abs: float
+    p99_abs: float
+
+
+class TopKComparison(BaseModel):
+    top1_match_rate: float
+    top20_overlap_rate: float
+    top20_intersection_logprob_mae: float
+    compared_intersection_count: int
+
+
+class RolloutComparison(BaseModel):
+    rollout_mode: RolloutMode
+    base: PairComparison
+    lora: PairComparison
+    delta: PairComparison
+    base_topk: TopKComparison
+    lora_topk: TopKComparison
+
+
+class TrainInfOutputParityReport(BaseModel):
+    base_model: str
+    artifact_dir: str
+    topology: str
+    trainer_gpu_ids: list[int]
+    inference_gpu_ids: list[int]
+    logical_prompt_count: int
+    logical_token_count: int
+    adapter_path: str
+    megatron_base_scores: str
+    megatron_lora_scores: str
+    rollout_comparisons: list[RolloutComparison]
+    passed: bool
+
+
+class MegatronWorkerRequest(BaseModel):
+    config: TrainInfOutputParityConfig
+    artifact_dir: str
+    weight_state: WeightState
+    adapter_path: str | None = None
+
+
+class MegatronWorkerResult(BaseModel):
+    score_path: str
+    logical_map_path: str
+    adapter_path: str | None = None
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise TypeError(f"Expected JSON object in {path}")
+    return value
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _parse_gpu_ids(value: str | None, default: list[int]) -> list[int]:
+    if value is None or value.strip() == "":
+        return list(default)
+    return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+
+@contextmanager
+def _provider_topology_env(topology: Topology) -> Any:
+    names = topology.env()
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(names)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def config_from_env() -> TrainInfOutputParityConfig:
+    config = TrainInfOutputParityConfig(
+        base_model=os.environ.get(
+            "ART_TRAIN_INF_MISMATCH_BASE_MODEL",
+            os.environ.get("BASE_MODEL", TrainInfOutputParityConfig().base_model),
+        ),
+        trainer_gpu_ids=_parse_gpu_ids(
+            os.environ.get("ART_TRAIN_INF_MISMATCH_TRAINER_GPU_IDS"),
+            [0, 1],
+        ),
+        inference_gpu_ids=_parse_gpu_ids(
+            os.environ.get("ART_TRAIN_INF_MISMATCH_INFERENCE_GPU_IDS"),
+            [2, 3],
+        ),
+        allow_unvalidated_arch=os.environ.get(
+            "ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH", "0"
+        )
+        == "1",
+    )
+    if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
+        config.rollout_modes = cast(
+            list[RolloutMode],
+            [mode.strip() for mode in raw_modes.split(",") if mode.strip()],
+        )
+    if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):
+        config.packed.sequence_length = int(raw_seq_len)
+    if raw_prefill := os.environ.get("ART_TRAIN_INF_MISMATCH_PREFILL_TOKENS"):
+        config.packed.prefill_tokens = int(raw_prefill)
+    if raw_decode := os.environ.get("ART_TRAIN_INF_MISMATCH_DECODE_TOKENS"):
+        config.packed.decode_tokens = int(raw_decode)
+    return config
+
+
+def _prompt_family_segments(
+    group_ids: Any,
+    parent_ids: Any,
+    *,
+    required_completion_count: int = 1,
+) -> list[tuple[tuple[int, int], list[tuple[int, int]]]]:
+    valid_tokens = int((group_ids != -1).sum().item())
+    families: list[tuple[tuple[int, int], list[tuple[int, int]]]] = []
+    cursor = 0
+    while cursor < valid_tokens:
+        group_id = int(group_ids[cursor].item())
+        parent_id = int(parent_ids[cursor].item())
+        prompt_start = cursor
+        while cursor < valid_tokens and int(group_ids[cursor].item()) == group_id:
+            cursor += 1
+        prompt_end = cursor
+        if group_id != parent_id:
+            continue
+        completions: list[tuple[int, int]] = []
+        while cursor < valid_tokens:
+            completion_group_id = int(group_ids[cursor].item())
+            completion_parent_id = int(parent_ids[cursor].item())
+            if completion_parent_id != group_id or completion_group_id == group_id:
+                break
+            completion_start = cursor
+            while (
+                cursor < valid_tokens
+                and int(group_ids[cursor].item()) == completion_group_id
+            ):
+                cursor += 1
+            completions.append((completion_start, cursor))
+        if len(completions) >= required_completion_count:
+            families.append(((prompt_start, prompt_end), completions))
+    return families
+
+
+def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
+    tokens = packed_tensors["tokens"]
+    group_ids = packed_tensors["group_ids"]
+    parent_ids = packed_tensors["parent_ids"]
+    prompts: list[LogicalPrompt] = []
+    logical_tokens: list[LogicalToken] = []
+    prompt_id_by_tokens: dict[tuple[int, ...], int] = {}
+
+    for sample_id in range(int(tokens.shape[0])):
+        families = _prompt_family_segments(group_ids[sample_id], parent_ids[sample_id])
+        for family_id, (prompt_segment, completion_segments) in enumerate(families):
+            prompt_start, prompt_end = prompt_segment
+            prompt_len = prompt_end - prompt_start
+            for completion_id, (completion_start, completion_end) in enumerate(
+                completion_segments
+            ):
+                if completion_end - completion_start < 2:
+                    continue
+                flat = [
+                    int(value)
+                    for value in tokens[sample_id, prompt_start:prompt_end].tolist()
+                ] + [
+                    int(value)
+                    for value in tokens[
+                        sample_id, completion_start:completion_end
+                    ].tolist()
+                ]
+                flat_key = tuple(flat)
+                prompt_id = prompt_id_by_tokens.get(flat_key)
+                if prompt_id is None:
+                    prompt_id = len(prompts)
+                    prompt_id_by_tokens[flat_key] = prompt_id
+                    prompts.append(
+                        LogicalPrompt(
+                            prompt_id=prompt_id,
+                            sample_id=sample_id,
+                            family_id=family_id,
+                            completion_id=completion_id,
+                            token_ids=flat,
+                        )
+                    )
+                for packed_i in range(completion_start + 1, completion_end):
+                    logical_tokens.append(
+                        LogicalToken(
+                            token_id=int(tokens[sample_id, packed_i].item()),
+                            sample_id=sample_id,
+                            family_id=family_id,
+                            completion_id=completion_id,
+                            prompt_id=prompt_id,
+                            art_packed_token_index=packed_i,
+                            art_logit_index=packed_i - 1,
+                            vllm_prompt_token_index=prompt_len
+                            + (packed_i - completion_start),
+                        )
+                    )
+
+    if not prompts or not logical_tokens:
+        raise RuntimeError("Shared-prefix probe produced no comparable logical tokens")
+    return LogicalTokenMap(prompts=prompts, tokens=logical_tokens)
+
+
+def _abs_pct_outlier_trim_count(numel: int) -> int:
+    if numel < MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL:
+        return 0
+    return min(MEAN_ABS_PCT_OUTLIER_TRIM_K, max(numel - 1, 0))
+
+
+def sequence_mean_abs_pct(
+    *,
+    candidate: Any,
+    target: Any,
+    sequence_ids: list[int],
+) -> MeanAbsPctSummary:
+    import torch
+
+    cand = candidate.detach().float().reshape(-1)
+    ref = target.detach().float().reshape(-1)
+    if cand.shape != ref.shape:
+        raise RuntimeError(f"Shape mismatch: candidate={cand.shape} target={ref.shape}")
+    if cand.numel() != len(sequence_ids):
+        raise RuntimeError(
+            f"sequence_ids length mismatch: {len(sequence_ids)} != {cand.numel()}"
+        )
+    if cand.numel() == 0:
+        return MeanAbsPctSummary(
+            mean_abs_pct=0.0,
+            sequence_count=0,
+            source_numel=0,
+            trimmed_numel=0,
+        )
+    ratio = (cand - ref).abs() / ref.abs().clamp_min(MEAN_ABS_PCT_DENOMINATOR_EPS)
+    ratios_by_sequence: dict[int, list[float]] = defaultdict(list)
+    for sequence_id, value in zip(sequence_ids, ratio.tolist(), strict=True):
+        ratios_by_sequence[int(sequence_id)].append(float(value))
+
+    sequence_pcts: list[float] = []
+    trimmed_total = 0
+    source_total = 0
+    for values in ratios_by_sequence.values():
+        tensor = torch.tensor(values, dtype=torch.float32)
+        source_total += int(tensor.numel())
+        trim_count = _abs_pct_outlier_trim_count(int(tensor.numel()))
+        trimmed_total += trim_count
+        if trim_count > 0:
+            keep_mask = torch.ones_like(tensor, dtype=torch.bool)
+            keep_mask[torch.topk(tensor, trim_count).indices] = False
+            tensor = tensor[keep_mask]
+        sequence_pcts.append(float(tensor.mean().item()) * 100.0)
+    return MeanAbsPctSummary(
+        mean_abs_pct=float(sum(sequence_pcts) / len(sequence_pcts)),
+        sequence_count=len(sequence_pcts),
+        source_numel=source_total,
+        trimmed_numel=trimmed_total,
+    )
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = min(len(sorted_values) - 1, max(0, math.ceil(q * len(sorted_values)) - 1))
+    return float(sorted_values[index])
+
+
+def compare_pair(
+    *,
+    candidate: Any,
+    target: Any,
+    sequence_ids: list[int],
+) -> PairComparison:
+    import torch
+
+    cand = candidate.detach().float().reshape(-1)
+    ref = target.detach().float().reshape(-1)
+    pct = sequence_mean_abs_pct(
+        candidate=cand,
+        target=ref,
+        sequence_ids=sequence_ids,
+    )
+    diff = (cand - ref).abs()
+    sorted_diff = sorted(float(value) for value in diff.tolist())
+    return PairComparison(
+        mean_abs_pct=pct.mean_abs_pct,
+        sequence_count=pct.sequence_count,
+        source_numel=pct.source_numel,
+        trimmed_numel=pct.trimmed_numel,
+        mae=float(diff.mean().item()) if diff.numel() else 0.0,
+        max_abs=float(diff.max().item()) if diff.numel() else 0.0,
+        p50_abs=_percentile(sorted_diff, 0.50),
+        p95_abs=_percentile(sorted_diff, 0.95),
+        p99_abs=_percentile(sorted_diff, 0.99),
+    )
+
+
+def compare_topk(candidate: ScoreBundle, target: ScoreBundle) -> TopKComparison:
+    if len(candidate.topk) != len(target.topk):
+        raise RuntimeError("top-k score length mismatch")
+    top1_matches = 0
+    overlap_sum = 0.0
+    intersection_abs_sum = 0.0
+    intersection_count = 0
+    for cand_topk, ref_topk in zip(candidate.topk, target.topk, strict=True):
+        cand_ids = cand_topk.token_ids[:TOP_K]
+        ref_ids = ref_topk.token_ids[:TOP_K]
+        if cand_ids and ref_ids and cand_ids[0] == ref_ids[0]:
+            top1_matches += 1
+        cand_set = set(cand_ids)
+        ref_set = set(ref_ids)
+        intersection = cand_set & ref_set
+        overlap_sum += len(intersection) / max(TOP_K, 1)
+        cand_by_id = dict(zip(cand_topk.token_ids, cand_topk.logprobs, strict=True))
+        ref_by_id = dict(zip(ref_topk.token_ids, ref_topk.logprobs, strict=True))
+        for token_id in intersection:
+            intersection_abs_sum += abs(cand_by_id[token_id] - ref_by_id[token_id])
+            intersection_count += 1
+    count = max(len(candidate.topk), 1)
+    return TopKComparison(
+        top1_match_rate=top1_matches / count,
+        top20_overlap_rate=overlap_sum / count,
+        top20_intersection_logprob_mae=(
+            intersection_abs_sum / intersection_count if intersection_count else 0.0
+        ),
+        compared_intersection_count=intersection_count,
+    )
+
+
+def compare_rollout(
+    *,
+    rollout_mode: RolloutMode,
+    megatron_base: ScoreBundle,
+    megatron_lora: ScoreBundle,
+    vllm_base: ScoreBundle,
+    vllm_lora: ScoreBundle,
+    logical_map: LogicalTokenMap,
+) -> RolloutComparison:
+    import torch
+
+    sequence_ids = [token.prompt_id for token in logical_map.tokens]
+    mb = torch.tensor(megatron_base.target_logprobs, dtype=torch.float32)
+    ml = torch.tensor(megatron_lora.target_logprobs, dtype=torch.float32)
+    vb = torch.tensor(vllm_base.target_logprobs, dtype=torch.float32)
+    vl = torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32)
+    return RolloutComparison(
+        rollout_mode=rollout_mode,
+        base=compare_pair(candidate=vb, target=mb, sequence_ids=sequence_ids),
+        lora=compare_pair(candidate=vl, target=ml, sequence_ids=sequence_ids),
+        delta=compare_pair(
+            candidate=vl - vb,
+            target=ml - mb,
+            sequence_ids=sequence_ids,
+        ),
+        base_topk=compare_topk(vllm_base, megatron_base),
+        lora_topk=compare_topk(vllm_lora, megatron_lora),
+    )
+
+
+def _set_seed(seed: int) -> None:
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _packed_tensor_config(config: TrainInfOutputParityConfig) -> Any:
+    from ..model_support.oracle_harness import PackedTensorConfig
+
+    return PackedTensorConfig(
+        num_sequences=config.packed.num_sequences,
+        sequence_length=config.packed.sequence_length,
+        prefill_tokens=config.packed.prefill_tokens,
+        completion_branches_per_prefix=config.packed.completion_branches_per_prefix,
+        decode_tokens=config.packed.decode_tokens,
+        decode_tokens_jitter=config.packed.decode_tokens_jitter,
+        vocab_high=config.packed.vocab_high,
+        packing_mode=config.packed.packing_mode,
+    )
+
+
+def _build_packed_tensors(config: TrainInfOutputParityConfig) -> dict[str, Any]:
+    from ..model_support.packed_position_ids import (
+        _build_art_realistic_packed_tensors,
+    )
+
+    return _build_art_realistic_packed_tensors(
+        _packed_tensor_config(config), config.seed
+    )
+
+
+def _configure_provider(provider: Any, config: TrainInfOutputParityConfig) -> None:
+    if hasattr(provider, "attention_dropout"):
+        provider.attention_dropout = 0.0
+    if hasattr(provider, "hidden_dropout"):
+        provider.hidden_dropout = 0.0
+
+
+def _build_deterministic_nonzero_lora(
+    initial_state: dict[str, Any],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    import torch
+
+    initialized: dict[str, Any] = {}
+    for key in sorted(initial_state):
+        value = initial_state[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Expected tensor for LoRA key {key!r}")
+        digest = hashlib.sha256(f"{seed}:{key}".encode("utf-8")).digest()
+        key_seed = int.from_bytes(digest[:8], "little") % (2**31)
+        generator = torch.Generator(device="cpu").manual_seed(key_seed)
+        random_values = torch.randn(value.shape, generator=generator)
+        initialized[key] = (0.01 * random_values).to(value.dtype).contiguous()
+    return initialized
+
+
+def _merge_sharded_lora(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
+    from art.megatron.weights.merge import merge_sharded_adapter_entries
+
+    entries_by_key: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+    for rank_entry in shards_by_rank:
+        state = rank_entry["state"]
+        manifest = rank_entry["manifest"]
+        for key, tensor in state.items():
+            entries_by_key.setdefault(key, []).append((manifest[key], tensor))
+    return merge_sharded_adapter_entries(entries_by_key)
+
+
+def _collect_full_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
+    import torch
+
+    local_state: dict[str, Any] = {}
+    local_manifest: dict[str, Any] = {}
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if hasattr(module, "sharded_lora_manifest"):
+                local_manifest.update(module.sharded_lora_manifest())
+            if hasattr(module, "sharded_lora_state_dict"):
+                local_state.update(
+                    {
+                        key: value.detach().cpu()
+                        for key, value in module.sharded_lora_state_dict().items()
+                    }
+                )
+    rank = torch.distributed.get_rank()  # type: ignore[possibly-missing-attribute]
+    world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+    gathered = [None for _ in range(world_size)] if rank == 0 else None
+    torch.distributed.gather_object(  # type: ignore[possibly-missing-attribute]
+        {"state": local_state, "manifest": local_manifest},
+        gathered,
+        dst=0,
+    )
+    if rank != 0:
+        return None
+    assert gathered is not None
+    return _merge_sharded_lora([entry for entry in gathered if entry is not None])
+
+
+def _adapter_config(base_model: str) -> dict[str, Any]:
+    from peft.tuners.lora.config import LoraConfig
+
+    from art.dev.get_model_config import default_target_modules
+    from art.megatron.lora import LORA_ALPHA, LORA_RANK
+
+    return LoraConfig(
+        base_model_name_or_path=base_model,
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        target_modules=default_target_modules(base_model),
+        bias="none",
+    ).to_dict()
+
+
+def _save_vllm_lora_adapter(
+    *,
+    lora_path: Path,
+    state: dict[str, Any],
+    runtime: Any,
+    base_model: str,
+) -> None:
+    import torch
+
+    from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
+
+    if not state:
+        raise RuntimeError("Refusing to save empty LoRA state")
+    zero_keys = [
+        key
+        for key, value in state.items()
+        if isinstance(value, torch.Tensor)
+        and int(torch.count_nonzero(value).item()) == 0
+    ]
+    if zero_keys:
+        raise RuntimeError(f"Refusing zero LoRA tensors: {zero_keys[:5]}")
+    adapter_config = _adapter_config(base_model)
+    tensors, adapter_config = runtime.model_support_handler.to_vllm_lora_tensors(
+        state,
+        adapter_config=adapter_config,
+    )
+    save_vllm_lora_tensors(lora_path, tensors, adapter_config)
+
+
+def _run_logits(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+) -> Any:
+    import torch
+
+    from art.megatron.flex_attention import create_shared_prefix_attention_state
+
+    device = next(runtime.model[0].parameters()).device
+    input_ids = packed_tensors["tokens"].to(device=device)
+    position_ids = packed_tensors["input_pos"].to(device=device)
+    group_ids = packed_tensors["group_ids"].to(device=device)
+    parent_ids = packed_tensors["parent_ids"].to(device=device)
+    attention_state = create_shared_prefix_attention_state(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    )
+    with torch.no_grad():
+        return runtime.model[0](
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
+            labels=None,
+            **runtime.model_support_handler.get_forward_kwargs(
+                runtime.model[0],
+                attention_bias=attention_state,
+            ),
+        )
+
+
+def _extract_scores_from_logits(
+    *,
+    logits: Any,
+    logical_map: LogicalTokenMap,
+    side: EngineSide,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None = None,
+) -> ScoreBundle:
+    import torch
+
+    log_probs = torch.log_softmax(logits.detach().float(), dim=-1).cpu()
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    for token in logical_map.tokens:
+        row = log_probs[token.sample_id, token.art_logit_index]
+        target_logprobs.append(float(row[token.token_id].item()))
+        values, indices = torch.topk(row, TOP_K)
+        topk.append(
+            TokenTopK(
+                token_ids=[int(value) for value in indices.tolist()],
+                logprobs=[float(value) for value in values.tolist()],
+            )
+        )
+    return ScoreBundle(
+        side=side,
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
+
+
+def _megatron_worker(request: MegatronWorkerRequest) -> None:
+    import torch
+
+    from art.megatron import train as megatron_train
+    from art.megatron.weights.merge import load_lora_adapter_state_dict
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend="nccl")  # type: ignore[possibly-missing-attribute]
+    _set_seed(request.config.seed)
+    os.environ.update(request.config.topology.env())
+
+    runtime = megatron_train.build_training_runtime(
+        model_identifier=request.config.base_model,
+        provider_torch_dtype=torch.bfloat16,
+        provider_configure=lambda provider: _configure_provider(
+            provider, request.config
+        ),
+        print_env=False,
+        build_optimizer=False,
+        trainable_parameter_mode=(
+            "base_model" if request.weight_state == "base" else "lora"
+        ),
+        allow_unvalidated_arch=request.config.allow_unvalidated_arch,
+    )
+    for chunk in runtime.model:
+        chunk.eval()
+
+    artifact_dir = Path(request.artifact_dir)
+    packed_tensors = _build_packed_tensors(request.config)
+    logical_map = build_logical_token_map(packed_tensors)
+
+    adapter_path: Path | None = None
+    if request.weight_state == "lora":
+        if request.adapter_path is None:
+            initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
+            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+                adapter_path = artifact_dir / "active_lora"
+                initialized = _build_deterministic_nonzero_lora(
+                    initial_state or {},
+                    seed=request.config.seed,
+                )
+                _save_vllm_lora_adapter(
+                    lora_path=adapter_path,
+                    state=initialized,
+                    runtime=runtime,
+                    base_model=request.config.base_model,
+                )
+            torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
+            adapter_path = artifact_dir / "active_lora"
+        else:
+            adapter_path = Path(request.adapter_path)
+        adapter_model = load_lora_adapter_state_dict(
+            str(adapter_path),
+            handler=runtime.model_support_handler,
+            allow_unvalidated_arch=request.config.allow_unvalidated_arch,
+        )
+        megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+
+    logits = _run_logits(runtime=runtime, packed_tensors=packed_tensors)
+    score = _extract_scores_from_logits(
+        logits=logits,
+        logical_map=logical_map,
+        side="megatron",
+        weight_state=request.weight_state,
+    )
+
+    if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+        score_path = artifact_dir / f"megatron_{request.weight_state}_scores.json"
+        logical_map_path = artifact_dir / "logical_token_map.json"
+        _write_json(score_path, score.model_dump(mode="json"))
+        _write_json(logical_map_path, logical_map.model_dump(mode="json"))
+        result = MegatronWorkerResult(
+            score_path=str(score_path),
+            logical_map_path=str(logical_map_path),
+            adapter_path=str(adapter_path) if adapter_path is not None else None,
+        )
+        _write_json(
+            artifact_dir / f"megatron_{request.weight_state}_worker_result.json",
+            result.model_dump(mode="json"),
+        )
+    torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
+    torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
+
+
+def _run_megatron_worker(request: MegatronWorkerRequest) -> MegatronWorkerResult:
+    artifact_dir = Path(request.artifact_dir)
+    request_path = artifact_dir / f"megatron_{request.weight_state}_request.json"
+    _write_json(request_path, request.model_dump(mode="json"))
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(
+        str(value) for value in request.config.trainer_gpu_ids
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    tests_dir = str(REPO_ROOT / "tests")
+    env["PYTHONPATH"] = (
+        tests_dir
+        if not env.get("PYTHONPATH")
+        else f"{tests_dir}{os.pathsep}{env['PYTHONPATH']}"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(request.config.topology.world_size()),
+        "-m",
+        "integration.megatron.train_inf_mismatch.output_parity",
+        "--worker",
+        "--request",
+        str(request_path),
+    ]
+    log_path = artifact_dir / f"megatron_{request.weight_state}_worker.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        run = subprocess.run(
+            command,
+            cwd=str(REPO_ROOT / "tests"),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if run.returncode != 0:
+        tail = "\n".join(log_path.read_text(encoding="utf-8").splitlines()[-120:])
+        raise RuntimeError(
+            f"Megatron {request.weight_state} worker failed with exit code "
+            f"{run.returncode}.\n{tail}"
+        )
+    return MegatronWorkerResult.model_validate(
+        _read_json(artifact_dir / f"megatron_{request.weight_state}_worker_result.json")
+    )
+
+
+@asynccontextmanager
+async def _direct_vllm_runtime(
+    *,
+    config: TrainInfOutputParityConfig,
+    artifact_dir: Path,
+    served_model_name: str,
+    lora_path: str,
+    rollout_weights_mode: Literal["lora", "merged"],
+    engine_args: dict[str, Any],
+) -> AsyncIterator[tuple[str, int]]:
+    import art.vllm_runtime as runtime
+
+    port = _free_port()
+    launch_config = runtime.VllmRuntimeLaunchConfig(
+        base_model=config.base_model,
+        port=port,
+        host="127.0.0.1",
+        cuda_visible_devices=",".join(str(value) for value in config.inference_gpu_ids),
+        lora_path=lora_path,
+        served_model_name=served_model_name,
+        rollout_weights_mode=rollout_weights_mode,
+        engine_args=engine_args,
+        server_args={
+            "return_tokens_as_token_ids": True,
+            **config.server_args,
+        },
+    )
+    command = runtime.build_vllm_runtime_server_cmd(launch_config)
+    log_path = artifact_dir / f"vllm_{served_model_name}.log"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(runtime.get_vllm_runtime_working_dir()),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    try:
+        await runtime.wait_for_vllm_runtime(
+            process=process,
+            host=launch_config.host,
+            port=launch_config.port,
+            timeout=float(
+                os.environ.get("ART_TRAIN_INF_MISMATCH_VLLM_TIMEOUT", "1200")
+            ),
+        )
+        yield launch_config.host, launch_config.port
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
+
+
+async def _request_prompt_logprobs(
+    *,
+    base_url: str,
+    model_name: str,
+    prompt_token_ids: list[int],
+) -> dict[str, Any]:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        response = await client.post(
+            f"{base_url}/v1/completions",
+            json={
+                "model": model_name,
+                "prompt": prompt_token_ids,
+                "add_special_tokens": False,
+                "max_tokens": 0,
+                "echo": True,
+                "prompt_logprobs": TOP_K,
+                "return_token_ids": True,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _logprob_entry_value(entry: dict[str, Any], token_id: int) -> float:
+    raw = entry.get(str(token_id))
+    if raw is None:
+        raise RuntimeError(f"Token {token_id} missing from vLLM prompt_logprobs entry")
+    if isinstance(raw, dict):
+        return float(raw["logprob"])
+    return float(raw.logprob)
+
+
+def _topk_from_entry(entry: dict[str, Any]) -> TokenTopK:
+    parsed: list[tuple[int, int, float]] = []
+    for raw_token_id, raw_value in entry.items():
+        token_id = int(raw_token_id)
+        if isinstance(raw_value, dict):
+            rank = int(raw_value.get("rank", TOP_K + 1))
+            logprob = float(raw_value["logprob"])
+        else:
+            rank = int(raw_value.rank)
+            logprob = float(raw_value.logprob)
+        if 1 <= rank <= TOP_K:
+            parsed.append((rank, token_id, logprob))
+    parsed.sort(key=lambda item: item[0])
+    return TokenTopK(
+        token_ids=[token_id for _rank, token_id, _logprob in parsed[:TOP_K]],
+        logprobs=[logprob for _rank, _token_id, logprob in parsed[:TOP_K]],
+    )
+
+
+async def _score_vllm_at_url(
+    *,
+    base_url: str,
+    model_name: str,
+    logical_map: LogicalTokenMap,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode,
+    artifact_dir: Path,
+) -> ScoreBundle:
+    responses_by_prompt: dict[int, dict[str, Any]] = {}
+    prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
+    for prompt in logical_map.prompts:
+        response = await _request_prompt_logprobs(
+            base_url=base_url,
+            model_name=model_name,
+            prompt_token_ids=prompt.token_ids,
+        )
+        choice = response["choices"][0]
+        returned_prompt_ids = [int(value) for value in choice["prompt_token_ids"]]
+        if returned_prompt_ids != prompt.token_ids:
+            raise RuntimeError(
+                "vLLM returned prompt_token_ids do not match request for "
+                f"prompt_id={prompt.prompt_id}"
+            )
+        responses_by_prompt[prompt.prompt_id] = response
+    _write_json(
+        artifact_dir / f"vllm_{rollout_mode}_{weight_state}_responses.json",
+        responses_by_prompt,
+    )
+
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    for token in logical_map.tokens:
+        prompt = prompt_by_id[token.prompt_id]
+        choice = responses_by_prompt[token.prompt_id]["choices"][0]
+        entries = choice["prompt_logprobs"]
+        returned_token_id = int(prompt.token_ids[token.vllm_prompt_token_index])
+        if returned_token_id != token.token_id:
+            raise RuntimeError(
+                "Logical token alignment mismatch: "
+                f"expected={token.token_id} returned={returned_token_id}"
+            )
+        entry = entries[token.vllm_prompt_token_index]
+        if entry is None:
+            raise RuntimeError(
+                f"Missing prompt logprob entry for prompt_id={token.prompt_id} "
+                f"index={token.vllm_prompt_token_index}"
+            )
+        target_logprobs.append(_logprob_entry_value(entry, token.token_id))
+        topk.append(_topk_from_entry(entry))
+    return ScoreBundle(
+        side="vllm",
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
+
+
+async def _score_vllm_base(
+    *,
+    config: TrainInfOutputParityConfig,
+    rollout_mode: RolloutMode,
+    logical_map: LogicalTokenMap,
+    artifact_dir: Path,
+) -> ScoreBundle:
+    served_name = f"train_inf_base_{rollout_mode}_{int(time.time())}"
+    placeholder_lora = artifact_dir / "unused_lora_placeholder"
+    placeholder_lora.mkdir(exist_ok=True)
+    engine_args = {
+        "tensor_parallel_size": len(config.inference_gpu_ids),
+        "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
+        "max_model_len": config.packed.sequence_length + 8,
+        **config.engine_args,
+    }
+    if rollout_mode == "native_lora":
+        engine_args["enable_lora"] = True
+    async with _direct_vllm_runtime(
+        config=config,
+        artifact_dir=artifact_dir,
+        served_model_name=served_name,
+        lora_path=str(placeholder_lora),
+        rollout_weights_mode="merged",
+        engine_args=engine_args,
+    ) as (host, port):
+        return await _score_vllm_at_url(
+            base_url=f"http://{host}:{port}",
+            model_name=served_name,
+            logical_map=logical_map,
+            weight_state="base",
+            rollout_mode=rollout_mode,
+            artifact_dir=artifact_dir,
+        )
+
+
+async def _score_vllm_native_lora(
+    *,
+    config: TrainInfOutputParityConfig,
+    adapter_path: str,
+    logical_map: LogicalTokenMap,
+    artifact_dir: Path,
+) -> ScoreBundle:
+    served_name = f"train_inf_native_lora_{int(time.time())}"
+    engine_args = {
+        "tensor_parallel_size": len(config.inference_gpu_ids),
+        "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
+        "max_model_len": config.packed.sequence_length + 8,
+        **config.engine_args,
+    }
+    async with _direct_vllm_runtime(
+        config=config,
+        artifact_dir=artifact_dir,
+        served_model_name=served_name,
+        lora_path=adapter_path,
+        rollout_weights_mode="lora",
+        engine_args=engine_args,
+    ) as (host, port):
+        return await _score_vllm_at_url(
+            base_url=f"http://{host}:{port}",
+            model_name=served_name,
+            logical_map=logical_map,
+            weight_state="lora",
+            rollout_mode="native_lora",
+            artifact_dir=artifact_dir,
+        )
+
+
+async def _score_vllm_merged_lora(
+    *,
+    config: TrainInfOutputParityConfig,
+    adapter_path: str,
+    logical_map: LogicalTokenMap,
+    artifact_dir: Path,
+) -> ScoreBundle:
+    from art import dev
+    from art.megatron.service import MegatronService
+
+    service_name = f"train_inf_merged_lora_{int(time.time())}"
+    output_dir = artifact_dir / "merged_service"
+    checkpoint_dir = output_dir / "step_0000"
+    checkpoint_dir.mkdir(parents=True)
+    for filename in ("adapter_model.safetensors", "adapter_config.json"):
+        shutil.copy(Path(adapter_path) / filename, checkpoint_dir / filename)
+    internal_config = dev.InternalModelConfig(
+        trainer_gpu_ids=config.trainer_gpu_ids,
+        inference_gpu_ids=config.inference_gpu_ids,
+        rollout_weights_mode="merged",
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+        engine_args={
+            "tensor_parallel_size": len(config.inference_gpu_ids),
+            "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
+            "max_model_len": config.packed.sequence_length + 8,
+            **config.engine_args,
+        },
+    )
+    with _provider_topology_env(config.topology):
+        service = MegatronService(
+            model_name=service_name,
+            base_model=config.base_model,
+            config=internal_config,
+            output_dir=str(output_dir),
+        )
+        try:
+            host, port = await service.start_openai_server(
+                {"server_args": {"port": _free_port(), **config.server_args}}
+            )
+            return await _score_vllm_at_url(
+                base_url=f"http://{host}:{port}",
+                model_name=f"{service_name}@0",
+                logical_map=logical_map,
+                weight_state="lora",
+                rollout_mode="merged",
+                artifact_dir=artifact_dir,
+            )
+        finally:
+            await service.aclose()
+
+
+def _assert_lora_active(
+    base: ScoreBundle, lora: ScoreBundle, *, side: EngineSide
+) -> None:
+    import torch
+
+    base_values = torch.tensor(base.target_logprobs, dtype=torch.float32)
+    lora_values = torch.tensor(lora.target_logprobs, dtype=torch.float32)
+    if not bool(torch.isfinite(base_values).all().item()):
+        raise RuntimeError(f"{side} base target logprobs contain non-finite values")
+    if not bool(torch.isfinite(lora_values).all().item()):
+        raise RuntimeError(f"{side} LoRA target logprobs contain non-finite values")
+    if int(torch.count_nonzero((lora_values - base_values).abs() > 0).item()) == 0:
+        raise RuntimeError(f"{side} LoRA is not active: all deltas are zero")
+
+
+async def run_train_inf_output_parity(
+    *,
+    config: TrainInfOutputParityConfig,
+    artifact_dir: Path,
+) -> TrainInfOutputParityReport:
+    _write_json(artifact_dir / "probe_config.json", config.model_dump(mode="json"))
+    lora_result = _run_megatron_worker(
+        MegatronWorkerRequest(
+            config=config,
+            artifact_dir=str(artifact_dir),
+            weight_state="lora",
+            adapter_path=None,
+        )
+    )
+    if lora_result.adapter_path is None:
+        raise RuntimeError("LoRA worker did not produce an adapter")
+    base_result = _run_megatron_worker(
+        MegatronWorkerRequest(
+            config=config,
+            artifact_dir=str(artifact_dir),
+            weight_state="base",
+            adapter_path=None,
+        )
+    )
+    logical_map = LogicalTokenMap.model_validate(
+        _read_json(Path(lora_result.logical_map_path))
+    )
+    base_logical_map = LogicalTokenMap.model_validate(
+        _read_json(Path(base_result.logical_map_path))
+    )
+    if base_logical_map != logical_map:
+        raise RuntimeError("Base and LoRA Megatron workers produced different maps")
+
+    megatron_base = ScoreBundle.model_validate(_read_json(Path(base_result.score_path)))
+    megatron_lora = ScoreBundle.model_validate(_read_json(Path(lora_result.score_path)))
+    _assert_lora_active(megatron_base, megatron_lora, side="megatron")
+
+    rollout_comparisons: list[RolloutComparison] = []
+    for rollout_mode in config.rollout_modes:
+        vllm_base = await _score_vllm_base(
+            config=config,
+            rollout_mode=rollout_mode,
+            logical_map=logical_map,
+            artifact_dir=artifact_dir,
+        )
+        if rollout_mode == "native_lora":
+            vllm_lora = await _score_vllm_native_lora(
+                config=config,
+                adapter_path=lora_result.adapter_path,
+                logical_map=logical_map,
+                artifact_dir=artifact_dir,
+            )
+        else:
+            vllm_lora = await _score_vllm_merged_lora(
+                config=config,
+                adapter_path=lora_result.adapter_path,
+                logical_map=logical_map,
+                artifact_dir=artifact_dir,
+            )
+        _assert_lora_active(vllm_base, vllm_lora, side="vllm")
+        _write_json(
+            artifact_dir / f"vllm_{rollout_mode}_base_scores.json",
+            vllm_base.model_dump(mode="json"),
+        )
+        _write_json(
+            artifact_dir / f"vllm_{rollout_mode}_lora_scores.json",
+            vllm_lora.model_dump(mode="json"),
+        )
+        rollout_comparisons.append(
+            compare_rollout(
+                rollout_mode=rollout_mode,
+                megatron_base=megatron_base,
+                megatron_lora=megatron_lora,
+                vllm_base=vllm_base,
+                vllm_lora=vllm_lora,
+                logical_map=logical_map,
+            )
+        )
+
+    passed = all(
+        comparison.base.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
+        and comparison.lora.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
+        and comparison.delta.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
+        for comparison in rollout_comparisons
+    )
+    report = TrainInfOutputParityReport(
+        base_model=config.base_model,
+        artifact_dir=str(artifact_dir),
+        topology=config.topology.slug(),
+        trainer_gpu_ids=config.trainer_gpu_ids,
+        inference_gpu_ids=config.inference_gpu_ids,
+        logical_prompt_count=len(logical_map.prompts),
+        logical_token_count=len(logical_map.tokens),
+        adapter_path=lora_result.adapter_path,
+        megatron_base_scores=base_result.score_path,
+        megatron_lora_scores=lora_result.score_path,
+        rollout_comparisons=rollout_comparisons,
+        passed=passed,
+    )
+    _write_json(artifact_dir / "comparison_report.json", report.model_dump(mode="json"))
+    return report
+
+
+def _worker_cli(request_path: Path) -> None:
+    request = MegatronWorkerRequest.model_validate(_read_json(request_path))
+    _megatron_worker(request)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--request", type=Path)
+    return parser.parse_args(argv)
+
+
+def _main(argv: list[str]) -> int:
+    args = _parse_args(argv)
+    if args.worker:
+        if args.request is None:
+            raise ValueError("--worker requires --request")
+        _worker_cli(args.request)
+        return 0
+    raise ValueError("This module is intended to be run through pytest or --worker")
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
