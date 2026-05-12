@@ -6,11 +6,11 @@ import pytest
 
 from .oracle_harness import (
     LIVE_TRAINING_LOG_PATH,
-    ORACLE_TOPOLOGY,
     SENSITIVITY_MUTATION_ENV,
     TEST_DEFAULT_FLEX_BACKEND,
     available_gpu_count,
     case_config,
+    oracle_topology,
     run_sensitivity_suite,
     run_suite,
     sensitivity_enabled,
@@ -55,23 +55,25 @@ def test_megatron_lora_topology_suite(capsys: pytest.CaptureFixture[str]) -> Non
     Runs the suite of topologies and expects each to pass (numerical differences within our thresholds)
     """
     _announce_report_log(log_path=CORRECTNESS_LOG_PATH, capsys=capsys)
+    config = case_config()
+    topology = oracle_topology(is_moe=config.is_moe)
     gpu_count = available_gpu_count()
-    if gpu_count < ORACLE_TOPOLOGY.world_size():
+    if gpu_count < topology.world_size():
         CORRECTNESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CORRECTNESS_LOG_PATH.write_text(
             (
                 "Topology suite skipped. "
-                f"Need {ORACLE_TOPOLOGY.world_size()} GPUs, found {gpu_count}.\n"
+                f"Need {topology.world_size()} GPUs, found {gpu_count}.\n"
             ),
             encoding="utf-8",
         )
         pytest.skip(
-            f"Need {ORACLE_TOPOLOGY.world_size()} GPUs for topology run, only found {gpu_count}"
+            f"Need {topology.world_size()} GPUs for topology run, only found {gpu_count}"
         )
     _run_suite_with_log(
         log_path=CORRECTNESS_LOG_PATH,
         run=lambda: run_suite(
-            case_config=case_config(),
+            case_config=config,
             max_world_size=gpu_count,
             oracle_flex_backend=TEST_FLEX_BACKEND,
             variant_flex_backend=TEST_FLEX_BACKEND,
@@ -101,7 +103,11 @@ def test_megatron_lora_diff_sensitivity(capsys: pytest.CaptureFixture[str]) -> N
         )
     mutations = sensitivity_mutations()
     assert mutations
-    sensitivity_world_size = sensitivity_required_world_size(mutations)
+    config = case_config()
+    sensitivity_world_size = sensitivity_required_world_size(
+        mutations,
+        is_moe=config.is_moe,
+    )
     gpu_count = available_gpu_count()
     if gpu_count < sensitivity_world_size:
         SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +124,7 @@ def test_megatron_lora_diff_sensitivity(capsys: pytest.CaptureFixture[str]) -> N
     _run_suite_with_log(
         log_path=SENSITIVITY_LOG_PATH,
         run=lambda: run_sensitivity_suite(
-            case_config=case_config(),
+            case_config=config,
             mutations=mutations,
             oracle_flex_backend=TEST_FLEX_BACKEND,
             variant_flex_backend=TEST_FLEX_BACKEND,

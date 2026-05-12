@@ -42,6 +42,11 @@ FlexBackend = Literal[
 TEST_DEFAULT_FLEX_BACKEND: FlexBackend = "TRITON"
 
 DEFAULT_SENSITIVITY_MUTATION = "skip_finalize"
+CP_ATTENTION_SENSITIVITY_MUTATIONS = (
+    "attn_kv_fetch_pack_on_comm_stream",
+    "attn_skip_nested_grad_sanitize",
+    "attn_skip_flash_lse_normalize",
+)
 SHARED_SENSITIVITY_MUTATIONS = (
     DEFAULT_SENSITIVITY_MUTATION,
     "fwd_skip_o_proj_tp_reduce",
@@ -52,6 +57,7 @@ SHARED_SENSITIVITY_MUTATIONS = (
     "save_drop_nonzero_ranked_tp_shards",
     "save_duplicate_replicated_entries",
     "dp_grad_accumulation_seqs",
+    *CP_ATTENTION_SENSITIVITY_MUTATIONS,
 )
 RL_ONLY_SENSITIVITY_MUTATIONS = ("dp_local_token_normalization",)
 SFT_ONLY_SENSITIVITY_MUTATIONS = ("sft_local_token_normalization",)
@@ -125,16 +131,19 @@ def supported_sensitivity_mutations_for_objective(
     *,
     is_moe: bool = True,
 ) -> tuple[SensitivityMutation, ...]:
-    if not is_moe:
-        return (DEFAULT_SENSITIVITY_MUTATION,)
+    del is_moe
     return OBJECTIVE_SENSITIVITY_MUTATIONS[objective]
 
 
 def objective_supports_sensitivity_mutation(
     objective: OracleObjective,
     mutation: SensitivityMutation,
+    *,
+    is_moe: bool = True,
 ) -> bool:
-    return mutation in supported_sensitivity_mutations_for_objective(objective)
+    return mutation in supported_sensitivity_mutations_for_objective(
+        objective, is_moe=is_moe
+    )
 
 
 def selected_oracle_objectives() -> list[OracleObjective]:
@@ -215,6 +224,9 @@ TOPOLOGIES = [
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
+    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
     Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
     Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
@@ -222,9 +234,18 @@ DENSE_TOPOLOGIES = [
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
 DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+CP_ATTENTION_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
 DENSE_SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
+DENSE_DP_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=1, etp=1, dp=2, sp=False)
+DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY = Topology(
+    tp=1, ep=1, etp=1, dp=1, cp=2, sp=False
+)
 SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
     mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
+}
+SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
+    mutation: CP_ATTENTION_SENSITIVITY_TOPOLOGY
+    for mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS
 }
 SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
     tp=2, ep=1, etp=2, dp=1, sp=True
@@ -752,6 +773,14 @@ def sensitivity_topology_for_mutation(
 ) -> Topology:
     """Returns the sensitivity topology required for one mutation."""
     if not is_moe:
+        if mutation in {
+            "dp_grad_accumulation_seqs",
+            "dp_local_token_normalization",
+            "sft_local_token_normalization",
+        }:
+            return DENSE_DP_SENSITIVITY_TOPOLOGY
+        if mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS:
+            return DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY
         return DENSE_SENSITIVITY_TOPOLOGY
     return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
 
@@ -1335,7 +1364,8 @@ class VariantRunner:
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
-        self.oracle_slug = oracle_output_slug(objective, ORACLE_TOPOLOGY)
+        self.oracle_topology = oracle_topology(is_moe=case_config.is_moe)
+        self.oracle_slug = oracle_output_slug(objective, self.oracle_topology)
         self.oracle_dir = self.case_dir / self.oracle_slug
         self.oracle_routing_bundle_dir = (
             self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
@@ -1555,21 +1585,27 @@ class VariantRunner:
         )
         run_oracle_topology = partial(
             self._run_topology,
-            topology=ORACLE_TOPOLOGY,
+            topology=self.oracle_topology,
             mutation=None,
             flex_backend=self.oracle_flex_backend,
             regenerate=True,
         )
-        if need_capture:
+        if self.case_config.is_moe and need_capture:
             run_oracle_topology(
                 output_slug=f"{self.oracle_slug}__oracle_capture",
                 replay_bundle_dir=None,
                 capture_bundle_dir=self.oracle_routing_bundle_dir,
             )
-        if regenerate or not oracle_manifest.exists():
+        if (
+            regenerate
+            or not oracle_manifest.exists()
+            or not self.shared_init_path.exists()
+        ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
-                replay_bundle_dir=self.oracle_routing_bundle_dir,
+                replay_bundle_dir=(
+                    self.oracle_routing_bundle_dir if self.case_config.is_moe else None
+                ),
                 capture_bundle_dir=None,
             )
         self._oracle_initialized = True
@@ -1590,7 +1626,9 @@ class VariantRunner:
             output_slug=output_slug,
             mutation=variant.mutation,
             flex_backend=variant.flex_backend or self.variant_flex_backend,
-            replay_bundle_dir=self.oracle_routing_bundle_dir,
+            replay_bundle_dir=(
+                self.oracle_routing_bundle_dir if self.case_config.is_moe else None
+            ),
             capture_bundle_dir=None,
             regenerate=variant.force_regenerate,
         )

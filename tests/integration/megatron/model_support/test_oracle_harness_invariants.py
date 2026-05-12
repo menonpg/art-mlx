@@ -3,6 +3,11 @@ import torch
 
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
+    CP_ATTENTION_SENSITIVITY_MUTATIONS,
+    DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY,
+    DENSE_DP_SENSITIVITY_TOPOLOGY,
+    DENSE_ORACLE_TOPOLOGY,
+    DENSE_TOPOLOGIES,
     FORWARD_EXPERT_LORA_TRACE_NOISE_REASON,
     FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT,
     ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT,
@@ -20,6 +25,8 @@ from .oracle_harness import (
     _resolve_test_flex_backend,
     _suite_variants,
     case_config,
+    selected_sensitivity_mutations_for_objective,
+    sensitivity_topology_for_mutation,
 )
 
 
@@ -525,6 +532,28 @@ def test_forward_trace_sums_expert_tp_row_shards_inside_ep_groups() -> None:
     )
 
 
+def test_gate_up_rank_interleaved_trace_layout_canonicalizes_dense_tp() -> None:
+    canonical = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8)
+    gate0, gate1, up0, up1 = canonical.chunk(4, dim=-1)
+    rank_concat = torch.cat((gate0, up0, gate1, up1), dim=-1)
+
+    actual = ForwardTraceCapture._canonicalize_primary_output_tensor(
+        module_name="chunk0.module.decoder.layers.0.mlp.linear_fc1",
+        tensor=rank_concat,
+        call={
+            "merge_hints": {
+                "primary_output": {
+                    "layout": "gate_up_rank_interleaved",
+                    "world_size_key": "tp_world_size",
+                }
+            },
+            "rank_meta": [{"tp_world_size": 2}, {"tp_world_size": 2}],
+        },
+    )
+
+    assert torch.equal(actual, canonical)
+
+
 def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas() -> (
     None
 ):
@@ -685,6 +714,35 @@ def test_suite_variants_skip_duplicate_oracle_replay_variant() -> None:
     assert all("oracle_replay" not in variant.name for variant in variants)
 
 
+def test_dense_suite_variants_preserve_dense_and_cp_topologies() -> None:
+    variants = _suite_variants("rl", is_moe=False)
+
+    assert variants
+    assert all(variant.topology != DENSE_ORACLE_TOPOLOGY for variant in variants)
+    assert any(
+        variant.topology.tp == 2
+        and variant.topology.dp == 2
+        and variant.topology.cp == 1
+        for variant in variants
+    )
+    assert any(
+        variant.topology.tp == 2
+        and variant.topology.dp == 2
+        and variant.topology.cp == 2
+        for variant in variants
+    )
+
+
+def test_max_world_size_arg_filters_dense_variants() -> None:
+    variants = _suite_variants("rl", is_moe=False, max_world_size=2)
+
+    assert variants
+    assert all(variant.topology.world_size() <= 2 for variant in variants)
+    assert not any(
+        variant.topology.tp == 2 and variant.topology.dp == 2 for variant in variants
+    )
+
+
 def test_oracle_topologies_are_the_compact_cp_validation_matrix() -> None:
     assert TOPOLOGIES == [
         Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
@@ -693,6 +751,62 @@ def test_oracle_topologies_are_the_compact_cp_validation_matrix() -> None:
         Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
     ]
     assert [topology.world_size() for topology in TOPOLOGIES] == [1, 2, 4, 8]
+
+
+def test_dense_topologies_include_vllm_separation_and_cp_coverage() -> None:
+    assert DENSE_TOPOLOGIES == [
+        Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
+        Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
+        Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
+        Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
+        Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
+        Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
+        Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
+    ]
+    assert [topology.world_size() for topology in DENSE_TOPOLOGIES] == [
+        1,
+        2,
+        2,
+        4,
+        2,
+        4,
+        8,
+    ]
+
+
+def test_dense_sensitivity_keeps_dp_and_cp_attention_cases() -> None:
+    mutations = selected_sensitivity_mutations_for_objective(
+        "rl",
+        [
+            "skip_finalize",
+            "dp_local_token_normalization",
+            *CP_ATTENTION_SENSITIVITY_MUTATIONS,
+        ],
+        is_moe=False,
+    )
+
+    assert mutations == [
+        "skip_finalize",
+        "dp_local_token_normalization",
+        *CP_ATTENTION_SENSITIVITY_MUTATIONS,
+    ]
+    assert sensitivity_topology_for_mutation("skip_finalize", is_moe=False) == Topology(
+        tp=2, ep=1, etp=1, dp=1, sp=True
+    )
+    assert (
+        sensitivity_topology_for_mutation(
+            "dp_local_token_normalization",
+            is_moe=False,
+        )
+        == DENSE_DP_SENSITIVITY_TOPOLOGY
+    )
+    assert (
+        sensitivity_topology_for_mutation(
+            CP_ATTENTION_SENSITIVITY_MUTATIONS[0],
+            is_moe=False,
+        )
+        == DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY
+    )
 
 
 def test_case_config_base_model_can_be_overridden_by_env(

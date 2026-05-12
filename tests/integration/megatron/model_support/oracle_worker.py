@@ -775,6 +775,8 @@ def _matches_grad_sync_skip_mutation(
         return (
             ".mlp.experts.linear_fc1.gate_lora.A_T" in param_name
             or ".mlp.experts.linear_fc1.up_lora.A_T" in param_name
+            or ".mlp.linear_fc1.gate_lora.A_T" in param_name
+            or ".mlp.linear_fc1.up_lora.A_T" in param_name
         )
     return False
 
@@ -797,8 +799,8 @@ def _apply_grad_sync_skip_mutation(
         # this only passes lora params atm, so we assume lora params below
         if not _matches_grad_sync_skip_mutation(param_name, mutation):
             continue
-        if (
-            mutation == "bwd_skip_sync_fc1_a" and param.grad_sync_domain != "expert_tp"  # ty: ignore[unresolved-attribute]
+        if mutation == "bwd_skip_sync_fc1_a" and (
+            ".mlp.experts." in param_name and param.grad_sync_domain != "expert_tp"  # ty: ignore[unresolved-attribute]
         ):
             continue
 
@@ -1170,8 +1172,8 @@ def _mutation_hook(
         raise ValueError(f"Unsupported mutation: {mutation}")
 
     if mutation == "skip_finalize":
-        megatron_train_module.finalize_model_grads_extended = (
-            lambda _model, **_kwargs: (None)
+        megatron_train_module.finalize_model_grads_extended = lambda _model, **_kwargs: (
+            None
         )
 
     if mutation == "dp_local_token_normalization":
@@ -1348,6 +1350,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 ),
                 optimizer_config=_build_optimizer_config(request.case_config),
                 print_env=False,
+                allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
             )
         _debug("finished build_training_runtime")
     model_chunks = runtime.model

@@ -27,6 +27,12 @@ CAPTURE_NAME_TOKENS = (
     ".mlp.experts.linear_fc1.up_lora",
     ".mlp.experts.linear_fc2",
     ".mlp.experts.linear_fc2.lora",
+    ".mlp.linear_fc1",
+    ".mlp.linear_fc1.gate_lora",
+    ".mlp.linear_fc1.up_lora",
+    ".mlp.linear_fc2",
+    ".mlp.linear_fc2.row_parallel_lora",
+    ".mlp.linear_fc2.row_parallel_lora.lora",
 )
 ROUTER_NAME_TOKEN = ".mlp.router"
 PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
@@ -471,6 +477,17 @@ class ForwardTraceCapture:
                     "world_size_key": "tp_world_size",
                 }
             return {"op": "concat", "dim": -1}
+        if ".mlp.linear_fc2.row_parallel_lora" in name and ".lora" not in name:
+            if self._sequence_parallel_enabled(module):
+                return {"op": "concat", "dim": 0}
+            return None
+        if ".mlp.linear_fc2" in name and ".lora" not in name:
+            row_parallel_lora = getattr(module, "row_parallel_lora", None)
+            if row_parallel_lora is not None and self._sequence_parallel_enabled(
+                row_parallel_lora
+            ):
+                return {"op": "concat", "dim": 0}
+            return None
 
         if ".mlp.experts." in name:
             return {"op": "concat", "dim": 0}
