@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 def apply_vllm_runtime_patches() -> None:
     patch_transformers_v5_compat()
     patch_punica_ep_moe_lora_alignment()
+    patch_lora_duplicate_module_aliases()
     patch_fused_moe_ep_lora_support()
     subclass_chat_completion_request()
     patch_listen_for_disconnect()
@@ -183,6 +184,178 @@ def patch_punica_ep_moe_lora_alignment() -> None:
     punica_gpu.PunicaWrapperGPU.moe_lora_align_block_size = (
         patched_moe_lora_align_block_size  # type: ignore[method-assign]
     )
+
+
+def patch_lora_duplicate_module_aliases() -> None:
+    from vllm.lora import model_manager
+
+    manager_cls = model_manager.LoRAModelManager
+    if getattr(manager_cls, "__art_lora_duplicate_alias_patch__", False):
+        return
+
+    def _parent_module(module_name: str) -> str:
+        return module_name.rpartition(".")[0]
+
+    def _refresh_shared_expert_gate_alias(
+        self: Any,
+        module_name: str,
+        old_module: Any,
+        new_module: Any,
+    ) -> None:
+        if not module_name.endswith(".shared_expert_gate"):
+            return
+        parent_module = self.model.get_submodule(_parent_module(module_name))
+        shared_expert = getattr(parent_module, "shared_expert", None)
+        if shared_expert is None:
+            return
+        if getattr(shared_expert, "expert_gate", None) is old_module:
+            shared_expert.expert_gate = new_module
+
+    def patched_create_lora_modules(self: Any) -> None:
+        seen_modules: set[Any] = set()
+        for module_name, module in self.model.named_modules(remove_duplicate=False):
+            if module in seen_modules:
+                continue
+            seen_modules.add(module)
+
+            if isinstance(module, model_manager.PPMissingLayer):
+                continue
+
+            if not self._match_target_modules(module_name):
+                continue
+
+            punica_wrapper = self._get_punica_wrapper(module_name)
+            if punica_wrapper is None:
+                model_manager.logger.warning(
+                    "Regarding %s, no matching PunicaWrapper "
+                    "is found; %s will be ignored.",
+                    self.model.__class__.__name__,
+                    module_name,
+                )
+                continue
+
+            if self._is_non_gated_moe and module_name.endswith("mixer.gate"):
+                model_manager.logger.debug_once(
+                    "LoRA is not supported for non-gated MoE gate module."
+                    " %s will be ignored.",
+                    module_name,
+                    scope="local",
+                )
+                continue
+
+            parts = module_name.split(".")[-1]
+            packed_moduled_lst = self.packed_modules_mapping.get(parts, [])
+            if isinstance(module, model_manager.FusedMoE):
+                packed_moduled_lst = ["w13"] if self._is_3d_moe_model else ["w1", "w3"]
+            new_module = model_manager.replace_submodule(
+                self.model,
+                module_name,
+                model_manager.from_layer(
+                    module,
+                    self.lora_slots,
+                    self.lora_config,
+                    packed_moduled_lst,
+                    self.model.config,
+                ),
+            )
+            seen_modules.add(new_module)
+            _refresh_shared_expert_gate_alias(self, module_name, module, new_module)
+
+            if "lm_head" in module_name:
+                logits_processor_module_name = "logits_processor"
+                parent_module = _parent_module(module_name)
+                if parent_module:
+                    logits_processor_module_name = (
+                        f"{parent_module}.{logits_processor_module_name}"
+                    )
+
+                logits_processor_module = self.model.get_submodule(
+                    logits_processor_module_name
+                )
+
+                new_module = model_manager.replace_submodule(
+                    self.model,
+                    logits_processor_module_name,
+                    model_manager.from_layer_logits_processor(
+                        logits_processor_module,
+                        module,
+                        self.lora_slots,
+                        self.lora_config,
+                        self.model.config,
+                    ),
+                )
+                seen_modules.add(new_module)
+
+            if self.supports_mm and not isinstance(
+                new_module, model_manager.BaseLayerWithLoRA
+            ):
+                continue
+            self.register_module(module_name, new_module)
+
+            self._register_packed_modules(module_name)
+            new_module.set_mapping(punica_wrapper)
+
+    def patched_activate_adapter(self: Any, lora_id: int) -> bool:
+        if lora_id in self._active_adapters:
+            return False
+        first_free_slot = next(
+            (
+                (i, active_lora_id)
+                for i, active_lora_id in enumerate(self.lora_index_to_id)
+                if active_lora_id is None
+            ),
+            None,
+        )
+        if first_free_slot is None:
+            raise ValueError("No free lora slots")
+        index, _ = first_free_slot
+        self._active_adapters[lora_id] = None
+        lora_model = self._registered_adapters[lora_id]
+        model_manager.logger.debug(
+            "Activating LoRA. int id: %d, slot index: %d", lora_model.id, index
+        )
+        self.lora_index_to_id[index] = lora_model.id
+
+        module_aliases: dict[Any, list[str]] = {}
+        for module_name, module in self.modules.items():
+            module_aliases.setdefault(module, []).append(module_name)
+
+        for module, aliases in module_aliases.items():
+            matches = []
+            for module_name in aliases:
+                module_lora = self._get_lora_layer_weights(lora_model, module_name)
+                if module_lora is not None:
+                    matches.append((module_name, module_lora))
+            if not matches:
+                module.reset_lora(index)
+                model_manager.logger.debug(
+                    "No LoRA weights found for module %s, skipping.", aliases[0]
+                )
+                continue
+            if len({id(module_lora) for _, module_lora in matches}) > 1:
+                raise RuntimeError(
+                    "Multiple LoRA weight entries matched aliases for the same "
+                    f"live module: {[module_name for module_name, _ in matches]}"
+                )
+
+            module_name, module_lora = matches[0]
+            module.set_lora(
+                index,
+                module_lora.lora_a,
+                module_lora.lora_b,
+            )
+            model_manager.logger.debug(
+                "Successfully loaded LoRA weights for module %s.", module_name
+            )
+        return True
+
+    patched_create_lora_modules.__art_patched__ = True  # type: ignore[attr-defined]
+    patched_activate_adapter.__art_patched__ = True  # type: ignore[attr-defined]
+    manager_cls._create_lora_modules = (  # type: ignore[method-assign]
+        patched_create_lora_modules
+    )
+    manager_cls.activate_adapter = patched_activate_adapter  # type: ignore[method-assign]
+    setattr(manager_cls, "__art_lora_duplicate_alias_patch__", True)
 
 
 def patch_fused_moe_ep_lora_support() -> None:

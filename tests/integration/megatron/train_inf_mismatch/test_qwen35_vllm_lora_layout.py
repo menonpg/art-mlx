@@ -9,6 +9,124 @@ from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER
 ROOT = Path(__file__).resolve().parents[4]
 
 
+def test_vllm_lora_duplicate_alias_patch_keeps_shared_module_active() -> None:
+    script = r"""
+from types import MethodType, SimpleNamespace
+
+import torch
+from torch import nn
+
+from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+apply_vllm_runtime_patches()
+
+from vllm.lora import model_manager
+from vllm.lora.model_manager import LoRAModelManager
+
+
+class FakeLoraLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def set_lora(self, index, lora_a, lora_b):
+        self.ops.append(("set", index, lora_a, lora_b))
+
+    def reset_lora(self, index):
+        self.ops.append(("reset", index))
+
+    def set_mapping(self, punica_wrapper):
+        self.ops.append(("mapping", punica_wrapper))
+
+
+shared = FakeLoraLayer()
+manager = object.__new__(LoRAModelManager)
+manager._active_adapters = {}
+manager._registered_adapters = {1: SimpleNamespace(id=1)}
+manager.lora_index_to_id = [None]
+manager.modules = {
+    "layer.mlp.shared_expert.gate_up_proj": shared,
+    "layer.mlp.experts._shared_experts.gate_up_proj": shared,
+}
+lora_weights = SimpleNamespace(lora_a="a", lora_b="b")
+
+
+def get_lora(self, lora_model, module_name):
+    if module_name == "layer.mlp.shared_expert.gate_up_proj":
+        return lora_weights
+    return None
+
+
+manager._get_lora_layer_weights = MethodType(get_lora, manager)
+assert LoRAModelManager.activate_adapter(manager, 1) is True
+assert shared.ops == [("set", 0, "a", "b")]
+
+
+class SharedExpert(nn.Module):
+    def __init__(self, expert_gate):
+        super().__init__()
+        self.expert_gate = expert_gate
+
+
+class SparseBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared_expert_gate = nn.Linear(2, 1, bias=False)
+        self.shared_expert = SharedExpert(self.shared_expert_gate)
+
+
+class Root(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = SparseBlock()
+        self.config = SimpleNamespace()
+
+
+root = Root()
+original_gate = root.layer.shared_expert_gate
+manager = object.__new__(LoRAModelManager)
+manager.model = root
+manager._is_non_gated_moe = False
+manager._is_3d_moe_model = False
+manager.packed_modules_mapping = {}
+manager.lora_config = SimpleNamespace(max_loras=1)
+manager.supports_mm = False
+manager.modules = {}
+manager._match_target_modules = MethodType(lambda self, name: name.endswith("shared_expert_gate"), manager)
+manager._get_punica_wrapper = MethodType(lambda self, name: "punica", manager)
+manager.register_module = MethodType(lambda self, name, module: self.modules.__setitem__(name, module), manager)
+manager._register_packed_modules = MethodType(lambda self, name: None, manager)
+
+original_from_layer = model_manager.from_layer
+try:
+    model_manager.from_layer = lambda *args, **kwargs: FakeLoraLayer()
+    LoRAModelManager._create_lora_modules(manager)
+finally:
+    model_manager.from_layer = original_from_layer
+
+assert root.layer.shared_expert_gate is root.layer.shared_expert.expert_gate
+assert root.layer.shared_expert_gate is not original_gate
+assert list(manager.modules) == ["layer.shared_expert_gate"]
+print("ok")
+"""
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            script,
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "ok"
+
+
 def _config(base_model: str, *, rank: int) -> dict:
     return {
         "base_model_name_or_path": base_model,
