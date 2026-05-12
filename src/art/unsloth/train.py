@@ -814,7 +814,18 @@ async def run_unsloth_rl_training(
         param_group["weight_decay"] = 0.1
 
     packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
+
+    if verbose:
+        unfinished = getattr(ctx.results_queue, "_unfinished_tasks", "?")
+        qsize = ctx.results_queue.qsize()
+        print(
+            f"[run_unsloth_rl_training] before join: warmup_pending={ctx.warmup_pending} "
+            f"train_task={'none' if ctx.train_task is None else ('done' if ctx.train_task.done() else 'running')} "
+            f"results_queue.qsize={qsize} results_queue._unfinished_tasks={unfinished}"
+        )
     await ctx.results_queue.join()
+    if verbose:
+        print("[run_unsloth_rl_training] join complete")
 
     if ctx.train_task is None:
         ctx.train_task = asyncio.create_task(
@@ -842,8 +853,13 @@ async def run_unsloth_rl_training(
             ctx.inputs_queue.put_nowait(
                 create_train_inputs(packed_tensors, offset, config, _config, warmup)
             )
+            if verbose:
+                print(
+                    f"[run_unsloth_rl_training] put input (warmup={warmup}, offset={offset}), "
+                    f"inputs_queue.qsize={ctx.inputs_queue.qsize()}"
+                )
 
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 [
                     asyncio.create_task(ctx.results_queue.get()),
                     ctx.train_task,
@@ -852,10 +868,34 @@ async def run_unsloth_rl_training(
             )
             if verbose:
                 print(
+                    f"[run_unsloth_rl_training] asyncio.wait returned: "
+                    f"done={len(done)} tasks, train_task_in_done={ctx.train_task in done}"
+                )
+            # Cancel any abandoned results_queue.get() tasks that didn't complete
+            for t in pending:
+                if t is not ctx.train_task:
+                    t.cancel()
+            if verbose:
+                print(
                     "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"
                 )
             for task in done:
-                result = task.result()
+                if task is ctx.train_task:
+                    try:
+                        result = task.result()
+                    except Exception as e:
+                        print(
+                            f"[run_unsloth_rl_training] train_task raised exception: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        raise
+                    print(
+                        f"[run_unsloth_rl_training] train_task returned (should never happen): "
+                        f"result={result!r}"
+                    )
+                    assert result is not None, "The training task should never finish."
+                else:
+                    result = task.result()
                 assert result is not None, "The training task should never finish."
                 ctx.results_queue.task_done()
                 if warmup:
