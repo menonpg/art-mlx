@@ -80,6 +80,7 @@ class TrainInfOutputParityConfig(BaseModel):
     trainer_gpu_ids: list[int] = Field(default_factory=lambda: [0, 1])
     inference_gpu_ids: list[int] = Field(default_factory=lambda: [2, 3])
     allow_unvalidated_arch: bool = False
+    include_shared_expert_lora: bool = True
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
 
@@ -242,6 +243,10 @@ def config_from_env() -> TrainInfOutputParityConfig:
         ),
         allow_unvalidated_arch=os.environ.get(
             "ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH", "0"
+        )
+        == "1",
+        include_shared_expert_lora=os.environ.get(
+            "ART_TRAIN_INF_MISMATCH_INCLUDE_SHARED_EXPERT_LORA", "1"
         )
         == "1",
     )
@@ -551,6 +556,77 @@ def _configure_provider(provider: Any, config: TrainInfOutputParityConfig) -> No
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+    if not config.include_shared_expert_lora:
+        _disable_shared_expert_lora(provider)
+
+
+def _disable_shared_expert_lora(provider: Any) -> None:
+    from types import MethodType
+
+    from art.megatron.weights.adapter_export import add_grouped_moe_adapter_weights
+
+    handler = provider._art_model_support_handler
+
+    def _wrap_mlp_lora_without_shared(
+        self: Any,
+        module: Any,
+        *,
+        adapter_model_prefix: str,
+        provider: Any,
+        target_modules: set[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        del self, provider
+        from art.megatron.lora import wrap_grouped_moe_experts
+        from art.megatron.model_support.handlers.default_dense import (
+            _require_moe_experts,
+        )
+
+        wrap_grouped_moe_experts(
+            _require_moe_experts(module),
+            adapter_model_prefix=adapter_model_prefix,
+            target_modules=target_modules,
+            rank=rank,
+            alpha=alpha,
+        )
+
+    def _add_mlp_adapter_weights_without_shared(
+        self: Any,
+        adapter_weights_by_base: dict[str, list[Any]],
+        *,
+        layer_prefix: str,
+        module: Any,
+    ) -> None:
+        del self
+        from art.megatron.model_support.handlers.default_dense import (
+            _require_moe_experts,
+        )
+
+        add_grouped_moe_adapter_weights(
+            adapter_weights_by_base,
+            layer_prefix=layer_prefix,
+            experts=_require_moe_experts(module),
+        )
+
+    handler._wrap_mlp_lora = MethodType(_wrap_mlp_lora_without_shared, handler)
+    handler._add_mlp_adapter_weights = MethodType(
+        _add_mlp_adapter_weights_without_shared,
+        handler,
+    )
+
+
+def _vllm_non_shared_lora_target_modules(base_model: str) -> list[str]:
+    from art.dev.get_model_config import default_target_modules
+
+    modules = [
+        module
+        for module in default_target_modules(base_model)
+        if module not in {"gate_proj", "up_proj", "down_proj"}
+    ]
+    if "experts" not in modules:
+        modules.append("experts")
+    return modules
 
 
 def _build_deterministic_nonzero_lora(
@@ -636,6 +712,7 @@ def _save_vllm_lora_adapter(
     state: dict[str, Any],
     runtime: Any,
     base_model: str,
+    include_shared_expert_lora: bool,
 ) -> None:
     import torch
 
@@ -656,6 +733,10 @@ def _save_vllm_lora_adapter(
         state,
         adapter_config=adapter_config,
     )
+    if not include_shared_expert_lora:
+        adapter_config["target_modules"] = _vllm_non_shared_lora_target_modules(
+            base_model
+        )
     save_vllm_lora_tensors(lora_path, tensors, adapter_config)
 
 
@@ -769,6 +850,9 @@ def _megatron_worker(request: MegatronWorkerRequest) -> None:
                     state=initialized,
                     runtime=runtime,
                     base_model=request.config.base_model,
+                    include_shared_expert_lora=(
+                        request.config.include_shared_expert_lora
+                    ),
                 )
             torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
             adapter_path = artifact_dir / "active_lora"
@@ -1046,6 +1130,10 @@ async def _score_vllm_base(
     }
     if rollout_mode == "native_lora":
         engine_args["enable_lora"] = True
+        if not config.include_shared_expert_lora:
+            engine_args["lora_target_modules"] = _vllm_non_shared_lora_target_modules(
+                config.base_model
+            )
     async with _direct_vllm_runtime(
         config=config,
         artifact_dir=artifact_dir,
@@ -1078,6 +1166,10 @@ async def _score_vllm_native_lora(
         "max_model_len": config.packed.sequence_length + 8,
         **config.engine_args,
     }
+    if not config.include_shared_expert_lora:
+        engine_args["lora_target_modules"] = _vllm_non_shared_lora_target_modules(
+            config.base_model
+        )
     async with _direct_vllm_runtime(
         config=config,
         artifact_dir=artifact_dir,
