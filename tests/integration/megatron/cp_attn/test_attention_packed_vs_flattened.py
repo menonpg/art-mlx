@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import math
 from typing import Any
 
@@ -12,6 +13,7 @@ from art.megatron.shared_prefix_state import create_shared_prefix_state
 from tests.integration.megatron.gdn_shared_prefix.cases import default_phase0_cases
 from tests.integration.megatron.gdn_shared_prefix.metrics import (
     GDN_CORRECTNESS_DTYPE,
+    MEAN_ABS_PCT_MISMATCH_THRESHOLD,
     MEAN_ABS_PCT_THRESHOLD,
     assert_mean_abs_pct,
     mean_abs_pct,
@@ -22,6 +24,29 @@ from tests.integration.megatron.gdn_shared_prefix.packed_layout import (
 from tests.integration.megatron.gdn_shared_prefix.parser_import import (
     parse_gdn_shared_prefix_segments,
 )
+from tests.integration.megatron.model_support.oracle_harness import (
+    TEST_DEFAULT_FLEX_BACKEND,
+)
+from tests.integration.megatron.model_support.oracle_worker import (
+    _apply_requested_flex_backend_patch,
+    _apply_test_attention_full_fp32_patch,
+    _apply_test_flex_inner_fp32_patch,
+)
+
+
+@pytest.fixture(autouse=True)
+def _fp32_test_flex_backend():
+    with ExitStack() as stack:
+        stack.enter_context(
+            _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        stack.enter_context(
+            _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        stack.enter_context(
+            _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        yield
 
 
 @pytest.mark.skipif(
@@ -137,7 +162,7 @@ def test_physical_causal_attention_leaks_across_siblings() -> None:
             packed_out[completion_mask],
             physical_out[completion_mask],
         )
-        > MEAN_ABS_PCT_THRESHOLD
+        > MEAN_ABS_PCT_MISMATCH_THRESHOLD
     )
 
 

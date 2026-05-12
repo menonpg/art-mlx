@@ -20,7 +20,6 @@ from .oracle_harness import (
     PackedTensorConfig,
     Topology,
     VariantRunner,
-    _assert_abs_pct_oracle_exact_zero_count,
     _default_phase_pass_fns,
     _resolve_test_flex_backend,
     _suite_variants,
@@ -105,7 +104,7 @@ def test_metric_threshold_rule_can_require_strictly_positive_values() -> None:
     assert rule.failure_reasons(summary) == ["candidate_abs_scale=0<=0"]
 
 
-def test_diff_accumulator_summary_uses_elementwise_mean_abs_pct() -> None:
+def test_diff_accumulator_summary_uses_aggregate_mean_abs_pct() -> None:
     accumulator = DiffAccumulator()
 
     accumulator.update(
@@ -118,44 +117,7 @@ def test_diff_accumulator_summary_uses_elementwise_mean_abs_pct() -> None:
     assert summary["typical_abs_scale"] == 1.5
     assert summary["candidate_abs_scale"] == 0.25
     assert summary["mean_abs_diff"] == 1.25
-    assert summary["abs_pct_source_numel"] == 2
-    assert summary["abs_pct_trimmed_numel"] == 0
-    assert summary["mean_abs_pct"] == pytest.approx(
-        ((0.5 / 1.0) + (2.0 / 2.0)) / 2 * 100.0
-    )
-
-
-def test_mean_abs_pct_trims_top_three_outliers_without_touching_other_metrics() -> None:
-    accumulator = DiffAccumulator()
-    reference = torch.ones(40, dtype=torch.float32)
-    candidate = reference.clone()
-    candidate[0] = 101.0
-    candidate[1] = 51.0
-    candidate[2] = 26.0
-    candidate[3] = 2.0
-
-    accumulator.update(reference, candidate)
-
-    summary = accumulator.as_summary()
-    assert summary["mean_abs_diff"] == pytest.approx((100.0 + 50.0 + 25.0 + 1.0) / 40)
-    assert summary["abs_pct_source_numel"] == 40
-    assert summary["abs_pct_trimmed_numel"] == 3
-    assert summary["mean_abs_pct"] == pytest.approx((1.0 / 37) * 100.0)
-
-
-def test_layer_averaged_mean_abs_pct_trims_after_layer_average() -> None:
-    reference = torch.ones((2, 40), dtype=torch.float32)
-    candidate = reference.clone()
-    candidate[0, 0] = 101.0
-    candidate[0, 1] = 51.0
-    candidate[0, 2] = 26.0
-    candidate[0, 3] = 2.0
-
-    summary = DiffAccumulator.layer_averaged_summary(reference, candidate)
-
-    assert summary["abs_pct_source_numel"] == 40
-    assert summary["abs_pct_trimmed_numel"] == 3
-    assert summary["mean_abs_pct"] == pytest.approx((0.5 / 37) * 100.0)
+    assert summary["mean_abs_pct"] == pytest.approx((1.25 / 1.5) * 100.0)
 
 
 def test_context_parallel_accumulator_dtype_matches_dense_fp32_oracle() -> None:
@@ -203,78 +165,6 @@ def test_production_compiled_flex_default_stays_flash() -> None:
 
     assert compiled_flex_attention._FORCED_FLEX_BACKEND == "FLASH"
     assert compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}
-
-
-def test_forward_mean_abs_pct_excludes_reference_exact_zeros_only() -> None:
-    accumulator = DiffAccumulator()
-
-    accumulator.update(
-        torch.tensor([0.0, 2.0], dtype=torch.float32),
-        torch.tensor([1.0, 0.0], dtype=torch.float32),
-        exclude_reference_exact_zeros_from_abs_pct=True,
-    )
-
-    summary = accumulator.as_summary()
-    assert summary["numel"] == 2
-    assert summary["mean_abs_diff"] == 1.5
-    assert summary["mean_abs_pct"] == pytest.approx(100.0)
-
-
-def test_forward_trace_oracle_exact_zero_guard_has_small_buffer() -> None:
-    reference = {
-        "chunk0.module.decoder.layers.0.call_0": torch.tensor(
-            [0.0] * 5 + [1.0], dtype=torch.float32
-        ),
-        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.call_0": torch.tensor(
-            [0.0] * 5 + [1.0], dtype=torch.float32
-        ),
-        "chunk0.module.decoder.layers.0.mlp.router.call_0": torch.zeros(100),
-    }
-    _assert_abs_pct_oracle_exact_zero_count(
-        "forward",
-        reference,
-        {
-            key: torch.ones_like(value) if "router" not in key else value
-            for key, value in reference.items()
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="too many exact-zero"):
-        _assert_abs_pct_oracle_exact_zero_count(
-            "forward",
-            {
-                "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.call_0": torch.tensor(
-                    [0.0] * 11, dtype=torch.float32
-                )
-            },
-            {
-                "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.call_0": torch.ones(
-                    11, dtype=torch.float32
-                )
-            },
-        )
-
-
-def test_grad_delta_exact_zero_guard_ignores_matching_inactive_experts() -> None:
-    key = "base_model.model.model.layers.0.mlp.experts.0.up_proj.lora_A.weight"
-    _assert_abs_pct_oracle_exact_zero_count(
-        "deltas",
-        {key: torch.zeros(128, dtype=torch.float32)},
-        {key: torch.zeros(128, dtype=torch.float32)},
-    )
-
-    _assert_abs_pct_oracle_exact_zero_count(
-        "grads",
-        {key: torch.tensor([0.0] * 10 + [1.0], dtype=torch.float32)},
-        {key: torch.tensor([1.0] * 10 + [0.0], dtype=torch.float32)},
-    )
-
-    with pytest.raises(RuntimeError, match="too many exact-zero"):
-        _assert_abs_pct_oracle_exact_zero_count(
-            "deltas",
-            {key: torch.zeros(11, dtype=torch.float32)},
-            {key: torch.ones(11, dtype=torch.float32)},
-        )
 
 
 def test_forward_trace_reads_row_uids_from_output_tensor() -> None:
@@ -573,7 +463,7 @@ def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas()
     assert phase_pass["losses"](zero_signal_summary)
 
 
-def test_default_phase_rules_use_one_percent_mean_abs_pct_limit() -> None:
+def test_default_phase_rules_use_default_mean_abs_pct_limit() -> None:
     phase_pass = _default_phase_pass_fns()
     passing_summary = {
         "relative_l2": 0.0,

@@ -16,6 +16,7 @@ from .cases import (
 )
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
+    MEAN_ABS_PCT_MISMATCH_THRESHOLD,
     MEAN_ABS_PCT_THRESHOLD,
     assert_mean_abs_pct,
     mean_abs_pct,
@@ -154,11 +155,11 @@ def test_real_qwen35_gdn_cp_chain_known_bad_mutations_fail() -> None:
             )
         assert (
             _real_token_mean_abs_pct(cp1_out, bad_conv_out, boundary_group_ids)
-            > MEAN_ABS_PCT_THRESHOLD
+            > MEAN_ABS_PCT_MISMATCH_THRESHOLD
         )
         assert (
             _real_token_mean_abs_pct(cp1_out, bad_rec_out, boundary_group_ids)
-            > MEAN_ABS_PCT_THRESHOLD
+            > MEAN_ABS_PCT_MISMATCH_THRESHOLD
         )
 
         ragged_case = cases_by_name["ragged_family_mix"]
@@ -187,7 +188,7 @@ def test_real_qwen35_gdn_cp_chain_known_bad_mutations_fail() -> None:
             )
         assert (
             _real_token_mean_abs_pct(ragged_cp1_out, physical_out, ragged_group_ids)
-            > MEAN_ABS_PCT_THRESHOLD
+            > MEAN_ABS_PCT_MISMATCH_THRESHOLD
         )
 
 
@@ -251,9 +252,12 @@ def test_real_qwen35_gdn_cp_chain_detached_prefix_state_loses_gradients() -> Non
         assert_mean_abs_pct(cp1_loss.detach(), bad_loss.detach(), case.name)
         assert cp1_hidden.grad is not None
         assert bad_hidden.grad is not None
-        assert mean_abs_pct(cp1_hidden.grad, bad_hidden.grad) > MEAN_ABS_PCT_THRESHOLD
+        assert (
+            mean_abs_pct(cp1_hidden.grad, bad_hidden.grad)
+            > MEAN_ABS_PCT_MISMATCH_THRESHOLD
+        )
         _, param_pct = parameter_grad_mean_abs_pct_with_name(cp1_gdn, bad_gdn)
-        assert param_pct > MEAN_ABS_PCT_THRESHOLD
+        assert param_pct > MEAN_ABS_PCT_MISMATCH_THRESHOLD
 
 
 @pytest.mark.skipif(

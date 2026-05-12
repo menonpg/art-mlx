@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 
 from .cases import default_phase0_cases
-from .metrics import GDN_CORRECTNESS_DTYPE, MEAN_ABS_PCT_THRESHOLD, mean_abs_pct
+from .metrics import (
+    GDN_CORRECTNESS_DTYPE,
+    MEAN_ABS_PCT_MISMATCH_THRESHOLD,
+    MEAN_ABS_PCT_THRESHOLD,
+    mean_abs_pct,
+)
 from .oracles import (
     ToyGdnConfig,
     ToyStatefulGdn,
@@ -107,7 +112,10 @@ def test_toy_stateful_oracle_rejects_physical_stream() -> None:
     )
     real_mask = tensors["group_ids"] != -1
 
-    assert mean_abs_pct(packed[real_mask], physical[real_mask]) > MEAN_ABS_PCT_THRESHOLD
+    assert (
+        mean_abs_pct(packed[real_mask], physical[real_mask])
+        > MEAN_ABS_PCT_MISMATCH_THRESHOLD
+    )
 
 
 def _expanded_output_mask(mask: torch.Tensor, hidden_size: int) -> torch.Tensor:

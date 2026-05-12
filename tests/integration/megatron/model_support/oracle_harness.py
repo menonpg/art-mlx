@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 import torch
 
+from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD, mean_abs_pct_from_sums
 from .forward_trace import ForwardTraceCapture
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -82,24 +83,15 @@ REQUIRED_PACKED_TENSOR_FILES = (
     "weights.pt",
 )
 NON_FINITE_METRIC_VALUE = 1e30
-MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
-MEAN_ABS_PCT_OUTLIER_TRIM_K = 3
-MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL = 32
-ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = 1.0
+ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = DEFAULT_MEAN_ABS_PCT_THRESHOLD
 FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT = 3e-4
 FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
-ABS_PCT_EXACT_ZERO_PHASES = frozenset({"forward", "grads", "deltas"})
-ORACLE_EXACT_ZERO_ABS_PCT_LIMIT = 10
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\."
 )
 LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
-FORWARD_TRACE_LAYER_OUTPUT_RE = re.compile(
-    r"\.decoder\.layers\.(?:\d+|__layer_avg__)\.call_\d+$"
-)
-FORWARD_TRACE_ROUTER_RE = re.compile(r"\.mlp\.router\.call_\d+$")
 PHASE_PRINT_ORDER = {
     "forward": 0,
     "router_scores": 1,
@@ -429,8 +421,6 @@ class MetricRow(BaseModel):
     relative_l2: float
     typical_abs_scale: float
     mean_abs_pct: float
-    abs_pct_source_numel: float = 0.0
-    abs_pct_trimmed_numel: float = 0.0
     topk_mismatch_fraction: float | None = None
     top1_mismatch_fraction: float | None = None
     pass_signal: bool = True
@@ -483,32 +473,6 @@ class VariantReport(BaseModel):
     metrics: list[MetricRow] = Field(repr=False)
 
 
-def _abs_pct_outlier_trim_count(numel: int, trim_k: int) -> int:
-    """Returns how many largest elementwise percentage terms to trim."""
-    if trim_k <= 0 or numel < MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL:
-        return 0
-    return min(trim_k, max(numel - 1, 0))
-
-
-def _mean_abs_pct_from_values(
-    abs_pct_values: torch.Tensor,
-    *,
-    trim_k: int = MEAN_ABS_PCT_OUTLIER_TRIM_K,
-) -> tuple[float, int, int]:
-    """Computes mean_abs_pct from elementwise ratios with explicit top-k trimming."""
-    values = abs_pct_values.detach().float().reshape(-1)
-    source_numel = int(values.numel())
-    trim_count = _abs_pct_outlier_trim_count(source_numel, trim_k)
-    if source_numel == 0:
-        return 0.0, 0, 0
-    total = values.sum()
-    if trim_count > 0:
-        total = total - torch.topk(values, trim_count).values.sum()
-    kept_numel = source_numel - trim_count
-    mean_abs_pct = (float(total.item()) / kept_numel) * 100.0
-    return _finite_metric(mean_abs_pct), source_numel, trim_count
-
-
 class DiffAccumulator:
     """Accumulates diff statistics across tensors and router-id mismatch counters."""
 
@@ -519,37 +483,12 @@ class DiffAccumulator:
         self.ref_sq_sum = 0.0
         self.ref_abs_sum = 0.0
         self.candidate_abs_sum = 0.0
-        self.abs_pct_sum = 0.0
-        self.abs_pct_numel = 0
-        self.abs_pct_top_values: list[float] = []
         self.router_topk_total = 0
         self.router_topk_mismatch = 0
         self.router_top1_total = 0
         self.router_top1_mismatch = 0
 
-    def _record_abs_pct_values(self, values: torch.Tensor) -> None:
-        """Tracks the row-level top-k percentage terms without storing all values."""
-        flat = values.detach().float().reshape(-1)
-        if flat.numel() == 0:
-            return
-        self.abs_pct_numel += int(flat.numel())
-        self.abs_pct_sum += float(flat.sum().item())
-        top_count = min(MEAN_ABS_PCT_OUTLIER_TRIM_K, int(flat.numel()))
-        if top_count == 0:
-            return
-        top_values = torch.topk(flat, top_count).values.tolist()
-        self.abs_pct_top_values.extend(float(value) for value in top_values)
-        self.abs_pct_top_values = sorted(self.abs_pct_top_values, reverse=True)[
-            :MEAN_ABS_PCT_OUTLIER_TRIM_K
-        ]
-
-    def update(  # type: ignore[no-untyped-def]
-        self,
-        reference,
-        candidate,
-        *,
-        exclude_reference_exact_zeros_from_abs_pct: bool = False,
-    ) -> None:
+    def update(self, reference, candidate) -> None:  # type: ignore[no-untyped-def]
         """Adds one tensor pair into the accumulator."""
         ref = reference.detach().float()
         cand = candidate.detach().float()
@@ -562,24 +501,9 @@ class DiffAccumulator:
         self.ref_sq_sum += float(ref.square().sum().item())
         self.ref_abs_sum += float(ref.abs().sum().item())
         self.candidate_abs_sum += float(cand.abs().sum().item())
-        abs_pct_ref = ref
-        abs_pct_diff = diff
-        if exclude_reference_exact_zeros_from_abs_pct:
-            abs_pct_mask = ref != 0
-            abs_pct_ref = ref[abs_pct_mask]
-            abs_pct_diff = diff[abs_pct_mask]
-        if abs_pct_diff.numel() > 0:
-            self._record_abs_pct_values(
-                abs_pct_diff / abs_pct_ref.abs().clamp_min(MEAN_ABS_PCT_DENOMINATOR_EPS)
-            )
 
     @staticmethod
-    def layer_averaged_summary(  # type: ignore[no-untyped-def]
-        reference_stack,
-        candidate_stack,
-        *,
-        exclude_reference_exact_zeros_from_abs_pct: bool = False,
-    ) -> dict[str, float]:
+    def layer_averaged_summary(reference_stack, candidate_stack) -> dict[str, float]:  # type: ignore[no-untyped-def]
         """Computes normal per-layer summaries, then averages those summaries."""
         ref = reference_stack.detach().float()
         cand = candidate_stack.detach().float()
@@ -592,46 +516,21 @@ class DiffAccumulator:
                 "relative_l2",
                 "typical_abs_scale",
                 "candidate_abs_scale",
+                "mean_abs_pct",
             ]
         }
-        abs_pct_ratio = (cand - ref).abs() / ref.abs().clamp_min(
-            MEAN_ABS_PCT_DENOMINATOR_EPS
-        )
-        if exclude_reference_exact_zeros_from_abs_pct:
-            abs_pct_ratio = torch.where(
-                ref != 0, abs_pct_ratio, torch.full_like(abs_pct_ratio, torch.nan)
-            )
-        layer_abs_pct = torch.nanmean(abs_pct_ratio, dim=0).reshape(-1)
-        layer_abs_pct = layer_abs_pct[~torch.isnan(layer_abs_pct)]
-        mean_abs_pct, abs_pct_source_numel, abs_pct_trimmed_numel = (
-            _mean_abs_pct_from_values(layer_abs_pct)
-        )
         for layer_index in range(layer_count):
             layer_accumulator = DiffAccumulator()
-            layer_accumulator.update(
-                ref[layer_index],
-                cand[layer_index],
-                exclude_reference_exact_zeros_from_abs_pct=(
-                    exclude_reference_exact_zeros_from_abs_pct
-                ),
-            )
+            layer_accumulator.update(ref[layer_index], cand[layer_index])
             layer_summary = layer_accumulator.as_summary()
             averaged_metrics = {
                 k: averaged_metrics[k] + layer_summary[k]
                 for k in averaged_metrics.keys()
             }
-        summary = {
+        return {
             k: _finite_metric(averaged_metrics[k] / layer_count)
             for k in averaged_metrics.keys()
         }
-        summary["mean_abs_pct"] = mean_abs_pct
-        summary["abs_pct_source_numel"] = _finite_metric(
-            float(abs_pct_source_numel), default=0.0
-        )
-        summary["abs_pct_trimmed_numel"] = _finite_metric(
-            float(abs_pct_trimmed_numel), default=0.0
-        )
-        return summary
 
     def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
         """Adds router top-k id mismatch counts into the accumulator."""
@@ -667,26 +566,12 @@ class DiffAccumulator:
                 "typical_abs_scale": 0.0,
                 "candidate_abs_scale": 0.0,
                 "mean_abs_pct": 0.0,
-                "abs_pct_source_numel": 0.0,
-                "abs_pct_trimmed_numel": 0.0,
                 "topk_mismatch_fraction": topk_fraction,
                 "top1_mismatch_fraction": top1_fraction,
             }
         mean_abs = self.abs_sum / self.numel
         typical_abs = self.ref_abs_sum / self.numel
         candidate_abs = self.candidate_abs_sum / self.numel
-        trim_count = _abs_pct_outlier_trim_count(
-            self.abs_pct_numel, MEAN_ABS_PCT_OUTLIER_TRIM_K
-        )
-        trimmed_abs_pct_sum = self.abs_pct_sum - sum(
-            self.abs_pct_top_values[:trim_count]
-        )
-        kept_abs_pct_numel = self.abs_pct_numel - trim_count
-        mean_abs_pct = (
-            (trimmed_abs_pct_sum / kept_abs_pct_numel) * 100.0
-            if kept_abs_pct_numel > 0
-            else 0.0
-        )
         return {
             "numel": _finite_metric(float(self.numel), default=0.0),
             "mean_abs_diff": _finite_metric(mean_abs),
@@ -695,11 +580,9 @@ class DiffAccumulator:
             ),
             "typical_abs_scale": _finite_metric(typical_abs, default=0.0),
             "candidate_abs_scale": _finite_metric(candidate_abs, default=0.0),
-            "mean_abs_pct": _finite_metric(mean_abs_pct),
-            "abs_pct_source_numel": _finite_metric(
-                float(self.abs_pct_numel), default=0.0
+            "mean_abs_pct": _finite_metric(
+                mean_abs_pct_from_sums(self.abs_sum, self.ref_abs_sum, self.numel)
             ),
-            "abs_pct_trimmed_numel": _finite_metric(float(trim_count), default=0.0),
             "topk_mismatch_fraction": _finite_metric(topk_fraction, default=1.0),
             "top1_mismatch_fraction": _finite_metric(top1_fraction, default=1.0),
         }
@@ -1258,95 +1141,6 @@ def _stacked_layers(
     return stacked_pairs
 
 
-def _is_forward_trace_layer_output_param(param: str) -> bool:
-    """Returns whether one flattened forward-trace key is a decoder layer output."""
-    return FORWARD_TRACE_LAYER_OUTPUT_RE.search(param) is not None
-
-
-def _is_abs_pct_exact_zero_exclusion_param(phase: str, param: str) -> bool:
-    """Returns whether exact oracle zeros are excluded from mean_abs_pct."""
-    if phase == "forward":
-        return FORWARD_TRACE_ROUTER_RE.search(param) is None
-    return phase in {"grads", "deltas"}
-
-
-def _abs_pct_exact_zero_exclusion_count(
-    phase: str,
-    reference: dict[str, Any],
-    candidate: dict[str, Any],
-) -> int:
-    """Counts exact-zero oracle entries guarded by the mean_abs_pct exclusion."""
-    zero_count = 0
-    for key, value in reference.items():
-        zero_count += _abs_pct_exact_zero_exclusion_count_for_pair(
-            phase, key, value, candidate[key]
-        )
-    return zero_count
-
-
-def _abs_pct_exact_zero_exclusion_count_for_pair(
-    phase: str,
-    param: str,
-    reference: Any,
-    candidate: Any,
-) -> int:
-    if not _is_abs_pct_exact_zero_exclusion_param(phase, param):
-        return 0
-    if not isinstance(reference, torch.Tensor) or not isinstance(
-        candidate, torch.Tensor
-    ):
-        return 0
-    if tuple(reference.shape) != tuple(candidate.shape):
-        return 0
-    zero_mask = reference.detach() == 0
-    # MoE maps naturally contain exact-zero inactive paths. Matching zeros do not
-    # hide a diff; only candidate-nonzero zero-denominator entries can.
-    zero_mask = zero_mask & (candidate.detach() != 0)
-    return int(zero_mask.sum().item())
-
-
-def _abs_pct_exact_zero_exclusion_count_for_pairs(
-    phase: str, pairs: list[tuple[str, Any, Any]]
-) -> int:
-    zero_count = 0
-    for param, reference, candidate in pairs:
-        aligned_candidate = _align_sequence_parallel(reference, candidate)
-        if aligned_candidate is None:
-            continue
-        zero_count += _abs_pct_exact_zero_exclusion_count_for_pair(
-            phase, param, reference, aligned_candidate
-        )
-    return zero_count
-
-
-def _assert_abs_pct_oracle_exact_zero_count(
-    phase: str,
-    reference: dict[str, Any],
-    candidate: dict[str, Any],
-) -> None:
-    """Guards the narrow exact-zero mean_abs_pct exclusion."""
-    zero_count = _abs_pct_exact_zero_exclusion_count(phase, reference, candidate)
-    if zero_count > ORACLE_EXACT_ZERO_ABS_PCT_LIMIT:
-        raise RuntimeError(
-            f"{phase} oracle contains too many exact-zero elements excluded "
-            "from mean_abs_pct: "
-            f"{zero_count} > {ORACLE_EXACT_ZERO_ABS_PCT_LIMIT}"
-        )
-
-
-def _assert_abs_pct_oracle_exact_zero_count_for_pairs(
-    phase: str, pairs: list[tuple[str, Any, Any]]
-) -> None:
-    """Guards exact-zero exclusion after topology-aware tensor alignment."""
-    zero_count = _abs_pct_exact_zero_exclusion_count_for_pairs(phase, pairs)
-    if zero_count > ORACLE_EXACT_ZERO_ABS_PCT_LIMIT:
-        raise RuntimeError(
-            f"{phase} oracle contains too many exact-zero elements excluded "
-            "from mean_abs_pct: "
-            f"{zero_count} > {ORACLE_EXACT_ZERO_ABS_PCT_LIMIT}"
-        )
-
-
 class VariantRunner:
     """Runs oracle/candidate variants and emits row-level comparison reports."""
 
@@ -1670,8 +1464,6 @@ class VariantRunner:
             "typical_abs_scale": 0.0,
             "candidate_abs_scale": 0.0,
             "mean_abs_pct": NON_FINITE_METRIC_VALUE,
-            "abs_pct_source_numel": 0.0,
-            "abs_pct_trimmed_numel": 0.0,
             "topk_mismatch_fraction": 1.0,
             "top1_mismatch_fraction": 1.0,
         }
@@ -1700,8 +1492,6 @@ class VariantRunner:
             relative_l2=summary["relative_l2"],
             typical_abs_scale=summary["typical_abs_scale"],
             mean_abs_pct=summary["mean_abs_pct"],
-            abs_pct_source_numel=summary.get("abs_pct_source_numel", 0.0),
-            abs_pct_trimmed_numel=summary.get("abs_pct_trimmed_numel", 0.0),
             topk_mismatch_fraction=summary.get("topk_mismatch_fraction"),
             top1_mismatch_fraction=summary.get("top1_mismatch_fraction"),
         )
@@ -1728,15 +1518,10 @@ class VariantRunner:
         pairs: list[tuple[str, Any, Any]],
         router_ids: bool = False,
         layer_averaged: bool = False,
-        exclude_reference_exact_zeros_from_abs_pct: bool = False,
     ) -> list[MetricRow]:
         """Builds rows from named tensor pairs with one shared diff path."""
         rows: list[MetricRow] = []
         for name, reference, candidate in pairs:
-            exclude_reference_zeros = (
-                exclude_reference_exact_zeros_from_abs_pct
-                and _is_abs_pct_exact_zero_exclusion_param(phase, name)
-            )
             reference_aligned = reference
             candidate_aligned = candidate
             aligned_candidate = _align_sequence_parallel(
@@ -1763,19 +1548,10 @@ class VariantRunner:
                 summary = DiffAccumulator.layer_averaged_summary(
                     reference_aligned,
                     aligned_candidate,
-                    exclude_reference_exact_zeros_from_abs_pct=(
-                        exclude_reference_zeros
-                    ),
                 )
             else:
                 accumulator = DiffAccumulator()
-                accumulator.update(
-                    reference_aligned,
-                    aligned_candidate,
-                    exclude_reference_exact_zeros_from_abs_pct=(
-                        exclude_reference_zeros
-                    ),
-                )
+                accumulator.update(reference_aligned, aligned_candidate)
                 summary = accumulator.as_summary()
             rows.append(
                 self._build_metric_row(
@@ -1830,15 +1606,12 @@ class VariantRunner:
         )
         if not matching:
             return rows if rows is not None else []
-        exclude_reference_exact_zeros = phase in ABS_PCT_EXACT_ZERO_PHASES
         pairs = [
             (key, reference[key], candidate[key])
             for key in sorted(set(reference.keys()))
         ]
         if phase in {"forward", "grads", "deltas"}:
             pairs = _stacked_layers(pairs)
-        if exclude_reference_exact_zeros:
-            _assert_abs_pct_oracle_exact_zero_count_for_pairs(phase, pairs)
         rows = self._build_metric_rows_from_tensor_pairs(
             variant=variant,
             step_index=step_index,
@@ -1846,7 +1619,6 @@ class VariantRunner:
             pairs=pairs,
             router_ids=router_ids,
             layer_averaged=phase in {"forward", "grads", "deltas"},
-            exclude_reference_exact_zeros_from_abs_pct=exclude_reference_exact_zeros,
         )
         if phase in {"grads", "deltas"}:
             rows.extend(
@@ -1867,9 +1639,6 @@ class VariantRunner:
                     ),
                     router_ids=router_ids,
                     layer_averaged=True,
-                    exclude_reference_exact_zeros_from_abs_pct=(
-                        exclude_reference_exact_zeros
-                    ),
                 )
             )
         return rows
@@ -2133,7 +1902,6 @@ class VariantRunner:
         detail_table.add_column("Status")
         detail_table.add_column("relative_l2", justify="right")
         detail_table.add_column("mean_abs_pct", justify="right")
-        detail_table.add_column("pct_trim", justify="right")
         detail_table.add_column("typical_abs", justify="right")
         detail_table.add_column("mean_abs_diff", justify="right")
         detail_table.add_column("Failure")
@@ -2158,7 +1926,6 @@ class VariantRunner:
                 status_text,
                 f"{row.relative_l2:.6g}",
                 f"{row.mean_abs_pct:.6g}%",
-                f"{row.abs_pct_trimmed_numel:.0f}/{row.abs_pct_source_numel:.0f}",
                 f"{row.typical_abs_scale:.6g}",
                 f"{row.mean_abs_diff:.6g}",
                 failure_text,

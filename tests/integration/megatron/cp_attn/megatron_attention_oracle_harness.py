@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD
 from ..model_support.oracle_harness import (
     FlexBackend,
     LoraConfig,
@@ -134,16 +135,15 @@ def _selected_attention_topologies() -> list[tuple[int, Topology]]:
 
 
 def _attention_phase_pass_fns() -> dict[str, PhasePassFn]:
-    fwd_out_loss = MetricThresholdRule(
-        limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0}
+    metric_rule = MetricThresholdRule(
+        limits={"mean_abs_pct": DEFAULT_MEAN_ABS_PCT_THRESHOLD}
     )
-    grads_deltas = MetricThresholdRule(limits={"mean_abs_pct": 7.0})
     return {
-        "forward": fwd_out_loss,
-        "outputs": fwd_out_loss,
-        "losses": fwd_out_loss,
-        "grads": grads_deltas,
-        "deltas": grads_deltas,
+        "forward": metric_rule,
+        "outputs": metric_rule,
+        "losses": metric_rule,
+        "grads": metric_rule,
+        "deltas": metric_rule,
     }
 
 

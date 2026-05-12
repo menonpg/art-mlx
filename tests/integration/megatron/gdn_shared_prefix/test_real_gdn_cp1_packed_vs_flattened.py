@@ -27,7 +27,12 @@ from torch.distributed import (
 from art.megatron.gdn.operator import _causal_conv1d_with_state
 
 from .cases import default_phase0_cases
-from .metrics import GDN_CORRECTNESS_DTYPE, MEAN_ABS_PCT_THRESHOLD, mean_abs_pct
+from .metrics import (
+    GDN_CORRECTNESS_DTYPE,
+    MEAN_ABS_PCT_MISMATCH_THRESHOLD,
+    MEAN_ABS_PCT_THRESHOLD,
+    mean_abs_pct,
+)
 from .packed_layout import build_phase0_packed_tensors
 from .real_gdn_oracle import (
     attach_main_grads,
@@ -152,7 +157,7 @@ def test_real_qwen35_gdn_cp1_matches_flattened_and_rejects_physical() -> None:
                         flattened.transpose(0, 1)[assistant_mask],
                         physical.transpose(0, 1)[assistant_mask],
                     )
-                    > MEAN_ABS_PCT_THRESHOLD
+                    > MEAN_ABS_PCT_MISMATCH_THRESHOLD
                 ), case.name
 
 
