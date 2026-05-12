@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import faulthandler
 import os
 from pathlib import Path
@@ -36,8 +37,16 @@ from .hf_parity import (
     summarize_tensor_pair,
     zero_hf_dropout_config,
 )
-from .oracle_harness import ORACLE_TOPOLOGY, _read_json, _write_json
+from .oracle_harness import (
+    ORACLE_TOPOLOGY,
+    TEST_DEFAULT_FLEX_BACKEND,
+    _read_json,
+    _write_json,
+)
 from .oracle_worker import (
+    _apply_requested_flex_backend_patch,
+    _apply_test_attention_full_fp32_patch,
+    _apply_test_flex_inner_fp32_patch,
     _assert_runtime_configuration,
     _build_optimizer_config,
     _configure_cuda_precision,
@@ -788,6 +797,16 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
     )
     device = torch.device("cuda", 0)
+    flex_patch_stack = ExitStack()
+    flex_patch_stack.enter_context(
+        _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
+    flex_patch_stack.enter_context(
+        _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
+    flex_patch_stack.enter_context(
+        _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
     try:
         _debug("starting HF parity worker")
         model_support_handler = get_model_support_handler(
@@ -857,6 +876,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
         _debug("wrote HF parity report")
     finally:
+        flex_patch_stack.close()
         if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
             torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
 
