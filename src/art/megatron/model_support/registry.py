@@ -21,7 +21,7 @@ _DENSE_TARGET_MODULES = (
     "down_proj",
 )
 
-_QWEN3_5_MOE_TARGET_MODULES = (
+_QWEN3_5_DENSE_TARGET_MODULES = (
     "q_proj",
     "k_proj",
     "v_proj",
@@ -32,6 +32,17 @@ _QWEN3_5_MOE_TARGET_MODULES = (
     "gate_proj",
     "up_proj",
     "down_proj",
+)
+
+_QWEN3_5_MOE_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "out_proj",
+    "experts",
 )
 
 DEFAULT_DENSE_SPEC = ModelSupportSpec(
@@ -84,7 +95,7 @@ QWEN3_5_DENSE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.6-27B",
     ),
-    default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
+    default_target_modules=_QWEN3_5_DENSE_TARGET_MODULES,
     native_vllm_lora_status=QWEN3_5_DENSE_HANDLER.native_vllm_lora_status,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",

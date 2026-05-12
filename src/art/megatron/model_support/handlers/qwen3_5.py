@@ -29,7 +29,7 @@ _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+    r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
 )
 _VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
@@ -414,25 +414,15 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import wrap_grouped_moe_experts, wrap_shared_experts_mlp
+        from art.megatron.lora import wrap_grouped_moe_experts_3d
 
-        wrap_grouped_moe_experts(
+        wrap_grouped_moe_experts_3d(
             _require_moe_experts(module),
             adapter_model_prefix=adapter_model_prefix,
             target_modules=target_modules,
             rank=rank,
             alpha=alpha,
         )
-        shared_experts = getattr(module.mlp, "shared_experts", None)
-        if shared_experts is not None:
-            wrap_shared_experts_mlp(
-                shared_experts,
-                adapter_model_prefix=adapter_model_prefix,
-                provider=provider,
-                target_modules=target_modules,
-                rank=rank,
-                alpha=alpha,
-            )
 
     def _add_mlp_adapter_weights(
         self,
@@ -443,7 +433,6 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     ) -> None:
         from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
-            add_shared_experts_adapter_weights,
         )
 
         add_grouped_moe_adapter_weights(
@@ -451,13 +440,6 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             layer_prefix=layer_prefix,
             experts=_require_moe_experts(module),
         )
-        shared_experts = getattr(module.mlp, "shared_experts", None)
-        if shared_experts is not None:
-            add_shared_experts_adapter_weights(
-                adapter_weights_by_base,
-                layer_prefix=layer_prefix,
-                shared_experts=shared_experts,
-            )
 
     def compile_workaround_config(
         self,
@@ -606,26 +588,6 @@ def _from_vllm_lora_tensor(
     return art_key, tensor
 
 
-def _pad_a(tensor: torch.Tensor, rank: int) -> torch.Tensor:
-    if tensor.shape[0] == rank:
-        return tensor
-    if tensor.shape[0] > rank:
-        return tensor[:rank, :].contiguous()
-    padded = tensor.new_zeros((rank, tensor.shape[1]))
-    padded[: tensor.shape[0], :] = tensor
-    return padded.contiguous()
-
-
-def _pad_b(tensor: torch.Tensor, rank: int) -> torch.Tensor:
-    if tensor.shape[1] == rank:
-        return tensor
-    if tensor.shape[1] > rank:
-        return tensor[:, :rank].contiguous()
-    padded = tensor.new_zeros((tensor.shape[0], rank))
-    padded[:, : tensor.shape[1]] = tensor
-    return padded.contiguous()
-
-
 def _pack_vllm_3d_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
     stacked = torch.stack(blocks, dim=0)
     return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
@@ -640,18 +602,13 @@ def _unpack_vllm_3d_lora_b(
     return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
 
 
-def _adapter_scale(adapter_config: dict[str, Any]) -> float:
-    rank = int(adapter_config.get("r", 1) or 1)
-    alpha = int(adapter_config.get("lora_alpha", rank) or rank)
-    return alpha / rank
-
-
-def _vllm_moe_config(adapter_config: dict[str, Any], rank: int) -> dict[str, Any]:
-    vllm_rank = 2 * rank
+def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     config = dict(adapter_config)
-    config["r"] = vllm_rank
-    config["lora_alpha"] = round(_adapter_scale(adapter_config) * vllm_rank)
-    target_modules = list(config.get("target_modules") or [])
+    target_modules = [
+        module
+        for module in list(config.get("target_modules") or [])
+        if module not in {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+    ]
     if "experts" not in target_modules:
         target_modules.append("experts")
     config["target_modules"] = target_modules
@@ -673,19 +630,6 @@ def _group_art_moe_tensors(
     return grouped
 
 
-def _rank_from_grouped_moe(
-    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]],
-) -> int:
-    for experts in grouped.values():
-        for modules in experts.values():
-            for loras in modules.values():
-                if "lora_A" in loras:
-                    return int(loras["lora_A"].shape[0])
-                if "lora_B" in loras:
-                    return int(loras["lora_B"].shape[1])
-    raise RuntimeError("Could not infer Qwen3.5 MoE LoRA rank")
-
-
 def _to_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
@@ -702,8 +646,6 @@ def _to_vllm_lora_tensors(
             )
             transformed[vllm_key] = tensor
         return transformed, adapter_config
-    rank = _rank_from_grouped_moe(grouped)
-    vllm_rank = 2 * rank
     transformed: dict[str, torch.Tensor] = {}
     used_keys: set[str] = set()
     for prefix, experts in grouped.items():
@@ -715,24 +657,19 @@ def _to_vllm_lora_tensors(
         for expert in sorted(experts):
             modules = experts[expert]
             try:
-                gate_a = modules["gate_proj"]["lora_A"]
-                gate_b = modules["gate_proj"]["lora_B"]
-                up_a = modules["up_proj"]["lora_A"]
-                up_b = modules["up_proj"]["lora_B"]
+                gate_up_a_tensor = modules["gate_up_proj"]["lora_A"]
+                gate_up_b_tensor = modules["gate_up_proj"]["lora_B"]
                 d_a = modules["down_proj"]["lora_A"]
                 d_b = modules["down_proj"]["lora_B"]
             except KeyError as exc:
                 raise RuntimeError(
                     f"Incomplete Qwen3.5 MoE LoRA block for {prefix}.{expert}"
                 ) from exc
-            gate_up_a.append(torch.cat((gate_a, up_a), dim=0).contiguous())
-            block_b = gate_b.new_zeros((gate_b.shape[0] + up_b.shape[0], vllm_rank))
-            block_b[: gate_b.shape[0], :rank] = gate_b
-            block_b[gate_b.shape[0] :, rank:] = up_b
-            gate_up_b.append(block_b.contiguous())
-            down_a.append(_pad_a(d_a, vllm_rank))
-            down_b.append(_pad_b(d_b, vllm_rank))
-            for module_name in ("gate_proj", "up_proj", "down_proj"):
+            gate_up_a.append(gate_up_a_tensor.contiguous())
+            gate_up_b.append(gate_up_b_tensor.contiguous())
+            down_a.append(d_a.contiguous())
+            down_b.append(d_b.contiguous())
+            for module_name in ("gate_up_proj", "down_proj"):
                 for lora_name in ("lora_A", "lora_B"):
                     used_keys.add(f"{prefix}.{expert}.{module_name}.{lora_name}.weight")
         transformed[f"{vllm_prefix}.base_layer.lora_A.weight"] = torch.cat(
@@ -755,12 +692,8 @@ def _to_vllm_lora_tensors(
             tensor,
             adapter_config=adapter_config,
         )
-        if vllm_key.endswith(".lora_A.weight"):
-            tensor = _pad_a(tensor, vllm_rank)
-        elif vllm_key.endswith(".lora_B.weight"):
-            tensor = _pad_b(tensor, vllm_rank)
         transformed[vllm_key] = tensor
-    return transformed, _vllm_moe_config(adapter_config, rank)
+    return transformed, _vllm_moe_config(adapter_config)
 
 
 def _from_vllm_lora_tensors(
@@ -788,10 +721,7 @@ def _from_vllm_lora_tensors(
             transformed[art_key] = tensor
         return transformed
 
-    vllm_rank = int(adapter_config["r"])
-    if vllm_rank % 2 != 0:
-        raise RuntimeError(f"Qwen3.5 vLLM MoE LoRA rank must be even, got {vllm_rank}")
-    rank = vllm_rank // 2
+    rank = int(adapter_config["r"])
     transformed: dict[str, torch.Tensor] = {}
     used_keys: set[str] = set()
     for prefix, slots in grouped.items():
@@ -804,47 +734,40 @@ def _from_vllm_lora_tensors(
             raise RuntimeError(
                 f"Incomplete Qwen3.5 vLLM MoE LoRA block for {prefix}"
             ) from exc
-        if gate_up_a.shape[0] % vllm_rank != 0:
+        if gate_up_a.shape[0] % rank != 0:
             raise RuntimeError(
                 f"{prefix}: gate/up lora_A shape {tuple(gate_up_a.shape)} "
-                f"is not divisible by rank {vllm_rank}"
+                f"is not divisible by rank {rank}"
             )
-        num_experts = gate_up_a.shape[0] // vllm_rank
-        intermediate = gate_up_b.shape[0] // 2
+        num_experts = gate_up_a.shape[0] // rank
         art_prefix = _from_vllm_key(prefix)
         gate_up_b_by_expert = _unpack_vllm_3d_lora_b(
             gate_up_b,
             num_experts=num_experts,
-            rank=vllm_rank,
+            rank=rank,
         )
         down_b_by_expert = _unpack_vllm_3d_lora_b(
             down_b,
             num_experts=num_experts,
-            rank=vllm_rank,
+            rank=rank,
         )
         for expert in range(num_experts):
-            row = expert * vllm_rank
-            gate_up_a_block = gate_up_a[row : row + vllm_rank]
-            down_a_block = down_a[row : row + vllm_rank]
+            row = expert * rank
+            gate_up_a_block = gate_up_a[row : row + rank]
+            down_a_block = down_a[row : row + rank]
             gate_up_b_block = gate_up_b_by_expert[expert]
             down_b_block = down_b_by_expert[expert]
-            transformed[f"{art_prefix}.{expert}.gate_proj.lora_A.weight"] = (
-                gate_up_a_block[:rank].contiguous()
+            transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"] = (
+                gate_up_a_block.contiguous()
             )
-            transformed[f"{art_prefix}.{expert}.up_proj.lora_A.weight"] = (
-                gate_up_a_block[rank:].contiguous()
-            )
-            transformed[f"{art_prefix}.{expert}.gate_proj.lora_B.weight"] = (
-                gate_up_b_block[:intermediate, :rank].contiguous()
-            )
-            transformed[f"{art_prefix}.{expert}.up_proj.lora_B.weight"] = (
-                gate_up_b_block[intermediate:, rank:].contiguous()
+            transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"] = (
+                gate_up_b_block.contiguous()
             )
             transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = (
-                down_a_block[:rank].contiguous()
+                down_a_block.contiguous()
             )
             transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = (
-                down_b_block[:, :rank].contiguous()
+                down_b_block.contiguous()
             )
         used_keys.update(
             {
@@ -862,10 +785,6 @@ def _from_vllm_lora_tensors(
             tensor,
             adapter_config=adapter_config,
         )
-        if art_key.endswith(".lora_A.weight"):
-            tensor = _pad_a(tensor, rank)
-        elif art_key.endswith(".lora_B.weight"):
-            tensor = _pad_b(tensor, rank)
         transformed[art_key] = tensor
     return transformed
 
