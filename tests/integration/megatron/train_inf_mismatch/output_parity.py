@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .artifacts import REPO_ROOT
 
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
-MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-12
+MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 
 RolloutMode = Literal["native_lora", "merged"]
