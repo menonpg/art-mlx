@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -10,10 +12,11 @@ from .output_parity import (
     ScoreBundle,
     TokenTopK,
     WeightState,
+    aggregate_mean_abs_pct,
     build_logical_token_map,
     compare_rollout,
+    compare_topk,
     config_from_env,
-    sequence_mean_abs_pct,
 )
 
 
@@ -40,40 +43,19 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
     ]
 
 
-def test_sequence_mean_abs_pct_uses_elementwise_support_branch_formula() -> None:
-    summary = sequence_mean_abs_pct(
-        candidate=torch.tensor([0.5, 0.0]),
-        target=torch.tensor([1.0, -2.0]),
+def test_aggregate_mean_abs_pct_uses_vllm_merge_formula() -> None:
+    summary = aggregate_mean_abs_pct(
+        candidate=torch.tensor([2.0, 4.0]),
+        target=torch.tensor([1.0, 3.0]),
         sequence_ids=[0, 0],
     )
 
     assert summary.source_numel == 2
     assert summary.trimmed_numel == 0
-    assert summary.mean_abs_pct == pytest.approx(
-        ((0.5 / 1.0) + (2.0 / 2.0)) / 2 * 100.0
-    )
+    assert summary.mean_abs_pct == pytest.approx((2.0 / 4.0) * 100.0)
 
 
-def test_sequence_mean_abs_pct_trims_top_three_per_sequence() -> None:
-    target = torch.ones(40)
-    candidate = target.clone()
-    candidate[0] = 101.0
-    candidate[1] = 51.0
-    candidate[2] = 26.0
-    candidate[3] = 2.0
-
-    summary = sequence_mean_abs_pct(
-        candidate=candidate,
-        target=target,
-        sequence_ids=[0] * 40,
-    )
-
-    assert summary.source_numel == 40
-    assert summary.trimmed_numel == 3
-    assert summary.mean_abs_pct == pytest.approx((1.0 / 37) * 100.0)
-
-
-def test_sequence_mean_abs_pct_averages_sequence_summaries() -> None:
+def test_aggregate_mean_abs_pct_does_not_trim_or_average_sequence_summaries() -> None:
     target = torch.ones(80)
     candidate = target.clone()
     candidate[0] = 101.0
@@ -81,15 +63,16 @@ def test_sequence_mean_abs_pct_averages_sequence_summaries() -> None:
     candidate[2] = 26.0
     candidate[3] = 2.0
 
-    summary = sequence_mean_abs_pct(
+    summary = aggregate_mean_abs_pct(
         candidate=candidate,
         target=target,
         sequence_ids=[0] * 40 + [1] * 40,
     )
 
     assert summary.source_numel == 80
-    assert summary.trimmed_numel == 6
-    assert summary.mean_abs_pct == pytest.approx(((1.0 / 37) * 100.0) / 2)
+    assert summary.sequence_count == 2
+    assert summary.trimmed_numel == 0
+    assert summary.mean_abs_pct == pytest.approx((176.0 / 80.0) * 100.0)
 
 
 def _score(
@@ -132,6 +115,40 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
     assert report.base.mean_abs_pct > 0
     assert report.lora.mean_abs_pct > 0
     assert report.delta.mean_abs_pct > 0
+
+
+def test_compare_topk_reports_restricted_intersection_kl() -> None:
+    target = ScoreBundle(
+        side="megatron",
+        weight_state="base",
+        target_logprobs=[0.0],
+        topk=[
+            TokenTopK(
+                token_ids=[10, 11],
+                logprobs=[math.log(0.75), math.log(0.25)],
+            )
+        ],
+    )
+    candidate = ScoreBundle(
+        side="vllm",
+        weight_state="base",
+        target_logprobs=[0.0],
+        topk=[
+            TokenTopK(
+                token_ids=[10, 11],
+                logprobs=[math.log(0.5), math.log(0.5)],
+            )
+        ],
+    )
+
+    report = compare_topk(candidate, target)
+
+    assert report.top20_intersection_kl_target_to_candidate == pytest.approx(
+        0.75 * math.log(0.75 / 0.5) + 0.25 * math.log(0.25 / 0.5)
+    )
+    assert report.top20_intersection_kl_candidate_to_target == pytest.approx(
+        0.5 * math.log(0.5 / 0.75) + 0.5 * math.log(0.5 / 0.25)
+    )
 
 
 def test_config_from_env_accepts_lora_target_module_override(

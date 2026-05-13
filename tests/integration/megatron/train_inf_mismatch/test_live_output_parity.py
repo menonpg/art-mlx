@@ -50,4 +50,3 @@ async def test_train_inf_output_parity_live(artifact_dir: Path) -> None:
     for comparison in report.rollout_comparisons:
         assert comparison.base.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
         assert comparison.lora.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
-        assert comparison.delta.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT

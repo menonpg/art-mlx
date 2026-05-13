@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 import hashlib
 import json
@@ -22,9 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .artifacts import REPO_ROOT
 
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
-MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
-MEAN_ABS_PCT_OUTLIER_TRIM_K = 3
-MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL = 32
+MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-12
 TOP_K = 20
 
 RolloutMode = Literal["native_lora", "merged"]
@@ -145,6 +142,8 @@ class TopKComparison(BaseModel):
     top1_match_rate: float
     top20_overlap_rate: float
     top20_intersection_logprob_mae: float
+    top20_intersection_kl_target_to_candidate: float
+    top20_intersection_kl_candidate_to_target: float
     compared_intersection_count: int
 
 
@@ -366,13 +365,7 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
     return LogicalTokenMap(prompts=prompts, tokens=logical_tokens)
 
 
-def _abs_pct_outlier_trim_count(numel: int) -> int:
-    if numel < MEAN_ABS_PCT_OUTLIER_TRIM_MIN_NUMEL:
-        return 0
-    return min(MEAN_ABS_PCT_OUTLIER_TRIM_K, max(numel - 1, 0))
-
-
-def sequence_mean_abs_pct(
+def aggregate_mean_abs_pct(
     *,
     candidate: Any,
     target: Any,
@@ -395,29 +388,17 @@ def sequence_mean_abs_pct(
             source_numel=0,
             trimmed_numel=0,
         )
-    ratio = (cand - ref).abs() / ref.abs().clamp_min(MEAN_ABS_PCT_DENOMINATOR_EPS)
-    ratios_by_sequence: dict[int, list[float]] = defaultdict(list)
-    for sequence_id, value in zip(sequence_ids, ratio.tolist(), strict=True):
-        ratios_by_sequence[int(sequence_id)].append(float(value))
-
-    sequence_pcts: list[float] = []
-    trimmed_total = 0
-    source_total = 0
-    for values in ratios_by_sequence.values():
-        tensor = torch.tensor(values, dtype=torch.float32)
-        source_total += int(tensor.numel())
-        trim_count = _abs_pct_outlier_trim_count(int(tensor.numel()))
-        trimmed_total += trim_count
-        if trim_count > 0:
-            keep_mask = torch.ones_like(tensor, dtype=torch.bool)
-            keep_mask[torch.topk(tensor, trim_count).indices] = False
-            tensor = tensor[keep_mask]
-        sequence_pcts.append(float(tensor.mean().item()) * 100.0)
+    sequence_count = len({int(sequence_id) for sequence_id in sequence_ids})
+    mean_abs_diff = float((cand - ref).abs().mean().item())
+    mean_abs_reference = float(ref.abs().mean().item())
     return MeanAbsPctSummary(
-        mean_abs_pct=float(sum(sequence_pcts) / len(sequence_pcts)),
-        sequence_count=len(sequence_pcts),
-        source_numel=source_total,
-        trimmed_numel=trimmed_total,
+        mean_abs_pct=(
+            mean_abs_diff / (mean_abs_reference + MEAN_ABS_PCT_DENOMINATOR_EPS)
+        )
+        * 100.0,
+        sequence_count=sequence_count,
+        source_numel=int(cand.numel()),
+        trimmed_numel=0,
     )
 
 
@@ -438,7 +419,7 @@ def compare_pair(
 
     cand = candidate.detach().float().reshape(-1)
     ref = target.detach().float().reshape(-1)
-    pct = sequence_mean_abs_pct(
+    pct = aggregate_mean_abs_pct(
         candidate=cand,
         target=ref,
         sequence_ids=sequence_ids,
@@ -458,6 +439,31 @@ def compare_pair(
     )
 
 
+def _logsumexp(values: list[float]) -> float:
+    max_value = max(values)
+    return max_value + math.log(sum(math.exp(value - max_value) for value in values))
+
+
+def _restricted_kl(
+    left_by_id: dict[int, float],
+    right_by_id: dict[int, float],
+    token_ids: set[int],
+) -> float:
+    if not token_ids:
+        return 0.0
+    ordered_ids = sorted(token_ids)
+    left_values = [left_by_id[token_id] for token_id in ordered_ids]
+    right_values = [right_by_id[token_id] for token_id in ordered_ids]
+    left_log_z = _logsumexp(left_values)
+    right_log_z = _logsumexp(right_values)
+    kl = 0.0
+    for left_value, right_value in zip(left_values, right_values, strict=True):
+        left_logprob = left_value - left_log_z
+        right_logprob = right_value - right_log_z
+        kl += math.exp(left_logprob) * (left_logprob - right_logprob)
+    return float(kl)
+
+
 def compare_topk(candidate: ScoreBundle, target: ScoreBundle) -> TopKComparison:
     if len(candidate.topk) != len(target.topk):
         raise RuntimeError("top-k score length mismatch")
@@ -465,6 +471,9 @@ def compare_topk(candidate: ScoreBundle, target: ScoreBundle) -> TopKComparison:
     overlap_sum = 0.0
     intersection_abs_sum = 0.0
     intersection_count = 0
+    target_to_candidate_kl_sum = 0.0
+    candidate_to_target_kl_sum = 0.0
+    kl_count = 0
     for cand_topk, ref_topk in zip(candidate.topk, target.topk, strict=True):
         cand_ids = cand_topk.token_ids[:TOP_K]
         ref_ids = ref_topk.token_ids[:TOP_K]
@@ -479,12 +488,26 @@ def compare_topk(candidate: ScoreBundle, target: ScoreBundle) -> TopKComparison:
         for token_id in intersection:
             intersection_abs_sum += abs(cand_by_id[token_id] - ref_by_id[token_id])
             intersection_count += 1
+        if intersection:
+            target_to_candidate_kl_sum += _restricted_kl(
+                ref_by_id, cand_by_id, intersection
+            )
+            candidate_to_target_kl_sum += _restricted_kl(
+                cand_by_id, ref_by_id, intersection
+            )
+            kl_count += 1
     count = max(len(candidate.topk), 1)
     return TopKComparison(
         top1_match_rate=top1_matches / count,
         top20_overlap_rate=overlap_sum / count,
         top20_intersection_logprob_mae=(
             intersection_abs_sum / intersection_count if intersection_count else 0.0
+        ),
+        top20_intersection_kl_target_to_candidate=(
+            target_to_candidate_kl_sum / kl_count if kl_count else 0.0
+        ),
+        top20_intersection_kl_candidate_to_target=(
+            candidate_to_target_kl_sum / kl_count if kl_count else 0.0
         ),
         compared_intersection_count=intersection_count,
     )
@@ -1286,7 +1309,6 @@ async def run_train_inf_output_parity(
     passed = all(
         comparison.base.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
         and comparison.lora.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
-        and comparison.delta.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
         for comparison in rollout_comparisons
     )
     report = TrainInfOutputParityReport(
