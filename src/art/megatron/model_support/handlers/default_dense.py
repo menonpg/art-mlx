@@ -47,6 +47,8 @@ class DefaultDenseHandler:
             suffixes.extend(("up_proj.weight", "mlp.experts.gate_up_proj"))
         if "down_proj" in target_set:
             suffixes.extend(("down_proj.weight", "mlp.experts.down_proj"))
+        if "experts" in target_set:
+            suffixes.extend(("mlp.experts.gate_up_proj", "mlp.experts.down_proj"))
         return tuple(dict.fromkeys(suffixes))
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:

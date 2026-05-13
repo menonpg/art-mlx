@@ -398,6 +398,14 @@ def sync_merged_weights_to_vllm(
                 error=pause_error,
             )
             try:
+                _post_with_retry(
+                    client.post,
+                    f"{spec.vllm_base_url}/start_weight_update",
+                    phase="start merged weight update",
+                    json={"is_checkpoint_format": True},
+                    headers=_runtime_headers(spec),
+                    timeout=300.0,
+                )
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     send_future = executor.submit(_send_weights)
                     _post_with_retry(
@@ -409,7 +417,6 @@ def sync_merged_weights_to_vllm(
                                 "names": names,
                                 "dtype_names": dtype_names,
                                 "shapes": shapes,
-                                "is_checkpoint_format": True,
                                 "packed": True,
                                 "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
                                 "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
@@ -419,6 +426,13 @@ def sync_merged_weights_to_vllm(
                         timeout=600.0,
                     )
                     send_future.result()
+                _post_with_retry(
+                    client.post,
+                    f"{spec.vllm_base_url}/finish_weight_update",
+                    phase="finish merged weight update",
+                    headers=_runtime_headers(spec),
+                    timeout=600.0,
+                )
                 _post_with_retry(
                     client.post,
                     f"{spec.vllm_base_url}/art/set_served_model_name",

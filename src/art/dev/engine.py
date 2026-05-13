@@ -72,6 +72,7 @@ class EngineArgs(TypedDict, total=False):
     max_prompt_adapters: int
     max_prompt_adapter_token: int
     fully_sharded_loras: bool
+    lora_target_modules: list[str]
     lora_extra_vocab_size: int
     long_lora_scaling_factors: Tuple[float] | None
     lora_dtype: str | None

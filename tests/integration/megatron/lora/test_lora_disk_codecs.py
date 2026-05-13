@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 import torch
 
 from art.megatron.model_support.handlers import (
@@ -12,6 +12,7 @@ from art.megatron.model_support.handlers import (
     QWEN3_MOE_HANDLER,
 )
 from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
 VLLM_PYTHON = REPO_ROOT / "vllm_runtime/.venv/bin/python"
@@ -36,6 +37,18 @@ def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
         ],
         "bias": "none",
     }
+
+
+def _qwen35_config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
+    config = _config(base_model, rank=rank, alpha=alpha)
+    config.update(
+        {
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 3,
+        }
+    )
+    return config
 
 
 def _assert_tensors_equal(
@@ -101,6 +114,7 @@ print(json.dumps(sorted(lora.loras)))
 
 def _qwen35_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
     hidden = 3
+    q_out = 12
     intermediate = 4
     tensors: dict[str, torch.Tensor] = {
         f"{prefix}.self_attn.q_proj.lora_A.weight": torch.arange(
@@ -108,15 +122,15 @@ def _qwen35_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
             dtype=torch.float32,
         ).reshape(rank, hidden),
         f"{prefix}.self_attn.q_proj.lora_B.weight": torch.arange(
-            hidden * rank,
+            q_out * rank,
             dtype=torch.float32,
-        ).reshape(hidden, rank)
+        ).reshape(q_out, rank)
         + 100,
     }
     offset = 200
     for expert in range(2):
-        for module in ("gate_proj", "up_proj", "down_proj"):
-            out_dim = hidden if module == "down_proj" else intermediate
+        for module in ("gate_up_proj", "down_proj"):
+            out_dim = hidden if module == "down_proj" else 2 * intermediate
             in_dim = intermediate if module == "down_proj" else hidden
             tensors[f"{prefix}.mlp.experts.{expert}.{module}.lora_A.weight"] = (
                 torch.arange(rank * in_dim, dtype=torch.float32).reshape(rank, in_dim)
@@ -190,17 +204,88 @@ def _qwen3_moe_lora_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
     return tensors
 
 
+def test_peft_fused_moe_checkpoint_converts_to_vllm_3d_layout(tmp_path: Path) -> None:
+    prefix = "base_model.model.model.layers.0.mlp.experts"
+    peft_tensors = {
+        f"{prefix}.base_layer.lora_A.weight": torch.arange(
+            2 * 8,
+            dtype=torch.float32,
+        ).reshape(2, 8),
+        f"{prefix}.base_layer.lora_B.weight": torch.arange(
+            3 * 2,
+            dtype=torch.float32,
+        ).reshape(3, 2)
+        + 100,
+        f"{prefix}.lora_A.weight": torch.arange(
+            2 * 3,
+            dtype=torch.float32,
+        ).reshape(2, 3)
+        + 200,
+        f"{prefix}.lora_B.weight": torch.arange(
+            4 * 2,
+            dtype=torch.float32,
+        ).reshape(4, 2)
+        + 300,
+    }
+    _save_adapter(
+        tmp_path,
+        peft_tensors,
+        {
+            "r": 1,
+            "lora_alpha": 1,
+            "target_modules": ["q_proj"],
+            "target_parameters": [
+                "model.layers.0.mlp.experts.gate_up_proj",
+                "model.layers.0.mlp.experts.down_proj",
+            ],
+        },
+    )
+
+    convert_checkpoint_if_needed(str(tmp_path))
+
+    converted = load_file(tmp_path / "adapter_model.safetensors")
+    _assert_tensors_equal(
+        converted,
+        {
+            f"{prefix}.base_layer.lora_A.weight": peft_tensors[
+                f"{prefix}.base_layer.lora_B.weight"
+            ].T.contiguous(),
+            f"{prefix}.base_layer.lora_B.weight": peft_tensors[
+                f"{prefix}.base_layer.lora_A.weight"
+            ].T.contiguous(),
+            f"{prefix}.lora_A.weight": peft_tensors[
+                f"{prefix}.lora_B.weight"
+            ].T.contiguous(),
+            f"{prefix}.lora_B.weight": peft_tensors[
+                f"{prefix}.lora_A.weight"
+            ].T.contiguous(),
+        },
+    )
+    adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert adapter_config["target_modules"] == ["q_proj", "experts"]
+    assert "target_parameters" not in adapter_config
+
+
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _qwen35_moe_art_tensors(art_prefix)
     for base_model in ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.6-35B-A3B"):
         vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
             original,
-            adapter_config=_config(base_model),
+            adapter_config=_qwen35_config(base_model),
         )
-        assert vllm_config["r"] == 4
-        assert vllm_config["lora_alpha"] == 8
-        assert "experts" in vllm_config["target_modules"]
+        assert vllm_config["r"] == 2
+        assert vllm_config["lora_alpha"] == 4
+        assert vllm_config["target_modules"] == [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "experts",
+        ]
         assert all("language_model.layers" in key for key in vllm_tensors)
         roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
             vllm_tensors,
@@ -211,7 +296,7 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         _save_adapter(adapter_dir, vllm_tensors, vllm_config)
         loaded_modules = _assert_stock_vllm_loads(
             adapter_dir,
-            expected_modules=set(vllm_config["target_modules"]) | {"experts"},
+            expected_modules=set(vllm_config["target_modules"]),
             mapper="qwen35",
         )
         assert "language_model.model.layers.0.mlp.experts" in loaded_modules
@@ -225,14 +310,14 @@ def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Pat
             3,
         ),
         "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(
-            3,
+            12,
             2,
         ),
     }
     for base_model in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-4B"):
         vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
             original,
-            adapter_config=_config(base_model),
+            adapter_config=_qwen35_config(base_model),
         )
         assert set(vllm_tensors) == {
             key.replace(
@@ -334,17 +419,11 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
     hidden = 2
     intermediate = 4
     full = {
-        f"{prefix}.gate_proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
-        f"{prefix}.gate_proj.lora_B.weight": torch.arange(
-            intermediate * rank,
+        f"{prefix}.gate_up_proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+        f"{prefix}.gate_up_proj.lora_B.weight": torch.arange(
+            2 * intermediate * rank,
             dtype=torch.float32,
-        ).reshape(intermediate, rank),
-        f"{prefix}.up_proj.lora_A.weight": torch.tensor([[3.0, 4.0]]),
-        f"{prefix}.up_proj.lora_B.weight": torch.arange(
-            intermediate * rank,
-            dtype=torch.float32,
-        ).reshape(intermediate, rank)
-        + 10,
+        ).reshape(2 * intermediate, rank),
         f"{prefix}.down_proj.lora_A.weight": torch.arange(
             rank * intermediate,
             dtype=torch.float32,
@@ -370,37 +449,33 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
         }
 
     shard0 = {
-        f"{prefix}.gate_proj.lora_A.weight": full[f"{prefix}.gate_proj.lora_A.weight"],
-        f"{prefix}.up_proj.lora_A.weight": full[f"{prefix}.up_proj.lora_A.weight"],
-        f"{prefix}.down_proj.lora_B.weight": full[f"{prefix}.down_proj.lora_B.weight"],
-        f"{prefix}.gate_proj.lora_B.weight": full[f"{prefix}.gate_proj.lora_B.weight"][
-            :2
+        f"{prefix}.gate_up_proj.lora_A.weight": full[
+            f"{prefix}.gate_up_proj.lora_A.weight"
         ],
-        f"{prefix}.up_proj.lora_B.weight": full[f"{prefix}.up_proj.lora_B.weight"][:2],
+        f"{prefix}.down_proj.lora_B.weight": full[f"{prefix}.down_proj.lora_B.weight"],
+        f"{prefix}.gate_up_proj.lora_B.weight": full[
+            f"{prefix}.gate_up_proj.lora_B.weight"
+        ][:4],
         f"{prefix}.down_proj.lora_A.weight": full[f"{prefix}.down_proj.lora_A.weight"][
             :, :2
         ],
     }
     manifest0 = {
-        f"{prefix}.gate_proj.lora_A.weight": unsharded(),
-        f"{prefix}.up_proj.lora_A.weight": unsharded(),
+        f"{prefix}.gate_up_proj.lora_A.weight": unsharded(),
         f"{prefix}.down_proj.lora_B.weight": unsharded(),
-        f"{prefix}.gate_proj.lora_B.weight": sharded(0, 0),
-        f"{prefix}.up_proj.lora_B.weight": sharded(0, 0),
+        f"{prefix}.gate_up_proj.lora_B.weight": sharded(0, 0),
         f"{prefix}.down_proj.lora_A.weight": sharded(0, 1),
     }
     shard1 = {
-        f"{prefix}.gate_proj.lora_B.weight": full[f"{prefix}.gate_proj.lora_B.weight"][
-            2:
-        ],
-        f"{prefix}.up_proj.lora_B.weight": full[f"{prefix}.up_proj.lora_B.weight"][2:],
+        f"{prefix}.gate_up_proj.lora_B.weight": full[
+            f"{prefix}.gate_up_proj.lora_B.weight"
+        ][4:],
         f"{prefix}.down_proj.lora_A.weight": full[f"{prefix}.down_proj.lora_A.weight"][
             :, 2:
         ],
     }
     manifest1 = {
-        f"{prefix}.gate_proj.lora_B.weight": sharded(1, 0),
-        f"{prefix}.up_proj.lora_B.weight": sharded(1, 0),
+        f"{prefix}.gate_up_proj.lora_B.weight": sharded(1, 0),
         f"{prefix}.down_proj.lora_A.weight": sharded(1, 1),
     }
     adapter_dir = tmp_path / "qwen35_megatron_shards"
