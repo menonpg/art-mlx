@@ -129,6 +129,11 @@ class InternalModelConfig(TypedDict, total=False):
               into vLLM for inference
         chat_template_kwargs: Extra keyword arguments passed to chat-template
             rendering for both rollout inference and local training tokenization.
+        chat_template: Raw chat template text used by rollout inference and
+            local training tokenization.
+        chat_template_path: Path to a chat template file used by rollout
+            inference and local training tokenization.
+        chat_template_content_format: vLLM chat template content format.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -143,6 +148,9 @@ class InternalModelConfig(TypedDict, total=False):
     inference_gpu_ids: list[int]
     rollout_weights_mode: "RolloutWeightsMode"
     chat_template_kwargs: dict[str, object]
+    chat_template: str
+    chat_template_path: str
+    chat_template_content_format: str
     allow_unvalidated_arch: bool
 
 

@@ -71,6 +71,57 @@ from .checkpoints import (
 from .service import ModelService
 
 
+def _configured_chat_template_value(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    if chat_template_path is not None:
+        with open(chat_template_path, encoding="utf-8") as handle:
+            return handle.read()
+    return chat_template
+
+
+def _configured_chat_template_server_arg(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    return chat_template_path or chat_template
+
+
+def _apply_configured_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is not None:
+        tokenizer.chat_template = chat_template
+
+
+def _apply_configured_chat_template_server_args(
+    config_dict: dict,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None:
+        return
+    server_args = dict(config_dict.get("server_args", {}))
+    server_args.setdefault("chat_template", chat_template)
+    if chat_template_content_format := internal_config.get(
+        "chat_template_content_format"
+    ):
+        server_args.setdefault(
+            "chat_template_content_format",
+            chat_template_content_format,
+        )
+    config_dict["server_args"] = server_args
+
+
 class LocalBackend(Backend):
     def __init__(
         self,
@@ -349,6 +400,7 @@ class LocalBackend(Backend):
                 self._image_processors[model.base_model] = None
         tokenizer = self._tokenizers[model.base_model]
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        _apply_configured_chat_template(tokenizer, internal_config)
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
         tokenized_results = list(
             tokenize_trajectory_groups(
@@ -476,6 +528,8 @@ class LocalBackend(Backend):
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        _apply_configured_chat_template_server_args(config_dict, internal_config)
         server_args = dict(config_dict.get("server_args", {}))
 
         # Avoid binding collisions on busy hosts when no explicit port is provided.
@@ -875,6 +929,8 @@ class LocalBackend(Backend):
                 model.base_model
             )
         tokenizer = self._tokenizers[model.base_model]
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        _apply_configured_chat_template(tokenizer, internal_config)
 
         from ..utils.sft import resolve_sft_batch_size
 
@@ -890,7 +946,6 @@ class LocalBackend(Backend):
         instruction_part, response_part = get_instruction_response_parts(
             model.base_model, tokenizer
         )
-        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
 
         if verbose:
