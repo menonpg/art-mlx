@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 
 DEFAULT_MEAN_ABS_PCT_THRESHOLD = 1.0
-MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-12
+MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 
 
 def mean_abs_pct_from_sums(
