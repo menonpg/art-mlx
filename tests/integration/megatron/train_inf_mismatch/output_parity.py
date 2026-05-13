@@ -16,7 +16,7 @@ import sys
 import time
 from typing import Any, AsyncIterator, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .artifacts import REPO_ROOT
 
@@ -71,15 +71,22 @@ class TrainInfOutputParityConfig(BaseModel):
     seed: int = 20260512
     topology: Topology = Field(default_factory=Topology)
     packed: ProbePackedConfig = Field(default_factory=ProbePackedConfig)
-    rollout_modes: list[RolloutMode] = Field(
-        default_factory=lambda: ["native_lora", "merged"]
-    )
+    rollout_modes: list[RolloutMode] = Field(default_factory=list)
     trainer_gpu_ids: list[int] = Field(default_factory=lambda: [0, 1])
     inference_gpu_ids: list[int] = Field(default_factory=lambda: [2, 3])
     allow_unvalidated_arch: bool = False
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
+        if not self.rollout_modes:
+            self.rollout_modes = default_rollout_modes_for_model(
+                self.base_model,
+                allow_unvalidated_arch=self.allow_unvalidated_arch,
+            )
+        return self
 
 
 class LogicalPrompt(BaseModel):
@@ -218,6 +225,34 @@ def _parse_str_list(value: str) -> list[str]:
     return parts
 
 
+def _parse_rollout_modes(value: str) -> list[RolloutMode]:
+    modes = _parse_str_list(value)
+    invalid = sorted(set(modes) - {"native_lora", "merged"})
+    if invalid:
+        raise ValueError(f"Unsupported rollout modes: {invalid}")
+    return cast(list[RolloutMode], modes)
+
+
+def default_rollout_modes_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> list[RolloutMode]:
+    from art.megatron.model_support.registry import native_vllm_lora_status_for_model
+
+    modes: list[RolloutMode] = []
+    if (
+        native_vllm_lora_status_for_model(
+            base_model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+        != "disabled"
+    ):
+        modes.append("native_lora")
+    modes.append("merged")
+    return modes
+
+
 @contextmanager
 def _provider_topology_env(topology: Topology) -> Any:
     names = topology.env()
@@ -253,10 +288,7 @@ def config_from_env() -> TrainInfOutputParityConfig:
         == "1",
     )
     if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
-        config.rollout_modes = cast(
-            list[RolloutMode],
-            [mode.strip() for mode in raw_modes.split(",") if mode.strip()],
-        )
+        config.rollout_modes = _parse_rollout_modes(raw_modes)
     if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):
         config.packed.sequence_length = int(raw_seq_len)
     if raw_prefill := os.environ.get("ART_TRAIN_INF_MISMATCH_PREFILL_TOKENS"):

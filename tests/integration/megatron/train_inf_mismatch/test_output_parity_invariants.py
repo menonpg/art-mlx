@@ -6,11 +6,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from . import workflow_stage
 from .output_parity import (
     TOP_K,
     EngineSide,
     ScoreBundle,
     TokenTopK,
+    TrainInfOutputParityConfig,
     WeightState,
     aggregate_mean_abs_pct,
     build_logical_token_map,
@@ -162,3 +164,54 @@ def test_config_from_env_accepts_lora_target_module_override(
     config = config_from_env()
 
     assert config.lora_target_modules == ["experts", "in_proj_qkv", "in_proj_z"]
+
+
+def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
+    assert TrainInfOutputParityConfig(
+        base_model="Qwen/Qwen3.5-35B-A3B"
+    ).rollout_modes == ["native_lora", "merged"]
+    assert TrainInfOutputParityConfig(
+        base_model="unvalidated/native-disabled",
+        allow_unvalidated_arch=True,
+    ).rollout_modes == ["merged"]
+
+
+def test_config_from_env_rollout_modes_override_handler_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ART_TRAIN_INF_MISMATCH_BASE_MODEL",
+        "unvalidated/native-disabled",
+    )
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH", "1")
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES", "native_lora")
+
+    config = config_from_env()
+
+    assert config.rollout_modes == ["native_lora"]
+
+
+def test_workflow_stage_enables_live_train_inf_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import subprocess
+
+    captured_env = {}
+
+    def fake_run(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="1 passed\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
+    monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
+
+    report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
+
+    assert report.passed is True
+    assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"

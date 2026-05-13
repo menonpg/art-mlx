@@ -43,6 +43,7 @@ def run_train_inf_mismatch(*, base_model: str) -> TrainInfMismatchReport:
     stderr_path = artifact_dir / "pytest_stderr.txt"
     env = os.environ.copy()
     env["BASE_MODEL"] = base_model
+    env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] = "1"
     env["ART_TRAIN_INF_MISMATCH_BASE_MODEL"] = base_model
     existing_pythonpath = env.get("PYTHONPATH")
     tests_dir = str(REPO_ROOT / "tests")
