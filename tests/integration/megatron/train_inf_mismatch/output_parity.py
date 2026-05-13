@@ -779,9 +779,10 @@ def _megatron_worker(request: MegatronWorkerRequest) -> None:
         ),
         print_env=False,
         build_optimizer=False,
-        trainable_parameter_mode=(
-            "base_model" if request.weight_state == "base" else "lora"
-        ),
+        # This worker only runs forward passes. Use the LoRA trainable path for
+        # both base and LoRA scoring so Megatron freezes base weights before DDP
+        # allocates buffers; base scoring simply does not load a nonzero adapter.
+        trainable_parameter_mode="lora",
         allow_unvalidated_arch=request.config.allow_unvalidated_arch,
     )
     for chunk in runtime.model:
