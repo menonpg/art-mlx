@@ -24,6 +24,19 @@ def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool
     return isinstance(chat_template, str) and "enable_thinking" in chat_template
 
 
+def _chat_template_kwargs(
+    tokenizer: PreTrainedTokenizerBase,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    kwargs = (
+        {"enable_thinking": False}
+        if _chat_template_disables_thinking(tokenizer)
+        else {}
+    )
+    kwargs.update(chat_template_kwargs or {})
+    return kwargs
+
+
 def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | None:
     if tools is None:
         return None
@@ -180,6 +193,7 @@ def tokenize_trajectory_groups(
     shuffle_group_trajectories: bool = True,
     drop_zero_advantage_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -213,6 +227,7 @@ def tokenize_trajectory_groups(
                     advantage,
                     allow_training_without_logprobs,
                     trajectory,
+                    chat_template_kwargs=chat_template_kwargs,
                 ):
                     trajectory_results.append(result)
             weight = 1 / (
@@ -262,6 +277,7 @@ def tokenize_trajectory(
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -285,27 +301,23 @@ def tokenize_trajectory(
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
     messages = _messages_for_chat_template(tokenizer, messages_and_choices)
     tools = _normalize_tools_for_chat_template(history.tools)
-    chat_template_kwargs = (
-        {"enable_thinking": False}
-        if _chat_template_disables_thinking(tokenizer)
-        else {}
-    )
+    template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
     chat = cast(
         str,
         cast(Any, tokenizer).apply_chat_template(
             messages,
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=False,
             tokenize=False,
-            **chat_template_kwargs,
+            **template_kwargs,
         ),
     )
     original_token_ids = _apply_chat_template_token_ids(
         tokenizer,
         messages,
         tools=tools,
-        continue_final_message=True,
-        **chat_template_kwargs,
+        continue_final_message=False,
+        **template_kwargs,
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinel_token = tokenizer.decode(sentinel_token_id)
@@ -337,7 +349,7 @@ def tokenize_trajectory(
         token_template_messages,
         tools=tools,
         continue_final_message=True,
-        **chat_template_kwargs,
+        **template_kwargs,
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
@@ -493,6 +505,7 @@ def tokenize_sft_batch(
     tokenizer: PreTrainedTokenizerBase,
     instruction_part: str,
     response_part: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
     max_seq_length: int | None = None,
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
@@ -533,11 +546,7 @@ def tokenize_sft_batch(
             trajectory.messages_and_choices,
         )
         tools = _normalize_tools_for_chat_template(trajectory.tools)
-        chat_template_kwargs = (
-            {"enable_thinking": False}
-            if _chat_template_disables_thinking(tokenizer)
-            else {}
-        )
+        template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
 
         # Single-step tokenization: apply_chat_template with tokenize=True
         input_ids = _apply_chat_template_token_ids(
@@ -546,7 +555,7 @@ def tokenize_sft_batch(
             tools=tools,
             tokenize=True,
             add_generation_prompt=False,
-            **chat_template_kwargs,
+            **template_kwargs,
         )
         if max_seq_length is not None and len(input_ids) > max_seq_length:
             num_dropped_trajectories += 1

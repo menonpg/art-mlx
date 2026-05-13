@@ -348,6 +348,8 @@ class LocalBackend(Backend):
             except Exception:
                 self._image_processors[model.base_model] = None
         tokenizer = self._tokenizers[model.base_model]
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -355,14 +357,13 @@ class LocalBackend(Backend):
                 allow_training_without_logprobs,
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
+                chat_template_kwargs=chat_template_kwargs,
             )
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = (
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768)
+        model_max_sequence_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         if packed_sequence_length is None:
             assert not self._requires_explicit_packed_sequence_length, (
@@ -889,15 +890,15 @@ class LocalBackend(Backend):
         instruction_part, response_part = get_instruction_response_parts(
             model.base_model, tokenizer
         )
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
 
         if verbose:
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
-        max_seq_length = (
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768)
+        max_seq_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         max_seq_length = int(max_seq_length) if max_seq_length is not None else None
 
@@ -923,6 +924,7 @@ class LocalBackend(Backend):
                     tokenizer=tokenizer,
                     instruction_part=instruction_part,
                     response_part=response_part,
+                    chat_template_kwargs=chat_template_kwargs,
                     max_seq_length=max_seq_length,
                 )
             )
