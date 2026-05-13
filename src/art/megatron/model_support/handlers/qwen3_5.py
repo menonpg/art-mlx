@@ -437,22 +437,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import (
-            wrap_dense_mlp,
-            wrap_grouped_moe_experts_3d,
-        )
-
-        if getattr(module.mlp, "experts", None) is None:
-            _require_dense_mlp(module)
-            wrap_dense_mlp(
-                module.mlp,
-                adapter_model_prefix=adapter_model_prefix,
-                provider=provider,
-                target_modules=target_modules,
-                rank=rank,
-                alpha=alpha,
-            )
-            return
+        from art.megatron.lora import wrap_grouped_moe_experts_3d
 
         wrap_grouped_moe_experts_3d(
             _require_moe_experts(module),
@@ -470,18 +455,8 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         module: Any,
     ) -> None:
         from art.megatron.weights.adapter_export import (
-            add_dense_mlp_adapter_weights,
             add_grouped_moe_adapter_weights,
         )
-
-        if getattr(module.mlp, "experts", None) is None:
-            _require_dense_mlp(module)
-            add_dense_mlp_adapter_weights(
-                adapter_weights_by_base,
-                layer_prefix=layer_prefix,
-                mlp=module.mlp,
-            )
-            return
 
         add_grouped_moe_adapter_weights(
             adapter_weights_by_base,
