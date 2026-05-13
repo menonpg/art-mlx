@@ -306,11 +306,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "PipelineTrainer + LocalBackend(dedicated) requires "
                 "loss_fn_config=None."
             )
-        if not self.normalize_advantages:
-            raise ValueError(
-                "PipelineTrainer + LocalBackend(dedicated) requires "
-                "normalize_advantages=True."
-            )
         if self.adam_params is not None:
             raise ValueError(
                 "PipelineTrainer + LocalBackend(dedicated) requires adam_params=None."

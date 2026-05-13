@@ -563,8 +563,9 @@ class LocalBackend(Backend):
                 "cispo" and "ppo".
             loss_fn_config: Additional loss-function config. Not supported by
                 LocalBackend.
-            normalize_advantages: Whether to normalize advantages. LocalBackend
-                currently requires True.
+            normalize_advantages: Backward-compatible alias for reward std scaling.
+                When False, LocalBackend centers rewards but does not divide by
+                group reward std dev.
             adam_params: Custom optimizer params. Not supported by
                 LocalBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
@@ -627,7 +628,7 @@ class LocalBackend(Backend):
         if loss_fn_config is not None:
             raise ValueError("LocalBackend requires loss_fn_config=None.")
         if not normalize_advantages:
-            raise ValueError("LocalBackend requires normalize_advantages=True.")
+            scale_rewards = False
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
         if (
