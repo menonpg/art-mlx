@@ -32,6 +32,10 @@ _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
     "gate_proj": (".gate_proj",),
     "up_proj": (".up_proj",),
     "down_proj": (".down_proj",),
+    "experts": (
+        ".mlp.experts.{expert}.gate_up_proj",
+        ".mlp.experts.{expert}.down_proj",
+    ),
 }
 
 
@@ -91,6 +95,10 @@ def _covered_wrapped_target_modules(adapter_prefixes: set[str]) -> set[str]:
             for suffix in suffixes
         ):
             covered.add(target_module)
+        if target_module == "experts" and any(
+            ".mlp.experts." in prefix for prefix in adapter_prefixes
+        ):
+            covered.add(target_module)
     return covered
 
 
@@ -117,6 +125,9 @@ def _covered_exported_target_modules(
             continue
         if base_name.endswith(".self_attention.out_proj.weight"):
             covered.add("out_proj")
+            continue
+        if ".mlp.experts.linear_fc" in base_name:
+            covered.add("experts")
             continue
         if ".linear_fc1.weight" in base_name:
             covered.update({"gate_proj", "up_proj"})

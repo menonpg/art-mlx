@@ -108,6 +108,19 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
         case dict():
             vllm_args.append(f"{cli_key}={json.dumps(value)}")
         case list():
+            if key == "lora_target_modules":
+                vllm_args.append(cli_key)
+                for item in value:
+                    match item:
+                        case str() | int() | float():
+                            vllm_args.append(str(item))
+                        case dict():
+                            vllm_args.append(json.dumps(item))
+                        case _:
+                            assert False, (
+                                f"Unsupported CLI list item for {key}: {type(item)}"
+                            )
+                return
             for item in value:
                 match item:
                     case str() | int() | float():

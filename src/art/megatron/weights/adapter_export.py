@@ -9,6 +9,7 @@ import torch
 from art.megatron.lora import (
     GatedDeltaNetInProjLoRA,
     LoRA,
+    MLPExpertsLinearFC1FusedLoRA,
     MLPExpertsLinearFC1LoRA,
     MLPExpertsLinearFC2LoRA,
     SelfAttentionLinearProjLoRA,
@@ -247,7 +248,18 @@ def add_grouped_moe_adapter_weights(
     experts: Any,
 ) -> None:
     linear_fc1 = getattr(experts, "linear_fc1", None)
-    if isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
+    if isinstance(linear_fc1, MLPExpertsLinearFC1FusedLoRA):
+        base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
+        for local_expert_idx in range(linear_fc1.lora.num_local_experts):
+            global_expert_idx = local_expert_idx + linear_fc1.lora._expert_offset
+            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
+                _simple_adapter_weight(
+                    base_prefix,
+                    linear_fc1.lora,
+                    expert_idx=local_expert_idx,
+                )
+            ]
+    elif isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
         base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
         for local_expert_idx in range(linear_fc1.gate_lora.num_local_experts):
             global_expert_idx = local_expert_idx + linear_fc1.gate_lora._expert_offset

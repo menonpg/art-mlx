@@ -4,7 +4,9 @@
 
 import ctypes
 from datetime import timedelta
+import importlib.util
 import os
+from pathlib import Path
 import pickle
 import socket
 from typing import Any, cast
@@ -306,7 +308,17 @@ def _find_nccl_library() -> str:
     if override := os.environ.get("VLLM_NCCL_SO_PATH"):
         return override
     if torch.version.cuda is not None:
-        return "libnccl.so.2"
+        spec = importlib.util.find_spec("nvidia.nccl")
+        if spec is None or spec.submodule_search_locations is None:
+            raise RuntimeError(
+                "CUDA weight transfer requires the nvidia-nccl-cu12 package."
+            )
+        nccl_library = (
+            Path(next(iter(spec.submodule_search_locations))) / "lib" / "libnccl.so.2"
+        )
+        if not nccl_library.exists():
+            raise RuntimeError(f"nvidia-nccl-cu12 is missing {nccl_library}")
+        return str(nccl_library)
     if torch.version.hip is not None:
         return "librccl.so.1"
     raise ValueError("NCCL only supports CUDA and ROCm backends.")

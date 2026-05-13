@@ -31,6 +31,7 @@ def get_model_config(
         max_seq_length=32768,
         model_name=base_model,
     )
+    target_modules = default_target_modules(base_model)
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,
@@ -45,10 +46,14 @@ def get_model_config(
         lora_alpha=16,
         r=8,
         random_state=3407,
-        target_modules=default_target_modules(base_model),
+        target_modules=target_modules,
         use_gradient_checkpointing="unsloth",
     )
     peft_args.update(config.get("peft_args", {}))
+    if rollout_weights_mode == "lora" and "lora_target_modules" not in config.get(
+        "engine_args", {}
+    ):
+        engine_args["lora_target_modules"] = peft_args["target_modules"]
     trainer_args = TrainerArgs(
         adam_beta1=0.9,
         adam_beta2=0.99,

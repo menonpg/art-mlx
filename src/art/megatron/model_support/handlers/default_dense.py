@@ -20,9 +20,10 @@ def _compile_workaround_flags_for_provider(
     base_flags: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     flags = base_flags
-    if bool(getattr(provider, "sequence_parallel", False)) and int(
-        getattr(provider, "tensor_model_parallel_size", 1) or 1
-    ) > 1:
+    if (
+        bool(getattr(provider, "sequence_parallel", False))
+        and int(getattr(provider, "tensor_model_parallel_size", 1) or 1) > 1
+    ):
         flags = (*flags, _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG)
     if int(getattr(provider, "context_parallel_size", 1) or 1) <= 1:
         return flags
@@ -67,6 +68,8 @@ class DefaultDenseHandler:
             suffixes.extend(("up_proj.weight", "mlp.experts.gate_up_proj"))
         if "down_proj" in target_set:
             suffixes.extend(("down_proj.weight", "mlp.experts.down_proj"))
+        if "experts" in target_set:
+            suffixes.extend(("mlp.experts.gate_up_proj", "mlp.experts.down_proj"))
         return tuple(dict.fromkeys(suffixes))
 
     def patch_provider(self, provider: Any, bridge: Any) -> None:
