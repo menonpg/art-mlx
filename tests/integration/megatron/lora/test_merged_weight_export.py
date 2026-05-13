@@ -232,13 +232,18 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
     assert posts == [
         ("http://runtime.test/pause", None, {"mode": "wait"}, 300.0),
         (
+            "http://runtime.test/start_weight_update",
+            {"is_checkpoint_format": True},
+            None,
+            300.0,
+        ),
+        (
             "http://runtime.test/update_weights",
             {
                 "update_info": {
                     "names": ["layer.weight", "layer.bias"],
                     "dtype_names": ["float16", "float32"],
                     "shapes": [[2, 3], [3]],
-                    "is_checkpoint_format": True,
                     "packed": True,
                     "packed_buffer_size_bytes": export.DEFAULT_PACKED_BUFFER_SIZE_BYTES,
                     "packed_num_buffers": export.DEFAULT_PACKED_NUM_BUFFERS,
@@ -247,6 +252,7 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
             None,
             600.0,
         ),
+        ("http://runtime.test/finish_weight_update", None, None, 600.0),
         (
             "http://runtime.test/art/set_served_model_name",
             {"name": "model@7"},

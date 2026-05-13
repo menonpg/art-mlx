@@ -451,6 +451,13 @@ class UnslothService:
                 torch.cuda.synchronize()
 
                 weights = self._merged_checkpoint_weights_for_vllm()
+                response = await client.post(
+                    f"{self._vllm_base_url}/start_weight_update",
+                    json={"is_checkpoint_format": True},
+                    **self._runtime_request_kwargs(),
+                    timeout=300.0,
+                )
+                response.raise_for_status()
                 update_info = {
                     "names": [name for name, _ in weights],
                     "dtype_names": [
@@ -458,7 +465,6 @@ class UnslothService:
                         for _, tensor in weights
                     ],
                     "shapes": [list(tensor.shape) for _, tensor in weights],
-                    "is_checkpoint_format": True,
                     "packed": True,
                     "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
                     "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
@@ -489,6 +495,12 @@ class UnslothService:
                         "Merged rollout weights require a vLLM build with the "
                         "/update_weights endpoint"
                     ) from exc
+                response = await client.post(
+                    f"{self._vllm_base_url}/finish_weight_update",
+                    **self._runtime_request_kwargs(),
+                    timeout=600.0,
+                )
+                response.raise_for_status()
                 self._latest_step = step
                 await self._set_served_model_name(step)
             except Exception as exc:

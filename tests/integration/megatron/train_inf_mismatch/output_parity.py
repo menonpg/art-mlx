@@ -1148,7 +1148,9 @@ async def _score_vllm_merged_lora(
 
     service_name = f"train_inf_merged_lora_{int(time.time())}"
     output_dir = artifact_dir / "merged_service"
-    checkpoint_dir = output_dir / "step_0000"
+    from art.utils.output_dirs import get_step_checkpoint_dir
+
+    checkpoint_dir = Path(get_step_checkpoint_dir(str(output_dir), 0))
     checkpoint_dir.mkdir(parents=True)
     for filename in ("adapter_model.safetensors", "adapter_config.json"):
         shutil.copy(Path(adapter_path) / filename, checkpoint_dir / filename)
