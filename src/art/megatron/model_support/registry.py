@@ -80,6 +80,7 @@ QWEN3_DENSE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3-8B-Base",
         "Qwen/Qwen3-14B",
         "Qwen/Qwen3-14B-Base",
+        "OpenPipe/Qwen3-14B-Instruct",
         "Qwen/Qwen3-32B",
         "Qwen/Qwen3-32B-Base",
     ),
