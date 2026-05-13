@@ -659,9 +659,17 @@ def _run_cp_planned_prefixes_and_completions(
         )
     else:
         gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
+    empty_gdn_rank = plan.gdn_token_count == 0
     with _nvtx_range("art_gdn_in_proj", gdn_hidden):
-        qkv, gate, beta, recurrent_g = _project_gdn_inputs(gdn, gdn_hidden)
-    cp_dependency = _empty_autograd_dependency(qkv)
+        if empty_gdn_rank:
+            qkv, gate, beta, recurrent_g = _project_empty_gdn_inputs(gdn, gdn_hidden)
+        else:
+            qkv, gate, beta, recurrent_g = _project_gdn_inputs(gdn, gdn_hidden)
+    cp_dependency = (
+        _make_zero_autograd_dependency(gdn_hidden)
+        if empty_gdn_rank
+        else _empty_autograd_dependency(qkv)
+    )
     qkv_with_remote_tail = qkv
     beta_with_remote_tail = beta
     recurrent_g_with_remote_tail = recurrent_g
@@ -1747,6 +1755,31 @@ def _project_gdn_inputs(
         -gdn.A_log.exp() * F.softplus(alpha.float() + gdn.dt_bias)
     ).contiguous()
     return qkv.contiguous(), gate, beta, recurrent_g
+
+
+def _project_empty_gdn_inputs(
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    sequence_parallel_input: bool = True,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    seq_len, batch_size, _ = hidden_states.shape
+    if sequence_parallel_input:
+        seq_len *= int(getattr(gdn, "sp_size", 1))
+    value_heads = _local_value_heads(gdn)
+    qkv_width = (gdn.qk_dim * 2 + gdn.v_dim) // gdn.tp_size
+    qkv = hidden_states.new_zeros((batch_size, seq_len, qkv_width))
+    gate = hidden_states.new_zeros(
+        (batch_size, seq_len, value_heads, gdn.value_head_dim)
+    )
+    beta = hidden_states.new_zeros((batch_size, seq_len, value_heads))
+    recurrent_g = hidden_states.new_zeros((batch_size, seq_len, value_heads))
+    return (
+        qkv.contiguous(),
+        gate.contiguous(),
+        beta.contiguous(),
+        recurrent_g.contiguous(),
+    )
 
 
 def _in_proj(
