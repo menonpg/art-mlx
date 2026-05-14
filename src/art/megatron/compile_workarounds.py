@@ -448,3 +448,23 @@ def install_torch_compile_workarounds(
     if _env_enabled("ART_MEGATRON_MOE_DEBUG"):
         _install_moe_debug_wrappers(moe_experts)
     _INSTALLED_CONFIG = installed_config
+
+
+def install_debug_wrappers_if_requested() -> None:
+    if not (
+        _env_enabled("ART_MEGATRON_DEEPEP_DEBUG")
+        or _env_enabled("ART_MEGATRON_DEEPEP_FORCE_SYNC")
+        or _env_enabled("ART_MEGATRON_MOE_DEBUG")
+    ):
+        return
+    from megatron.core.transformer.moe import experts as moe_experts
+    from megatron.core.transformer.moe import token_dispatcher
+
+    deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
+    if deepep_manager is not None and (
+        _env_enabled("ART_MEGATRON_DEEPEP_DEBUG")
+        or _env_enabled("ART_MEGATRON_DEEPEP_FORCE_SYNC")
+    ):
+        _install_deepep_debug_wrappers(deepep_manager)
+    if _env_enabled("ART_MEGATRON_MOE_DEBUG"):
+        _install_moe_debug_wrappers(moe_experts)
