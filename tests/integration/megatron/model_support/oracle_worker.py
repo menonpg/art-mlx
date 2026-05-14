@@ -115,6 +115,7 @@ def run_worker_subprocess(
                 live_log.flush()
             env = {
                 **os.environ,
+                "ART_DISABLE_MEGATRON_COMPILE": "1",
                 "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
                 "PYTHONUNBUFFERED": "1",
             }

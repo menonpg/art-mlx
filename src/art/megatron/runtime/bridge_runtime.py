@@ -21,6 +21,8 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
 import torch
 
+from art.megatron.fp8 import quantize_loaded_fp8_base_weights
+
 
 class ExpertTensorSlice:
     __slots__ = ("global_start", "global_stop", "tensor")
@@ -478,6 +480,7 @@ def _optimized_load_weights_hf_to_megatron(
     if pending_device_copy and torch.cuda.is_available():
         torch.cuda.synchronize()
     self._broadcast_shared_embeddings(megatron_model)
+    quantize_loaded_fp8_base_weights(megatron_model)
     return megatron_model
 
 

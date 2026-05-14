@@ -2064,7 +2064,7 @@ def fp8_base_weight_precision_overrides() -> ProviderPrecisionOverrides:
     """Returns the production FP8 base-weight settings used by the oracle sanity gate."""
     return ProviderPrecisionOverrides(
         fp8="e4m3",
-        fp8_recipe="blockwise",
+        fp8_recipe="tensorwise",
         fp8_param=True,
         fp8_wgrad=True,
         fp8_dot_product_attention=False,

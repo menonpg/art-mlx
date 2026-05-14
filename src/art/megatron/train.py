@@ -47,7 +47,15 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     PreparedMegatronBatch,
 )
-from art.megatron.training.finalize_grads import finalize_model_grads_extended
+from art.megatron.lora import apply_lora_adapters
+from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
+from art.megatron.provider_common import ProviderBundle
+from art.megatron.routing_replay import (
+    TRACE_ROW_TOKEN_UIDS_ATTR,
+    TRACE_UID_SPAN_ATTR,
+    MoeRoutingReplayBundle,
+    MoeRoutingReplayController,
+)
 from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
@@ -60,11 +68,8 @@ from art.megatron.runtime.jobs import (
     MergedWeightTransferSpec,
     load_megatron_job,
 )
-from art.megatron.lora import apply_lora_adapters
-from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
-from art.megatron.weights.merged_weight_export import (
-    sync_merged_weights_to_vllm,
-)
+from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.training.finalize_grads import finalize_model_grads_extended
 from art.megatron.training.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
@@ -75,16 +80,11 @@ from art.megatron.training.offload import (
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
-from art.megatron.provider_common import ProviderBundle
-from art.megatron.routing_replay import (
-    TRACE_ROW_TOKEN_UIDS_ATTR,
-    TRACE_UID_SPAN_ATTR,
-    MoeRoutingReplayBundle,
-    MoeRoutingReplayController,
-)
 from art.megatron.training.sft_batches import load_sft_batch_from_disk
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.weights.merged_weight_export import (
+    sync_merged_weights_to_vllm,
+)
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.pack import (
     PackedTensors,
@@ -1856,7 +1856,9 @@ def run_megatron_sft_step(
             _set_root_output_trace_token_uids(model_chunks[0], None)
             if attach_trace_token_uids:
                 _set_module_trace_token_uids(model_chunks, None)
-        masked_loss = per_token_loss[prepared_micro.loss_mask].sum()
+        masked_loss = (
+            per_token_loss[prepared_micro.loss_mask].sum() + per_token_loss.sum() * 0.0
+        )
         masked_loss.backward()
         pending_prepared_micro = _prepare_next_sft_cp_micro(
             _next_micro_lookahead(micro_inputs, micro_order),
@@ -2063,7 +2065,7 @@ def run_training_step(
             experimental_config=experimental_config,
             reduction="sum",
         )
-        micro_loss = loss_info.policy_loss
+        micro_loss = loss_info.policy_loss + new_logprobs.sum() * 0.0
         if not micro_loss.requires_grad:
             assistant_tokens = _count_trainable_tokens(prepared_micro.loss_inputs)
             nonzero_weights = int(
