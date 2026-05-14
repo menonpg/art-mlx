@@ -60,6 +60,7 @@ from ..preprocessing.pack import (
     plot_packed_tensors,
 )
 from ..preprocessing.tokenize import (
+    ChatTemplateToolSchemaFormat,
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
@@ -170,6 +171,9 @@ class LocalBackend(Backend):
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
+        self._default_chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = (
+            "default"
+        )
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -221,6 +225,18 @@ class LocalBackend(Backend):
         if not torch.cuda.is_available():
             return 0
         return torch.cuda.device_count()
+
+    def _chat_template_tool_schema_format(
+        self,
+        internal_config: dev.InternalModelConfig,
+    ) -> ChatTemplateToolSchemaFormat:
+        return cast(
+            ChatTemplateToolSchemaFormat,
+            internal_config.get(
+                "chat_template_tool_schema_format",
+                self._default_chat_template_tool_schema_format,
+            ),
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -413,6 +429,9 @@ class LocalBackend(Backend):
                 self._image_processors[model.base_model] = None
         tokenizer = self._tokenizers[tokenizer_key]
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -421,6 +440,7 @@ class LocalBackend(Backend):
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
             )
         )
         if not tokenized_results:
@@ -957,6 +977,9 @@ class LocalBackend(Backend):
             model.base_model, tokenizer
         )
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
 
         if verbose:
             print(f"Using instruction_part: {instruction_part!r}")
@@ -990,6 +1013,7 @@ class LocalBackend(Backend):
                     instruction_part=instruction_part,
                     response_part=response_part,
                     chat_template_kwargs=chat_template_kwargs,
+                    chat_template_tool_schema_format=chat_template_tool_schema_format,
                     max_seq_length=max_seq_length,
                 )
             )

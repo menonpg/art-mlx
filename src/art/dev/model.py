@@ -134,6 +134,8 @@ class InternalModelConfig(TypedDict, total=False):
         chat_template_path: Path to a chat template file used by rollout
             inference and local training tokenization.
         chat_template_content_format: vLLM chat template content format.
+        chat_template_tool_schema_format: Tool schema rendering format used for
+            local training tokenization.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -151,6 +153,7 @@ class InternalModelConfig(TypedDict, total=False):
     chat_template: str
     chat_template_path: str
     chat_template_content_format: str
+    chat_template_tool_schema_format: Literal["default", "vllm_openai"]
     allow_unvalidated_arch: bool
 
 
