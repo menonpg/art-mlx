@@ -40,7 +40,6 @@ from art.loss import Loss, shift_tensor
 from art.loss import loss_fn as base_loss_fn
 from art.megatron.compile_workarounds import (
     install_debug_wrappers_if_requested,
-    install_megatron_runtime_workarounds,
     install_torch_compile_workarounds,
 )
 from art.megatron.context_parallel.loss import loss_fn_dispatched
@@ -446,7 +445,6 @@ def build_training_runtime(
     compile_workaround_config = provider_bundle.handler.compile_workaround_config(
         provider
     )
-    install_megatron_runtime_workarounds(compile_workaround_config)
     if _compile_enabled() and not compile_workaround_config.disable_compile:
         install_torch_compile_workarounds(compile_workaround_config)
         for chunk in model:

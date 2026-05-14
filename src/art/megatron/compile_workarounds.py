@@ -12,13 +12,11 @@ import torch.distributed as dist
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
 _INSTALLED_CONFIG: tuple[frozenset[str], str] | None = None
-_INSTALLED_RUNTIME_CONFIG: frozenset[str] | None = None
 _DEEPEP_DEBUG_COUNTERS: dict[str, int] = {}
 _MOE_DEBUG_COUNTERS: dict[str, int] = {}
 _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG = (
     "disable_compile_self_attn_linear_proj_reduce_scatter"
 )
-_DEEPEP_COMBINE_READINESS_SYNC_FLAG = "deepep_combine_readiness_sync"
 
 
 def _disable(fn):
@@ -648,60 +646,10 @@ def _install_deepep_debug_wrappers(deepep_manager: Any) -> None:
     setattr(deepep_manager, "__art_deepep_debug_wrapped__", True)
 
 
-def _install_deepep_combine_readiness_sync(deepep_manager: Any) -> None:
-    original = getattr(deepep_manager, "combine", None)
-    if original is None or getattr(
-        original, "__art_deepep_combine_sync_wrapped__", False
-    ):
-        return
-
-    def wrapped(
-        self: Any, hidden_states: torch.Tensor, *args: Any, **kwargs: Any
-    ) -> Any:
-        _deepep_debug_log(
-            "combine_readiness_sync_enter",
-            hidden_shape=_tensor_shape(hidden_states),
-            handle_is_none=getattr(self, "handle", None) is None,
-            group_size=int(self.group.size()),
-        )
-        token = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
-        dist.all_reduce(token, group=self.group)
-        _deepep_debug_log(
-            "combine_readiness_sync_exit",
-            hidden_shape=_tensor_shape(hidden_states),
-            handle_is_none=getattr(self, "handle", None) is None,
-            group_size=int(self.group.size()),
-        )
-        return original(self, hidden_states, *args, **kwargs)
-
-    setattr(wrapped, "__art_deepep_combine_sync_wrapped__", True)
-    setattr(deepep_manager, "combine", _disable(wrapped))
-
-
-def install_megatron_runtime_workarounds(
-    config: CompileWorkaroundConfig | None = None,
-) -> None:
-    global _INSTALLED_RUNTIME_CONFIG
-    flags = frozenset(_selected_workaround_flags(config))
-    if _INSTALLED_RUNTIME_CONFIG is not None:
-        if _INSTALLED_RUNTIME_CONFIG != flags:
-            raise RuntimeError(
-                "Megatron runtime workarounds already installed with a different config"
-            )
-        return
-    from megatron.core.transformer.moe import token_dispatcher
-
-    deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
-    if deepep_manager is not None and _DEEPEP_COMBINE_READINESS_SYNC_FLAG in flags:
-        _install_deepep_combine_readiness_sync(deepep_manager)
-    _INSTALLED_RUNTIME_CONFIG = flags
-
-
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
     global _INSTALLED_CONFIG
-    install_megatron_runtime_workarounds(config)
     flags = _selected_workaround_flags(config)
     shared_expert_state = "none" if config is None else config.shared_expert_state
     installed_config = (frozenset(flags), shared_expert_state)
@@ -737,8 +685,6 @@ def install_torch_compile_workarounds(
 
     deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
     if deepep_manager is not None:
-        if _DEEPEP_COMBINE_READINESS_SYNC_FLAG in flags:
-            _install_deepep_combine_readiness_sync(deepep_manager)
         if "deepep_permute_restore" in flags:
             deepep_manager.get_permuted_hidden_states_by_experts = _disable(
                 deepep_manager.get_permuted_hidden_states_by_experts

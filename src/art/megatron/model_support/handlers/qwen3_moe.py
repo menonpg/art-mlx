@@ -12,7 +12,6 @@ from art.megatron.model_support.spec import CompileWorkaroundConfig
 _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
-    "deepep_combine_readiness_sync",
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "te_triton_permute_with_mask_map",
