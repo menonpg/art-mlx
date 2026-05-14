@@ -123,8 +123,20 @@ def _normalize_tool_call_arguments_for_chat_template(
 def _messages_for_chat_template(
     tokenizer: PreTrainedTokenizerBase,
     messages_and_choices: MessagesAndChoices,
+    *,
+    final_trainable_choice_index: int | None = None,
 ) -> list[dict[str, Any]]:
     messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
+    if (
+        final_trainable_choice_index is not None
+        and 0 <= final_trainable_choice_index < len(messages)
+    ):
+        message = messages[final_trainable_choice_index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            messages[final_trainable_choice_index] = {
+                "role": "assistant",
+                "content": message.get("content") or "",
+            }
     return _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
 
 
@@ -337,7 +349,16 @@ def tokenize_trajectory(
     if last_assistant_index == -1:
         return None
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
-    messages = _messages_for_chat_template(tokenizer, messages_and_choices)
+    messages = _messages_for_chat_template(
+        tokenizer,
+        messages_and_choices,
+        final_trainable_choice_index=(
+            len(messages_and_choices) - 1
+            if isinstance(messages_and_choices[-1], Choice)
+            and messages_and_choices[-1].logprobs is not None
+            else None
+        ),
+    )
     tools = _normalize_tools_for_chat_template(
         history.tools,
         tool_schema_format=chat_template_tool_schema_format,

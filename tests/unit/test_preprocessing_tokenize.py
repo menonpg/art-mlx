@@ -332,6 +332,68 @@ def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template
     assert result is not None
 
 
+def test_tokenize_trajectory_uses_exact_tokens_for_malformed_final_tool_call() -> None:
+    tokenizer = _Qwen3_5FakeTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "tool_calls",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:65",
+                        "bytes": [65],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    }
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "prefix",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "arguments": '{"offer_id": None}',
+                            "name": "create_booking",
+                        },
+                        "type": "function",
+                    }
+                ],
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Book it."},
+            choice,
+        ],
+    )
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(messages_and_choices=messages),
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=Trajectory(messages_and_choices=messages, reward=1.0),
+    )
+
+    assert result is not None
+    assistant_ids = [
+        token_id
+        for token_id, mask in zip(result.token_ids, result.assistant_mask)
+        if mask
+    ]
+    assert assistant_ids == [65]
+
+
 def test_tokenize_trajectory_non_final_tool_call_mutation_changes_prefill_tokens() -> (
     None
 ):
