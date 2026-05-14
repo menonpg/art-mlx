@@ -40,6 +40,7 @@ from art.loss import Loss, shift_tensor
 from art.loss import loss_fn as base_loss_fn
 from art.megatron.compile_workarounds import (
     install_debug_wrappers_if_requested,
+    install_megatron_runtime_workarounds,
     install_torch_compile_workarounds,
 )
 from art.megatron.context_parallel.loss import loss_fn_dispatched
@@ -445,6 +446,7 @@ def build_training_runtime(
     compile_workaround_config = provider_bundle.handler.compile_workaround_config(
         provider
     )
+    install_megatron_runtime_workarounds(compile_workaround_config)
     if _compile_enabled() and not compile_workaround_config.disable_compile:
         install_torch_compile_workarounds(compile_workaround_config)
         for chunk in model:
@@ -1865,7 +1867,9 @@ def run_megatron_sft_step(
             _set_root_output_trace_token_uids(model_chunks[0], None)
             if attach_trace_token_uids:
                 _set_module_trace_token_uids(model_chunks, None)
-        masked_loss = per_token_loss[prepared_micro.loss_mask].sum()
+        masked_loss = (
+            per_token_loss[prepared_micro.loss_mask].sum() + per_token_loss.sum() * 0.0
+        )
         masked_loss.backward()
         pending_prepared_micro = _prepare_next_sft_cp_micro(
             _next_micro_lookahead(micro_inputs, micro_order),
@@ -2072,7 +2076,7 @@ def run_training_step(
             experimental_config=experimental_config,
             reduction="sum",
         )
-        micro_loss = loss_info.policy_loss
+        micro_loss = loss_info.policy_loss + new_logprobs.sum() * 0.0
         if not micro_loss.requires_grad:
             assistant_tokens = _count_trainable_tokens(prepared_micro.loss_inputs)
             nonzero_weights = int(

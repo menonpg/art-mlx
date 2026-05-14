@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
 import os
+import threading
 from typing import Any
 
 from megatron.core.models.gpt import GPTModel
@@ -18,20 +20,64 @@ class StreamingWeightOffloadConfig(BaseModel):
 
     enabled: bool = False
     num_layers: int = Field(default=0, ge=0)
+    num_slots: int = Field(default=2, ge=2)
+
+
+class _ParamSpec:
+    def __init__(
+        self,
+        *,
+        param: torch.nn.Parameter,
+        offset: int,
+        numel: int,
+        shape: torch.Size,
+    ) -> None:
+        self.param = param
+        self.offset = offset
+        self.numel = numel
+        self.shape = shape
+
+
+class _TensorGroup:
+    def __init__(
+        self, *, dtype: torch.dtype, cpu_flat: torch.Tensor, specs: list[_ParamSpec]
+    ):
+        self.dtype = dtype
+        self.cpu_flat = cpu_flat
+        self.specs = specs
+
+
+class _LoadSlot:
+    def __init__(self, index: int):
+        self.index = index
+        self.owner: _LayerState | None = None
+        self.release_stream: torch.cuda.Stream | None = None
+        self.pinned: dict[torch.dtype, torch.Tensor] = {}
+        self.gpu: dict[torch.dtype, torch.Tensor] = {}
+
+    def ensure_capacity(self, dtype: torch.dtype, numel: int) -> None:
+        pinned = self.pinned.get(dtype)
+        if pinned is None or pinned.numel() < numel:
+            self.pinned[dtype] = torch.empty(
+                numel, dtype=dtype, device="cpu", pin_memory=True
+            )
+        gpu = self.gpu.get(dtype)
+        if gpu is None or gpu.numel() < numel:
+            self.gpu[dtype] = torch.empty(
+                numel, dtype=dtype, device=torch.cuda.current_device()
+            )
 
 
 class _LayerState:
-    def __init__(
-        self, index: int, layer: torch.nn.Module, params: list[torch.nn.Parameter]
-    ):
+    def __init__(self, index: int, layer: torch.nn.Module, groups: list[_TensorGroup]):
         self.index = index
         self.layer = layer
-        self.params = params
-        self.cpu_tensors: list[torch.Tensor] = []
-        self.pinned_tensors: list[torch.Tensor] = []
-        self.gpu_tensors: list[torch.Tensor] = []
+        self.groups = groups
         self.status = "gpu"
+        self.slot: _LoadSlot | None = None
         self.load_event: torch.cuda.Event | None = None
+        self.load_ready = False
+        self.load_error: BaseException | None = None
 
 
 class StreamingWeightOffloader:
@@ -46,10 +92,21 @@ class StreamingWeightOffloader:
         self.config = config
         selected_layers = layers[: config.num_layers or len(layers)]
         self.layers = [
-            _LayerState(i, layer, _frozen_cuda_parameters(layer))
+            _LayerState(i, layer, _build_tensor_groups(_frozen_cuda_parameters(layer)))
             for i, layer in enumerate(selected_layers)
         ]
+        self.device = torch.cuda.current_device()
         self.h2d_stream = torch.cuda.Stream()
+        self.slots = [_LoadSlot(i) for i in range(config.num_slots)]
+        self._condition = threading.Condition()
+        self._queue: deque[tuple[_LayerState, _LoadSlot]] = deque()
+        self._worker_error: BaseException | None = None
+        self._closed = False
+        self._worker = threading.Thread(
+            target=self._load_worker,
+            name=f"streaming_weight_offload_rank{rank}",
+            daemon=True,
+        )
         self._hooks: list[Any] = []
 
     def install(self) -> None:
@@ -57,12 +114,8 @@ class StreamingWeightOffloader:
             raise RuntimeError(
                 "Streaming weight offload found no transformer layers to manage"
             )
+        self._worker.start()
         for layer_state in self.layers:
-            for param in layer_state.params:
-                cpu_tensor = torch.empty(param.shape, dtype=param.dtype, device="cpu")
-                cpu_tensor.copy_(param.data, non_blocking=False)
-                layer_state.cpu_tensors.append(cpu_tensor)
-                layer_state.gpu_tensors.append(param.data)
             self._hooks.append(
                 layer_state.layer.register_forward_pre_hook(
                     lambda module, inputs, state=layer_state: self._pre_forward(state)
@@ -78,7 +131,10 @@ class StreamingWeightOffloader:
         self.offload_all(wait=True)
         if self.rank == 0:
             param_count = sum(
-                param.numel() for layer in self.layers for param in layer.params
+                spec.numel
+                for layer in self.layers
+                for group in layer.groups
+                for spec in group.specs
             )
             print(
                 "Installed streaming frozen weight offload for "
@@ -95,6 +151,10 @@ class StreamingWeightOffloader:
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._worker.join(timeout=5.0)
 
     def offload_all(self, *, wait: bool) -> None:
         for layer_state in self.layers:
@@ -121,6 +181,7 @@ class StreamingWeightOffloader:
                 self._ensure_offloaded(layer_state)
 
     def _start_load(self, index: int) -> None:
+        self._check_worker_error()
         if index < 0 or index >= len(self.layers):
             return
         layer_state = self.layers[index]
@@ -128,48 +189,38 @@ class StreamingWeightOffloader:
             return
         if layer_state.status != "cpu":
             raise RuntimeError(f"Unexpected layer offload state {layer_state.status!r}")
-        layer_state.gpu_tensors = [
-            torch.empty_like(cpu_tensor, device=torch.cuda.current_device())
-            for cpu_tensor in layer_state.cpu_tensors
-        ]
-        layer_state.pinned_tensors = [
-            torch.empty_like(cpu_tensor, pin_memory=True)
-            for cpu_tensor in layer_state.cpu_tensors
-        ]
-        for pinned_tensor, cpu_tensor in zip(
-            layer_state.pinned_tensors, layer_state.cpu_tensors, strict=True
-        ):
-            pinned_tensor.copy_(cpu_tensor, non_blocking=False)
-        current_stream = torch.cuda.current_stream()
-        self.h2d_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.h2d_stream):
-            for gpu_tensor, pinned_tensor in zip(
-                layer_state.gpu_tensors, layer_state.pinned_tensors, strict=True
-            ):
-                gpu_tensor.copy_(pinned_tensor, non_blocking=True)
-                gpu_tensor.record_stream(self.h2d_stream)
-            event = torch.cuda.Event()
-            event.record(self.h2d_stream)
-        layer_state.load_event = event
+        slot = self._acquire_slot()
+        layer_state.slot = slot
+        layer_state.load_event = None
+        layer_state.load_ready = False
+        layer_state.load_error = None
         layer_state.status = "loading"
+        slot.owner = layer_state
+        with self._condition:
+            self._queue.append((layer_state, slot))
+            self._condition.notify()
 
     def _finish_load(self, layer_state: _LayerState) -> None:
+        self._check_worker_error()
         if layer_state.status == "gpu":
             return
         if layer_state.status == "cpu":
             self._start_load(layer_state.index)
-        if layer_state.status != "loading" or layer_state.load_event is None:
+        if layer_state.status != "loading":
+            raise RuntimeError(f"Unexpected layer load state {layer_state.status!r}")
+        self._wait_for_load_launch(layer_state)
+        if layer_state.load_error is not None:
+            raise RuntimeError(
+                f"Streaming weight offload failed while loading layer {layer_state.index}"
+            ) from layer_state.load_error
+        if layer_state.load_event is None or layer_state.slot is None:
             raise RuntimeError(f"Unexpected layer load state {layer_state.status!r}")
         # Transformer Engine can launch work on internal streams. Complete the H2D
         # copy before installing the parameter pointer so every downstream stream
         # observes initialized weights.
         layer_state.load_event.synchronize()
-        for param, gpu_tensor in zip(
-            layer_state.params, layer_state.gpu_tensors, strict=True
-        ):
-            param.data = gpu_tensor
+        self._install_gpu_views(layer_state)
         layer_state.load_event = None
-        layer_state.pinned_tensors = []
         layer_state.status = "gpu"
 
     def _ensure_offloaded(self, layer_state: _LayerState) -> None:
@@ -188,20 +239,107 @@ class StreamingWeightOffloader:
         if layer_state.status != "gpu":
             raise RuntimeError(f"Unexpected layer offload state {layer_state.status!r}")
         current_stream = torch.cuda.current_stream()
-        for gpu_tensor in layer_state.gpu_tensors:
-            gpu_tensor.record_stream(current_stream)
-        for param, cpu_tensor in zip(
-            layer_state.params, layer_state.cpu_tensors, strict=True
-        ):
-            param.data = cpu_tensor
-        layer_state.gpu_tensors = []
+        slot = layer_state.slot
+        if slot is not None:
+            for tensor in slot.gpu.values():
+                tensor.record_stream(current_stream)
+            slot.owner = None
+            slot.release_stream = current_stream
+        self._install_cpu_views(layer_state)
+        layer_state.slot = None
         layer_state.status = "cpu"
+
+    def _acquire_slot(self) -> _LoadSlot:
+        free_slots = [slot for slot in self.slots if slot.owner is None]
+        if not free_slots:
+            raise RuntimeError(
+                "Streaming weight offload has no free load slots; increase "
+                "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS"
+            )
+        return next(
+            (slot for slot in free_slots if slot.release_stream is None),
+            free_slots[0],
+        )
+
+    def _load_worker(self) -> None:
+        torch.cuda.set_device(self.device)
+        while True:
+            with self._condition:
+                while not self._queue and not self._closed:
+                    self._condition.wait()
+                if self._closed and not self._queue:
+                    return
+                layer_state, slot = self._queue.popleft()
+            try:
+                self._run_load(layer_state, slot)
+            except BaseException as exc:  # noqa: BLE001 - propagated to training thread.
+                with self._condition:
+                    layer_state.load_error = exc
+                    layer_state.load_ready = True
+                    self._worker_error = exc
+                    self._condition.notify_all()
+
+    def _run_load(self, layer_state: _LayerState, slot: _LoadSlot) -> None:
+        for group in layer_state.groups:
+            slot.ensure_capacity(group.dtype, group.cpu_flat.numel())
+            slot.pinned[group.dtype][: group.cpu_flat.numel()].copy_(
+                group.cpu_flat,
+                non_blocking=False,
+            )
+        release_stream = slot.release_stream
+        if release_stream is not None:
+            self.h2d_stream.wait_stream(release_stream)
+            slot.release_stream = None
+        with torch.cuda.stream(self.h2d_stream):
+            for group in layer_state.groups:
+                n = group.cpu_flat.numel()
+                gpu_tensor = slot.gpu[group.dtype][:n]
+                gpu_tensor.copy_(slot.pinned[group.dtype][:n], non_blocking=True)
+                gpu_tensor.record_stream(self.h2d_stream)
+            event = torch.cuda.Event()
+            event.record(self.h2d_stream)
+        with self._condition:
+            layer_state.load_event = event
+            layer_state.load_ready = True
+            self._condition.notify_all()
+
+    def _wait_for_load_launch(self, layer_state: _LayerState) -> None:
+        with self._condition:
+            while not layer_state.load_ready and self._worker_error is None:
+                self._condition.wait()
+        self._check_worker_error()
+
+    def _check_worker_error(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError(
+                "Streaming weight offload worker failed"
+            ) from self._worker_error
+
+    def _install_cpu_views(self, layer_state: _LayerState) -> None:
+        for group in layer_state.groups:
+            for spec in group.specs:
+                spec.param.data = group.cpu_flat[
+                    spec.offset : spec.offset + spec.numel
+                ].view(spec.shape)
+
+    def _install_gpu_views(self, layer_state: _LayerState) -> None:
+        if layer_state.slot is None:
+            raise RuntimeError(
+                "Cannot install GPU views before a layer has a load slot"
+            )
+        for group in layer_state.groups:
+            gpu_flat = layer_state.slot.gpu[group.dtype]
+            for spec in group.specs:
+                spec.param.data = gpu_flat[spec.offset : spec.offset + spec.numel].view(
+                    spec.shape
+                )
 
 
 def streaming_weight_offload_config_from_env() -> StreamingWeightOffloadConfig:
     return StreamingWeightOffloadConfig(
         enabled=_env_flag("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD"),
         num_layers=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_LAYERS", 0),
+        num_slots=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS", 2),
     )
 
 
@@ -279,6 +417,32 @@ def _frozen_cuda_parameters(module: torch.nn.Module) -> list[torch.nn.Parameter]
         and not param.requires_grad
         and param.device.type == "cuda"
     ]
+
+
+def _build_tensor_groups(params: list[torch.nn.Parameter]) -> list[_TensorGroup]:
+    grouped: dict[torch.dtype, list[torch.nn.Parameter]] = {}
+    for param in params:
+        grouped.setdefault(param.dtype, []).append(param)
+    groups: list[_TensorGroup] = []
+    for dtype, dtype_params in grouped.items():
+        total_numel = sum(param.numel() for param in dtype_params)
+        cpu_flat = torch.empty(total_numel, dtype=dtype, device="cpu")
+        specs: list[_ParamSpec] = []
+        offset = 0
+        for param in dtype_params:
+            numel = param.numel()
+            cpu_flat[offset : offset + numel].copy_(param.detach().view(-1).cpu())
+            specs.append(
+                _ParamSpec(
+                    param=param,
+                    offset=offset,
+                    numel=numel,
+                    shape=param.shape,
+                )
+            )
+            offset += numel
+        groups.append(_TensorGroup(dtype=dtype, cpu_flat=cpu_flat, specs=specs))
+    return groups
 
 
 def _is_recompute_forward() -> bool:

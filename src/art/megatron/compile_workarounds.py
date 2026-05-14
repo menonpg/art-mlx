@@ -12,11 +12,13 @@ import torch.distributed as dist
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
 _INSTALLED_CONFIG: tuple[frozenset[str], str] | None = None
+_INSTALLED_RUNTIME_CONFIG: frozenset[str] | None = None
 _DEEPEP_DEBUG_COUNTERS: dict[str, int] = {}
 _MOE_DEBUG_COUNTERS: dict[str, int] = {}
 _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG = (
     "disable_compile_self_attn_linear_proj_reduce_scatter"
 )
+_DEEPEP_COMBINE_READINESS_SYNC_FLAG = "deepep_combine_readiness_sync"
 
 
 def _disable(fn):
@@ -153,9 +155,12 @@ def _moe_debug_log(event: str, **payload: Any) -> None:
 
 
 def _tokens_per_expert_payload(tokens_per_expert: Any) -> dict[str, Any]:
-    if not isinstance(tokens_per_expert, torch.Tensor):
+    if isinstance(tokens_per_expert, (list, tuple)):
+        counts = torch.tensor(tokens_per_expert, dtype=torch.int64)
+    elif isinstance(tokens_per_expert, torch.Tensor):
+        counts = tokens_per_expert.detach().cpu().to(torch.int64)
+    else:
         return {}
-    counts = tokens_per_expert.detach().cpu().to(torch.int64)
     if counts.numel() == 0:
         return {
             "tokens_per_expert_shape": tuple(int(dim) for dim in counts.shape),
@@ -186,42 +191,380 @@ def _install_moe_debug_wrappers(moe_experts: Any) -> None:
     grouped_mlp = getattr(moe_experts, "TEGroupedMLP", None)
     if grouped_mlp is None:
         return
-    original = getattr(grouped_mlp, "forward", None)
-    if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+
+    def install_inline_grouped_mlp_forward() -> bool:
+        if not _env_enabled("ART_MEGATRON_MOE_DEBUG_INLINE_FORWARD"):
+            return False
+        original = getattr(grouped_mlp, "forward", None)
+        if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+            return True
+
+        from megatron.core import tensor_parallel
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        from megatron.core.typed_torch import apply_module
+
+        def wrapped(
+            self: Any,
+            permuted_local_hidden_states: torch.Tensor,
+            tokens_per_expert: Any,
+            permuted_probs: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            counter = _next_moe_debug_count("te_grouped_mlp_forward")
+            tokens_payload = tokens_per_expert
+            start_time = time.time()
+            _moe_debug_log(
+                "te_grouped_mlp_forward_enter",
+                count=counter,
+                module_id=id(self),
+                hidden_shape=_tensor_shape(permuted_local_hidden_states),
+                probs_shape=_tensor_shape(permuted_probs),
+                activation_recompute=bool(getattr(self, "activation_recompute", False)),
+                offload_expert_fc1=bool(getattr(self, "offload_expert_fc1", False)),
+                offload_moe_act=bool(getattr(self, "offload_moe_act", False)),
+                inline_forward=True,
+                **_tokens_per_expert_payload(tokens_payload),
+            )
+            if isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = tokens_per_expert.tolist()
+            else:
+                tokens_per_expert = list(tokens_per_expert)
+            if self.config.fp8 or self.config.fp4:
+                actual_tokens_per_expert = tokens_per_expert
+                permuted_local_hidden_states, tokens_per_expert = (
+                    self.quantization_padding(
+                        permuted_local_hidden_states, tokens_per_expert
+                    )
+                )
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+                )
+            else:
+                actual_tokens_per_expert = None
+                permuted_probs = permuted_probs.unsqueeze(-1)
+
+            if self.config.moe_apply_probs_on_input:
+                assert self.config.moe_router_topk == 1
+                original_dtype = permuted_local_hidden_states.dtype
+                permuted_local_hidden_states = (
+                    permuted_probs * permuted_local_hidden_states
+                )
+                permuted_local_hidden_states = permuted_local_hidden_states.to(
+                    original_dtype
+                )
+                permuted_probs = torch.ones_like(permuted_probs)
+
+            with off_interface(
+                self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            ) as permuted_local_hidden_states:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+            if self.offload_expert_fc1:
+                fc1_output = off_interface.group_commit(
+                    fc1_output,
+                    name="expert_fc1",
+                    forced_released_tensors=[permuted_local_hidden_states],
+                )
+
+            if self.activation_recompute:
+                self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with off_interface(
+                    self.offload_moe_act, fc1_output, "moe_act"
+                ) as fc1_output:
+                    bias_act_output = self.activation_checkpoint.checkpoint(
+                        self.bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    )
+            else:
+                with off_interface(
+                    self.offload_moe_act, fc1_output, "moe_act"
+                ) as fc1_output:
+                    bias_act_output = self.bias_act_func(
+                        fc1_output, bias_parallel, permuted_probs
+                    )
+
+            _moe_debug_log(
+                "te_grouped_mlp_inline_before_fc2",
+                count=counter,
+                module_id=id(self),
+                hidden_shape=_tensor_shape(bias_act_output),
+                **_tokens_per_expert_payload(tokens_payload),
+            )
+            output, output_bias = apply_module(self.linear_fc2)(
+                bias_act_output, tokens_per_expert
+            )
+            _moe_debug_log(
+                "te_grouped_mlp_inline_after_fc2",
+                count=counter,
+                module_id=id(self),
+                result_shape=_tensor_shape(output),
+                bias_shape=_tensor_shape(output_bias),
+                activation_recompute=bool(self.activation_recompute),
+                offload_moe_act=bool(self.offload_moe_act),
+            )
+            if self.activation_recompute:
+                _moe_debug_log(
+                    "te_grouped_mlp_inline_before_recompute_discard",
+                    count=counter,
+                    module_id=id(self),
+                    result_shape=_tensor_shape(output),
+                )
+                self.activation_checkpoint.discard_output_and_register_recompute(output)
+            if self.offload_moe_act:
+                _moe_debug_log(
+                    "te_grouped_mlp_inline_before_moe_act_commit",
+                    count=counter,
+                    module_id=id(self),
+                    result_shape=_tensor_shape(output),
+                )
+                output = off_interface.group_commit(
+                    output, name="moe_act", forced_released_tensors=[fc1_output]
+                )
+            _moe_debug_log(
+                "te_grouped_mlp_inline_before_apply_bias",
+                count=counter,
+                module_id=id(self),
+                result_shape=_tensor_shape(output),
+                bias_shape=_tensor_shape(output_bias),
+                probs_shape=_tensor_shape(permuted_probs),
+            )
+            output = self._apply_bias(
+                output, output_bias, tokens_per_expert, permuted_probs
+            )
+            _moe_debug_log(
+                "te_grouped_mlp_inline_after_apply_bias",
+                count=counter,
+                module_id=id(self),
+                result_shape=_tensor_shape(output),
+            )
+            if self.config.fp8 or self.config.fp4:
+                output = self.quantization_unpadding(output, actual_tokens_per_expert)
+            _moe_debug_log(
+                "te_grouped_mlp_forward_exit",
+                count=counter,
+                module_id=id(self),
+                elapsed_ms=(time.time() - start_time) * 1000.0,
+                result_shape=_tensor_shape(output),
+                inline_forward=True,
+            )
+            return output, None
+
+        setattr(wrapped, "__art_moe_debug_wrapped__", True)
+        grouped_mlp.forward = wrapped
+        return True
+
+    def wrap_grouped_mlp_forward() -> None:
+        original = getattr(grouped_mlp, "forward", None)
+        if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+            return
+
+        def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+            counter = _next_moe_debug_count("te_grouped_mlp_forward")
+            hidden_states = (
+                args[0]
+                if len(args) >= 1
+                else kwargs.get("permuted_local_hidden_states")
+            )
+            tokens_per_expert = (
+                args[1] if len(args) >= 2 else kwargs.get("tokens_per_expert")
+            )
+            permuted_probs = args[2] if len(args) >= 3 else kwargs.get("permuted_probs")
+            start_time = time.time()
+            _moe_debug_log(
+                "te_grouped_mlp_forward_enter",
+                count=counter,
+                module_id=id(self),
+                hidden_shape=_tensor_shape(hidden_states),
+                probs_shape=_tensor_shape(permuted_probs),
+                activation_recompute=bool(getattr(self, "activation_recompute", False)),
+                offload_expert_fc1=bool(getattr(self, "offload_expert_fc1", False)),
+                offload_moe_act=bool(getattr(self, "offload_moe_act", False)),
+                **_tokens_per_expert_payload(tokens_per_expert),
+            )
+            result = original(self, *args, **kwargs)
+            elapsed_ms = (time.time() - start_time) * 1000.0
+            output = result[0] if isinstance(result, tuple) and result else result
+            _moe_debug_log(
+                "te_grouped_mlp_forward_exit",
+                count=counter,
+                module_id=id(self),
+                elapsed_ms=elapsed_ms,
+                result_shape=_tensor_shape(output),
+            )
+            return result
+
+        setattr(wrapped, "__art_moe_debug_wrapped__", True)
+        grouped_mlp.forward = _disable(wrapped)
+
+    def wrap_bias_act_func() -> None:
+        original = getattr(grouped_mlp, "bias_act_func", None)
+        if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+            return
+
+        def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+            counter = _next_moe_debug_count("te_grouped_mlp_bias_act")
+            start_time = time.time()
+            _moe_debug_log(
+                "te_grouped_mlp_bias_act_enter",
+                count=counter,
+                module_id=id(self),
+                hidden_shape=_tensor_shape(args[0] if args else None),
+                probs_shape=_tensor_shape(args[2] if len(args) >= 3 else None),
+            )
+            result = original(self, *args, **kwargs)
+            _moe_debug_log(
+                "te_grouped_mlp_bias_act_exit",
+                count=counter,
+                module_id=id(self),
+                elapsed_ms=(time.time() - start_time) * 1000.0,
+                result_shape=_tensor_shape(result),
+            )
+            return result
+
+        setattr(wrapped, "__art_moe_debug_wrapped__", True)
+        grouped_mlp.bias_act_func = _disable(wrapped)
+
+    def wrap_apply_bias() -> None:
+        original = getattr(grouped_mlp, "_apply_bias", None)
+        if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+            return
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            counter = _next_moe_debug_count("te_grouped_mlp_apply_bias")
+            start_time = time.time()
+            output = args[0] if len(args) >= 1 else None
+            bias = args[1] if len(args) >= 2 else None
+            tokens_per_expert = args[2] if len(args) >= 3 else None
+            probs = args[3] if len(args) >= 4 else None
+            _moe_debug_log(
+                "te_grouped_mlp_apply_bias_enter",
+                count=counter,
+                hidden_shape=_tensor_shape(output),
+                bias_shape=_tensor_shape(bias),
+                probs_shape=_tensor_shape(probs),
+                **_tokens_per_expert_payload(tokens_per_expert),
+            )
+            result = original(*args, **kwargs)
+            _moe_debug_log(
+                "te_grouped_mlp_apply_bias_exit",
+                count=counter,
+                elapsed_ms=(time.time() - start_time) * 1000.0,
+                result_shape=_tensor_shape(result),
+            )
+            return result
+
+        setattr(wrapped, "__art_moe_debug_wrapped__", True)
+        grouped_mlp._apply_bias = staticmethod(_disable(wrapped))
+
+    def wrap_grouped_linear(cls: Any, label: str) -> None:
+        original = getattr(cls, "forward", None)
+        if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+            return
+
+        def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+            counter = _next_moe_debug_count(label)
+            start_time = time.time()
+            hidden_states = args[0] if args else None
+            tokens_per_expert = args[1] if len(args) >= 2 else None
+            _moe_debug_log(
+                f"{label}_enter",
+                count=counter,
+                module_id=id(self),
+                hidden_shape=_tensor_shape(hidden_states),
+                **_tokens_per_expert_payload(tokens_per_expert),
+            )
+            result = original(self, *args, **kwargs)
+            output = result[0] if isinstance(result, tuple) and result else result
+            sync_target = os.environ.get("ART_MEGATRON_MOE_DEBUG_SYNC_LINEAR", "")
+            if sync_target and sync_target in {"1", "true", "all", label}:
+                _moe_debug_log(
+                    f"{label}_sync_enter",
+                    count=counter,
+                    module_id=id(self),
+                    result_shape=_tensor_shape(output),
+                )
+                torch.cuda.synchronize()
+                _moe_debug_log(
+                    f"{label}_sync_exit",
+                    count=counter,
+                    module_id=id(self),
+                    result_shape=_tensor_shape(output),
+                )
+            _moe_debug_log(
+                f"{label}_exit",
+                count=counter,
+                module_id=id(self),
+                elapsed_ms=(time.time() - start_time) * 1000.0,
+                result_shape=_tensor_shape(output),
+            )
+            return result
+
+        setattr(wrapped, "__art_moe_debug_wrapped__", True)
+        cls.forward = _disable(wrapped)
+
+    def wrap_offload_group_commit() -> None:
+        try:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+        except ImportError:
+            return
+        original = getattr(off_interface, "group_commit", None)
+        if original is None or getattr(original, "__art_moe_debug_wrapped__", False):
+            return
+
+        def wrapped(
+            tensor: torch.Tensor,
+            name: str,
+            forced_released_tensors: Any = None,
+            delay_offload: bool = False,
+        ) -> torch.Tensor:
+            counter = _next_moe_debug_count("fine_grained_group_commit")
+            start_time = time.time()
+            _moe_debug_log(
+                "fine_grained_group_commit_enter",
+                count=counter,
+                name=name,
+                hidden_shape=_tensor_shape(tensor),
+                forced_count=(
+                    len(forced_released_tensors)
+                    if forced_released_tensors is not None
+                    else 0
+                ),
+                delay_offload=bool(delay_offload),
+            )
+            result = original(tensor, name, forced_released_tensors, delay_offload)
+            _moe_debug_log(
+                "fine_grained_group_commit_exit",
+                count=counter,
+                name=name,
+                elapsed_ms=(time.time() - start_time) * 1000.0,
+                result_shape=_tensor_shape(result),
+            )
+            return result
+
+        setattr(wrapped, "__art_moe_debug_wrapped__", True)
+        setattr(off_interface, "group_commit", staticmethod(_disable(wrapped)))
+
+    inline_forward = install_inline_grouped_mlp_forward()
+    if not inline_forward:
+        wrap_grouped_mlp_forward()
+    wrap_bias_act_func()
+    wrap_apply_bias()
+    wrap_offload_group_commit()
+    try:
+        from megatron.core.extensions import transformer_engine as te_ext
+    except ImportError:
         return
-
-    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
-        counter = _next_moe_debug_count("te_grouped_mlp_forward")
-        hidden_states = (
-            args[0] if len(args) >= 1 else kwargs.get("permuted_local_hidden_states")
-        )
-        tokens_per_expert = (
-            args[1] if len(args) >= 2 else kwargs.get("tokens_per_expert")
-        )
-        permuted_probs = args[2] if len(args) >= 3 else kwargs.get("permuted_probs")
-        start_time = time.time()
-        _moe_debug_log(
-            "te_grouped_mlp_forward_enter",
-            count=counter,
-            module_id=id(self),
-            hidden_shape=_tensor_shape(hidden_states),
-            probs_shape=_tensor_shape(permuted_probs),
-            **_tokens_per_expert_payload(tokens_per_expert),
-        )
-        result = original(self, *args, **kwargs)
-        elapsed_ms = (time.time() - start_time) * 1000.0
-        output = result[0] if isinstance(result, tuple) and result else result
-        _moe_debug_log(
-            "te_grouped_mlp_forward_exit",
-            count=counter,
-            module_id=id(self),
-            elapsed_ms=elapsed_ms,
-            result_shape=_tensor_shape(output),
-        )
-        return result
-
-    setattr(wrapped, "__art_moe_debug_wrapped__", True)
-    grouped_mlp.forward = _disable(wrapped)
+    wrap_grouped_linear(
+        getattr(te_ext, "TEColumnParallelGroupedLinear", None),
+        "te_grouped_mlp_fc1",
+    )
+    wrap_grouped_linear(
+        getattr(te_ext, "TERowParallelGroupedLinear", None),
+        "te_grouped_mlp_fc2",
+    )
 
 
 def _install_deepep_debug_wrappers(deepep_manager: Any) -> None:
@@ -278,9 +621,7 @@ def _install_deepep_debug_wrappers(deepep_manager: Any) -> None:
             payload = {}
             if _env_enabled("ART_MEGATRON_DEEPEP_DEBUG"):
                 payload.update(
-                    _tokens_per_expert_payload(
-                        getattr(self, "tokens_per_expert", None)
-                    )
+                    _tokens_per_expert_payload(getattr(self, "tokens_per_expert", None))
                 )
             _deepep_debug_log(
                 f"{name}_exit",
@@ -307,10 +648,60 @@ def _install_deepep_debug_wrappers(deepep_manager: Any) -> None:
     setattr(deepep_manager, "__art_deepep_debug_wrapped__", True)
 
 
+def _install_deepep_combine_readiness_sync(deepep_manager: Any) -> None:
+    original = getattr(deepep_manager, "combine", None)
+    if original is None or getattr(
+        original, "__art_deepep_combine_sync_wrapped__", False
+    ):
+        return
+
+    def wrapped(
+        self: Any, hidden_states: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> Any:
+        _deepep_debug_log(
+            "combine_readiness_sync_enter",
+            hidden_shape=_tensor_shape(hidden_states),
+            handle_is_none=getattr(self, "handle", None) is None,
+            group_size=int(self.group.size()),
+        )
+        token = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
+        dist.all_reduce(token, group=self.group)
+        _deepep_debug_log(
+            "combine_readiness_sync_exit",
+            hidden_shape=_tensor_shape(hidden_states),
+            handle_is_none=getattr(self, "handle", None) is None,
+            group_size=int(self.group.size()),
+        )
+        return original(self, hidden_states, *args, **kwargs)
+
+    setattr(wrapped, "__art_deepep_combine_sync_wrapped__", True)
+    setattr(deepep_manager, "combine", _disable(wrapped))
+
+
+def install_megatron_runtime_workarounds(
+    config: CompileWorkaroundConfig | None = None,
+) -> None:
+    global _INSTALLED_RUNTIME_CONFIG
+    flags = frozenset(_selected_workaround_flags(config))
+    if _INSTALLED_RUNTIME_CONFIG is not None:
+        if _INSTALLED_RUNTIME_CONFIG != flags:
+            raise RuntimeError(
+                "Megatron runtime workarounds already installed with a different config"
+            )
+        return
+    from megatron.core.transformer.moe import token_dispatcher
+
+    deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
+    if deepep_manager is not None and _DEEPEP_COMBINE_READINESS_SYNC_FLAG in flags:
+        _install_deepep_combine_readiness_sync(deepep_manager)
+    _INSTALLED_RUNTIME_CONFIG = flags
+
+
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
     global _INSTALLED_CONFIG
+    install_megatron_runtime_workarounds(config)
     flags = _selected_workaround_flags(config)
     shared_expert_state = "none" if config is None else config.shared_expert_state
     installed_config = (frozenset(flags), shared_expert_state)
@@ -346,6 +737,8 @@ def install_torch_compile_workarounds(
 
     deepep_manager = getattr(token_dispatcher, "_DeepepManager", None)
     if deepep_manager is not None:
+        if _DEEPEP_COMBINE_READINESS_SYNC_FLAG in flags:
+            _install_deepep_combine_readiness_sync(deepep_manager)
         if "deepep_permute_restore" in flags:
             deepep_manager.get_permuted_hidden_states_by_experts = _disable(
                 deepep_manager.get_permuted_hidden_states_by_experts
