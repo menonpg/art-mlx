@@ -2082,6 +2082,39 @@ def make_runtime_key(
     )
 
 
+def build_context_parallel_token_layout_index(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+) -> TokenLayoutIndex:
+    """Return the token ownership chosen by the real CP attention planner."""
+
+    spec = build_shared_prefix_attention_spec(
+        group_ids=group_ids, parent_ids=parent_ids
+    )
+    if int(topology.cp) <= 1:
+        valid_tokens = int(spec.rows[0].valid_tokens) if spec.rows else 0
+        return TokenLayoutIndex(
+            ownership_ranges_by_rank=(((0, valid_tokens, 0),) if valid_tokens else (),),
+            token_counts_by_rank=(valid_tokens,),
+        )
+    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
+    _row_spec, chunk_ranges, owners, _wave_assignment = _runtime_plan_assignment(
+        spec,
+        topology=topology,
+        config=runtime_config,
+    )
+    del original_seq_len
+    return _build_runtime_token_layout_index(
+        chunk_ranges=chunk_ranges,
+        owners=owners,
+        cp_size=max(int(topology.cp), 1),
+    )
+
+
 def prepare_cp_micro(
     *,
     micro: PackedTensors,

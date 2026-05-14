@@ -352,7 +352,11 @@ def _hidden_and_grad(
 
 
 def _packed_correctness_cases() -> tuple[GdnPhase0Case, ...]:
-    return (*default_phase0_cases(conv_width=2), _mixed_local_chain_case())
+    return (
+        *default_phase0_cases(conv_width=2),
+        _mixed_local_chain_case(),
+        _local_prefix_chain_completion_case(),
+    )
 
 
 def _planner_config_for_case(case: GdnPhase0Case) -> GdnPlannerConfig | None:
@@ -380,6 +384,20 @@ def _mixed_local_chain_case() -> GdnPhase0Case:
         ),
         seed=67,
         description="One row mixing long native CP-chain work and short local-fork siblings.",
+    )
+
+
+def _local_prefix_chain_completion_case() -> GdnPhase0Case:
+    return GdnPhase0Case(
+        name="local_prefix_chain_completion_edge",
+        sequence_length=768,
+        rows=(
+            GdnPackedRowShape(
+                families=(GdnFamilyShape(prefix_length=96, suffix_lengths=(640, 17)),)
+            ),
+        ),
+        seed=71,
+        description="Short local prefix feeding a long native CP-chain completion.",
     )
 
 

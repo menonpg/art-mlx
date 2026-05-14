@@ -19,9 +19,10 @@ import torch
 from torch.distributed import destroy_process_group, init_process_group
 import torch.multiprocessing as mp
 
+from art.megatron.context_parallel import build_context_parallel_token_layout_index
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.context_parallel.runtime import _normalized_chunk_size
-from art.megatron.context_parallel.types import ContextParallelConfig
+from art.megatron.context_parallel.types import ContextParallelConfig, ParallelTopology
 from art.megatron.gdn.gdn_shared_prefix import (
     GdnPlannerConfig,
     build_gdn_rank_execution_plan,
@@ -65,6 +66,7 @@ class StackedWorkloadConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
+    scale_target_seq_len_with_cp: bool = True
     prefix_length_mode: str = "fixed"
     family_pattern: str = "uniform"
     base_target_seq_len: int = Field(ge=1)
@@ -510,21 +512,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cp-attention-layout",
         choices=(
+            "actual_cp",
             "planner_default",
+            "gdn_proxy",
             "contiguous",
             "striped",
             "reversed_striped",
             "randomized_cp_chunks",
         ),
-        default="planner_default",
+        default="actual_cp",
         help=(
             "CP attention-token ownership fed into the GDN planner. "
-            "planner_default lets the GDN planner choose the current low-exchange "
-            "layout; reversed_striped reverses CP-sized chunk assignment order "
-            "as a layout sensitivity check; randomized_cp_chunks "
-            "shuffles attention-CP-sized token chunks across ranks."
+            "actual_cp uses the real ART context-parallel attention planner; "
+            "planner_default/gdn_proxy lets the GDN planner choose its old "
+            "proxy low-exchange source layout; reversed_striped reverses "
+            "CP-sized chunk assignment order as a layout sensitivity check; "
+            "randomized_cp_chunks shuffles attention-CP-sized token chunks "
+            "across ranks."
         ),
     )
+    parser.add_argument("--cp-chain-beam-max-steps", type=int, default=4)
+    parser.add_argument("--planner-local-token-ms", type=float, default=0.00065)
+    parser.add_argument("--planner-chain-token-ms", type=float, default=0.00055)
+    parser.add_argument("--planner-chain-bucket-ms", type=float, default=22.0)
+    parser.add_argument("--planner-local-segment-ms", type=float, default=0.010)
+    parser.add_argument(
+        "--planner-layout-cross-rank-token-ms", type=float, default=0.00008
+    )
+    parser.add_argument(
+        "--planner-parent-state-exchange-base-ms", type=float, default=40.0
+    )
+    parser.add_argument("--planner-parent-state-exchange-ms", type=float, default=0.5)
+    parser.add_argument("--planner-empty-rank-ms", type=float, default=32.0)
     parser.add_argument("--conv-width", type=int, default=None)
     parser.add_argument(
         "--target-seq-len",
@@ -581,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         "--output-dir", "--results-dir", dest="output_dir", type=Path, required=True
     )
     args = parser.parse_args(argv)
+    args.gdn_planner_config = _planner_config_from_args(args)
     args.num_sequences = int(
         args.num_sequences if args.num_sequences is not None else args.iters or 32
     )
@@ -855,6 +875,7 @@ def _prepare_sequence(
                 cp_size=cp_size,
                 cp_group=cp_group,
                 cp_attention_layout=args.cp_attention_layout,
+                planner_config=args.gdn_planner_config,
                 seed=int(args.seed),
                 device=torch.device("cpu"),
             )
@@ -899,6 +920,7 @@ def _build_execution_plan(
     cp_size: int,
     cp_group: Any | None,
     cp_attention_layout: str,
+    planner_config: GdnPlannerConfig,
     seed: int,
     device: torch.device,
 ) -> tuple[Any, Any]:
@@ -906,12 +928,16 @@ def _build_execution_plan(
         spec = parse_gdn_shared_prefix_segments(
             group_ids, parent_ids, min_completions_per_family=0
         )
-        return spec, build_gdn_rank_execution_plan(spec, device=device)
+        return spec, build_gdn_rank_execution_plan(
+            spec, device=device, planner_config=planner_config
+        )
     spec = parse_gdn_shared_prefix_segments(
         group_ids, parent_ids, min_completions_per_family=0
     )
     attention_token_layout_index = _attention_layout_index_for_mode(
         spec,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
         cp_size=cp_size,
         mode=cp_attention_layout,
         seed=seed,
@@ -922,17 +948,28 @@ def _build_execution_plan(
         cp_rank=cp_rank,
         cp_size=cp_size,
         attention_token_layout_index=attention_token_layout_index,
+        planner_config=planner_config,
     )
 
 
 def _attention_layout_index_for_mode(
     spec: Any,
     *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
     cp_size: int,
     mode: str,
     seed: int,
 ) -> TokenLayoutIndex | None:
-    if mode == "planner_default":
+    if mode == "actual_cp":
+        return build_context_parallel_token_layout_index(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+            topology=ParallelTopology(cp=cp_size),
+            config=ContextParallelConfig(),
+            original_seq_len=int(spec.sequence_length),
+        )
+    if mode in {"planner_default", "gdn_proxy"}:
         return None
     ranges_by_rank = _attention_layout_ranges_for_mode(
         spec,
@@ -2026,6 +2063,24 @@ def _selected_workloads(args: argparse.Namespace) -> tuple[StackedWorkloadConfig
     return tuple(available[name] for name in names)
 
 
+def _planner_config_from_args(args: argparse.Namespace) -> GdnPlannerConfig:
+    return GdnPlannerConfig(
+        cp_chain_beam_max_steps=int(args.cp_chain_beam_max_steps),
+        planner_local_token_ms=float(args.planner_local_token_ms),
+        planner_chain_token_ms=float(args.planner_chain_token_ms),
+        planner_chain_bucket_ms=float(args.planner_chain_bucket_ms),
+        planner_local_segment_ms=float(args.planner_local_segment_ms),
+        planner_layout_cross_rank_token_ms=float(
+            args.planner_layout_cross_rank_token_ms
+        ),
+        planner_parent_state_exchange_base_ms=float(
+            args.planner_parent_state_exchange_base_ms
+        ),
+        planner_parent_state_exchange_ms=float(args.planner_parent_state_exchange_ms),
+        planner_empty_rank_ms=float(args.planner_empty_rank_ms),
+    )
+
+
 def _workload_matrix() -> dict[str, StackedWorkloadConfig]:
     return {
         "fixed_5k_16x100": StackedWorkloadConfig(
@@ -2080,6 +2135,32 @@ def _workload_matrix() -> dict[str, StackedWorkloadConfig]:
             branches_per_prefix=4,
             description="Many small prompt families, kept on the backburner but selectable.",
         ),
+        "varied_many_small_64x8x16": StackedWorkloadConfig(
+            name="varied_many_small_64x8x16",
+            prefix_length_mode="clipped_normal",
+            base_target_seq_len=40960,
+            prefix_length_mean=64,
+            prefix_length_std=7,
+            prefix_length_clip_delta=13,
+            branch_length_mean=16,
+            branch_length_std=5,
+            branch_length_clip_delta=10,
+            branches_per_prefix=8,
+            description="Many small sampled prompt families with eight short completions each.",
+        ),
+        "varied_medium_long_8k_8x1k": StackedWorkloadConfig(
+            name="varied_medium_long_8k_8x1k",
+            prefix_length_mode="clipped_normal",
+            base_target_seq_len=40960,
+            prefix_length_mean=8192,
+            prefix_length_std=512,
+            prefix_length_clip_delta=1024,
+            branch_length_mean=1024,
+            branch_length_std=256,
+            branch_length_clip_delta=512,
+            branches_per_prefix=8,
+            description="Sampled medium-long 8k prefix plus eight 1k completions.",
+        ),
         "varied_dominant_14745_16x921": StackedWorkloadConfig(
             name="varied_dominant_14745_16x921",
             prefix_length_mode="clipped_normal",
@@ -2114,6 +2195,45 @@ def _workload_matrix() -> dict[str, StackedWorkloadConfig]:
             branches_per_prefix=16,
             description="Long-branch 8k plus 16x8k workload.",
         ),
+        "completion_chain_1k_2x32k": StackedWorkloadConfig(
+            name="completion_chain_1k_2x32k",
+            prefix_length_mode="fixed",
+            base_target_seq_len=81920,
+            prefix_length_mean=1024,
+            prefix_length_std=0,
+            prefix_length_clip_delta=0,
+            branch_length_mean=32768,
+            branch_length_std=0,
+            branch_length_clip_delta=0,
+            branches_per_prefix=2,
+            description="Short prefix with long completions to exercise completion-chain planning.",
+        ),
+        "forced_prefix_chain_64k_8x16k": StackedWorkloadConfig(
+            name="forced_prefix_chain_64k_8x16k",
+            prefix_length_mode="fixed",
+            base_target_seq_len=49152,
+            prefix_length_mean=65536,
+            prefix_length_std=0,
+            prefix_length_clip_delta=0,
+            branch_length_mean=16384,
+            branch_length_std=0,
+            branch_length_clip_delta=0,
+            branches_per_prefix=8,
+            description="Oversized prefix workload that forces prefix-chain planning for CP sizes above one.",
+        ),
+        "true_completion_chain_32k_2x32k": StackedWorkloadConfig(
+            name="true_completion_chain_32k_2x32k",
+            prefix_length_mode="fixed",
+            base_target_seq_len=65536,
+            prefix_length_mean=32768,
+            prefix_length_std=0,
+            prefix_length_clip_delta=0,
+            branch_length_mean=32768,
+            branch_length_std=0,
+            branch_length_clip_delta=0,
+            branches_per_prefix=2,
+            description="Long prefix plus long completions to exercise prefix and completion-chain planning.",
+        ),
         "long_64k_8x64k": StackedWorkloadConfig(
             name="long_64k_8x64k",
             prefix_length_mode="fixed",
@@ -2127,6 +2247,24 @@ def _workload_matrix() -> dict[str, StackedWorkloadConfig]:
             branches_per_prefix=8,
             description="Very long 64k plus 8x64k workload.",
         ),
+        "long_20k_4x120k_varied": StackedWorkloadConfig(
+            name="long_20k_4x120k_varied",
+            scale_target_seq_len_with_cp=False,
+            prefix_length_mode="fixed",
+            base_target_seq_len=500000,
+            prefix_length_mean=20000,
+            prefix_length_std=0,
+            prefix_length_clip_delta=0,
+            branch_length_mean=120000,
+            branch_length_std=4096,
+            branch_length_clip_delta=8192,
+            branches_per_prefix=4,
+            description=(
+                "Fixed-total single-family 20k prefix plus four varied "
+                "120k completions; target sequence length is not weak-scaled "
+                "with CP size."
+            ),
+        ),
     }
 
 
@@ -2139,7 +2277,8 @@ def _args_for_run(
     run_args.workload = workload
     run_args.cp_size = cp_size
     run_args.target_seq_len = int(args.target_seq_len or workload.base_target_seq_len)
-    run_args.target_seq_len *= cp_size
+    if workload.scale_target_seq_len_with_cp:
+        run_args.target_seq_len *= cp_size
     run_args.prefix_len = int(args.prefix_len or workload.prefix_length_mean)
     run_args.suffix_len = int(args.suffix_len or workload.branch_length_mean)
     run_args.completions_per_family = int(
@@ -2277,9 +2416,9 @@ def _manifest_configs(
         "prefix_length_mode_override": args.prefix_length_mode,
         "base_cp1_target_seq_len": args.target_seq_len,
         "cp_target_seq_len_rule": (
-            "effective_target_seq_len = base_cp1_target_seq_len * cp_size; "
-            "per-family prefix/completion lengths stay fixed and additional "
-            "families are packed to target"
+            "effective_target_seq_len = base_target_seq_len * cp_size for "
+            "workloads with scale_target_seq_len_with_cp=True; otherwise the "
+            "base target is fixed across CP sizes"
         ),
         "overlap_next_state_prep": args.overlap_next_state_prep,
         "activation_checkpoint_gdn": args.activation_checkpoint_gdn,
@@ -2287,7 +2426,7 @@ def _manifest_configs(
         "layer_execution_pattern": "attention_style_independent_fwd_bwd",
         "benchmark_dtype": str(BENCHMARK_DTYPE),
         "rank_torch_num_threads": torch.get_num_threads(),
-        "planner_config": GdnPlannerConfig().model_dump(),
+        "planner_config": args.gdn_planner_config.model_dump(),
     }
 
 
@@ -2421,12 +2560,12 @@ def _render_report(results: tuple[StackedGdnProxyResult, ...]) -> str:
             "The default GDN module uses Qwen3.5-35B-A3B GDN-relevant dimensions: hidden size 2048, 16 linear key heads, 32 linear value heads, 128-dimensional GDN keys/values, and convolution width 4. The stacked proxy reuses one representative GDN module across executed GDN applications to keep long-sequence activation and CP timing measurable without adding parameter-footprint pressure that is orthogonal to the GDN sequence path.",
             "By default --gdn-linear-policy=noop replaces GDN in/out projection modules inside this benchmark only, so reported times isolate the shared-prefix GDN recurrence/layout/setup path. Use --gdn-linear-policy=real for a full layer-style projection timing.",
             "Each counted GDN layer receives a fresh detached input and runs backward immediately, matching the stacked attention proxy rather than retaining activations through a full model stack. Activation checkpointing is disabled because there is no cross-layer autograd graph in this benchmark.",
-            "Target sequence length is weak-scaled by adding more fixed-shape families; the final family may use fewer completions to fit the target.",
+            "Target sequence length is weak-scaled only for workloads with scale_target_seq_len_with_cp=True; fixed-total workloads keep the same target across CP sizes.",
             "Distributed GDN token exchange, parent-state exchange, native FLA CP scans, and parameter-gradient all-reduce use Megatron's context-parallel process group.",
             "CP token layout conversion is charged at Qwen3.5 GDN/full-attention boundaries: attention layout to GDN layout once per contiguous GDN group, GDN layout reused by every layer in that group, then GDN layout back to attention layout once at the next full-attention boundary.",
-            "`--cp-attention-layout=planner_default` lets the GDN planner pick its low-exchange rank ownership. `reversed_striped` reverses CP-sized chunk assignment order and `randomized_cp_chunks` shuffles those chunks to check layout sensitivity without relying on token-list ownership.",
+            "`--cp-attention-layout=actual_cp` uses the real ART context-parallel attention planner token ownership. `planner_default`/`gdn_proxy` preserves the old GDN proxy source layout. `reversed_striped` reverses CP-sized chunk assignment order and `randomized_cp_chunks` shuffles those chunks to check layout sensitivity without relying on token-list ownership.",
             "GDN planning is built once per packed sequence. Setup blocking includes any exposed next-sequence prep that appears as sync overhang after the current layer-window event, so e2e is layer-window plus blocking setup without dropping that training gap.",
-            "The default workload keeps prefixes fixed and samples completion lengths, matching the attention proxy contract. Select `varied_5k_16x100`, `varied_dominant_14745_16x921`, or `--prefix-length-mode clipped_normal` to sample prefixes.",
+            "A new packed sequence is sampled for every sequence_index, so varied workloads exercise sequence-to-sequence completion length changes across repeated fwd/bwd layer passes.",
             "",
         ]
     )

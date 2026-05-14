@@ -965,6 +965,21 @@ def _run_cp_planned_prefixes_and_completions(
         state_chunks=prefix_rec_chunks,
         zero_state=_zero_recurrent_state(gdn, qkv, batch_size=plan.family_count),
     )
+    parent_state_exchanged = False
+    if plan.chain_completion_buckets and plan.parent_state_exchange_family_indices:
+        if not plan.parent_state_transfers:
+            raise ValueError("CP parent-state exchange requires planned transfers")
+        with _nvtx_range("art_gdn_cp_parent_state_exchange", prefix_conv_table):
+            prefix_conv_table, prefix_rec_table, exchange_dependency = (
+                _exchange_parent_state_rows(
+                    prefix_conv_table,
+                    prefix_rec_table,
+                    transfers=plan.parent_state_transfers,
+                    group=group,
+                )
+            )
+        cp_dependency = cp_dependency + exchange_dependency
+        parent_state_exchanged = True
     for bucket in plan.chain_completion_buckets:
         with _nvtx_range("art_gdn_input_layout_gather_reorder", qkv):
             completion_qkv, completion_beta, completion_g = _gather_bucket_streams(
@@ -1021,7 +1036,7 @@ def _run_cp_planned_prefixes_and_completions(
             recurrent_output, bucket, completion_out
         )
 
-    if plan.parent_state_exchange_family_indices:
+    if plan.parent_state_exchange_family_indices and not parent_state_exchanged:
         if not plan.parent_state_transfers:
             raise ValueError("CP parent-state exchange requires planned transfers")
         with _nvtx_range("art_gdn_cp_parent_state_exchange", prefix_conv_table):

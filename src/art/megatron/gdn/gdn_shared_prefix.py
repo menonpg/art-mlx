@@ -9,6 +9,7 @@ import torch
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 
 GdnSegmentKind = Literal["prefix", "completion"]
+GdnSegmentDecisionKey = tuple[int, int, int]
 # FLA's public chunk_gated_delta_rule hard-codes 64-token WY chunks.
 FLA_CHUNK_SIZE = 64
 _PydanticModelT = TypeVar("_PydanticModelT", bound=BaseModel)
@@ -178,12 +179,26 @@ class GdnPlannerConfig(BaseModel):
     local_fork_launch_penalty_tokens: int = Field(default=256, ge=0)
     cp_collective_latency_tokens: int = Field(default=512, ge=0)
     parent_state_exchange_penalty_tokens: int = Field(default=16384, ge=0)
-    layout_cross_rank_token_cost: float = Field(default=2.0, ge=0.0)
+    layout_cross_rank_token_cost: float = Field(default=6.0, ge=0.0)
     rank_idle_token_cost: float = Field(default=1.0, ge=0.0)
     empty_rank_penalty_tokens: int = Field(default=65536, ge=0)
     max_zero_exchange_load_imbalance: float = Field(default=1.5, ge=1.0)
     local_completion_rebalance_min_imbalance: float = Field(default=1.08, ge=1.0)
-    cp_schedule_improve_iters: int = Field(default=0, ge=0)
+    cp_chain_beam_width: int = Field(default=2, ge=1)
+    cp_chain_beam_branch_factor: int = Field(default=4, ge=1)
+    cp_chain_beam_candidate_limit: int = Field(default=16, ge=1)
+    cp_chain_beam_max_steps: int = Field(default=4, ge=0)
+    cp_chain_beam_min_score_delta_tokens: float = Field(default=512.0, ge=0.0)
+    cp_chain_min_score_delta_ms: float = Field(default=0.25, ge=0.0)
+    planner_local_token_ms: float = Field(default=0.00065, ge=0.0)
+    planner_chain_token_ms: float = Field(default=0.00055, ge=0.0)
+    planner_local_bucket_ms: float = Field(default=0.25, ge=0.0)
+    planner_chain_bucket_ms: float = Field(default=22.0, ge=0.0)
+    planner_local_segment_ms: float = Field(default=0.010, ge=0.0)
+    planner_layout_cross_rank_token_ms: float = Field(default=0.00008, ge=0.0)
+    planner_parent_state_exchange_base_ms: float = Field(default=40.0, ge=0.0)
+    planner_parent_state_exchange_ms: float = Field(default=0.5, ge=0.0)
+    planner_empty_rank_ms: float = Field(default=32.0, ge=0.0)
 
 
 class GdnRankExecutionPlan(BaseModel):
@@ -247,6 +262,14 @@ class GdnCpSegmentSchedule(BaseModel):
     local_completion_segments_by_rank: tuple[tuple[GdnSegmentSpec, ...], ...]
     parent_state_exchange_family_indices: tuple[int, ...] = ()
     parent_state_transfers: tuple[GdnParentStateTransferPlan, ...] = ()
+
+
+class _GdnCpSegmentSearchDecision(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey]
+    co_locate_local_families: bool
+    score: float
 
 
 class _ExplicitBucketColumn(BaseModel):
@@ -808,7 +831,7 @@ def _build_local_attention_layout_rank_execution_plan(
     if cp_size <= 1 or not spec.families:
         return None
     if any(
-        _can_chain_family(family, cp_size=cp_size, planner_config=planner_config)
+        _has_chainable_segment(family, cp_size=cp_size, planner_config=planner_config)
         for family in spec.families
     ):
         return None
@@ -840,20 +863,15 @@ def _build_local_attention_layout_rank_execution_plan(
         co_locate_local_families=False,
         planner_config=planner_config,
     )
-    if _can_zero_exchange_colocate_families(
+    co_located = _assign_local_attention_segments(
         spec,
         cp_size=cp_size,
         segment_attention_counts=segment_attention_counts,
-    ):
-        co_located = _assign_local_attention_segments(
-            spec,
-            cp_size=cp_size,
-            segment_attention_counts=segment_attention_counts,
-            co_locate_local_families=True,
-            planner_config=planner_config,
-        )
-        if co_located[3] == 0 and co_located[4] < best[4]:
-            best = co_located
+        co_locate_local_families=True,
+        planner_config=planner_config,
+    )
+    if co_located[4] < best[4]:
+        best = co_located
     (
         prefix_owner_by_family,
         completion_owners_by_family,
@@ -1142,18 +1160,16 @@ def _assign_local_attention_segments(
                 parent_state_exchange_families.add(family.family_index)
         completion_owners_by_family.append(tuple(completion_owners))
 
-    max_load = max(rank_loads, default=0)
-    idle_tokens = sum(max_load - load for load in rank_loads)
-    empty_rank_count = sum(1 for load in rank_loads if load == 0)
-    local_launches = sum(has_prefix) + sum(has_completion)
-    score = (
-        max_load
-        + planner_config.rank_idle_token_cost * idle_tokens
-        + planner_config.empty_rank_penalty_tokens * empty_rank_count
-        + planner_config.local_fork_launch_penalty_tokens * local_launches
-        + planner_config.layout_cross_rank_token_cost * cross_rank_token_count
-        + planner_config.parent_state_exchange_penalty_tokens
-        * len(parent_state_exchange_families)
+    del has_prefix, has_completion
+    score = _score_local_segment_assignment(
+        spec,
+        cp_size=cp_size,
+        prefix_owner_by_family=tuple(prefix_owner_by_family),
+        completion_owners_by_family=tuple(completion_owners_by_family),
+        rank_loads=tuple(rank_loads),
+        cross_rank_token_count=cross_rank_token_count,
+        parent_state_exchange_family_count=len(parent_state_exchange_families),
+        planner_config=planner_config,
     )
     return (
         tuple(prefix_owner_by_family),
@@ -1161,6 +1177,53 @@ def _assign_local_attention_segments(
         tuple(sorted(parent_state_exchange_families)),
         cross_rank_token_count,
         score,
+    )
+
+
+def _score_local_segment_assignment(
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    prefix_owner_by_family: tuple[int, ...],
+    completion_owners_by_family: tuple[tuple[int, ...], ...],
+    rank_loads: tuple[int, ...],
+    cross_rank_token_count: int,
+    parent_state_exchange_family_count: int,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    local_prefix_segments_by_rank: list[list[GdnSegmentSpec]] = [
+        [] for _ in range(cp_size)
+    ]
+    local_completion_segments_by_rank: list[list[GdnSegmentSpec]] = [
+        [] for _ in range(cp_size)
+    ]
+    for family in spec.families:
+        prefix_owner = prefix_owner_by_family[family.family_index]
+        local_prefix_segments_by_rank[prefix_owner].append(family.prefix)
+        completion_owners = completion_owners_by_family[family.family_index]
+        for completion, completion_owner in zip(
+            family.completions, completion_owners, strict=True
+        ):
+            local_completion_segments_by_rank[completion_owner].append(completion)
+    (
+        local_work_by_rank,
+        local_bucket_count,
+        local_segment_count,
+    ) = _estimate_local_rank_kernel_work(
+        tuple(tuple(segments) for segments in local_prefix_segments_by_rank),
+        tuple(tuple(segments) for segments in local_completion_segments_by_rank),
+        planner_config=planner_config,
+    )
+    return _score_cp_segment_stats(
+        rank_local_work=local_work_by_rank,
+        rank_chain_work=tuple(0 for _ in range(cp_size)),
+        rank_real_tokens=rank_loads,
+        cross_rank_token_count=cross_rank_token_count,
+        parent_state_exchange_family_count=parent_state_exchange_family_count,
+        local_bucket_count=local_bucket_count,
+        local_segment_count=local_segment_count,
+        chain_bucket_count=0,
+        planner_config=planner_config,
     )
 
 
@@ -1839,15 +1902,6 @@ def _build_cp_rank_execution_plan(
 
     has_explicit_attention_layout = attention_token_layout_index is not None
     if cp_segment_schedule is None and not has_explicit_attention_layout:
-        chain_only_plan = build_gdn_chain_only_rank_execution_plan(
-            spec,
-            device=device,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            planner_config=planner_config,
-        )
-        if chain_only_plan is not None:
-            return chain_only_plan
         local_family_plan = _build_local_family_rank_execution_plan(
             spec,
             device=device,
@@ -1858,16 +1912,6 @@ def _build_cp_rank_execution_plan(
         if local_family_plan is not None:
             return local_family_plan
     if cp_segment_schedule is None and has_explicit_attention_layout:
-        chain_layout_plan = _build_chain_attention_layout_rank_execution_plan(
-            spec,
-            device=device,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            attention_token_layout_index=attention_token_layout_index,
-            planner_config=planner_config,
-        )
-        if chain_layout_plan is not None:
-            return chain_layout_plan
         local_layout_plan = _build_local_attention_layout_rank_execution_plan(
             spec,
             device=device,
@@ -2126,145 +2170,662 @@ def _build_cp_segment_schedule(
         cp_size=cp_size,
         attention_layout_index=attention_layout_index,
     )
-    legal_chain_families = tuple(
-        family.family_index
+    legal_chain_segments = tuple(
+        segment
         for family in spec.families
-        if _can_chain_family(family, cp_size=cp_size, planner_config=planner_config)
+        for segment in (family.prefix, *family.completions)
+        if (
+            _can_chain_prefix_segment(
+                segment, cp_size=cp_size, planner_config=planner_config
+            )
+            if segment.kind == "prefix"
+            else _can_chain_segment(
+                segment, cp_size=cp_size, planner_config=planner_config
+            )
+        )
     )
-    chain_family_indices = frozenset(legal_chain_families)
-    best = _materialize_cp_segment_schedule(
+    decision = _beam_search_cp_segment_schedule_decision(
         spec,
         cp_size=cp_size,
         attention_layout_index=attention_layout_index,
         segment_attention_counts=segment_attention_counts,
-        chain_family_indices=chain_family_indices,
-        co_locate_local_families=False,
+        legal_chain_segments=legal_chain_segments,
         planner_config=planner_config,
     )
-    best_score = _score_cp_segment_schedule(
-        best,
-        planner_config=planner_config,
-    )
-    has_local_families = len(chain_family_indices) != spec.family_count
-    if has_local_families:
-        local_family_trial = _materialize_cp_segment_schedule(
-            spec,
-            cp_size=cp_size,
-            attention_layout_index=attention_layout_index,
-            segment_attention_counts=segment_attention_counts,
-            chain_family_indices=chain_family_indices,
-            co_locate_local_families=True,
-            planner_config=planner_config,
-        )
-        local_family_score = _score_cp_segment_schedule(
-            local_family_trial,
-            planner_config=planner_config,
-        )
-        if (
-            local_family_trial.cross_rank_token_count == 0
-            and local_family_score < best_score
-        ):
-            best = local_family_trial
-            best_score = local_family_score
-    if _is_balanced_zero_exchange_schedule(
-        best,
-        planner_config=planner_config,
-    ):
-        return best
-    candidate_sets = _candidate_chain_family_sets(
+    return _materialize_cp_segment_schedule(
         spec,
-        legal_chain_families=legal_chain_families,
         cp_size=cp_size,
+        attention_layout_index=attention_layout_index,
+        segment_attention_counts=segment_attention_counts,
+        chain_segment_keys=decision.chain_segment_keys,
+        co_locate_local_families=decision.co_locate_local_families,
+        planner_config=planner_config,
     )
-    for trial_chain in candidate_sets:
-        if trial_chain == chain_family_indices:
-            continue
-        trial = _materialize_cp_segment_schedule(
+
+
+def _beam_search_cp_segment_schedule_decision(
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    attention_layout_index: _AttentionLayoutIndex,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    legal_chain_segments: tuple[GdnSegmentSpec, ...],
+    planner_config: GdnPlannerConfig,
+) -> _GdnCpSegmentSearchDecision:
+    legal_chain_keys = frozenset(
+        _segment_key(segment) for segment in legal_chain_segments
+    )
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]] = {}
+    chain_cross_rank_tokens_by_key: dict[GdnSegmentDecisionKey, int] = {}
+    for segment in legal_chain_segments:
+        key = _segment_key(segment)
+        (
+            chain_rank_counts_by_key[key],
+            chain_cross_rank_tokens_by_key[key],
+        ) = _chain_segment_rank_counts_and_cross_rank_tokens(
+            segment,
             spec,
             cp_size=cp_size,
             attention_layout_index=attention_layout_index,
+        )
+
+    score_cache: dict[
+        frozenset[GdnSegmentDecisionKey], _GdnCpSegmentSearchDecision
+    ] = {}
+
+    def decision_for(
+        chain_segment_keys: frozenset[GdnSegmentDecisionKey],
+    ) -> _GdnCpSegmentSearchDecision:
+        cached = score_cache.get(chain_segment_keys)
+        if cached is not None:
+            return cached
+        non_colocated_score = _score_cp_segment_decisions(
+            spec,
+            cp_size=cp_size,
             segment_attention_counts=segment_attention_counts,
-            chain_family_indices=trial_chain,
+            chain_rank_counts_by_key=chain_rank_counts_by_key,
+            chain_cross_rank_tokens_by_key=chain_cross_rank_tokens_by_key,
+            chain_segment_keys=chain_segment_keys,
             co_locate_local_families=False,
             planner_config=planner_config,
         )
-        trial_score = _score_cp_segment_schedule(
-            trial,
-            planner_config=planner_config,
-        )
-        if trial.cross_rank_token_count == 0 and trial_score < best_score:
-            best = trial
-            best_score = trial_score
-            chain_family_indices = trial_chain
-        trial = _materialize_cp_segment_schedule(
+        colocated_score = _score_cp_segment_decisions(
             spec,
             cp_size=cp_size,
-            attention_layout_index=attention_layout_index,
             segment_attention_counts=segment_attention_counts,
-            chain_family_indices=trial_chain,
+            chain_rank_counts_by_key=chain_rank_counts_by_key,
+            chain_cross_rank_tokens_by_key=chain_cross_rank_tokens_by_key,
+            chain_segment_keys=chain_segment_keys,
             co_locate_local_families=True,
             planner_config=planner_config,
         )
-        trial_score = _score_cp_segment_schedule(
-            trial,
-            planner_config=planner_config,
+        co_locate = colocated_score < non_colocated_score
+        decision = _GdnCpSegmentSearchDecision.model_construct(
+            chain_segment_keys=chain_segment_keys,
+            co_locate_local_families=co_locate,
+            score=colocated_score if co_locate else non_colocated_score,
         )
-        if trial_score < best_score:
-            best = trial
-            best_score = trial_score
-            chain_family_indices = trial_chain
-    for _ in range(planner_config.cp_schedule_improve_iters):
-        improved = False
-        for family_index in legal_chain_families:
-            for trial_chain in (
-                chain_family_indices - {family_index},
-                chain_family_indices | {family_index},
-            ):
-                if trial_chain == chain_family_indices:
-                    continue
-                trial = _materialize_cp_segment_schedule(
-                    spec,
-                    cp_size=cp_size,
-                    attention_layout_index=attention_layout_index,
-                    segment_attention_counts=segment_attention_counts,
-                    chain_family_indices=trial_chain,
-                    co_locate_local_families=False,
-                    planner_config=planner_config,
-                )
-                trial_score = _score_cp_segment_schedule(
-                    trial,
-                    planner_config=planner_config,
-                )
-                if trial_score < best_score:
-                    best = trial
-                    best_score = trial_score
-                    chain_family_indices = trial_chain
-                    improved = True
-                    break
-            if improved:
-                break
-        if not improved:
+        score_cache[chain_segment_keys] = decision
+        return decision
+
+    best = decision_for(frozenset())
+    beam_by_keys = {best.chain_segment_keys: best}
+    if legal_chain_keys:
+        all_chain = decision_for(legal_chain_keys)
+        beam_by_keys[all_chain.chain_segment_keys] = all_chain
+        if best.score - all_chain.score > planner_config.cp_chain_min_score_delta_ms:
+            best = all_chain
+    candidate_groups = _bounded_chain_candidate_groups(
+        spec,
+        legal_chain_segments,
+        segment_attention_counts=segment_attention_counts,
+        chain_rank_counts_by_key=chain_rank_counts_by_key,
+        planner_config=planner_config,
+    )
+    beam = _best_cp_segment_search_decisions(
+        beam_by_keys.values(),
+        limit=planner_config.cp_chain_beam_width,
+    )
+    stale_steps = 0
+    for _ in range(planner_config.cp_chain_beam_max_steps):
+        if not candidate_groups:
             break
+        expanded: dict[
+            frozenset[GdnSegmentDecisionKey], _GdnCpSegmentSearchDecision
+        ] = {}
+        for decision in beam:
+            neighbors = []
+            for segment_keys in _chain_beam_neighbor_groups(
+                decision.chain_segment_keys,
+                candidate_groups=candidate_groups,
+                branch_factor=planner_config.cp_chain_beam_branch_factor,
+            ):
+                if segment_keys.issubset(decision.chain_segment_keys):
+                    next_keys = decision.chain_segment_keys - segment_keys
+                else:
+                    next_keys = decision.chain_segment_keys | segment_keys
+                neighbors.append(decision_for(frozenset(next_keys)))
+            for neighbor in _best_cp_segment_search_decisions(
+                neighbors,
+                limit=planner_config.cp_chain_beam_branch_factor,
+            ):
+                expanded[neighbor.chain_segment_keys] = neighbor
+        if not expanded:
+            break
+        beam = _best_cp_segment_search_decisions(
+            (*beam, *expanded.values()),
+            limit=planner_config.cp_chain_beam_width,
+        )
+        step_best = beam[0]
+        if best.score - step_best.score > planner_config.cp_chain_min_score_delta_ms:
+            best = step_best
+            stale_steps = 0
+        else:
+            stale_steps += 1
+            if stale_steps >= 2:
+                break
     return best
 
 
-def _is_balanced_zero_exchange_schedule(
-    schedule: GdnCpSegmentSchedule,
+def _chain_beam_neighbor_groups(
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey],
+    *,
+    candidate_groups: tuple[frozenset[GdnSegmentDecisionKey], ...],
+    branch_factor: int,
+) -> tuple[frozenset[GdnSegmentDecisionKey], ...]:
+    selected: list[frozenset[GdnSegmentDecisionKey]] = []
+    for group in candidate_groups:
+        if group and not group.issubset(chain_segment_keys):
+            selected.append(group)
+            if len(selected) >= branch_factor:
+                return tuple(selected)
+    for group in reversed(candidate_groups):
+        if group and group.intersection(chain_segment_keys) and group not in selected:
+            selected.append(group)
+            if len(selected) >= branch_factor:
+                break
+    return tuple(selected)
+
+
+def _best_cp_segment_search_decisions(
+    decisions: Any,
+    *,
+    limit: int,
+) -> tuple[_GdnCpSegmentSearchDecision, ...]:
+    return tuple(
+        sorted(
+            decisions,
+            key=lambda decision: (
+                decision.score,
+                len(decision.chain_segment_keys),
+                tuple(sorted(decision.chain_segment_keys)),
+            ),
+        )[:limit]
+    )
+
+
+def _bounded_chain_candidate_groups(
+    spec: GdnPackedExecutionSpec,
+    legal_chain_segments: tuple[GdnSegmentSpec, ...],
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    planner_config: GdnPlannerConfig,
+) -> tuple[frozenset[GdnSegmentDecisionKey], ...]:
+    legal_key_set = frozenset(_segment_key(segment) for segment in legal_chain_segments)
+    if not legal_key_set:
+        return ()
+    prefix_keys = frozenset(
+        _segment_key(family.prefix)
+        for family in spec.families
+        if _segment_key(family.prefix) in legal_key_set
+    )
+    completion_keys = legal_key_set - prefix_keys
+    groups: list[frozenset[GdnSegmentDecisionKey]] = []
+    for group in (legal_key_set, prefix_keys, completion_keys):
+        if group and group not in groups:
+            groups.append(group)
+    for group in _ranked_chain_beam_groups(
+        spec,
+        legal_chain_segments,
+        segment_attention_counts=segment_attention_counts,
+        chain_rank_counts_by_key=chain_rank_counts_by_key,
+        planner_config=planner_config,
+    ):
+        if group and group not in groups:
+            groups.append(group)
+    return tuple(groups[: planner_config.cp_chain_beam_candidate_limit])
+
+
+def _ranked_chain_beam_groups(
+    spec: GdnPackedExecutionSpec,
+    legal_chain_segments: tuple[GdnSegmentSpec, ...],
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    planner_config: GdnPlannerConfig,
+) -> tuple[frozenset[GdnSegmentDecisionKey], ...]:
+    if not legal_chain_segments:
+        return ()
+    priority_by_key = {
+        _segment_key(segment): _chain_beam_segment_priority(
+            segment,
+            segment_attention_counts=segment_attention_counts,
+            chain_rank_counts_by_key=chain_rank_counts_by_key,
+        )
+        for segment in legal_chain_segments
+    }
+    legal_key_set = frozenset(priority_by_key)
+    groups: set[frozenset[GdnSegmentDecisionKey]] = {
+        frozenset((key,)) for key in legal_key_set
+    }
+    for family in spec.families:
+        completion_keys = frozenset(
+            _segment_key(completion)
+            for completion in family.completions
+            if _segment_key(completion) in legal_key_set
+        )
+        if len(completion_keys) > 1:
+            groups.add(completion_keys)
+        family_keys = completion_keys
+        prefix_key = _segment_key(family.prefix)
+        if prefix_key in legal_key_set:
+            family_keys = family_keys | frozenset((prefix_key,))
+        if len(family_keys) > 1:
+            groups.add(family_keys)
+    ranked = tuple(
+        sorted(
+            groups,
+            key=lambda group: _chain_beam_group_priority(
+                group, priority_by_key=priority_by_key
+            ),
+            reverse=True,
+        )
+    )
+    limit = planner_config.cp_chain_beam_candidate_limit
+    if len(ranked) <= limit:
+        return ranked
+    high_count = (limit + 1) // 2
+    low_count = limit - high_count
+    selected = [*ranked[:high_count]]
+    for group in ranked[-low_count:]:
+        if group not in selected:
+            selected.append(group)
+    return tuple(selected)
+
+
+def _chain_beam_group_priority(
+    group: frozenset[GdnSegmentDecisionKey],
+    *,
+    priority_by_key: dict[GdnSegmentDecisionKey, tuple[int, int, int, int]],
+) -> tuple[int, int, int, int, int]:
+    priorities = tuple(priority_by_key[key] for key in group)
+    return (
+        sum(priority[0] for priority in priorities),
+        sum(priority[1] for priority in priorities),
+        max((priority[2] for priority in priorities), default=0),
+        sum(priority[3] for priority in priorities),
+        len(group),
+    )
+
+
+def _chain_beam_segment_priority(
+    segment: GdnSegmentSpec,
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+) -> tuple[int, int, int, int]:
+    key = _segment_key(segment)
+    chain_max_load = max(chain_rank_counts_by_key[key], default=0)
+    best_attention_locality = max(segment_attention_counts[key], default=0)
+    chain_load_relief = segment.length - chain_max_load
+    minimum_local_exchange = segment.length - best_attention_locality
+    return (
+        chain_load_relief,
+        segment.length,
+        best_attention_locality,
+        -minimum_local_exchange,
+    )
+
+
+def _score_cp_segment_decisions(
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    chain_cross_rank_tokens_by_key: dict[GdnSegmentDecisionKey, int],
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey],
+    co_locate_local_families: bool,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    rank_loads = [0] * cp_size
+    local_prefix_segments_by_rank: list[list[GdnSegmentSpec]] = [
+        [] for _ in range(cp_size)
+    ]
+    local_completion_segments_by_rank: list[list[GdnSegmentSpec]] = [
+        [] for _ in range(cp_size)
+    ]
+    chain_prefix_segments: list[GdnSegmentSpec] = []
+    chain_completion_segments: list[GdnSegmentSpec] = []
+    parent_state_exchange_families: set[int] = set()
+    cross_rank_token_count = 0
+
+    for family in spec.families:
+        prefix_key = _segment_key(family.prefix)
+        chain_prefix = prefix_key in chain_segment_keys
+        local_completions = tuple(
+            completion
+            for completion in family.completions
+            if _segment_key(completion) not in chain_segment_keys
+        )
+        prefix_owner: int | None = None
+        if chain_prefix:
+            chain_prefix_segments.append(family.prefix)
+            cross_rank_token_count += _add_chain_search_load(
+                rank_loads,
+                family.prefix,
+                chain_rank_counts_by_key=chain_rank_counts_by_key,
+                chain_cross_rank_tokens_by_key=chain_cross_rank_tokens_by_key,
+            )
+        else:
+            owner_segments = (
+                (family.prefix, *local_completions)
+                if co_locate_local_families
+                else (family.prefix,)
+            )
+            prefix_owner = _best_segment_owner(
+                owner_segments,
+                rank_loads,
+                segment_attention_counts=segment_attention_counts,
+                planner_config=planner_config,
+            )
+            local_prefix_segments_by_rank[prefix_owner].append(family.prefix)
+            cross_rank_token_count += _add_local_search_load(
+                rank_loads,
+                prefix_owner,
+                family.prefix,
+                segment_attention_counts=segment_attention_counts,
+            )
+        for completion in family.completions:
+            completion_key = _segment_key(completion)
+            if completion_key in chain_segment_keys:
+                chain_completion_segments.append(completion)
+                cross_rank_token_count += _add_chain_search_load(
+                    rank_loads,
+                    completion,
+                    chain_rank_counts_by_key=chain_rank_counts_by_key,
+                    chain_cross_rank_tokens_by_key=chain_cross_rank_tokens_by_key,
+                )
+                if not chain_prefix:
+                    parent_state_exchange_families.add(family.family_index)
+                continue
+            if co_locate_local_families and not chain_prefix:
+                if prefix_owner is None:
+                    raise RuntimeError(
+                        "co-located local completion planning lost the prefix owner"
+                    )
+                owner = prefix_owner
+            else:
+                owner = _best_segment_owner(
+                    (completion,),
+                    rank_loads,
+                    segment_attention_counts=segment_attention_counts,
+                    planner_config=planner_config,
+                )
+            if not chain_prefix:
+                if prefix_owner is None:
+                    raise RuntimeError(
+                        "local completion planning lost the prefix owner"
+                    )
+                if owner != prefix_owner:
+                    parent_state_exchange_families.add(family.family_index)
+            local_completion_segments_by_rank[owner].append(completion)
+            cross_rank_token_count += _add_local_search_load(
+                rank_loads,
+                owner,
+                completion,
+                segment_attention_counts=segment_attention_counts,
+            )
+    (
+        local_work_by_rank,
+        local_bucket_count,
+        local_segment_count,
+    ) = _estimate_local_rank_kernel_work(
+        tuple(tuple(segments) for segments in local_prefix_segments_by_rank),
+        tuple(tuple(segments) for segments in local_completion_segments_by_rank),
+        planner_config=planner_config,
+    )
+    chain_work_by_rank, chain_bucket_count = _estimate_chain_rank_kernel_work(
+        cp_size=cp_size,
+        chain_prefix_segments=tuple(chain_prefix_segments),
+        chain_completion_segments=tuple(chain_completion_segments),
+        chain_rank_counts_by_key=chain_rank_counts_by_key,
+        planner_config=planner_config,
+    )
+    return _score_cp_segment_stats(
+        rank_local_work=local_work_by_rank,
+        rank_chain_work=chain_work_by_rank,
+        rank_real_tokens=tuple(rank_loads),
+        cross_rank_token_count=cross_rank_token_count,
+        parent_state_exchange_family_count=len(parent_state_exchange_families),
+        local_bucket_count=local_bucket_count,
+        local_segment_count=local_segment_count,
+        chain_bucket_count=chain_bucket_count,
+        planner_config=planner_config,
+    )
+
+
+def _estimate_local_rank_kernel_work(
+    local_prefix_segments_by_rank: tuple[tuple[GdnSegmentSpec, ...], ...],
+    local_completion_segments_by_rank: tuple[tuple[GdnSegmentSpec, ...], ...],
     *,
     planner_config: GdnPlannerConfig,
-) -> bool:
-    rank_loads = list(schedule.gdn_token_counts_by_rank)
-    if not rank_loads or any(load == 0 for load in rank_loads):
-        return False
-    if schedule.cross_rank_token_count:
-        return False
-    if schedule.parent_state_exchange_family_indices:
-        return False
-    if max(rank_loads) > planner_config.max_zero_exchange_load_imbalance * (
-        sum(rank_loads) / len(rank_loads)
+) -> tuple[tuple[int, ...], int, int]:
+    rank_work: list[int] = []
+    rank_bucket_counts: list[int] = []
+    rank_segment_counts: list[int] = []
+    for prefix_segments, completion_segments in zip(
+        local_prefix_segments_by_rank,
+        local_completion_segments_by_rank,
+        strict=True,
     ):
-        return False
-    return True
+        prefix_family_indices = {segment.family_index for segment in prefix_segments}
+        chunk_local_completion_segments = tuple(
+            segment
+            for segment in completion_segments
+            if segment.family_index in prefix_family_indices
+        )
+        plain_local_completion_segments = tuple(
+            segment
+            for segment in completion_segments
+            if segment.family_index not in prefix_family_indices
+        )
+        chunk_work, chunk_bucket_count = _estimate_chunk_aligned_local_work(
+            prefix_segments,
+            chunk_local_completion_segments,
+            planner_config=planner_config,
+        )
+        completion_work, completion_bucket_count = _padded_work_from_lengths(
+            tuple(segment.length for segment in plain_local_completion_segments),
+            max_padding_ratio=planner_config.max_padding_ratio,
+            max_segments_per_batch=planner_config.max_segments_per_batch,
+        )
+        rank_work.append(chunk_work + completion_work)
+        rank_bucket_counts.append(chunk_bucket_count + completion_bucket_count)
+        rank_segment_counts.append(len(prefix_segments) + len(completion_segments))
+    return (
+        tuple(rank_work),
+        max(rank_bucket_counts, default=0),
+        max(rank_segment_counts, default=0),
+    )
+
+
+def _estimate_chunk_aligned_local_work(
+    prefix_segments: tuple[GdnSegmentSpec, ...],
+    completion_segments: tuple[GdnSegmentSpec, ...],
+    *,
+    planner_config: GdnPlannerConfig,
+) -> tuple[int, int]:
+    completions_by_family: dict[int, list[GdnSegmentSpec]] = {}
+    for completion in completion_segments:
+        completions_by_family.setdefault(completion.family_index, []).append(completion)
+    boundary_lengths: list[int] = []
+    tail_lengths: list[int] = []
+    completion_column_lengths: list[int] = []
+    for prefix in prefix_segments:
+        boundary_end = _prefix_chunk_boundary_end(prefix)
+        boundary_length = boundary_end - prefix.start
+        if boundary_length > 0:
+            boundary_lengths.append(boundary_length)
+        tail_length = prefix.end - boundary_end
+        family_completions = tuple(completions_by_family.get(prefix.family_index, ()))
+        if tail_length > 0 and not family_completions:
+            tail_lengths.append(tail_length)
+        for completion in family_completions:
+            completion_column_lengths.append(tail_length + completion.length)
+    boundary_work, boundary_bucket_count = _padded_work_from_lengths(
+        tuple(boundary_lengths),
+        max_padding_ratio=planner_config.max_padding_ratio,
+        max_segments_per_batch=planner_config.max_segments_per_batch,
+    )
+    tail_work, tail_bucket_count = _padded_work_from_lengths(
+        tuple(tail_lengths),
+        max_padding_ratio=planner_config.max_padding_ratio,
+        max_segments_per_batch=planner_config.max_segments_per_batch,
+    )
+    completion_work, completion_bucket_count = _padded_work_from_lengths(
+        tuple(completion_column_lengths),
+        max_padding_ratio=planner_config.max_padding_ratio,
+        max_segments_per_batch=planner_config.max_segments_per_batch,
+    )
+    return (
+        boundary_work + tail_work + completion_work,
+        boundary_bucket_count + tail_bucket_count + completion_bucket_count,
+    )
+
+
+def _estimate_chain_rank_kernel_work(
+    *,
+    cp_size: int,
+    chain_prefix_segments: tuple[GdnSegmentSpec, ...],
+    chain_completion_segments: tuple[GdnSegmentSpec, ...],
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    planner_config: GdnPlannerConfig,
+) -> tuple[tuple[int, ...], int]:
+    rank_work = [0] * cp_size
+    bucket_count = 0
+    for segments in (chain_prefix_segments, chain_completion_segments):
+        buckets = _batch_segments_by_padded_work(
+            segments,
+            max_padding_ratio=planner_config.max_padding_ratio,
+            max_segments_per_batch=planner_config.max_segments_per_batch,
+        )
+        bucket_count += len(buckets)
+        for bucket in buckets:
+            for rank in range(cp_size):
+                lengths = tuple(
+                    chain_rank_counts_by_key[_segment_key(segment)][rank]
+                    for segment in bucket
+                )
+                rank_work[rank] += max(lengths, default=0) * len(lengths)
+    return tuple(rank_work), bucket_count
+
+
+def _padded_work_from_lengths(
+    lengths: tuple[int, ...],
+    *,
+    max_padding_ratio: float,
+    max_segments_per_batch: int,
+) -> tuple[int, int]:
+    if not lengths:
+        return 0, 0
+    ordered = sorted(length for length in lengths if length > 0)
+    if not ordered:
+        return 0, 0
+    bucket_count = 0
+    padded_work = 0
+    current_count = 0
+    current_tokens = 0
+    current_max = 0
+    for length in ordered:
+        next_count = current_count + 1
+        next_tokens = current_tokens + length
+        next_max = max(current_max, length)
+        next_padded = next_max * next_count
+        can_extend = current_count == 0 or (
+            next_count <= max_segments_per_batch
+            and next_padded <= max_padding_ratio * next_tokens
+        )
+        if not can_extend:
+            bucket_count += 1
+            padded_work += current_max * current_count
+            current_count = 0
+            current_tokens = 0
+            current_max = 0
+        current_count += 1
+        current_tokens += length
+        current_max = max(current_max, length)
+    if current_count:
+        bucket_count += 1
+        padded_work += current_max * current_count
+    return padded_work, bucket_count
+
+
+def _add_chain_search_load(
+    rank_loads: list[int],
+    segment: GdnSegmentSpec,
+    *,
+    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
+    chain_cross_rank_tokens_by_key: dict[GdnSegmentDecisionKey, int],
+) -> int:
+    key = _segment_key(segment)
+    for rank, token_count in enumerate(chain_rank_counts_by_key[key]):
+        rank_loads[rank] += token_count
+    return chain_cross_rank_tokens_by_key[key]
+
+
+def _add_local_search_load(
+    rank_loads: list[int],
+    rank: int,
+    segment: GdnSegmentSpec,
+    *,
+    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
+) -> int:
+    rank_loads[rank] += segment.length
+    return segment.length - segment_attention_counts[_segment_key(segment)][rank]
+
+
+def _chain_segment_rank_counts_and_cross_rank_tokens(
+    segment: GdnSegmentSpec,
+    spec: GdnPackedExecutionSpec,
+    *,
+    cp_size: int,
+    attention_layout_index: _AttentionLayoutIndex,
+) -> tuple[tuple[int, ...], int]:
+    token_start = _segment_token_start(segment, spec.sequence_length)
+    attention_shards = _attention_contiguous_chain_shards(
+        token_start,
+        segment.length,
+        cp_size=cp_size,
+        attention_layout_index=attention_layout_index,
+    )
+    if attention_shards is not None:
+        return tuple(len(shard) for shard in attention_shards), 0
+    shard_lengths = _fla_aligned_chain_shard_lengths(segment.length, cp_size=cp_size)
+    cross_rank_tokens = 0
+    start = 0
+    for rank, shard_length in enumerate(shard_lengths):
+        end = start + shard_length
+        shard_start = token_start + start
+        cross_rank_tokens += shard_length - _attention_overlap_count(
+            attention_layout_index,
+            rank,
+            shard_start,
+            shard_start + shard_length,
+        )
+        start = end
+    return shard_lengths, cross_rank_tokens
 
 
 def _materialize_cp_segment_schedule(
@@ -2273,7 +2834,7 @@ def _materialize_cp_segment_schedule(
     cp_size: int,
     attention_layout_index: _AttentionLayoutIndex,
     segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
-    chain_family_indices: frozenset[int],
+    chain_segment_keys: frozenset[GdnSegmentDecisionKey],
     co_locate_local_families: bool,
     planner_config: GdnPlannerConfig,
 ) -> GdnCpSegmentSchedule:
@@ -2292,7 +2853,15 @@ def _materialize_cp_segment_schedule(
     cross_rank_token_count = 0
 
     for family in spec.families:
-        if family.family_index in chain_family_indices:
+        prefix_key = _segment_key(family.prefix)
+        chain_prefix = prefix_key in chain_segment_keys
+        local_completions = tuple(
+            completion
+            for completion in family.completions
+            if _segment_key(completion) not in chain_segment_keys
+        )
+        prefix_owner: int | None = None
+        if chain_prefix:
             chain_prefix_segments.append(family.prefix)
             cross_rank_token_count += _append_chain_segment(
                 gdn_ranges_by_rank,
@@ -2301,64 +2870,14 @@ def _materialize_cp_segment_schedule(
                 spec,
                 attention_layout_index=attention_layout_index,
             )
-            for completion in family.completions:
-                if _can_chain_segment(
-                    completion, cp_size=cp_size, planner_config=planner_config
-                ):
-                    chain_completion_segments.append(completion)
-                    cross_rank_token_count += _append_chain_segment(
-                        gdn_ranges_by_rank,
-                        rank_loads,
-                        completion,
-                        spec,
-                        attention_layout_index=attention_layout_index,
-                    )
-                    continue
-                owner = _best_segment_owner(
-                    (completion,),
-                    rank_loads,
-                    segment_attention_counts=segment_attention_counts,
-                    planner_config=planner_config,
-                )
-                local_completion_segments_by_rank[owner].append(completion)
-                cross_rank_token_count += _append_local_segment(
-                    gdn_ranges_by_rank,
-                    rank_loads,
-                    owner,
-                    completion,
-                    spec,
-                    segment_attention_counts=segment_attention_counts,
-                )
         else:
-            if co_locate_local_families:
-                owner = _best_segment_owner(
-                    (family.prefix, *family.completions),
-                    rank_loads,
-                    segment_attention_counts=segment_attention_counts,
-                    planner_config=planner_config,
-                )
-                local_prefix_segments_by_rank[owner].append(family.prefix)
-                cross_rank_token_count += _append_local_segment(
-                    gdn_ranges_by_rank,
-                    rank_loads,
-                    owner,
-                    family.prefix,
-                    spec,
-                    segment_attention_counts=segment_attention_counts,
-                )
-                for completion in family.completions:
-                    local_completion_segments_by_rank[owner].append(completion)
-                    cross_rank_token_count += _append_local_segment(
-                        gdn_ranges_by_rank,
-                        rank_loads,
-                        owner,
-                        completion,
-                        spec,
-                        segment_attention_counts=segment_attention_counts,
-                    )
-                continue
+            owner_segments = (
+                (family.prefix, *local_completions)
+                if co_locate_local_families
+                else (family.prefix,)
+            )
             prefix_owner = _best_segment_owner(
-                (family.prefix,),
+                owner_segments,
                 rank_loads,
                 segment_attention_counts=segment_attention_counts,
                 planner_config=planner_config,
@@ -2372,27 +2891,61 @@ def _materialize_cp_segment_schedule(
                 spec,
                 segment_attention_counts=segment_attention_counts,
             )
-            for completion in family.completions:
+        for completion in family.completions:
+            if _segment_key(completion) in chain_segment_keys:
+                chain_completion_segments.append(completion)
+                cross_rank_token_count += _append_chain_segment(
+                    gdn_ranges_by_rank,
+                    rank_loads,
+                    completion,
+                    spec,
+                    attention_layout_index=attention_layout_index,
+                )
+                if not chain_prefix:
+                    if prefix_owner is None:
+                        raise RuntimeError(
+                            "local-prefix/chained-completion planning lost the prefix owner"
+                        )
+                    parent_state_exchange_families.add(family.family_index)
+                    for dest_rank in range(cp_size):
+                        if dest_rank == prefix_owner:
+                            continue
+                        parent_state_transfer_families.setdefault(
+                            (prefix_owner, dest_rank), set()
+                        ).add(family.family_index)
+                continue
+            if co_locate_local_families and not chain_prefix:
+                if prefix_owner is None:
+                    raise RuntimeError(
+                        "co-located local completion planning lost the prefix owner"
+                    )
+                owner = prefix_owner
+            else:
                 owner = _best_segment_owner(
                     (completion,),
                     rank_loads,
                     segment_attention_counts=segment_attention_counts,
                     planner_config=planner_config,
                 )
+            if not chain_prefix:
+                if prefix_owner is None:
+                    raise RuntimeError(
+                        "local completion planning lost the prefix owner"
+                    )
                 if owner != prefix_owner:
                     parent_state_exchange_families.add(family.family_index)
                     parent_state_transfer_families.setdefault(
                         (prefix_owner, owner), set()
                     ).add(family.family_index)
-                local_completion_segments_by_rank[owner].append(completion)
-                cross_rank_token_count += _append_local_segment(
-                    gdn_ranges_by_rank,
-                    rank_loads,
-                    owner,
-                    completion,
-                    spec,
-                    segment_attention_counts=segment_attention_counts,
-                )
+            local_completion_segments_by_rank[owner].append(completion)
+            cross_rank_token_count += _append_local_segment(
+                gdn_ranges_by_rank,
+                rank_loads,
+                owner,
+                completion,
+                spec,
+                segment_attention_counts=segment_attention_counts,
+            )
 
     return GdnCpSegmentSchedule.model_construct(
         gdn_token_counts_by_rank=tuple(rank_loads),
@@ -2438,7 +2991,9 @@ def _build_local_family_rank_execution_plan(
     prefix_owner_by_family: list[int] = []
     completion_owners_by_family: list[tuple[int, ...]] = []
     for family in spec.families:
-        if _can_chain_family(family, cp_size=cp_size, planner_config=planner_config):
+        if _has_chainable_segment(
+            family, cp_size=cp_size, planner_config=planner_config
+        ):
             return None
         prefix_locality_limit = max(
             planner_config.max_zero_exchange_load_imbalance * target_rank_load,
@@ -2887,6 +3442,13 @@ def _can_chain_segment(
     cp_size: int,
     planner_config: GdnPlannerConfig,
 ) -> bool:
+    min_tokens = (
+        planner_config.cp_chain_min_prefix_only_tokens
+        if segment.kind == "prefix"
+        else planner_config.cp_chain_min_total_tokens
+    )
+    if segment.length < min_tokens:
+        return False
     if segment.length < cp_size:
         return False
     if segment.length // FLA_CHUNK_SIZE < cp_size:
@@ -2894,7 +3456,7 @@ def _can_chain_segment(
     per_rank = segment.length / cp_size
     if per_rank < planner_config.cp_chain_min_tokens_per_rank:
         return False
-    return segment.length >= planner_config.cp_chain_min_total_tokens
+    return True
 
 
 def _build_parent_state_transfer_plans(
@@ -2948,22 +3510,18 @@ def _transfer_plans_to_device(
     )
 
 
-def _can_chain_family(
+def _has_chainable_segment(
     family: GdnPackedFamilySpec,
     *,
     cp_size: int,
     planner_config: GdnPlannerConfig,
 ) -> bool:
-    if not _can_chain_prefix_segment(
+    return _can_chain_prefix_segment(
         family.prefix, cp_size=cp_size, planner_config=planner_config
-    ):
-        return False
-    if any(
+    ) or any(
         _can_chain_segment(completion, cp_size=cp_size, planner_config=planner_config)
         for completion in family.completions
-    ):
-        return True
-    return family.prefix.length >= planner_config.cp_chain_min_prefix_only_tokens
+    )
 
 
 def _can_chain_prefix_segment(
@@ -2972,79 +3530,59 @@ def _can_chain_prefix_segment(
     cp_size: int,
     planner_config: GdnPlannerConfig,
 ) -> bool:
-    if segment.length < cp_size:
-        return False
-    if segment.length // FLA_CHUNK_SIZE < cp_size:
-        return False
-    per_rank = segment.length / cp_size
-    if per_rank < planner_config.cp_chain_min_tokens_per_rank:
-        return False
-    return segment.length >= planner_config.cp_chain_min_prefix_only_tokens
+    return _can_chain_segment(segment, cp_size=cp_size, planner_config=planner_config)
 
 
-def _candidate_chain_family_sets(
-    spec: GdnPackedExecutionSpec,
+def _score_cp_segment_stats(
     *,
-    legal_chain_families: tuple[int, ...],
-    cp_size: int,
-) -> tuple[frozenset[int], ...]:
-    if not legal_chain_families:
-        return (frozenset(),)
-    candidates: set[frozenset[int]] = {frozenset(), frozenset(legal_chain_families)}
-    if len(legal_chain_families) <= 4:
-        for mask in range(1, 1 << len(legal_chain_families)):
-            candidates.add(
-                frozenset(
-                    family_index
-                    for bit, family_index in enumerate(legal_chain_families)
-                    if mask & (1 << bit)
-                )
-            )
-    else:
-        by_chain_value = sorted(
-            legal_chain_families,
-            key=lambda family_index: (
-                _family_chain_candidate_tokens(spec.families[family_index]),
-                spec.families[family_index].prefix.length,
-            ),
-            reverse=True,
+    rank_local_work: tuple[int, ...],
+    rank_chain_work: tuple[int, ...],
+    rank_real_tokens: tuple[int, ...],
+    cross_rank_token_count: int,
+    parent_state_exchange_family_count: int,
+    local_bucket_count: int,
+    local_segment_count: int,
+    chain_bucket_count: int,
+    planner_config: GdnPlannerConfig,
+) -> float:
+    empty_rank_count = sum(1 for token_count in rank_real_tokens if token_count == 0)
+    return (
+        _rank_kernel_ms(
+            rank_local_work,
+            rank_chain_work,
+            local_token_ms=planner_config.planner_local_token_ms,
+            chain_token_ms=planner_config.planner_chain_token_ms,
         )
-        for count in range(1, min(len(by_chain_value), cp_size * 2) + 1):
-            candidates.add(frozenset(by_chain_value[:count]))
-        for family_index in by_chain_value[: max(cp_size * 2, 1)]:
-            candidates.add(frozenset((family_index,)))
-    return tuple(sorted(candidates, key=lambda item: (len(item), tuple(sorted(item)))))
-
-
-def _family_chain_candidate_tokens(family: GdnPackedFamilySpec) -> int:
-    return family.prefix.length + sum(
-        completion.length for completion in family.completions
+        + planner_config.planner_local_bucket_ms * local_bucket_count
+        + planner_config.planner_chain_bucket_ms * chain_bucket_count
+        + planner_config.planner_local_segment_ms * local_segment_count
+        + planner_config.planner_layout_cross_rank_token_ms * cross_rank_token_count
+        + (
+            planner_config.planner_parent_state_exchange_base_ms
+            + planner_config.planner_parent_state_exchange_ms
+            * parent_state_exchange_family_count
+            if parent_state_exchange_family_count
+            else 0.0
+        )
+        + planner_config.planner_empty_rank_ms * empty_rank_count
     )
 
 
-def _score_cp_segment_schedule(
-    schedule: GdnCpSegmentSchedule,
+def _rank_kernel_ms(
+    rank_local_work: tuple[int, ...],
+    rank_chain_work: tuple[int, ...],
     *,
-    planner_config: GdnPlannerConfig,
+    local_token_ms: float,
+    chain_token_ms: float,
 ) -> float:
-    rank_loads = list(schedule.gdn_token_counts_by_rank)
-    max_load = max(rank_loads, default=0)
-    idle_tokens = sum(max_load - load for load in rank_loads)
-    empty_rank_count = sum(1 for load in rank_loads if load == 0)
-    empty_rank_penalty = min(planner_config.empty_rank_penalty_tokens, max_load)
-    local_launches = sum(
-        1 for segments in schedule.local_prefix_segments_by_rank if segments
-    ) + sum(1 for segments in schedule.local_completion_segments_by_rank if segments)
-    return (
-        max_load
-        + planner_config.rank_idle_token_cost * idle_tokens
-        + empty_rank_penalty * empty_rank_count
-        + planner_config.local_fork_launch_penalty_tokens * local_launches
-        + planner_config.layout_cross_rank_token_cost * schedule.cross_rank_token_count
-        + planner_config.parent_state_exchange_penalty_tokens
-        * len(schedule.parent_state_exchange_family_indices)
-        + planner_config.cp_collective_latency_tokens
-        * (len(schedule.chain_prefix_buckets) + len(schedule.chain_completion_buckets))
+    return max(
+        (
+            local_work * local_token_ms + chain_work * chain_token_ms
+            for local_work, chain_work in zip(
+                rank_local_work, rank_chain_work, strict=True
+            )
+        ),
+        default=0.0,
     )
 
 
@@ -3055,7 +3593,7 @@ def _best_segment_owner(
     segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
     planner_config: GdnPlannerConfig,
 ) -> int:
-    del planner_config
+    segment_length = sum(segment.length for segment in segments)
     if len(segments) == 1:
         on_rank_tokens = segment_attention_counts[_segment_key(segments[0])]
     else:
@@ -3066,19 +3604,34 @@ def _best_segment_owner(
             for rank in range(rank_count):
                 counts_by_rank[rank] += segment_counts[rank]
         on_rank_tokens = tuple(counts_by_rank)
-    best_locality = max(on_rank_tokens, default=0)
-    if best_locality <= 0:
-        return _least_loaded_rank(rank_loads)
-    best_rank = 0
-    best_load = None
+    best: tuple[float, int, int, int, int] | None = None
     for rank, tokens in enumerate(on_rank_tokens):
-        if tokens != best_locality:
-            continue
-        load = rank_loads[rank]
-        if best_load is None or load < best_load:
-            best_rank = rank
-            best_load = load
-    return best_rank
+        projected_loads = list(rank_loads)
+        projected_loads[rank] += segment_length
+        max_load = max(projected_loads, default=0)
+        idle_tokens = sum(max_load - load for load in projected_loads)
+        cross_rank_tokens = segment_length - int(tokens)
+        empty_rank_count = sum(1 for load in projected_loads if load == 0)
+        score = (
+            max_load * planner_config.planner_local_token_ms
+            + idle_tokens
+            * planner_config.rank_idle_token_cost
+            * planner_config.planner_local_token_ms
+            + cross_rank_tokens * planner_config.planner_layout_cross_rank_token_ms
+            + empty_rank_count * planner_config.planner_empty_rank_ms
+        )
+        candidate = (
+            score,
+            max_load,
+            cross_rank_tokens,
+            -int(tokens),
+            rank,
+        )
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return _least_loaded_rank(rank_loads)
+    return best[-1]
 
 
 def _build_attention_layout_index_from_token_layout(
@@ -3176,16 +3729,31 @@ def _default_attention_layout_ranges(
 ) -> tuple[tuple[tuple[int, int, int], ...], ...]:
     ranks: list[list[tuple[int, int, int]]] = [[] for _ in range(cp_size)]
     loads = [0] * cp_size
+    target_rank_load = spec.real_token_count / cp_size
 
     def append_segment(rank: int, token_start: int, token_count: int) -> None:
         ranks[rank].append((token_start, token_start + token_count, loads[rank]))
         loads[rank] += token_count
 
-    for family in spec.families:
-        chain_family = _can_chain_family(
-            family, cp_size=cp_size, planner_config=planner_config
+    def should_split_segment(segment: GdnSegmentSpec) -> bool:
+        if segment.length <= planner_config.max_zero_exchange_load_imbalance * (
+            target_rank_load
+        ):
+            return False
+        if segment.kind == "prefix":
+            return _can_chain_prefix_segment(
+                segment, cp_size=cp_size, planner_config=planner_config
+            )
+        return _can_chain_segment(
+            segment, cp_size=cp_size, planner_config=planner_config
         )
-        if not chain_family:
+
+    for family in spec.families:
+        has_split_segment = any(
+            should_split_segment(segment)
+            for segment in (family.prefix, *family.completions)
+        )
+        if not has_split_segment:
             if _should_co_locate_non_chain_family(
                 family,
                 total_real_tokens=spec.real_token_count,
@@ -3204,14 +3772,7 @@ def _default_attention_layout_ranges(
             continue
         for segment in (family.prefix, *family.completions):
             token_start = _segment_token_start(segment, spec.sequence_length)
-            if (
-                segment.kind == "prefix"
-                and _can_chain_prefix_segment(
-                    segment, cp_size=cp_size, planner_config=planner_config
-                )
-            ) or _can_chain_segment(
-                segment, cp_size=cp_size, planner_config=planner_config
-            ):
+            if should_split_segment(segment):
                 _append_split_default_attention_segment(
                     ranks, loads, token_start, segment.length
                 )

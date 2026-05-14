@@ -1413,6 +1413,17 @@ def _selected_or_repeated_case(args: argparse.Namespace) -> GdnPhase0Case:
             branch_length_std=args.branch_length_std,
             branch_length_clip_delta=args.branch_length_clip_delta,
         )
+    if args.case_name == "sampled_single_family":
+        return _sampled_single_family_case(
+            prefix_len=args.prefix_len,
+            suffix_len=args.suffix_len,
+            completions_per_family=args.completions_per_family,
+            seed=args.seed,
+            prefix_length_std=args.prefix_length_std,
+            prefix_length_clip_delta=args.prefix_length_clip_delta,
+            branch_length_std=args.branch_length_std,
+            branch_length_clip_delta=args.branch_length_clip_delta,
+        )
     if args.case_name == "deterministic_jitter_repeated_family":
         return _deterministic_jitter_repeated_family_case(
             target_seq_len=args.target_seq_len,
@@ -1570,6 +1581,51 @@ def _sampled_repeated_family_case(
         description=(
             "One ART-realistic packed row with clipped-normal sampled prefix "
             "and completion lengths packed up to the target sequence length."
+        ),
+    )
+
+
+def _sampled_single_family_case(
+    *,
+    prefix_len: int,
+    suffix_len: int,
+    completions_per_family: int,
+    seed: int,
+    prefix_length_std: int,
+    prefix_length_clip_delta: int,
+    branch_length_std: int,
+    branch_length_clip_delta: int,
+) -> GdnPhase0Case:
+    rng = random.Random(seed)
+    prefix = _sample_length(
+        mean=prefix_len,
+        std=prefix_length_std,
+        clip_delta=prefix_length_clip_delta,
+        rng=rng,
+    )
+    suffixes = tuple(
+        _sample_length(
+            mean=suffix_len,
+            std=branch_length_std,
+            clip_delta=branch_length_clip_delta,
+            rng=rng,
+            min_value=2,
+        )
+        for _ in range(completions_per_family)
+    )
+    family = GdnFamilyShape(prefix_length=prefix, suffix_lengths=suffixes)
+    target_seq_len = gdn_family_token_count(family)
+    return GdnPhase0Case(
+        name=(
+            f"sampled_single_{prefix_len}_plus_{completions_per_family}x"
+            f"{suffix_len}_target_{target_seq_len}_seed_{seed}"
+        ),
+        sequence_length=target_seq_len,
+        rows=(GdnPackedRowShape(families=(family,)),),
+        seed=seed,
+        description=(
+            "One ART-realistic packed row with a single clipped-normal sampled "
+            "prefix family and exact sequence length."
         ),
     )
 

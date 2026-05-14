@@ -14,6 +14,12 @@ import torch
 from torch.distributed import destroy_process_group, init_process_group
 import torch.multiprocessing as mp
 
+from art.megatron.context_parallel import (
+    ContextParallelConfig,
+    ParallelTopology,
+    TokenLayoutIndex,
+    build_context_parallel_token_layout_index,
+)
 from art.megatron.gdn.gdn_shared_prefix import (
     GdnPlannerConfig,
     build_gdn_rank_execution_plan,
@@ -126,6 +132,19 @@ def main(argv: list[str] | None = None) -> int:
         choices=QWEN35_GDN_LINEAR_POLICY,
         default="noop",
     )
+    parser.add_argument("--cp-chain-beam-max-steps", type=int, default=4)
+    parser.add_argument("--planner-local-token-ms", type=float, default=0.00065)
+    parser.add_argument("--planner-chain-token-ms", type=float, default=0.00055)
+    parser.add_argument("--planner-chain-bucket-ms", type=float, default=22.0)
+    parser.add_argument("--planner-local-segment-ms", type=float, default=0.010)
+    parser.add_argument(
+        "--planner-layout-cross-rank-token-ms", type=float, default=0.00008
+    )
+    parser.add_argument(
+        "--planner-parent-state-exchange-base-ms", type=float, default=40.0
+    )
+    parser.add_argument("--planner-parent-state-exchange-ms", type=float, default=0.5)
+    parser.add_argument("--planner-empty-rank-ms", type=float, default=32.0)
     parser.add_argument("--warmup-iters", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--profile", action="store_true")
@@ -222,6 +241,13 @@ def _worker(
             parent_ids_cpu,
             cp_rank=rank,
         )
+        attention_token_layout_index = _build_distributed_attention_token_layout_index(
+            group_ids_cpu,
+            parent_ids_cpu,
+            cp_rank=rank,
+            cp_size=cp_size,
+            original_seq_len=int(spec.sequence_length),
+        )
         plan_times = []
         plan: Any | None = None
         for _ in range(args.warmup_iters):
@@ -230,6 +256,8 @@ def _worker(
                 cp_rank=rank,
                 cp_size=cp_size,
                 device=torch.device("cpu"),
+                planner_config=_planner_config_from_args(args),
+                attention_token_layout_index=attention_token_layout_index,
             )
         torch.distributed.barrier()
         for _ in range(args.iters):
@@ -240,6 +268,8 @@ def _worker(
                 cp_rank=rank,
                 cp_size=cp_size,
                 device=torch.device("cpu"),
+                planner_config=_planner_config_from_args(args),
+                attention_token_layout_index=attention_token_layout_index,
             )
             plan_times.append((time.perf_counter() - start) * 1000.0)
             torch.distributed.barrier()
@@ -453,18 +483,67 @@ def _build_distributed_execution_spec(
     return spec_payload[0]
 
 
+def _build_distributed_attention_token_layout_index(
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    original_seq_len: int,
+) -> TokenLayoutIndex | None:
+    if cp_size <= 1:
+        return None
+    layout_payload: list[TokenLayoutIndex | None] = [None]
+    if cp_rank == 0:
+        layout_payload[0] = build_context_parallel_token_layout_index(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+            topology=ParallelTopology(cp=cp_size),
+            config=ContextParallelConfig(),
+            original_seq_len=original_seq_len,
+        )
+    torch.distributed.broadcast_object_list(  # ty: ignore[possibly-missing-attribute]
+        layout_payload,
+        src=0,
+        group=torch.distributed.group.WORLD,  # ty: ignore[possibly-missing-attribute]
+    )
+    return layout_payload[0]
+
+
 def _build_rank_execution_plan_from_spec(
     spec: Any,
     *,
     cp_rank: int,
     cp_size: int,
     device: torch.device,
+    planner_config: GdnPlannerConfig,
+    attention_token_layout_index: TokenLayoutIndex | None,
 ) -> Any:
     return build_gdn_rank_execution_plan(
         spec,
         device=device,
         cp_rank=cp_rank,
         cp_size=cp_size,
+        planner_config=planner_config,
+        attention_token_layout_index=attention_token_layout_index,
+    )
+
+
+def _planner_config_from_args(args: argparse.Namespace) -> GdnPlannerConfig:
+    return GdnPlannerConfig(
+        cp_chain_beam_max_steps=int(args.cp_chain_beam_max_steps),
+        planner_local_token_ms=float(args.planner_local_token_ms),
+        planner_chain_token_ms=float(args.planner_chain_token_ms),
+        planner_chain_bucket_ms=float(args.planner_chain_bucket_ms),
+        planner_local_segment_ms=float(args.planner_local_segment_ms),
+        planner_layout_cross_rank_token_ms=float(
+            args.planner_layout_cross_rank_token_ms
+        ),
+        planner_parent_state_exchange_base_ms=float(
+            args.planner_parent_state_exchange_base_ms
+        ),
+        planner_parent_state_exchange_ms=float(args.planner_parent_state_exchange_ms),
+        planner_empty_rank_ms=float(args.planner_empty_rank_ms),
     )
 
 
@@ -549,16 +628,19 @@ def _manifest_configs(args: argparse.Namespace) -> dict[str, object]:
         "iters": args.iters,
         "benchmark_dtype": str(BENCHMARK_DTYPE),
         "worker_torch_num_threads": 1,
+        "cp_attention_layout": "actual_cp",
         "plan_timing_scope": (
-            "CPU rank execution plan from a parsed distributed spec; metadata "
-            "parse/broadcast and CPU-to-CUDA plan transfer run outside timing"
+            "CPU GDN rank execution plan from a parsed distributed spec and the "
+            "actual CP attention token layout; metadata parse/broadcast, CP "
+            "attention layout planning, and CPU-to-CUDA plan transfer run "
+            "outside timing"
         ),
         "benchmark_qwen35_gdn": qwen35_gdn_module_config()
         .model_copy(update={"linear_conv_kernel_dim": args.conv_width})
         .model_dump(),
         "profile": bool(args.profile),
         "nsys_profile": bool(args.nsys_profile),
-        "planner_config": GdnPlannerConfig().model_dump(),
+        "planner_config": _planner_config_from_args(args).model_dump(),
     }
 
 
@@ -590,7 +672,7 @@ def _render_report(results: tuple[PackedCpGdnBenchmark, ...]) -> str:
             "",
             "Per-rank medians use the slowest rank as the topology-level time.",
             "The target sequence length is weak-scaled by adding more fixed-shape families; the final family may use fewer completions to fit the target.",
-            "Planning is measured as CPU rank-plan construction from an already parsed distributed execution spec; metadata parse/broadcast and CPU-to-CUDA plan transfer are prepared outside the timed planner loop.",
+            "GDN planning is measured as CPU rank-plan construction from an already parsed distributed execution spec and the actual CP attention token layout; metadata parse/broadcast, CP attention layout planning, and CPU-to-CUDA plan transfer are prepared outside the timed planner loop.",
             "The parameter-reduce column uses one coalesced all-reduce bucket per dtype/device, matching production gradient-sync shape better than per-parameter test reductions.",
             "",
         ]

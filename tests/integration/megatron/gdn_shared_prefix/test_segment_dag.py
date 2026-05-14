@@ -536,6 +536,45 @@ def test_cp_local_family_plan_rebalances_skewed_completion_segments() -> None:
     assert any(plan.remote_completion_with_prefix_tail_buckets for plan in rank_plans)
 
 
+def test_cp_explicit_attention_layout_rebalances_skewed_local_work() -> None:
+    group_ids, parent_ids = _group_tensors_from_families(
+        [
+            (15825, tuple(921 for _ in range(16))),
+            *((512, (64, 65, 66, 67)) for _ in range(171)),
+        ]
+    )
+    spec = parse_gdn_shared_prefix_segments(
+        group_ids,
+        parent_ids,
+        min_completions_per_family=1,
+    )
+    token_count = int(spec.real_token_count)
+    attention_layout = _layout_from_tokens_by_rank(
+        (
+            tuple(range(0, 4096)),
+            tuple(range(4096, 8192)),
+            tuple(range(8192, 12288)),
+            tuple(range(12288, token_count)),
+        )
+    )
+
+    rank_plans = tuple(
+        build_gdn_rank_execution_plan(
+            spec,
+            device="cpu",
+            cp_rank=rank,
+            cp_size=4,
+            attention_token_layout_index=attention_layout,
+        )
+        for rank in range(4)
+    )
+    rank_loads = [plan.gdn_token_count for plan in rank_plans]
+
+    assert min(rank_loads) > 0
+    assert max(rank_loads) <= 1.10 * (sum(rank_loads) / len(rank_loads))
+    assert any(plan.attention_to_gdn.cross_rank_token_count > 0 for plan in rank_plans)
+
+
 def test_cp_remote_prefix_tail_plan_does_not_duplicate_legacy_work() -> None:
     group_ids, parent_ids = _many_small_group_tensors(
         family_count=49,

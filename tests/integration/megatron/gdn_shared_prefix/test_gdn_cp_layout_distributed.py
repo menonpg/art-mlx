@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.gdn.layout import (
+    build_cp_exchange_plan_from_rank_ranges,
     build_gdn_cp_layout_plan,
     exchange_rank_tensor_all_to_all,
 )
@@ -50,6 +51,28 @@ def test_distributed_gdn_cp_layout_handles_empty_ranks(tmp_path: Path) -> None:
     mp.start_processes(
         _distributed_layout_worker,
         args=(cp_size, str(init_path), "tiny_empty_rank", False),
+        nprocs=cp_size,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+    reason="requires at least four CUDA devices for NCCL zero-token exchange coverage",
+)
+def test_distributed_gdn_cp_layout_nccl_handles_zero_source_nonzero_dest(
+    tmp_path: Path,
+) -> None:
+    cp_size = 4
+    init_path = tmp_path / "gdn_cp_layout_nccl_zero_source"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_zero_source_nccl_worker,
+        args=(cp_size, str(init_path)),
         nprocs=cp_size,
         join=True,
         start_method="spawn",
@@ -137,6 +160,70 @@ def _distributed_layout_worker(
         destroy_process_group()
 
 
+def _distributed_zero_source_nccl_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        source_tokens = (tuple(range(16)), (), (), ())
+        dest_tokens = ((), (), (), tuple(range(16)))
+        source_ranges = _rank_ranges_from_tokens_by_rank(source_tokens)
+        dest_ranges = _rank_ranges_from_tokens_by_rank(dest_tokens)
+        forward_plan = build_cp_exchange_plan_from_rank_ranges(
+            source_ranges_by_rank=source_ranges,
+            dest_ranges_by_rank=dest_ranges,
+            device="cuda",
+            validate=False,
+            local_rank=rank,
+        )
+        backward_plan = build_cp_exchange_plan_from_rank_ranges(
+            source_ranges_by_rank=dest_ranges,
+            dest_ranges_by_rank=source_ranges,
+            device="cuda",
+            validate=False,
+            local_rank=rank,
+        )
+        flat = torch.arange(16 * 6, device="cuda", dtype=torch.float32).reshape(
+            16, 2, 3
+        )
+        local_source = flat.index_select(
+            0,
+            torch.tensor(source_tokens[rank], device="cuda", dtype=torch.long),
+        )
+        local_source = local_source.detach().clone().requires_grad_(True)
+        actual = exchange_rank_tensor_all_to_all(
+            local_source,
+            forward_plan,
+            rank=rank,
+            backward_plan=backward_plan,
+        )
+        expected = flat.index_select(
+            0,
+            torch.tensor(dest_tokens[rank], device="cuda", dtype=torch.long),
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        actual.sum().backward()
+        assert local_source.grad is not None
+        expected_grad = (
+            torch.ones_like(local_source)
+            if rank == 0
+            else torch.empty_like(local_source)
+        )
+        torch.testing.assert_close(local_source.grad, expected_grad, rtol=0, atol=0)
+        torch.cuda.synchronize()
+    finally:
+        destroy_process_group()
+
+
 def _case_by_name(case_name: str) -> GdnPhase0Case:
     if case_name == "tiny_empty_rank":
         return GdnPhase0Case(
@@ -179,11 +266,15 @@ def _layout_from_tokens_by_rank(
     tokens_by_rank: tuple[tuple[int, ...], ...],
 ) -> TokenLayoutIndex:
     return TokenLayoutIndex(
-        ownership_ranges_by_rank=tuple(
-            _rank_ranges_from_tokens(tokens) for tokens in tokens_by_rank
-        ),
+        ownership_ranges_by_rank=_rank_ranges_from_tokens_by_rank(tokens_by_rank),
         token_counts_by_rank=tuple(len(tokens) for tokens in tokens_by_rank),
     )
+
+
+def _rank_ranges_from_tokens_by_rank(
+    tokens_by_rank: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+    return tuple(_rank_ranges_from_tokens(tokens) for tokens in tokens_by_rank)
 
 
 def _rank_ranges_from_tokens(
