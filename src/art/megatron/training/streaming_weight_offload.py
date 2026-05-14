@@ -28,10 +28,10 @@ class _LayerState:
         self.layer = layer
         self.params = params
         self.cpu_tensors: list[torch.Tensor] = []
+        self.pinned_tensors: list[torch.Tensor] = []
         self.gpu_tensors: list[torch.Tensor] = []
         self.status = "gpu"
         self.load_event: torch.cuda.Event | None = None
-        self.offload_event: torch.cuda.Event | None = None
 
 
 class StreamingWeightOffloader:
@@ -50,7 +50,6 @@ class StreamingWeightOffloader:
             for i, layer in enumerate(selected_layers)
         ]
         self.h2d_stream = torch.cuda.Stream()
-        self.d2h_stream = torch.cuda.Stream()
         self._hooks: list[Any] = []
 
     def install(self) -> None:
@@ -60,14 +59,9 @@ class StreamingWeightOffloader:
             )
         for layer_state in self.layers:
             for param in layer_state.params:
-                layer_state.cpu_tensors.append(
-                    torch.empty(
-                        param.shape,
-                        dtype=param.dtype,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                )
+                cpu_tensor = torch.empty(param.shape, dtype=param.dtype, device="cpu")
+                cpu_tensor.copy_(param.data, non_blocking=False)
+                layer_state.cpu_tensors.append(cpu_tensor)
                 layer_state.gpu_tensors.append(param.data)
             self._hooks.append(
                 layer_state.layer.register_forward_pre_hook(
@@ -92,7 +86,6 @@ class StreamingWeightOffloader:
             )
 
     def begin_job(self) -> None:
-        self._finish_completed_offloads()
         self._start_load(0)
 
     def finish_job(self) -> None:
@@ -105,21 +98,17 @@ class StreamingWeightOffloader:
 
     def offload_all(self, *, wait: bool) -> None:
         for layer_state in self.layers:
-            self._ensure_offloaded(layer_state, wait=wait)
+            self._ensure_offloaded(layer_state)
         if wait:
-            self.d2h_stream.synchronize()
-            self._finish_completed_offloads()
             torch.cuda.empty_cache()
 
     def _pre_forward(self, layer_state: _LayerState) -> None:
-        self._finish_completed_offloads()
         recompute_forward = _is_recompute_forward()
         if recompute_forward:
             self._offload_recomputed_successors(layer_state.index)
-            self._finish_pending_offloads()
         self._finish_load(layer_state)
-        if not recompute_forward:
-            self._finish_neighbor_offload(layer_state.index - 1)
+        if recompute_forward:
+            self._start_load(layer_state.index - 1)
 
     def _post_forward(self, layer_state: _LayerState) -> None:
         if is_checkpointing() and not torch.is_grad_enabled():
@@ -129,7 +118,7 @@ class StreamingWeightOffloader:
     def _offload_recomputed_successors(self, index: int) -> None:
         for layer_state in self.layers[index + 1 :]:
             if layer_state.status in {"gpu", "loading"}:
-                self._ensure_offloaded(layer_state, wait=False)
+                self._ensure_offloaded(layer_state)
 
     def _start_load(self, index: int) -> None:
         if index < 0 or index >= len(self.layers):
@@ -137,21 +126,27 @@ class StreamingWeightOffloader:
         layer_state = self.layers[index]
         if layer_state.status in {"gpu", "loading"}:
             return
-        if layer_state.status == "offloading":
-            self._finish_offload(layer_state, wait=True)
         if layer_state.status != "cpu":
             raise RuntimeError(f"Unexpected layer offload state {layer_state.status!r}")
         layer_state.gpu_tensors = [
             torch.empty_like(cpu_tensor, device=torch.cuda.current_device())
             for cpu_tensor in layer_state.cpu_tensors
         ]
+        layer_state.pinned_tensors = [
+            torch.empty_like(cpu_tensor, pin_memory=True)
+            for cpu_tensor in layer_state.cpu_tensors
+        ]
+        for pinned_tensor, cpu_tensor in zip(
+            layer_state.pinned_tensors, layer_state.cpu_tensors, strict=True
+        ):
+            pinned_tensor.copy_(cpu_tensor, non_blocking=False)
         current_stream = torch.cuda.current_stream()
         self.h2d_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.h2d_stream):
-            for gpu_tensor, cpu_tensor in zip(
-                layer_state.gpu_tensors, layer_state.cpu_tensors, strict=True
+            for gpu_tensor, pinned_tensor in zip(
+                layer_state.gpu_tensors, layer_state.pinned_tensors, strict=True
             ):
-                gpu_tensor.copy_(cpu_tensor, non_blocking=True)
+                gpu_tensor.copy_(pinned_tensor, non_blocking=True)
                 gpu_tensor.record_stream(self.h2d_stream)
             event = torch.cuda.Event()
             event.record(self.h2d_stream)
@@ -174,17 +169,16 @@ class StreamingWeightOffloader:
         ):
             param.data = gpu_tensor
         layer_state.load_event = None
+        layer_state.pinned_tensors = []
         layer_state.status = "gpu"
 
-    def _ensure_offloaded(self, layer_state: _LayerState, *, wait: bool) -> None:
+    def _ensure_offloaded(self, layer_state: _LayerState) -> None:
         if layer_state.status == "cpu":
             return
         if layer_state.status == "loading":
             self._finish_load(layer_state)
         if layer_state.status == "gpu":
             self._start_offload(layer_state)
-        if layer_state.status == "offloading":
-            self._finish_offload(layer_state, wait=wait)
 
     def _start_offload(self, layer_state: _LayerState) -> None:
         if layer_state.status == "cpu":
@@ -194,48 +188,13 @@ class StreamingWeightOffloader:
         if layer_state.status != "gpu":
             raise RuntimeError(f"Unexpected layer offload state {layer_state.status!r}")
         current_stream = torch.cuda.current_stream()
-        self.d2h_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.d2h_stream):
-            for cpu_tensor, gpu_tensor in zip(
-                layer_state.cpu_tensors, layer_state.gpu_tensors, strict=True
-            ):
-                cpu_tensor.copy_(gpu_tensor, non_blocking=True)
-                gpu_tensor.record_stream(self.d2h_stream)
-            event = torch.cuda.Event()
-            event.record(self.d2h_stream)
-        layer_state.offload_event = event
-        layer_state.status = "offloading"
-
-    def _finish_completed_offloads(self) -> None:
-        for layer_state in self.layers:
-            if layer_state.status == "offloading":
-                self._finish_offload(layer_state, wait=False)
-
-    def _finish_pending_offloads(self) -> None:
-        for layer_state in self.layers:
-            if layer_state.status == "offloading":
-                self._finish_offload(layer_state, wait=True)
-
-    def _finish_neighbor_offload(self, index: int) -> None:
-        if 0 <= index < len(self.layers):
-            layer_state = self.layers[index]
-            if layer_state.status == "offloading":
-                self._finish_offload(layer_state, wait=True)
-
-    def _finish_offload(self, layer_state: _LayerState, *, wait: bool) -> None:
-        event = layer_state.offload_event
-        if event is None:
-            return
-        if wait:
-            event.synchronize()
-        elif not event.query():
-            return
+        for gpu_tensor in layer_state.gpu_tensors:
+            gpu_tensor.record_stream(current_stream)
         for param, cpu_tensor in zip(
             layer_state.params, layer_state.cpu_tensors, strict=True
         ):
             param.data = cpu_tensor
         layer_state.gpu_tensors = []
-        layer_state.offload_event = None
         layer_state.status = "cpu"
 
 
