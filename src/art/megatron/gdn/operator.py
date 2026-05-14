@@ -2656,7 +2656,8 @@ def run_gdn_bucket(
     if recurrent_cp:
         conv_initial, chain_conv_final = _chain_conv_initial_and_final(
             qkv,
-            bucket.cu_seqlens,
+            bucket.cu_seqlens_cpu,
+            bucket.lengths_by_rank_cpu,
             conv_initial,
             group=group,
             output_final_state=output_final_state,
@@ -2707,6 +2708,8 @@ def run_gdn_bucket(
                 group=group,
                 output_final_state=output_final_state,
                 cu_seqlens=bucket.cu_seqlens,
+                cu_seqlens_cpu=bucket.cu_seqlens_cpu,
+                lengths_by_rank_cpu=bucket.lengths_by_rank_cpu,
             )
         else:
             recurrent_out, recurrent_final = _chunk_gated_delta_rule(
@@ -2725,7 +2728,8 @@ def run_gdn_bucket(
 
 def _chain_conv_initial_and_final(
     qkv: Tensor,
-    cu_seqlens: Tensor,
+    cu_seqlens_cpu: Tensor,
+    lengths_by_rank_cpu: Tensor | None,
     parent_initial: Tensor,
     *,
     group: Any,
@@ -2739,16 +2743,17 @@ def _chain_conv_initial_and_final(
     tail_width = int(parent_initial.shape[-1])
     if tail_width <= 0:
         return parent_initial, parent_initial if output_final_state else None
-    local_tail, local_tail_lengths = _local_packed_conv_tail(
-        qkv, cu_seqlens, tail_width
-    )
+    if lengths_by_rank_cpu is None:
+        raise ValueError("CP chain conv requires static all-rank bucket lengths")
+    if cu_seqlens_cpu.device.type != "cpu" or lengths_by_rank_cpu.device.type != "cpu":
+        raise ValueError("CP chain conv metadata must stay on CPU")
+    local_tail = _local_packed_conv_tail(qkv, cu_seqlens_cpu, tail_width)
     gathered_tails = _AllGatherReplicated.apply(local_tail, group)
-    gathered_lengths = _all_gather_chain_tail_lengths(local_tail_lengths, group=group)
     rank = dist.get_rank(group)  # ty: ignore[possibly-missing-attribute]
     conv_initial = _scan_conv_tail_batch(
         parent_initial,
         gathered_tails,
-        gathered_lengths,
+        lengths_by_rank_cpu.clamp(max=tail_width),
         stop_rank=rank,
     )
     conv_initial = _add_autograd_dependency(
@@ -2758,7 +2763,7 @@ def _chain_conv_initial_and_final(
         _scan_conv_tail_batch(
             parent_initial,
             gathered_tails,
-            gathered_lengths,
+            lengths_by_rank_cpu.clamp(max=tail_width),
             stop_rank=dist.get_world_size(group),  # ty: ignore[possibly-missing-attribute]
         )
         if output_final_state
@@ -2768,47 +2773,33 @@ def _chain_conv_initial_and_final(
 
 
 def _local_packed_conv_tail(
-    qkv: Tensor, cu_seqlens: Tensor, tail_width: int
-) -> tuple[Tensor, Tensor]:
-    segment_count = int(cu_seqlens.numel()) - 1
+    qkv: Tensor, cu_seqlens_cpu: Tensor, tail_width: int
+) -> Tensor:
+    segment_count = int(cu_seqlens_cpu.numel()) - 1
     channels = int(qkv.shape[1])
     tails = qkv.new_zeros(segment_count, channels, tail_width)
-    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.long)
-    valid_lengths = torch.clamp(lengths, max=tail_width)
-    for segment in range(segment_count):
-        valid = int(valid_lengths[segment].item())
+    lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    valid_lengths = torch.clamp(lengths, max=tail_width).tolist()
+    ends = cu_seqlens_cpu[1:].tolist()
+    for segment, valid in enumerate(valid_lengths):
+        valid = int(valid)
         if valid <= 0:
             continue
-        end = int(cu_seqlens[segment + 1].item())
+        end = int(ends[segment])
         tails[segment, :, :valid] = qkv[end - valid : end].transpose(0, 1)
-    return tails, valid_lengths
-
-
-def _all_gather_chain_tail_lengths(lengths: Tensor, *, group: Any) -> Tensor:
-    gathered = torch.empty(
-        dist.get_world_size(group),  # ty: ignore[possibly-missing-attribute]
-        int(lengths.numel()),
-        device=lengths.device,
-        dtype=torch.long,
-    )
-    dist.all_gather_into_tensor(  # ty: ignore[possibly-missing-attribute]
-        gathered,
-        lengths.contiguous(),
-        group=group,
-    )
-    return gathered
+    return tails
 
 
 def _scan_conv_tail_batch(
     parent_initial: Tensor,
     tails_by_rank: Tensor,
-    lengths_by_rank: Tensor,
+    lengths_by_rank_cpu: Tensor,
     *,
     stop_rank: int,
 ) -> Tensor:
     states = []
     tail_width = int(parent_initial.shape[-1])
-    host_lengths = lengths_by_rank.detach().cpu().tolist()
+    host_lengths = lengths_by_rank_cpu.tolist()
     for segment in range(int(parent_initial.shape[0])):
         state = parent_initial[segment]
         for peer in range(int(stop_rank)):

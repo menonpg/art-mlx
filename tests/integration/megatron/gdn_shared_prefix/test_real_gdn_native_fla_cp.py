@@ -471,13 +471,20 @@ def _varlen_bucket(
     lengths: torch.Tensor, *, device: torch.device
 ) -> GdnSegmentBucketPlan:
     max_len = int(lengths.max().item())
+    lengths_cpu = lengths.detach().cpu()
+    cu_seqlens_cpu = torch.cat(
+        [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
+    )
     offsets = torch.arange(max_len, device=device, dtype=torch.long).unsqueeze(1)
     real_mask = offsets < lengths.unsqueeze(0)
     return GdnSegmentBucketPlan(
         length=max_len,
         lengths=lengths,
+        lengths_cpu=lengths_cpu,
+        lengths_by_rank_cpu=None,
         real_mask=real_mask,
-        cu_seqlens=torch.cat([lengths.new_zeros(1), torch.cumsum(lengths, dim=0)]),
+        cu_seqlens=cu_seqlens_cpu.to(device=device),
+        cu_seqlens_cpu=cu_seqlens_cpu,
         row_indices=torch.arange(int(lengths.numel()), device=device, dtype=torch.long)
         .unsqueeze(0)
         .expand(max_len, -1)

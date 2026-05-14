@@ -171,6 +171,9 @@ def _native_fla_cp_worker(
             initial_state=h0_local,
             group=torch.distributed.group.WORLD,
             output_final_state=True,
+            lengths_by_rank_cpu=torch.full(
+                (cp_size, 1), int(q_local.shape[1]), dtype=torch.long
+            ),
         )
         assert cp_ht is not None
         cp_loss = (cp_out * local_grad).sum() + (cp_ht * (ht_grad / cp_size)).sum()
@@ -250,7 +253,8 @@ def _native_fla_cp_varlen_multichain_worker(
         )
         h0_local = h0.clone().detach().requires_grad_(True)
         local_grad = _cat_varlen_slices(output_grad, local_slices).contiguous()
-        local_cu = _local_cu_seqlens(local_slices, device=q.device)
+        local_cu_cpu = _local_cu_seqlens_cpu(local_slices)
+        local_cu = local_cu_cpu.to(device=q.device)
 
         cp_out, cp_ht = chunk_gated_delta_rule_native_cp(
             q_local,
@@ -260,6 +264,8 @@ def _native_fla_cp_varlen_multichain_worker(
             beta=beta_local,
             initial_state=h0_local,
             cu_seqlens=local_cu,
+            cu_seqlens_cpu=local_cu_cpu,
+            lengths_by_rank_cpu=_lengths_by_rank_cpu(cu, cp_size=cp_size),
             group=torch.distributed.group.WORLD,
             output_final_state=True,
         )
@@ -487,15 +493,20 @@ def _rank_varlen_slices(
     return tuple(slices)
 
 
-def _local_cu_seqlens(
-    slices: tuple[tuple[int, int], ...], *, device: torch.device
-) -> torch.Tensor:
+def _local_cu_seqlens_cpu(slices: tuple[tuple[int, int], ...]) -> torch.Tensor:
     lengths = [end - start for start, end in slices]
     return torch.tensor(
         [0, *torch.cumsum(torch.tensor(lengths), dim=0).tolist()],
-        device=device,
         dtype=torch.long,
     )
+
+
+def _lengths_by_rank_cpu(cu_seqlens: torch.Tensor, *, cp_size: int) -> torch.Tensor:
+    rows = []
+    for rank in range(cp_size):
+        rank_slices = _rank_varlen_slices(cu_seqlens, rank=rank, cp_size=cp_size)
+        rows.append([end - start for start, end in rank_slices])
+    return torch.tensor(rows, dtype=torch.long)
 
 
 def _cat_varlen_slices(

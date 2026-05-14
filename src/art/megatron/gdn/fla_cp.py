@@ -18,6 +18,8 @@ def chunk_gated_delta_rule_native_cp(
     group: Any,
     output_final_state: bool,
     cu_seqlens: Tensor | None = None,
+    cu_seqlens_cpu: Tensor | None = None,
+    lengths_by_rank_cpu: Tensor | None = None,
     scale: float | None = None,
 ) -> tuple[Tensor, Tensor | None]:
     """Run FLA gated-delta recurrence on one CP-sharded logical chain.
@@ -50,14 +52,27 @@ def chunk_gated_delta_rule_native_cp(
     if cu_seqlens is None and int(initial_state.shape[0]) != 1:
         raise ValueError("single-chain native FLA CP requires one initial state")
     if cu_seqlens is not None:
+        if cu_seqlens_cpu is None:
+            raise ValueError("native FLA CP varlen requires CPU cu_seqlens metadata")
         if cu_seqlens.ndim != 1:
             raise ValueError(
                 f"cu_seqlens must be rank 1, got {tuple(cu_seqlens.shape)}"
             )
+        if cu_seqlens_cpu.ndim != 1:
+            raise ValueError(
+                f"cu_seqlens_cpu must be rank 1, got {tuple(cu_seqlens_cpu.shape)}"
+            )
+        if cu_seqlens_cpu.device.type != "cpu":
+            raise ValueError("native FLA CP cu_seqlens_cpu must stay on CPU")
         if int(cu_seqlens.numel()) != int(initial_state.shape[0]) + 1:
             raise ValueError(
                 "cu_seqlens entries must equal initial_state batch + 1, got "
                 f"{int(cu_seqlens.numel())} and {int(initial_state.shape[0])}"
+            )
+        if int(cu_seqlens_cpu.numel()) != int(cu_seqlens.numel()):
+            raise ValueError(
+                "cu_seqlens_cpu entries must match cu_seqlens, got "
+                f"{int(cu_seqlens_cpu.numel())} and {int(cu_seqlens.numel())}"
             )
     if tuple(initial_state.shape[1:3]) != tuple(q.shape[2:4]):
         raise ValueError(
@@ -71,12 +86,22 @@ def chunk_gated_delta_rule_native_cp(
         )
     if scale is None:
         scale = float(k.shape[-1] ** -0.5)
-    local_lengths = _local_sequence_lengths(q, cu_seqlens)
-    gathered_lengths = _all_gather_sequence_lengths(local_lengths, group)
-    if not _fla_chunk_boundaries_aligned(gathered_lengths):
+    if lengths_by_rank_cpu is None:
+        raise ValueError("native FLA CP requires static all-rank sequence lengths")
+    if lengths_by_rank_cpu.device.type != "cpu":
+        raise ValueError("native FLA CP lengths_by_rank_cpu must stay on CPU")
+    if tuple(lengths_by_rank_cpu.shape) != (
+        dist.get_world_size(group),  # ty: ignore[possibly-missing-attribute]
+        int(initial_state.shape[0]),
+    ):
+        raise ValueError(
+            "native FLA CP lengths_by_rank_cpu must be [world_size, segments], got "
+            f"{tuple(lengths_by_rank_cpu.shape)}"
+        )
+    if not _fla_chunk_boundaries_aligned_cpu(lengths_by_rank_cpu):
         raise ValueError(
             "native FLA CP GDN requires 64-token aligned non-final rank "
-            f"boundaries; gathered_lengths={gathered_lengths.detach().cpu().tolist()}"
+            f"boundaries; lengths_by_rank={lengths_by_rank_cpu.tolist()}"
         )
     return _NativeCpChunkGatedDeltaRule.apply(
         q,
@@ -86,35 +111,14 @@ def chunk_gated_delta_rule_native_cp(
         beta,
         initial_state,
         cu_seqlens,
+        cu_seqlens_cpu,
         group,
         bool(output_final_state),
         float(scale),
     )
 
 
-def _local_sequence_lengths(q: Tensor, cu_seqlens: Tensor | None) -> Tensor:
-    if cu_seqlens is None:
-        return torch.tensor([int(q.shape[1])], device=q.device, dtype=torch.long)
-    return cu_seqlens[1:] - cu_seqlens[:-1]
-
-
-def _all_gather_sequence_lengths(local_lengths: Tensor, group: Any) -> Tensor:
-    world_size = dist.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
-    gathered = torch.empty(
-        world_size,
-        int(local_lengths.numel()),
-        device=local_lengths.device,
-        dtype=torch.long,
-    )
-    dist.all_gather_into_tensor(  # ty: ignore[possibly-missing-attribute]
-        gathered,
-        local_lengths.contiguous(),
-        group=group,
-    )
-    return gathered
-
-
-def _fla_chunk_boundaries_aligned(lengths_by_rank: Tensor) -> bool:
+def _fla_chunk_boundaries_aligned_cpu(lengths_by_rank: Tensor) -> bool:
     if int(lengths_by_rank.shape[0]) <= 1:
         return True
     starts = torch.cumsum(lengths_by_rank, dim=0)[:-1]
@@ -132,6 +136,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         beta: Tensor,
         initial_state: Tensor,
         cu_seqlens: Tensor | None,
+        cu_seqlens_cpu: Tensor | None,
         group: Any,
         output_final_state: bool,
         scale: float,
@@ -143,7 +148,9 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, solve_tril
 
         chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
+            prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu)
+            if cu_seqlens is not None
+            else None
         )
         chunk_local_cumsum = cast(Any, chunk_local_cumsum)
         chunk_fwd_o = cast(Any, chunk_fwd_o)
@@ -296,6 +303,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             dg.to(g),
             db.to(beta),
             dh0.to(local_initial),
+            None,
             None,
             None,
             None,
