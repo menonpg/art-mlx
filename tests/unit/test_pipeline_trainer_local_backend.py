@@ -457,3 +457,32 @@ def test_local_backend_inference_name_prefers_served_step_in_dedicated_mode(
 
     assert backend._model_inference_name(model) == f"{model.name}@2"
     assert backend._model_inference_name(model, step=3) == f"{model.name}@3"
+
+
+@pytest.mark.asyncio
+async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-adapter-lease",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+        ),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    service = SimpleNamespace(
+        _latest_step=5,
+        prune_loaded_adapters=AsyncMock(),
+    )
+    backend._services[model.name] = cast(Any, service)
+
+    async with backend.adapter_lease(model, 3):
+        assert backend._model_inference_name(model) == f"{model.name}@3"
+        await backend.prune_model_adapters(model, retain_steps={4, 5})
+
+    assert backend._model_inference_name(model) == f"{model.name}@5"
+    service.prune_loaded_adapters.assert_awaited_once_with(retain_steps={3, 4, 5})

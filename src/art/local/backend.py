@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 import gc
 import hashlib
 import json
@@ -67,6 +68,11 @@ from ..preprocessing.tokenize import (
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
 from ..utils import format_message, get_model_step
+from .adapter_leases import (
+    AdapterLeaseManager,
+    pin_inference_step,
+    pinned_inference_step,
+)
 from .checkpoints import (
     delete_checkpoints,
 )
@@ -166,6 +172,7 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
+        self._adapter_leases: dict[str, AdapterLeaseManager] = {}
         self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
@@ -274,6 +281,7 @@ class LocalBackend(Backend):
                 await aclose()
             close_proxy(service)
         self._services.clear()
+        self._adapter_leases.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -286,6 +294,7 @@ class LocalBackend(Backend):
                 close()
             close_proxy(service)
         self._services.clear()
+        self._adapter_leases.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -337,6 +346,9 @@ class LocalBackend(Backend):
 
         requested_step = step
 
+        if step is None:
+            step = pinned_inference_step(model.name)
+
         if step is None and isinstance(model, TrainableModel):
             from ..dev.validate import is_dedicated_mode
 
@@ -358,6 +370,39 @@ class LocalBackend(Backend):
             f"actual_step={step} -> {name}"
         )
         return name
+
+    def _adapter_lease_manager(self, model_name: str) -> AdapterLeaseManager:
+        manager = self._adapter_leases.get(model_name)
+        if manager is None:
+            manager = AdapterLeaseManager()
+            self._adapter_leases[model_name] = manager
+        return manager
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with pin_inference_step(model.name, step), manager.lease(step):
+            yield
+
+    async def prune_model_adapters(
+        self,
+        model: AnyTrainableModel,
+        *,
+        retain_steps: set[int],
+    ) -> None:
+        service = self._services.get(model.name)
+        if service is None:
+            return
+        manager = self._adapter_leases.get(model.name)
+        if manager is not None:
+            retain_steps = set(retain_steps) | manager.active_steps()
+        prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
+        if prune_loaded_adapters is not None:
+            await prune_loaded_adapters(retain_steps=retain_steps)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config

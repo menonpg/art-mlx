@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import os
 import signal
 import time
@@ -349,6 +350,33 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             ):
                 await self.state.policy_updated.wait()
 
+    @asynccontextmanager
+    async def _adapter_lease(self, step: int) -> AsyncIterator[None]:
+        if not hasattr(type(self.backend), "adapter_lease"):
+            yield
+            return
+        lease = getattr(self.backend, "adapter_lease", None)
+        if lease is None:
+            yield
+            return
+        async with lease(self.model, step):
+            yield
+
+    def _retained_adapter_steps(self, current_step: int) -> set[int]:
+        min_step = max(0, current_step - self.max_steps_off_policy)
+        return set(range(min_step, current_step + 1))
+
+    async def _prune_model_adapters(self, current_step: int) -> None:
+        if not hasattr(type(self.backend), "prune_model_adapters"):
+            return
+        prune = getattr(self.backend, "prune_model_adapters", None)
+        if prune is None:
+            return
+        await prune(
+            self.model,
+            retain_steps=self._retained_adapter_steps(current_step),
+        )
+
     async def _rollout_worker(self, worker_id: int) -> None:
         assert self._output_queue is not None
         while not self.state.done:
@@ -369,7 +397,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 token = self.model.activate_metrics_context("train")
                 rollout_started = time.monotonic()
                 try:
-                    group = await self.rollout_fn(self.model, scenario, self.config)
+                    async with self._adapter_lease(initial_version):
+                        group = await self.rollout_fn(self.model, scenario, self.config)
                 finally:
                     token.var.reset(token)
                 rollout_wall_s = time.monotonic() - rollout_started
@@ -479,6 +508,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 current_step = result.step
                 self.state.policy_version = current_step
                 self.state.next_training_step = current_step
+                await self._prune_model_adapters(current_step)
 
                 step_seconds = time.monotonic() - step_start
                 self._status.note_training_batch(
@@ -624,7 +654,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             token = self.model.activate_metrics_context("eval")
             eval_started = time.monotonic()
             try:
-                result = await self.eval_fn(self.model, step, self.config)
+                async with self._adapter_lease(step):
+                    result = await self.eval_fn(self.model, step, self.config)
             finally:
                 token.var.reset(token)
                 eval_elapsed = time.monotonic() - eval_started
