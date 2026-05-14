@@ -250,6 +250,7 @@ def _install_deepep_debug_wrappers(deepep_manager: Any) -> None:
                     kwargs["allocate_on_comm_stream"] = False
                 args = tuple(args_list)
             counter = _next_deepep_debug_count(name)
+            start_time = time.time()
             _deepep_debug_log(
                 f"{name}_enter",
                 count=counter,
@@ -274,12 +275,21 @@ def _install_deepep_debug_wrappers(deepep_manager: Any) -> None:
                 force_sync=force_sync,
             )
             result = original(self, *args, **kwargs)
+            payload = {}
+            if _env_enabled("ART_MEGATRON_DEEPEP_DEBUG"):
+                payload.update(
+                    _tokens_per_expert_payload(
+                        getattr(self, "tokens_per_expert", None)
+                    )
+                )
             _deepep_debug_log(
                 f"{name}_exit",
                 count=counter,
+                elapsed_ms=(time.time() - start_time) * 1000.0,
                 manager_id=id(self),
                 result_shape=_tensor_shape(result),
                 force_sync=force_sync,
+                **payload,
             )
             return result
 
