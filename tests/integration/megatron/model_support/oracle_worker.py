@@ -28,6 +28,7 @@ from .forward_trace import ForwardTraceCapture
 from .oracle_harness import (
     SUPPORTED_SENSITIVITY_MUTATIONS,
     OracleCaseConfig,
+    ProviderPrecisionOverrides,
     RunManifest,
     SensitivityMutation,
     StepTrace,
@@ -386,6 +387,7 @@ def _configure_provider(
     provider: Any,
     topology: Topology,
     case_config: OracleCaseConfig,
+    precision_overrides: ProviderPrecisionOverrides | None = None,
 ) -> None:
     """Applies deterministic topology/model overrides to provider config."""
     del topology
@@ -399,10 +401,29 @@ def _configure_provider(
         provider.autocast_dtype = None
         provider.attention_softmax_in_fp32 = True
         provider.fp32_residual_connection = True
+    _apply_provider_precision_overrides(
+        provider,
+        precision_overrides or ProviderPrecisionOverrides(),
+    )
     if hasattr(provider, "attention_dropout"):
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+
+
+def _apply_provider_precision_overrides(
+    provider: Any,
+    precision_overrides: ProviderPrecisionOverrides,
+) -> None:
+    """Applies typed precision overrides to one oracle provider variant."""
+    if precision_overrides.art_lora_dtype == "bf16":
+        provider.art_lora_dtype = torch.bfloat16
+    for name, value in precision_overrides.model_dump(mode="python").items():
+        if name == "art_lora_dtype" or value is None:
+            continue
+        if not hasattr(provider, name):
+            raise RuntimeError(f"Provider has no precision attribute {name!r}.")
+        setattr(provider, name, value)
 
 
 @contextmanager
@@ -720,6 +741,37 @@ def _assert_runtime_configuration(
         raise RuntimeError(
             "Expected one-layer Qwen3.5 CP oracle to skip standard self-attention, "
             f"found {standard_attention_layers} SelfAttention layer(s)."
+        )
+
+
+def _assert_precision_overrides_effective(
+    model_chunks: list[Any],
+    provider: Any,
+    precision_overrides: ProviderPrecisionOverrides,
+) -> None:
+    """Checks that an FP8 oracle variant really exercises FP8 base params and BF16 LoRA."""
+    if precision_overrides.fp8_param:
+        from megatron.core.fp8_utils import is_float8tensor
+
+        fp8_param_count = sum(
+            1
+            for _, parameter in _iter_named_unique_parameters(model_chunks)
+            if is_float8tensor(parameter)
+        )
+        if fp8_param_count == 0:
+            raise RuntimeError("Expected fp8_param=True to create FP8 base parameters.")
+
+    expected_lora_dtype = provider.art_lora_dtype
+    mismatched_lora_params = [
+        f"{name}:{parameter.dtype}"
+        for name, parameter in _iter_named_unique_parameters(model_chunks)
+        if hasattr(parameter, "lora_shard_domain")
+        and parameter.dtype != expected_lora_dtype
+    ]
+    if mismatched_lora_params:
+        raise RuntimeError(
+            "LoRA parameter dtype mismatch under precision override: "
+            + ", ".join(mismatched_lora_params[:8])
         )
 
 
@@ -1346,7 +1398,10 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 model_identifier=request.case_config.base_model,
                 provider_torch_dtype=provider_torch_dtype,
                 provider_configure=lambda provider: _configure_provider(
-                    provider, request.topology, request.case_config
+                    provider,
+                    request.topology,
+                    request.case_config,
+                    request.provider_precision_overrides,
                 ),
                 optimizer_config=_build_optimizer_config(request.case_config),
                 print_env=False,
@@ -1361,6 +1416,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
         strict=request.moe_routing_replay_strict,
     )
     _assert_runtime_configuration(model_chunks, request.case_config, request.topology)
+    _assert_precision_overrides_effective(
+        model_chunks,
+        runtime.provider,
+        request.provider_precision_overrides,
+    )
 
     topology_dir = Path(request.topology_dir)
     traces_dir = topology_dir / "traces"
@@ -1607,6 +1667,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
             world_size=request.topology.world_size(),
             seed=request.case_config.seed,
             num_steps=request.case_config.num_steps,
+            provider_precision_overrides=request.provider_precision_overrides,
             packed_tensors=request.packed_tensors,
             steps=step_traces,
         )

@@ -442,6 +442,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         wrap_grouped_moe_experts_3d(
             _require_moe_experts(module),
             adapter_model_prefix=adapter_model_prefix,
+            provider=provider,
             target_modules=target_modules,
             rank=rank,
             alpha=alpha,

@@ -265,6 +265,7 @@ class DefaultMoeHandler(DefaultDenseHandler):
                 wrap_grouped_moe_experts(
                     _require_moe_experts(module),
                     adapter_model_prefix=adapter_model_prefix,
+                    provider=provider,
                     target_modules=target_set,
                     rank=rank,
                     alpha=alpha,

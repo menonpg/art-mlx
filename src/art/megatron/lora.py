@@ -23,6 +23,7 @@ from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
+import transformer_engine.pytorch as te
 
 from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
@@ -493,20 +494,26 @@ class LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
-        if tokens_per_expert is not None:
-            assert self.num_local_experts > 1, (
-                "tokens_per_expert is only supported if num_local_experts > 1"
-            )
-            bsz = tokens_per_expert
-            if isinstance(bsz, list):
-                bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
-            if x.shape[0] == 0:
-                return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
-            return quack_grouped_lora(x, self.A_T, self.B_T, bsz, scale=self.scale)
-        out = (x @ self.A_T) @ self.B_T
-        if self.scale == 1.0:
-            return out
-        return out * self.scale
+        with te.fp8_autocast(enabled=False):
+            input_dtype = x.dtype
+            work_x = x if x.dtype == self.A_T.dtype else x.to(dtype=self.A_T.dtype)
+            if tokens_per_expert is not None:
+                assert self.num_local_experts > 1, (
+                    "tokens_per_expert is only supported if num_local_experts > 1"
+                )
+                bsz = tokens_per_expert
+                if isinstance(bsz, list):
+                    bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
+                if work_x.shape[0] == 0:
+                    return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
+                out = quack_grouped_lora(
+                    work_x, self.A_T, self.B_T, bsz, scale=self.scale
+                )
+                return out.to(dtype=input_dtype)
+            out = (work_x @ self.A_T) @ self.B_T
+            if self.scale != 1.0:
+                out = out * self.scale
+            return out.to(dtype=input_dtype)
 
 
 class SelfAttentionLinearProjLoRA(torch.nn.Module):
@@ -544,7 +551,7 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
             out_features=linear_proj.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_proj.weight.dtype,
+            dtype=provider.art_lora_dtype,
             device=linear_proj.weight.device,
             a_parallel_spec=a_parallel_spec,
             b_parallel_spec=b_parallel_spec,
@@ -626,6 +633,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             out_features=q_and_gate_out_features_per_rank,
+            lora_dtype=provider.art_lora_dtype,
         )
         self.k_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.k_proj",
@@ -633,6 +641,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             out_features=kv_out_features_per_rank,
+            lora_dtype=provider.art_lora_dtype,
         )
         self.v_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.v_proj",
@@ -640,6 +649,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             out_features=kv_out_features_per_rank,
+            lora_dtype=provider.art_lora_dtype,
         )
 
     @staticmethod
@@ -650,6 +660,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         out_features: int,
+        lora_dtype: torch.dtype,
     ) -> LoRA:
         assert isinstance(linear_qkv.weight, torch.Tensor)
         a_parallel_spec = LoRAParallelSpec(
@@ -672,7 +683,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             out_features=out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_qkv.weight.dtype,
+            dtype=lora_dtype,
             device=linear_qkv.weight.device,
             a_parallel_spec=a_parallel_spec,
             b_parallel_spec=b_parallel_spec,
@@ -729,6 +740,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         gated_delta_net: GatedDeltaNet,
         rank: int,
         alpha: float,
+        lora_dtype: torch.dtype,
     ) -> None:
         super().__init__()
         in_proj.return_layernorm_output = True
@@ -750,6 +762,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             out_features=qkv_out_features_per_partition,
+            lora_dtype=lora_dtype,
         )
         _set_lora_shard_strategy_metadata(
             self.qkv_lora.B_T,
@@ -766,6 +779,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             out_features=z_out_features_per_partition,
+            lora_dtype=lora_dtype,
         )
 
     @staticmethod
@@ -776,6 +790,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         out_features: int,
+        lora_dtype: torch.dtype,
     ) -> LoRA:
         assert isinstance(in_proj.weight, torch.Tensor)
         a_parallel_spec = LoRAParallelSpec(
@@ -798,7 +813,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             out_features=out_features,
             rank=rank,
             alpha=alpha,
-            dtype=in_proj.weight.dtype,
+            dtype=lora_dtype,
             device=in_proj.weight.device,
             a_parallel_spec=a_parallel_spec,
             b_parallel_spec=b_parallel_spec,
@@ -832,6 +847,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         num_local_experts: int,
+        lora_dtype: torch.dtype,
     ) -> None:
         super().__init__()
         assert linear_fc1 is not None
@@ -842,6 +858,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             num_local_experts=num_local_experts,
+            lora_dtype=lora_dtype,
         )
         self.up_lora = self._build_fc1_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
@@ -849,6 +866,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             num_local_experts=num_local_experts,
+            lora_dtype=lora_dtype,
         )
         self.uses_direct_quack_grouped_lora_dual = True
 
@@ -860,6 +878,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         num_local_experts: int,
+        lora_dtype: torch.dtype,
     ) -> LoRA:
         assert linear_fc1 is not None
         assert isinstance(linear_fc1.weight0, torch.Tensor)
@@ -884,7 +903,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             out_features=linear_fc1.out_features // 2,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight0.dtype,
+            dtype=lora_dtype,
             device=linear_fc1.weight0.device,
             num_local_experts=num_local_experts,
             a_parallel_spec=a_parallel_spec,
@@ -903,16 +922,22 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         if x.shape[0] == 0:
             adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
         else:
-            adapter_out = quack_grouped_lora_dual(
-                x,
-                self.gate_lora.A_T,
-                self.gate_lora.B_T,
-                self.up_lora.A_T,
-                self.up_lora.B_T,
-                counts,
-                scale_gate=self.gate_lora.scale,
-                scale_up=self.up_lora.scale,
-            )
+            with te.fp8_autocast(enabled=False):
+                work_x = (
+                    x
+                    if x.dtype == self.gate_lora.A_T.dtype
+                    else x.to(dtype=self.gate_lora.A_T.dtype)
+                )
+                adapter_out = quack_grouped_lora_dual(
+                    work_x,
+                    self.gate_lora.A_T,
+                    self.gate_lora.B_T,
+                    self.up_lora.A_T,
+                    self.up_lora.B_T,
+                    counts,
+                    scale_gate=self.gate_lora.scale,
+                    scale_up=self.up_lora.scale,
+                ).to(dtype=x.dtype)
         return base_out + adapter_out, bias_out
 
 
@@ -924,6 +949,7 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         num_local_experts: int,
+        lora_dtype: torch.dtype,
     ) -> None:
         super().__init__()
         assert linear_fc1 is not None
@@ -950,7 +976,7 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
             out_features=linear_fc1.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight0.dtype,
+            dtype=lora_dtype,
             device=linear_fc1.weight0.device,
             num_local_experts=num_local_experts,
             a_parallel_spec=a_parallel_spec,
@@ -974,6 +1000,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         num_local_experts: int,
+        lora_dtype: torch.dtype,
     ) -> None:
         super().__init__()
         assert linear_fc2 is not None
@@ -1000,7 +1027,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             out_features=linear_fc2.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc2.weight0.dtype,
+            dtype=lora_dtype,
             device=linear_fc2.weight0.device,
             num_local_experts=num_local_experts,
             a_parallel_spec=a_parallel_spec,
@@ -1026,6 +1053,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
         rank: int,
         alpha: float,
+        lora_dtype: torch.dtype,
     ) -> None:
         super().__init__()
         if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
@@ -1037,12 +1065,14 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             linear_fc1=linear_fc1,
             rank=rank,
             alpha=alpha,
+            lora_dtype=lora_dtype,
         )
         self.up_lora = self._build_fc1_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
             linear_fc1=linear_fc1,
             rank=rank,
             alpha=alpha,
+            lora_dtype=lora_dtype,
         )
 
     @staticmethod
@@ -1052,6 +1082,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
         rank: int,
         alpha: float,
+        lora_dtype: torch.dtype,
     ) -> LoRA:
         assert isinstance(linear_fc1.weight, torch.Tensor)
         a_parallel_spec = LoRAParallelSpec(
@@ -1074,7 +1105,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             out_features=linear_fc1.out_features // 2,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight.dtype,
+            dtype=lora_dtype,
             device=linear_fc1.weight.device,
             a_parallel_spec=a_parallel_spec,
             b_parallel_spec=b_parallel_spec,
@@ -1222,6 +1253,7 @@ def wrap_gated_delta_net_attention(
             gated_delta_net=self_attention,
             rank=rank,
             alpha=alpha,
+            lora_dtype=provider.art_lora_dtype,
         )
 
 
@@ -1229,6 +1261,7 @@ def wrap_grouped_moe_experts(
     experts: TEGroupedMLP,
     *,
     adapter_model_prefix: str,
+    provider: GPTModelProvider,
     target_modules: set[str],
     rank: int,
     alpha: int,
@@ -1245,6 +1278,7 @@ def wrap_grouped_moe_experts(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            lora_dtype=provider.art_lora_dtype,
         )
     if _targets_include(target_modules, "down_proj"):
         mlp_experts_linear_fc2 = _unwrap_attr(
@@ -1258,6 +1292,7 @@ def wrap_grouped_moe_experts(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            lora_dtype=provider.art_lora_dtype,
         )
 
 
@@ -1265,6 +1300,7 @@ def wrap_grouped_moe_experts_3d(
     experts: TEGroupedMLP,
     *,
     adapter_model_prefix: str,
+    provider: GPTModelProvider,
     target_modules: set[str],
     rank: int,
     alpha: int,
@@ -1281,6 +1317,7 @@ def wrap_grouped_moe_experts_3d(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            lora_dtype=provider.art_lora_dtype,
         )
         mlp_experts_linear_fc2 = _unwrap_attr(
             experts.linear_fc2,
@@ -1293,6 +1330,7 @@ def wrap_grouped_moe_experts_3d(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            lora_dtype=provider.art_lora_dtype,
         )
 
 
@@ -1316,6 +1354,7 @@ def wrap_dense_mlp(
             linear_fc1=mlp_linear_fc1,
             rank=rank,
             alpha=alpha,
+            lora_dtype=provider.art_lora_dtype,
         )
     if _targets_include(target_modules, "down_proj"):
         mlp_linear_fc2 = _unwrap_attr(
@@ -1352,6 +1391,7 @@ def wrap_shared_experts_mlp(
             linear_fc1=shared_experts_linear_fc1,
             rank=rank,
             alpha=alpha,
+            lora_dtype=provider.art_lora_dtype,
         )
     if _targets_include(target_modules, "down_proj"):
         shared_experts_linear_fc2 = _unwrap_attr(

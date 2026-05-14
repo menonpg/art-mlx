@@ -9,7 +9,6 @@ from megatron.bridge.training.flex_dispatcher_backend import (
 from megatron.core.transformer.enums import AttnBackend
 import torch
 
-from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
 from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
     get_model_support_spec,
@@ -19,6 +18,7 @@ from art.megatron.provider_common import (
     patch_art_flex_attention,
     resolve_layer_spec,
 )
+from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
 
 install_art_bridge_runtime_patches()
 
@@ -165,6 +165,70 @@ def _normalize_recompute_settings(provider: GPTModelProvider) -> None:
 
 
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
+    found, fp8 = _env_optional_str("ART_MEGATRON_FP8")
+    if found:
+        if fp8 is not None and fp8 not in {"e4m3", "hybrid"}:
+            raise ValueError(
+                "ART_MEGATRON_FP8 must be one of 'e4m3', 'hybrid', or disabled, "
+                f"got {fp8!r}"
+            )
+        provider.fp8 = fp8
+
+    found, fp8_recipe = _env_optional_str("ART_MEGATRON_FP8_RECIPE")
+    if found:
+        if fp8_recipe is not None and fp8_recipe not in {
+            "tensorwise",
+            "delayed",
+            "mxfp8",
+            "blockwise",
+            "custom",
+        }:
+            raise ValueError(
+                "ART_MEGATRON_FP8_RECIPE must be one of 'tensorwise', 'delayed', "
+                f"'mxfp8', 'blockwise', 'custom', or disabled, got {fp8_recipe!r}"
+            )
+        provider.fp8_recipe = fp8_recipe
+
+    fp8_param = _env_flag("ART_MEGATRON_FP8_PARAM")
+    if fp8_param is not None:
+        provider.fp8_param = fp8_param
+
+    fp8_wgrad = _env_flag("ART_MEGATRON_FP8_WGRAD")
+    if fp8_wgrad is not None:
+        provider.fp8_wgrad = fp8_wgrad
+
+    fp8_dot_product_attention = _env_flag("ART_MEGATRON_FP8_DOT_PRODUCT_ATTENTION")
+    if fp8_dot_product_attention is not None:
+        provider.fp8_dot_product_attention = fp8_dot_product_attention
+
+    fp8_multi_head_attention = _env_flag("ART_MEGATRON_FP8_MULTI_HEAD_ATTENTION")
+    if fp8_multi_head_attention is not None:
+        provider.fp8_multi_head_attention = fp8_multi_head_attention
+
+    moe_router_padding_for_quantization = _env_flag(
+        "ART_MEGATRON_MOE_ROUTER_PADDING_FOR_QUANTIZATION"
+    )
+    if moe_router_padding_for_quantization is not None:
+        provider.moe_router_padding_for_quantization = (
+            moe_router_padding_for_quantization
+        )
+
+    first_last_layers_bf16 = _env_flag("ART_MEGATRON_FIRST_LAST_LAYERS_BF16")
+    if first_last_layers_bf16 is not None:
+        provider.first_last_layers_bf16 = first_last_layers_bf16
+
+    found, num_layers_at_start_in_bf16 = _env_optional_int(
+        "ART_MEGATRON_NUM_LAYERS_AT_START_IN_BF16"
+    )
+    if found and num_layers_at_start_in_bf16 is not None:
+        provider.num_layers_at_start_in_bf16 = num_layers_at_start_in_bf16
+
+    found, num_layers_at_end_in_bf16 = _env_optional_int(
+        "ART_MEGATRON_NUM_LAYERS_AT_END_IN_BF16"
+    )
+    if found and num_layers_at_end_in_bf16 is not None:
+        provider.num_layers_at_end_in_bf16 = num_layers_at_end_in_bf16
+
     overlap = _env_flag("ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM")
     if overlap is not None:
         provider.overlap_moe_expert_parallel_comm = overlap
@@ -355,6 +419,7 @@ def prepare_provider_bundle(
     provider.calculate_per_token_loss = True
     provider.cross_entropy_loss_fusion = True
     provider.cross_entropy_fusion_impl = "te"
+    provider.art_lora_dtype = torch.bfloat16
     _apply_art_training_runtime_prepare_defaults(provider)
     bundle.handler.configure_provider_for_runtime(provider)
     _apply_runtime_env_overrides(provider)

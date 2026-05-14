@@ -190,6 +190,7 @@ def _make_provider(*, tp_size: int) -> Qwen35VLMoEModelProvider:
         context_parallel_size=1,
         params_dtype=GDN_CORRECTNESS_DTYPE,
     )
+    provider.art_lora_dtype = GDN_CORRECTNESS_DTYPE
     provider.finalize()
     setattr(provider, "_art_model_support_handler", QWEN3_5_MOE_HANDLER)
     setattr(provider, "_art_model_support_spec", QWEN3_5_MOE_SPEC)

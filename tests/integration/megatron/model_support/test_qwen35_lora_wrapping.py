@@ -86,6 +86,7 @@ def _make_qwen35_provider() -> Qwen35VLMoEModelProvider:
         context_parallel_size=1,
         params_dtype=torch.bfloat16,
     )
+    provider.art_lora_dtype = torch.bfloat16
     provider.finalize()
     setattr(provider, "_art_model_support_handler", QWEN3_5_MOE_HANDLER)
     setattr(provider, "_art_model_support_spec", QWEN3_5_MOE_SPEC)
