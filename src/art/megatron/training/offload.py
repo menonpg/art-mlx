@@ -36,6 +36,26 @@ def _iter_megatron_param_buffers(model: Sequence[torch.nn.Module]) -> Iterator[A
         yield from expert_buffers
 
 
+def offload_trainable_buffers_to_cpu(
+    model: Sequence[torch.nn.Module],
+    rank: int,
+) -> None:
+    for param_buffer in _iter_megatron_param_buffers(model):
+        param_buffer.offload_to_cpu(move_params=True, move_grads=True)
+    if rank == 0:
+        print("Offloaded Megatron trainable param buffers to CPU")
+
+
+def reload_trainable_buffers_to_gpu(
+    model: Sequence[torch.nn.Module],
+    rank: int,
+) -> None:
+    for param_buffer in _iter_megatron_param_buffers(model):
+        param_buffer.reload_from_cpu(move_params=True, move_grads=True)
+    if rank == 0:
+        print("Reloaded Megatron trainable param buffers to GPU")
+
+
 def offload_to_cpu(
     model: Sequence[torch.nn.Module],
     rank: int,
@@ -46,8 +66,7 @@ def offload_to_cpu(
         return
     pinned_buffers = offload_state.pinned_buffers
 
-    for param_buffer in _iter_megatron_param_buffers(model):
-        param_buffer.offload_to_cpu(move_params=True, move_grads=True)
+    offload_trainable_buffers_to_cpu(model, rank)
 
     # Megatron remaps trainable params into contiguous DDP buffers. Offload those via the
     # native buffer APIs above, and only manually offload frozen params here.
@@ -94,8 +113,7 @@ def reload_to_gpu(
     else:
         device = torch.device(device)
 
-    for param_buffer in _iter_megatron_param_buffers(model):
-        param_buffer.reload_from_cpu(move_params=True, move_grads=True)
+    reload_trainable_buffers_to_gpu(model, rank)
 
     # Reload frozen params that were manually offloaded.
     for chunk in model:

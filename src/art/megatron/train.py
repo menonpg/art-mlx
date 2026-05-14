@@ -47,7 +47,15 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     PreparedMegatronBatch,
 )
-from art.megatron.training.finalize_grads import finalize_model_grads_extended
+from art.megatron.lora import apply_lora_adapters
+from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
+from art.megatron.provider_common import ProviderBundle
+from art.megatron.routing_replay import (
+    TRACE_ROW_TOKEN_UIDS_ATTR,
+    TRACE_UID_SPAN_ATTR,
+    MoeRoutingReplayBundle,
+    MoeRoutingReplayController,
+)
 from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
@@ -60,11 +68,8 @@ from art.megatron.runtime.jobs import (
     MergedWeightTransferSpec,
     load_megatron_job,
 )
-from art.megatron.lora import apply_lora_adapters
-from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
-from art.megatron.weights.merged_weight_export import (
-    sync_merged_weights_to_vllm,
-)
+from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.training.finalize_grads import finalize_model_grads_extended
 from art.megatron.training.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
@@ -73,18 +78,18 @@ from art.megatron.training.model_chunks import (
 from art.megatron.training.offload import (
     OffloadState,
     offload_to_cpu,
+    offload_trainable_buffers_to_cpu,
     reload_to_gpu,
-)
-from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
-from art.megatron.provider_common import ProviderBundle
-from art.megatron.routing_replay import (
-    TRACE_ROW_TOKEN_UIDS_ATTR,
-    TRACE_UID_SPAN_ATTR,
-    MoeRoutingReplayBundle,
-    MoeRoutingReplayController,
+    reload_trainable_buffers_to_gpu,
 )
 from art.megatron.training.sft_batches import load_sft_batch_from_disk
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.training.streaming_weight_offload import (
+    maybe_install_streaming_weight_offload,
+)
+from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.weights.merged_weight_export import (
+    sync_merged_weights_to_vllm,
+)
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.pack import (
     PackedTensors,
@@ -2190,6 +2195,11 @@ def _sync_merged_weights_to_vllm(
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_state = OffloadState()
+    streaming_weight_offloader = maybe_install_streaming_weight_offload(
+        model=runtime.model,
+        rank=runtime.rank,
+        compile_enabled=_compile_enabled(),
+    )
     wake_lock_path = os.environ.get(
         "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
     )
@@ -2199,13 +2209,22 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             time.sleep(0.2)
 
     def before_job() -> None:
-        reload_to_gpu(runtime.model, runtime.rank, offload_state)
+        if streaming_weight_offloader is None:
+            reload_to_gpu(runtime.model, runtime.rank, offload_state)
+        else:
+            reload_trainable_buffers_to_gpu(runtime.model, runtime.rank)
+            streaming_weight_offloader.begin_job()
 
     def after_job() -> None:
         runtime.optimizer = None
         gc.collect()
         torch.cuda.empty_cache()
-        offload_to_cpu(runtime.model, runtime.rank, offload_state)
+        if streaming_weight_offloader is None:
+            offload_to_cpu(runtime.model, runtime.rank, offload_state)
+        else:
+            streaming_weight_offloader.finish_job()
+            offload_trainable_buffers_to_cpu(runtime.model, runtime.rank)
+            torch.cuda.empty_cache()
 
     after_job()
     run_megatron_worker_loop(
