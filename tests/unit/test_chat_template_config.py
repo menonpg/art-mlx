@@ -3,6 +3,7 @@ import pytest
 from art.local.backend import (
     _apply_configured_chat_template,
     _apply_configured_chat_template_server_args,
+    _tokenizer_cache_key,
 )
 
 
@@ -54,3 +55,15 @@ def test_configured_chat_template_rejects_ambiguous_config(tmp_path) -> None:
                 "chat_template_path": str(path),
             },
         )
+
+
+def test_tokenizer_cache_key_includes_chat_template_content(tmp_path) -> None:
+    path = tmp_path / "chat_template.jinja"
+    path.write_text("first template", encoding="utf-8")
+    first_key = _tokenizer_cache_key("base-model", {"chat_template_path": str(path)})
+
+    path.write_text("second template", encoding="utf-8")
+    second_key = _tokenizer_cache_key("base-model", {"chat_template_path": str(path)})
+
+    assert _tokenizer_cache_key("base-model", {}) == ("base-model", None)
+    assert first_key != second_key

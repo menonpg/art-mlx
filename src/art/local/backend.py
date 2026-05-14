@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -122,6 +123,16 @@ def _apply_configured_chat_template_server_args(
     config_dict["server_args"] = server_args
 
 
+def _tokenizer_cache_key(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> tuple[str, str | None]:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is None:
+        return (base_model, None)
+    return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
+
+
 class LocalBackend(Backend):
     def __init__(
         self,
@@ -154,7 +165,7 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
-        self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
+        self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -387,10 +398,12 @@ class LocalBackend(Backend):
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
     ) -> PackedTensors | None:
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+            _apply_configured_chat_template(tokenizer, internal_config)
+            self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
                 self._image_processors[model.base_model] = (
@@ -398,9 +411,7 @@ class LocalBackend(Backend):
                 )
             except Exception:
                 self._image_processors[model.base_model] = None
-        tokenizer = self._tokenizers[model.base_model]
-        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template(tokenizer, internal_config)
+        tokenizer = self._tokenizers[tokenizer_key]
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
         tokenized_results = list(
             tokenize_trajectory_groups(
@@ -923,14 +934,13 @@ class LocalBackend(Backend):
         if verbose:
             print("Starting _train_sft")
 
-        # Get tokenizer
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
-        tokenizer = self._tokenizers[model.base_model]
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template(tokenizer, internal_config)
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+            _apply_configured_chat_template(tokenizer, internal_config)
+            self._tokenizers[tokenizer_key] = tokenizer
+        tokenizer = self._tokenizers[tokenizer_key]
 
         from ..utils.sft import resolve_sft_batch_size
 
