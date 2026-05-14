@@ -2217,13 +2217,14 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
     def after_job() -> None:
         runtime.optimizer = None
-        gc.collect()
-        torch.cuda.empty_cache()
         if streaming_weight_offloader is None:
+            gc.collect()
+            torch.cuda.empty_cache()
             offload_to_cpu(runtime.model, runtime.rank, offload_state)
         else:
             streaming_weight_offloader.finish_job()
             offload_trainable_buffers_to_cpu(runtime.model, runtime.rank)
+            gc.collect()
             torch.cuda.empty_cache()
 
     after_job()

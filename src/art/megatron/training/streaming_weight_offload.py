@@ -113,15 +113,18 @@ class StreamingWeightOffloader:
 
     def _pre_forward(self, layer_state: _LayerState) -> None:
         self._finish_completed_offloads()
-        if _is_recompute_forward():
+        recompute_forward = _is_recompute_forward()
+        if recompute_forward:
             self._offload_recomputed_successors(layer_state.index)
+            self._finish_pending_offloads()
         self._finish_load(layer_state)
-        next_index = layer_state.index + (-1 if _is_recompute_forward() else 1)
-        self._start_load(next_index)
+        if not recompute_forward:
+            self._finish_neighbor_offload(layer_state.index - 1)
 
     def _post_forward(self, layer_state: _LayerState) -> None:
         if is_checkpointing() and not torch.is_grad_enabled():
             self._start_offload(layer_state)
+            self._start_load(layer_state.index + 1)
 
     def _offload_recomputed_successors(self, index: int) -> None:
         for layer_state in self.layers[index + 1 :]:
@@ -207,6 +210,17 @@ class StreamingWeightOffloader:
         for layer_state in self.layers:
             if layer_state.status == "offloading":
                 self._finish_offload(layer_state, wait=False)
+
+    def _finish_pending_offloads(self) -> None:
+        for layer_state in self.layers:
+            if layer_state.status == "offloading":
+                self._finish_offload(layer_state, wait=True)
+
+    def _finish_neighbor_offload(self, index: int) -> None:
+        if 0 <= index < len(self.layers):
+            layer_state = self.layers[index]
+            if layer_state.status == "offloading":
+                self._finish_offload(layer_state, wait=True)
 
     def _finish_offload(self, layer_state: _LayerState, *, wait: bool) -> None:
         event = layer_state.offload_event
