@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 import math
 import os
 from pathlib import Path
 import socket
 import subprocess
-from typing import AsyncIterator, Iterator, Literal
+from typing import AsyncIterator, Literal
 import uuid
 
 from pydantic import BaseModel, Field
@@ -28,14 +28,6 @@ torch = pytest.importorskip("torch")
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 LIVE_ENV = "ART_RUN_LIVE_MEGATRON_EXTERNAL_VLLM_LENGTH_SMOKE"
 TRAINING_TOPOLOGY = Topology(tp=1, cp=2, ep=2, etp=1, dp=1, sp=False)
-MEGATRON_FP8_ENV_NAMES = (
-    "ART_MEGATRON_FP8",
-    "ART_MEGATRON_FP8_RECIPE",
-    "ART_MEGATRON_FP8_PARAM",
-    "ART_MEGATRON_FP8_WGRAD",
-    "ART_MEGATRON_FP8_DOT_PRODUCT_ATTENTION",
-    "ART_MEGATRON_FP8_MULTI_HEAD_ATTENTION",
-)
 
 
 class LengthScenario(BaseModel):
@@ -306,21 +298,6 @@ def _mean_reward(samples: list[LengthSampleReport]) -> float:
     return sum(sample.reward for sample in samples) / max(1, len(samples))
 
 
-@contextmanager
-def _megatron_bf16_env() -> Iterator[None]:
-    saved = {name: os.environ.get(name) for name in MEGATRON_FP8_ENV_NAMES}
-    for name in MEGATRON_FP8_ENV_NAMES:
-        os.environ.pop(name, None)
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-
 def _inference_engine_args(base_model: str, inference_gpu_ids: list[int]) -> dict:
     return {
         "tensor_parallel_size": 2,
@@ -463,11 +440,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
         base_model=base_model,
         inference_gpu_ids=inference_gpu_ids,
     ) as (server_url, command, runtime_log_path, engine_args):
-        with (
-            _wandb_disabled(),
-            _megatron_bf16_env(),
-            provider_topology_env(TRAINING_TOPOLOGY),
-        ):
+        with _wandb_disabled(), provider_topology_env(TRAINING_TOPOLOGY):
             async with MegatronBackend(
                 path=str(backend_root), in_process=False
             ) as backend:
