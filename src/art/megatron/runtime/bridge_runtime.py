@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 import contextlib
 import fnmatch
+import inspect
 from typing import Any, cast
 
-from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
     ColumnParallelMapping,
@@ -15,7 +15,7 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.enums import ModelType
+from megatron.core.enums import Fp8Recipe, ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
@@ -226,6 +226,119 @@ def _materialization_device() -> torch.device:
     return torch.device("cuda", torch.cuda.current_device())
 
 
+def _provider_fp8_recipe_name(model_provider: ModelProviderMixin) -> str:
+    fp8_recipe = getattr(model_provider, "fp8_recipe", None)
+    if isinstance(fp8_recipe, Fp8Recipe):
+        return fp8_recipe.value
+    if isinstance(fp8_recipe, str):
+        return fp8_recipe
+    raise RuntimeError(f"Unsupported fp8_recipe={fp8_recipe!r}")
+
+
+def _provider_fp8_format(model_provider: ModelProviderMixin) -> Any:
+    import transformer_engine as te
+
+    fp8_format = getattr(model_provider, "fp8", None)
+    if fp8_format == "e4m3":
+        return te.common.recipe.Format.E4M3
+    if fp8_format == "hybrid":
+        return te.common.recipe.Format.HYBRID
+    raise RuntimeError(f"Unsupported fp8 format for fp8_param: {fp8_format!r}")
+
+
+def _recipe_kwargs(recipe_cls: type[Any], **kwargs: Any) -> dict[str, Any]:
+    parameters = inspect.signature(recipe_cls).parameters
+    return {name: value for name, value in kwargs.items() if name in parameters}
+
+
+def _provider_fp8_model_init_recipe(model_provider: ModelProviderMixin) -> Any:
+    import transformer_engine as te
+
+    fp8_format = _provider_fp8_format(model_provider)
+    common_kwargs = {
+        "fp8_format": fp8_format,
+        "fp8_dpa": bool(getattr(model_provider, "fp8_dot_product_attention", False)),
+        "fp8_mha": bool(getattr(model_provider, "fp8_multi_head_attention", False)),
+    }
+    recipe_name = _provider_fp8_recipe_name(model_provider)
+    if recipe_name == "tensorwise":
+        return te.common.recipe.Float8CurrentScaling(
+            **_recipe_kwargs(te.common.recipe.Float8CurrentScaling, **common_kwargs)
+        )
+    if recipe_name == "blockwise":
+        return te.common.recipe.Float8BlockScaling(
+            **_recipe_kwargs(te.common.recipe.Float8BlockScaling, **common_kwargs)
+        )
+    if recipe_name == "mxfp8":
+        return te.common.recipe.MXFP8BlockScaling(
+            **_recipe_kwargs(te.common.recipe.MXFP8BlockScaling, **common_kwargs)
+        )
+    if recipe_name == "delayed":
+        return te.common.recipe.DelayedScaling(
+            **_recipe_kwargs(
+                te.common.recipe.DelayedScaling,
+                **common_kwargs,
+                margin=int(getattr(model_provider, "fp8_margin", 0)),
+                amax_history_len=int(
+                    getattr(model_provider, "fp8_amax_history_len", 1)
+                ),
+                amax_compute_algo=getattr(
+                    model_provider, "fp8_amax_compute_algo", "most_recent"
+                ),
+            )
+        )
+    if recipe_name == "custom":
+        quantizer_factory = getattr(model_provider, "fp8_quantizer_factory", None)
+        if not quantizer_factory:
+            raise RuntimeError("fp8_recipe='custom' requires fp8_quantizer_factory")
+        from megatron.core.fp8_utils import _get_custom_recipe
+
+        return _get_custom_recipe(str(quantizer_factory))
+    raise RuntimeError(f"Unsupported fp8_recipe={recipe_name!r}")
+
+
+def _fp8_model_init_context(model_provider: ModelProviderMixin):
+    if not bool(getattr(model_provider, "fp8_param", False)):
+        return contextlib.nullcontext()
+    import transformer_engine.pytorch as te
+
+    return te.quantized_model_init(
+        enabled=True,
+        recipe=_provider_fp8_model_init_recipe(model_provider),
+        preserve_high_precision_init_val=False,
+    )
+
+
+def _is_te_quantized_tensor(tensor: torch.Tensor) -> bool:
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return False
+    return isinstance(tensor, QuantizedTensor)
+
+
+def _to_empty_if_meta_preserving_quantized(
+    module: torch.nn.Module,
+    *,
+    device: torch.device,
+) -> torch.nn.Module:
+    def convert(tensor: torch.Tensor) -> torch.Tensor:
+        if _is_te_quantized_tensor(tensor):
+            if tensor.device.type == "meta":
+                raise RuntimeError("TE quantized parameter unexpectedly stayed on meta")
+            if tensor.device != device:
+                raise RuntimeError(
+                    "TE quantized parameter was materialized on "
+                    f"{tensor.device}, expected {device}"
+                )
+            return tensor
+        if tensor.device == torch.device("meta"):
+            return torch.empty_like(tensor, device=device)
+        return tensor if tensor.device == device else tensor.to(device)
+
+    return module._apply(convert)
+
+
 def _apply_pre_wrap_hook(
     model: list[MegatronModule],
     pre_wrap_hook: Any,
@@ -297,24 +410,32 @@ def _art_get_model(
 
     setattr(model_provider, "use_cpu_initialization", bool(use_cpu_initialization))
     if init_model_with_meta_device:
-        setattr(model_provider, "init_model_with_meta_device", True)
-        with torch.device("meta"):
+        fp8_param_init = bool(getattr(model_provider, "fp8_param", False))
+        # TE checks config.init_model_with_meta_device before honoring
+        # quantized_model_init. Keep the outer meta device for non-TE tensors,
+        # but let TE allocate rank-local FP8 parameter storage directly.
+        setattr(model_provider, "init_model_with_meta_device", not fp8_param_init)
+        try:
+            with torch.device("meta"), _fp8_model_init_context(model_provider):
+                model = model_provider_module._create_model(
+                    model_provider,
+                    model_type,
+                    pg_collection=pg_collection,
+                )
+        finally:
+            setattr(model_provider, "init_model_with_meta_device", True)
+    else:
+        with _fp8_model_init_context(model_provider):
             model = model_provider_module._create_model(
                 model_provider,
                 model_type,
                 pg_collection=pg_collection,
             )
-    else:
-        model = model_provider_module._create_model(
-            model_provider,
-            model_type,
-            pg_collection=pg_collection,
-        )
 
     if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         device = _materialization_device()
         model = [
-            to_empty_if_meta_device(model_module, device=device)
+            _to_empty_if_meta_preserving_quantized(model_module, device=device)
             for model_module in model
         ]
 
@@ -474,7 +595,8 @@ def _optimized_load_weights_hf_to_megatron(
                 f"  Bridge type: {type(task.mapping).__name__}\n"
                 f"  HF mapping: {task.mapping.hf_param}"
             )
-        task.param_weight.data.copy_(converted_weights, non_blocking=True)
+        with torch.no_grad():
+            task.param_weight.copy_(converted_weights, non_blocking=True)
         if task.param_weight.device.type == "cuda":
             pending_device_copy = True
     if pending_device_copy and torch.cuda.is_available():

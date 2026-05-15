@@ -4,6 +4,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import faulthandler
 import hashlib
+from importlib import import_module
 import os
 from pathlib import Path
 import random
@@ -404,7 +405,7 @@ def _configure_provider(
         provider.fp32_residual_connection = True
     _apply_provider_precision_overrides(
         provider,
-        precision_overrides or ProviderPrecisionOverrides(),
+        precision_overrides or {},
     )
     if hasattr(provider, "attention_dropout"):
         provider.attention_dropout = 0.0
@@ -416,10 +417,10 @@ def _apply_provider_precision_overrides(
     provider: Any,
     precision_overrides: ProviderPrecisionOverrides,
 ) -> None:
-    """Applies typed precision overrides to one oracle provider variant."""
-    if precision_overrides.art_lora_dtype == "bf16":
+    """Applies provider precision overrides to one oracle variant."""
+    if precision_overrides.get("art_lora_dtype") == "bf16":
         provider.art_lora_dtype = torch.bfloat16
-    for name, value in precision_overrides.model_dump(mode="python").items():
+    for name, value in precision_overrides.items():
         if name == "art_lora_dtype" or value is None:
             continue
         if not hasattr(provider, name):
@@ -749,31 +750,16 @@ def _assert_precision_overrides_effective(
     model_chunks: list[Any],
     provider: Any,
     precision_overrides: ProviderPrecisionOverrides,
+    validator: str | None,
 ) -> None:
-    """Checks that an FP8 oracle variant really exercises FP8 base params and BF16 LoRA."""
-    if precision_overrides.fp8_param:
-        from megatron.core.fp8_utils import is_float8tensor
-
-        fp8_param_count = sum(
-            1
-            for _, parameter in _iter_named_unique_parameters(model_chunks)
-            if is_float8tensor(parameter)
-        )
-        if fp8_param_count == 0:
-            raise RuntimeError("Expected fp8_param=True to create FP8 base parameters.")
-
-    expected_lora_dtype = provider.art_lora_dtype
-    mismatched_lora_params = [
-        f"{name}:{parameter.dtype}"
-        for name, parameter in _iter_named_unique_parameters(model_chunks)
-        if hasattr(parameter, "lora_shard_domain")
-        and parameter.dtype != expected_lora_dtype
-    ]
-    if mismatched_lora_params:
-        raise RuntimeError(
-            "LoRA parameter dtype mismatch under precision override: "
-            + ", ".join(mismatched_lora_params[:8])
-        )
+    """Checks precision override effects that need module-specific validation."""
+    if validator is None:
+        return
+    module_name, _, function_name = validator.partition(":")
+    if not module_name or not function_name:
+        raise RuntimeError(f"Invalid precision validator path: {validator!r}")
+    validator_fn = getattr(import_module(module_name), function_name)
+    validator_fn(model_chunks, provider, precision_overrides)
 
 
 def _delta_state(
@@ -1421,6 +1407,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         model_chunks,
         runtime.provider,
         request.provider_precision_overrides,
+        request.provider_precision_validator,
     )
 
     topology_dir = Path(request.topology_dir)
@@ -1669,6 +1656,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
             seed=request.case_config.seed,
             num_steps=request.case_config.num_steps,
             provider_precision_overrides=request.provider_precision_overrides,
+            provider_precision_validator=request.provider_precision_validator,
             packed_tensors=request.packed_tensors,
             steps=step_traces,
         )

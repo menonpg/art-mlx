@@ -89,7 +89,7 @@ FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<proj>gate_proj|up_proj|gate_up_proj|down_proj)\."
 )
 LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
 PHASE_PRINT_ORDER = {
@@ -283,26 +283,9 @@ class LoraConfig(BaseModel):
     )
 
 
-class ProviderPrecisionOverrides(BaseModel):
-    """Precision overrides applied to one oracle worker provider variant."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    fp8: Literal["e4m3", "hybrid"] | None = None
-    fp8_recipe: (
-        Literal["tensorwise", "delayed", "mxfp8", "blockwise", "custom"] | None
-    ) = None
-    fp8_param: bool | None = None
-    fp8_wgrad: bool | None = None
-    fp8_dot_product_attention: bool | None = None
-    fp8_multi_head_attention: bool | None = None
-    moe_router_padding_for_quantization: bool | None = None
-    moe_token_dispatcher_type: Literal["alltoall", "flex"] | None = None
-    art_lora_dtype: Literal["bf16"] | None = None
-
-
 MetricSummary = dict[str, float]
 PhasePassFn = Callable[[MetricSummary], bool]
+ProviderPrecisionOverrides = dict[str, Any]
 
 
 class MetricThresholdRule(BaseModel):
@@ -393,8 +376,9 @@ class WorkerRunRequest(BaseModel):
     capture_moe_routing_bundle_path: str | None = None
     flex_backend: FlexBackend | None = None
     provider_precision_overrides: ProviderPrecisionOverrides = Field(
-        default_factory=ProviderPrecisionOverrides
+        default_factory=dict
     )
+    provider_precision_validator: str | None = None
 
 
 class StepTrace(BaseModel):
@@ -424,8 +408,9 @@ class RunManifest(BaseModel):
     seed: int
     num_steps: int
     provider_precision_overrides: ProviderPrecisionOverrides = Field(
-        default_factory=ProviderPrecisionOverrides
+        default_factory=dict
     )
+    provider_precision_validator: str | None = None
     packed_tensors: DiskPackedTensorsSpec
     steps: list[StepTrace]
 
@@ -469,8 +454,9 @@ class VariantSpec(BaseModel):
     force_regenerate: bool = True
     flex_backend: FlexBackend | None = None
     provider_precision_overrides: ProviderPrecisionOverrides = Field(
-        default_factory=ProviderPrecisionOverrides
+        default_factory=dict
     )
+    provider_precision_validator: str | None = None
 
     def resolved_output_slug(self) -> str:
         """Resolves the artifact slug for this run, including mutation suffix when present."""
@@ -1360,6 +1346,7 @@ class VariantRunner:
         regenerate: bool,
         flex_backend: FlexBackend | None = None,
         provider_precision_overrides: ProviderPrecisionOverrides | None = None,
+        provider_precision_validator: str | None = None,
     ) -> Path:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
@@ -1385,9 +1372,8 @@ class VariantRunner:
                 None if capture_bundle_dir is None else str(capture_bundle_dir)
             ),
             flex_backend=flex_backend,
-            provider_precision_overrides=(
-                provider_precision_overrides or ProviderPrecisionOverrides()
-            ),
+            provider_precision_overrides=provider_precision_overrides or {},
+            provider_precision_validator=provider_precision_validator,
         )
         from .oracle_worker import run_worker_subprocess
 
@@ -1457,6 +1443,7 @@ class VariantRunner:
             capture_bundle_dir=None,
             regenerate=variant.force_regenerate,
             provider_precision_overrides=variant.provider_precision_overrides,
+            provider_precision_validator=variant.provider_precision_validator,
         )
 
     @staticmethod
@@ -2034,47 +2021,6 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     }
 
 
-def _fp8_base_weight_phase_pass_fns() -> dict[str, PhasePassFn]:
-    """Builds FP8-vs-BF16 sanity limits while preserving exact routing replay checks."""
-    non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out_loss = MetricThresholdRule(limits={"mean_abs_pct": 5.0})
-    fwd_out = MetricThresholdRule(
-        limits={"mean_abs_pct": 5.0},
-        minimums=non_zero_scales,
-    )
-    grads_deltas = MetricThresholdRule(
-        limits={"mean_abs_pct": 10.0},
-        minimums=non_zero_scales,
-    )
-    router_scores_rule = MetricThresholdRule(
-        limits={"relative_l2": 0.0, "mean_abs_pct": 0.0}
-    )
-    router_topk_rule = MetricThresholdRule(
-        limits={"topk_mismatch_fraction": 0.0, "top1_mismatch_fraction": 0.0}
-    )
-    return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
-        "grads": grads_deltas,
-        "deltas": grads_deltas,
-        "router_scores": router_scores_rule,
-        "router_topk_ids": router_topk_rule,
-    }
-
-
-def fp8_base_weight_precision_overrides() -> ProviderPrecisionOverrides:
-    """Returns the production FP8 base-weight settings used by the oracle sanity gate."""
-    return ProviderPrecisionOverrides(
-        fp8="e4m3",
-        fp8_recipe="tensorwise",
-        fp8_param=True,
-        fp8_wgrad=True,
-        fp8_dot_product_attention=False,
-        fp8_multi_head_attention=False,
-        moe_router_padding_for_quantization=True,
-        moe_token_dispatcher_type="alltoall",
-        art_lora_dtype="bf16",
-    )
-
-
 def _suite_variants(
     objective: OracleObjective,
     *,
@@ -2100,25 +2046,6 @@ def _suite_variants(
     return variants
 
 
-def _fp8_base_weight_variants(
-    objective: OracleObjective,
-    *,
-    is_moe: bool = True,
-) -> list[VariantSpec]:
-    """Builds the single-rank FP8 base-weight candidate against the canonical oracle."""
-    topology = oracle_topology(is_moe=is_moe)
-    return [
-        VariantSpec(
-            name=f"{objective}_fp8_base_weights_{topology.slug()}",
-            objective=objective,
-            topology=topology,
-            output_slug=oracle_output_slug(objective, topology, "fp8_base_weights"),
-            pass_fn_by_phase=_fp8_base_weight_phase_pass_fns(),
-            provider_precision_overrides=fp8_base_weight_precision_overrides(),
-        )
-    ]
-
-
 def run_suite(
     *,
     case_config: OracleCaseConfig,
@@ -2142,32 +2069,6 @@ def run_suite(
                     is_moe=case_config.is_moe,
                     max_world_size=max_world_size,
                     variant_flex_backend=variant_flex_backend,
-                )
-            )
-        )
-    return reports
-
-
-def run_fp8_base_weight_suite(
-    *,
-    case_config: OracleCaseConfig,
-    oracle_flex_backend: FlexBackend | None = None,
-    variant_flex_backend: FlexBackend | None = None,
-) -> list[VariantReport]:
-    """Runs a single-rank FP8 base-weight sanity candidate against the canonical oracle."""
-    reports: list[VariantReport] = []
-    for objective in selected_oracle_objectives():
-        runner = VariantRunner(
-            objective=objective,
-            case_config=case_config,
-            oracle_flex_backend=oracle_flex_backend,
-            variant_flex_backend=variant_flex_backend,
-        )
-        reports.extend(
-            runner.run_suite(
-                _fp8_base_weight_variants(
-                    objective,
-                    is_moe=case_config.is_moe,
                 )
             )
         )
