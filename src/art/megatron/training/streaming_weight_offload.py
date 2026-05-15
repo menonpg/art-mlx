@@ -21,6 +21,7 @@ class StreamingWeightOffloadConfig(BaseModel):
     enabled: bool = False
     num_layers: int = Field(default=0, ge=0)
     num_slots: int = Field(default=2, ge=2)
+    resident_layers: int = Field(default=1, ge=1)
 
 
 class _ParamSpec:
@@ -142,7 +143,7 @@ class StreamingWeightOffloader:
             )
 
     def begin_job(self) -> None:
-        self._start_load(0)
+        self._prefetch_window(0, 1, self.config.resident_layers)
 
     def finish_job(self) -> None:
         self.offload_all(wait=True)
@@ -168,12 +169,18 @@ class StreamingWeightOffloader:
             self._offload_recomputed_successors(layer_state.index)
         self._finish_load(layer_state)
         if recompute_forward:
-            self._start_load(layer_state.index - 1)
+            self._prefetch_window(
+                layer_state.index - 1, -1, self.config.resident_layers - 1
+            )
+        else:
+            self._prefetch_window(
+                layer_state.index + 1, 1, self.config.resident_layers - 1
+            )
 
     def _post_forward(self, layer_state: _LayerState) -> None:
         if is_checkpointing() and not torch.is_grad_enabled():
             self._start_offload(layer_state)
-            self._start_load(layer_state.index + 1)
+            self._prefetch_window(layer_state.index + self.config.resident_layers, 1, 1)
 
     def _offload_recomputed_successors(self, index: int) -> None:
         for layer_state in self.layers[index + 1 :]:
@@ -199,6 +206,16 @@ class StreamingWeightOffloader:
         with self._condition:
             self._queue.append((layer_state, slot))
             self._condition.notify()
+
+    def _prefetch_window(self, start_index: int, step: int, count: int) -> None:
+        if step not in {-1, 1}:
+            raise RuntimeError(f"Unexpected streaming prefetch step {step}")
+        self._check_worker_error()
+        if count <= 0:
+            return
+        end_index = start_index + step * count
+        for index in range(start_index, end_index, step):
+            self._start_load(index)
 
     def _finish_load(self, layer_state: _LayerState) -> None:
         self._check_worker_error()
@@ -336,11 +353,20 @@ class StreamingWeightOffloader:
 
 
 def streaming_weight_offload_config_from_env() -> StreamingWeightOffloadConfig:
-    return StreamingWeightOffloadConfig(
+    config = StreamingWeightOffloadConfig(
         enabled=_env_flag("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD"),
         num_layers=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_LAYERS", 0),
         num_slots=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS", 2),
+        resident_layers=_env_int(
+            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_RESIDENT_LAYERS", 1
+        ),
     )
+    if config.resident_layers > config.num_slots:
+        raise RuntimeError(
+            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_RESIDENT_LAYERS must be <= "
+            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS"
+        )
+    return config
 
 
 def maybe_install_streaming_weight_offload(
