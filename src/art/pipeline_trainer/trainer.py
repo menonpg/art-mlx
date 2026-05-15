@@ -420,7 +420,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 raise
             except Exception as exc:
                 errored = True
-                print(f"Worker {worker_id}: rollout failed: {exc}")
+                exc_type = f"{type(exc).__module__}.{type(exc).__name__}"
+                print(
+                    f"Worker {worker_id}: rollout failed ({exc_type}): {exc!r}"
+                    f"{self._scenario_error_context(scenario)}"
+                )
             finally:
                 self._status.note_rollout_finished(errored=errored)
 
@@ -749,6 +753,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 group.metadata["scenario_id"] = value
                 continue
             group.metadata[f"scenario_{key}"] = value
+
+    @staticmethod
+    def _scenario_error_context(scenario: ScenarioT) -> str:
+        metadata = scenario.get("metadata") if isinstance(scenario, dict) else None
+        if metadata is None or not isinstance(metadata, dict):
+            return ""
+        fields = (
+            f"{key}={metadata[key]!r}"
+            for key in ("scenario_id", "epoch", "scenario_index")
+            if key in metadata
+        )
+        context = " ".join(fields)
+        return f" [{context}]" if context else ""
 
     def _is_group_stale(self, group: TrajectoryGroup, min_version: int) -> bool:
         group_version = self._group_initial_version(group)
