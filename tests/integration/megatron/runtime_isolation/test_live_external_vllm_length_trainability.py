@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import math
 import os
 from pathlib import Path
+import random
 import socket
 import subprocess
 from typing import AsyncIterator, Literal
@@ -28,6 +29,62 @@ torch = pytest.importorskip("torch")
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 LIVE_ENV = "ART_RUN_LIVE_MEGATRON_EXTERNAL_VLLM_LENGTH_SMOKE"
 TRAINING_TOPOLOGY = Topology(tp=1, cp=2, ep=2, etp=1, dp=1, sp=False)
+BASE_PROMPT = (
+    "Write a plain answer about a quiet harbor. Use the unrelated notes below "
+    "only as background texture. Do not use bullets, numbering, code, or a preface."
+)
+FILLER_SENTENCES = (
+    "The morning ledger mentioned a bicycle bell near the old customs window.",
+    "A folded receipt waited beside three dull pencils and a chipped mug.",
+    "Someone had drawn a small square around Thursday on the calendar.",
+    "The storage room smelled faintly of rope, dust, and yesterday's rain.",
+    "A green notebook listed errands that no one seemed eager to finish.",
+    "The clock above the doorway ticked with a patient mechanical rhythm.",
+    "Two mismatched gloves rested under the bench near the umbrella stand.",
+    "A paper tag fluttered from a crate of spare brass hinges.",
+    "The shop radio murmured about traffic far from the waterfront.",
+    "A narrow envelope contained a map with several coffee stains.",
+    "The caretaker had stacked clean towels beside a basket of loose keys.",
+    "A faded poster advertised a lecture about practical knot repairs.",
+    "Someone left a blue scarf draped over the back of a wooden chair.",
+    "The rain gauge showed a modest line from a storm before dawn.",
+    "A quiet clerk sorted stamps into a tin marked for later use.",
+    "The window latch clicked softly whenever a colder breeze arrived.",
+    "A jar of buttons sat near the lamp with no label attached.",
+    "The floorboards held a faint shine where people usually turned left.",
+    "A postcard showed a bridge, though no bridge could be seen nearby.",
+    "The supply shelf included chalk, twine, soap, and several blank cards.",
+    "A small toolbox waited open with every socket arranged by size.",
+    "The notice board carried old schedules with careful handwritten corrections.",
+    "A kettle cooled on the counter beside a plate of plain biscuits.",
+    "The narrow hallway displayed framed photographs of ordinary cloudy afternoons.",
+    "A stack of forms leaned against a vase holding one dry reed.",
+    "The back office kept a spare lantern wrapped in brown paper.",
+    "A silver whistle hung from a nail beside the maintenance checklist.",
+    "The cupboard door closed unevenly unless pressed near the lower hinge.",
+    "A receipt book recorded purchases of candles, nails, and black ink.",
+    "The stair rail felt smooth where many hands had passed over it.",
+    "A shallow drawer contained string, labels, and a forgotten measuring tape.",
+    "The wall map used faded pins to mark unimportant delivery stops.",
+    "A wool cap lay on a crate beside a coil of clean line.",
+    "The afternoon light made the dust above the desk look almost orderly.",
+    "A clipboard noted that the north window should be painted soon.",
+    "The brass hook near the door held only an empty canvas bag.",
+    "A stack of newspapers waited under a stone used as a weight.",
+    "The broom leaned in a corner beside a cardboard box of washers.",
+    "A shallow bowl held wrapped peppermints for visitors who rarely arrived.",
+    "The gray filing cabinet opened with a scrape and a small sigh.",
+    "A pencil sharpener was screwed to the wall beside a crooked shelf.",
+    "The old ledger contained careful columns and very little useful drama.",
+    "A canvas cover protected the spare chair from dust and sunlight.",
+    "The side table held a ruler, a thimble, and a sealed jar.",
+    "A neat row of jars preserved screws sorted by uncertain categories.",
+    "The calendar showed local holidays in red and market days in blue.",
+    "A small bell above the entrance moved only when the door stuck.",
+    "The envelope tray was empty except for a note about lamp oil.",
+    "The desk drawer included a spare button and two brittle rubber bands.",
+    "A plain brown box carried the words archive later in pencil.",
+)
 
 
 class LengthScenario(BaseModel):
@@ -35,6 +92,8 @@ class LengthScenario(BaseModel):
     target_step: int
     target_tokens: int
     max_tokens: int
+    prompt: str
+    prompt_word_count: int
     metadata: dict[str, int] = Field(default_factory=dict)
 
 
@@ -45,6 +104,7 @@ class LengthSampleReport(BaseModel):
     target_step: int
     target_tokens: int
     max_tokens: int
+    prompt_word_count: int
     generated_tokens: int
     abs_error: int
     reward: float
@@ -188,6 +248,34 @@ def _target_tokens_for_step(step: int) -> int:
     )
 
 
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+def _check_prompt_hides_target(prompt: str) -> None:
+    lowered = prompt.lower()
+    forbidden = ("generated tokens", "target tokens", "target length", "exactly")
+    leaked = [phrase for phrase in forbidden if phrase in lowered]
+    if leaked:
+        raise RuntimeError(f"Length prompt leaks target wording: {leaked}")
+
+
+def _prompt_for_index(index: int) -> tuple[str, int]:
+    target_words = _env_int("ART_EXTERNAL_VLLM_LENGTH_PROMPT_WORDS", 300)
+    rng = random.Random(index)
+    sentences = list(FILLER_SENTENCES)
+    rng.shuffle(sentences)
+    selected: list[str] = []
+    prompt = BASE_PROMPT
+    for sentence in sentences:
+        if _word_count(prompt) >= target_words:
+            break
+        selected.append(sentence)
+        prompt = f"{BASE_PROMPT}\n\nNotes: {' '.join(selected)}"
+    _check_prompt_hides_target(prompt)
+    return prompt, _word_count(prompt)
+
+
 def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
     resolved_target_step = index if target_step is None else target_step
     target_tokens = _target_tokens_for_step(resolved_target_step)
@@ -198,16 +286,20 @@ def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
             * _env_float("ART_EXTERNAL_VLLM_LENGTH_MAX_TOKENS_MULTIPLIER", 1.4)
         ),
     )
+    prompt, prompt_word_count = _prompt_for_index(index)
     return LengthScenario(
         scenario_index=index,
         target_step=resolved_target_step,
         target_tokens=target_tokens,
         max_tokens=max_tokens,
+        prompt=prompt,
+        prompt_word_count=prompt_word_count,
         metadata={
             "scenario_index": index,
             "target_step": resolved_target_step,
             "target_tokens": target_tokens,
             "max_tokens": max_tokens,
+            "prompt_word_count": prompt_word_count,
         },
     )
 
@@ -242,11 +334,7 @@ def _messages(scenario: LengthScenario) -> art.Messages:
     return [
         {
             "role": "user",
-            "content": (
-                "Write a plain answer about a quiet harbor. "
-                f"Make the answer exactly {scenario.target_tokens} generated tokens. "
-                "Do not use bullets, numbering, code, or a preface."
-            ),
+            "content": scenario.prompt,
         }
     ]
 
@@ -287,6 +375,7 @@ def _sample_report(
         target_step=scenario.target_step,
         target_tokens=scenario.target_tokens,
         max_tokens=scenario.max_tokens,
+        prompt_word_count=scenario.prompt_word_count,
         generated_tokens=generated_tokens,
         abs_error=abs(generated_tokens - scenario.target_tokens),
         reward=_reward(generated_tokens, scenario.target_tokens),
@@ -335,12 +424,14 @@ async def _length_group(
                     "length/generated_tokens": report.generated_tokens,
                     "length/target_tokens": scenario.target_tokens,
                     "length/max_tokens": scenario.max_tokens,
+                    "length/prompt_word_count": scenario.prompt_word_count,
                     "length/abs_error": report.abs_error,
                 },
                 metadata={
                     "target_step": scenario.target_step,
                     "target_tokens": scenario.target_tokens,
                     "max_tokens": scenario.max_tokens,
+                    "prompt_word_count": scenario.prompt_word_count,
                     "scenario_index": scenario.scenario_index,
                 },
             )
