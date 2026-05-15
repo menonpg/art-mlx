@@ -31,7 +31,8 @@ LIVE_ENV = "ART_RUN_LIVE_MEGATRON_EXTERNAL_VLLM_LENGTH_SMOKE"
 TRAINING_TOPOLOGY = Topology(tp=1, cp=2, ep=2, etp=1, dp=1, sp=False)
 BASE_PROMPT = (
     "Write a plain answer about a quiet harbor. Use the unrelated notes below "
-    "only as background texture. Do not use bullets, numbering, code, or a preface."
+    "only as background texture. Use one sentence. Do not use bullets, numbering, "
+    "code, or a preface."
 )
 FILLER_SENTENCES = (
     "The morning ledger mentioned a bicycle bell near the old customs window.",
