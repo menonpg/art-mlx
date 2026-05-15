@@ -159,13 +159,11 @@ def _resolve_gpu_ids() -> tuple[list[int], list[int]]:
     return trainer_ids, inference_ids
 
 
-def _safe_gpu_memory_utilization(device_ids: list[int]) -> float:
-    requested = _env_float("ART_EXTERNAL_VLLM_LENGTH_GPU_MEMORY_UTILIZATION", 0.45)
+def _check_inference_gpu_memory(device_ids: list[int]) -> None:
     min_free_gib = _env_float("ART_EXTERNAL_VLLM_LENGTH_MIN_FREE_GPU_GIB", 20.0)
     memory_info = _gpu_memory_info_by_index()
-    free_ratios: list[float] = []
     for device_id in device_ids:
-        free_bytes, total_bytes = memory_info[device_id]
+        free_bytes, _total_bytes = memory_info[device_id]
         free_gib = free_bytes / (1024**3)
         if free_gib < min_free_gib:
             pytest.skip(
@@ -173,8 +171,6 @@ def _safe_gpu_memory_utilization(device_ids: list[int]) -> float:
                 f"GPU {device_id} has {free_gib:.1f} GiB free < "
                 f"{min_free_gib:.1f} GiB required."
             )
-        free_ratios.append(free_bytes / total_bytes)
-    return max(0.02, min(requested, min(free_ratios) * 0.9))
 
 
 def _free_port() -> int:
@@ -329,11 +325,11 @@ def _mean_reward(samples: list[LengthSampleReport]) -> float:
 
 
 def _inference_engine_args(base_model: str, inference_gpu_ids: list[int]) -> dict:
-    return {
+    _check_inference_gpu_memory(inference_gpu_ids)
+    engine_args: dict[str, object] = {
         "tensor_parallel_size": 2,
         "enable_expert_parallel": True,
         "dtype": "bfloat16",
-        "gpu_memory_utilization": _safe_gpu_memory_utilization(inference_gpu_ids),
         "max_model_len": _env_int("ART_EXTERNAL_VLLM_LENGTH_MAX_MODEL_LEN", 1024),
         "max_num_seqs": _env_int("ART_EXTERNAL_VLLM_LENGTH_MAX_NUM_SEQS", 8),
         "enforce_eager": True,
@@ -342,6 +338,12 @@ def _inference_engine_args(base_model: str, inference_gpu_ids: list[int]) -> dic
         "max_cpu_loras": _env_int("ART_EXTERNAL_VLLM_LENGTH_MAX_CPU_LORAS", 16),
         "lora_target_modules": list(default_target_modules(base_model)),
     }
+    requested_gpu_memory_utilization = os.environ.get(
+        "ART_EXTERNAL_VLLM_LENGTH_GPU_MEMORY_UTILIZATION"
+    )
+    if requested_gpu_memory_utilization is not None:
+        engine_args["gpu_memory_utilization"] = float(requested_gpu_memory_utilization)
+    return engine_args
 
 
 @asynccontextmanager
@@ -447,7 +449,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
     base_model = _base_model()
     trainer_gpu_ids, inference_gpu_ids = _resolve_gpu_ids()
     max_steps = _env_int("ART_EXTERNAL_VLLM_LENGTH_MAX_STEPS", 10)
-    rollouts_per_prompt = _env_int("ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT", 4)
+    rollouts_per_prompt = _env_int("ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT", 8)
     if rollouts_per_prompt < 2:
         raise RuntimeError(
             "ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT must be at least 2 "
