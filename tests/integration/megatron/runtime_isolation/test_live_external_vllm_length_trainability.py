@@ -122,6 +122,7 @@ class LengthTrainabilityReport(BaseModel):
     inference_engine_args: dict[str, object]
     runtime_command: list[str]
     runtime_log_path: str
+    summary_log_path: str
     baseline_final_target_reward: float
     final_eval_reward: float | None
     model_ids_after: list[str]
@@ -393,6 +394,7 @@ async def _length_group(
     n: int,
     temperature: float,
     samples: list[LengthSampleReport],
+    summary_log_path: Path | None = None,
 ) -> art.TrajectoryGroup:
     client = model.openai_client()
     messages = _messages(scenario)
@@ -436,11 +438,64 @@ async def _length_group(
                 },
             )
         )
+    _append_step_summary(summary_log_path, samples, split=split, step=step)
     return art.TrajectoryGroup(trajectories)
 
 
 def _mean_reward(samples: list[LengthSampleReport]) -> float:
     return sum(sample.reward for sample in samples) / max(1, len(samples))
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / max(1, len(values))
+
+
+def _init_summary_log(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            (
+                "# external vLLM length trainability summary",
+                "# rows append when a rollout/eval group completes; n is cumulative for split+step",
+                (
+                    "split      step target max_tok prompt_w     n reward_mean "
+                    "gen_mean abs_err_mean gen_min gen_max reward_min reward_max"
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _append_step_summary(
+    path: Path | None,
+    samples: list[LengthSampleReport],
+    *,
+    split: Literal["train", "eval", "baseline"],
+    step: int | None,
+) -> None:
+    if path is None:
+        return
+    matching = [
+        sample for sample in samples if sample.split == split and sample.step == step
+    ]
+    if not matching:
+        return
+    generated = [float(sample.generated_tokens) for sample in matching]
+    abs_errors = [float(sample.abs_error) for sample in matching]
+    rewards = [sample.reward for sample in matching]
+    latest = matching[-1]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"{split:<9} {step if step is not None else '-':>4} "
+            f"{latest.target_tokens:>6} {latest.max_tokens:>7} "
+            f"{latest.prompt_word_count:>8} {len(matching):>5} "
+            f"{_mean(rewards):>11.4f} {_mean(generated):>8.1f} "
+            f"{_mean(abs_errors):>12.1f} {int(min(generated)):>7} "
+            f"{int(max(generated)):>7} {min(rewards):>10.4f} "
+            f"{max(rewards):>10.4f}\n"
+        )
 
 
 def _inference_engine_args(base_model: str, inference_gpu_ids: list[int]) -> dict:
@@ -585,6 +640,8 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
     )
     backend_root = artifact_dir / f"workspace_off_policy_{max_steps_off_policy}"
     backend_root.mkdir(parents=True, exist_ok=True)
+    summary_log_path = artifact_dir / "external_vllm_length_trainability.log"
+    _init_summary_log(summary_log_path)
     samples: list[LengthSampleReport] = []
 
     async with _external_vllm_runtime(
@@ -620,6 +677,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
                     n=eval_rollouts,
                     temperature=0.0,
                     samples=samples,
+                    summary_log_path=summary_log_path,
                 )
                 baseline_final_target_reward = _mean_reward(
                     samples[baseline_samples_before:]
@@ -650,6 +708,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
                             1.1,
                         ),
                         samples=samples,
+                        summary_log_path=summary_log_path,
                     )
 
                 async def eval_fn(
@@ -667,6 +726,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
                             n=eval_rollouts,
                             temperature=0.0,
                             samples=samples,
+                            summary_log_path=summary_log_path,
                         )
                     ]
 
@@ -725,6 +785,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
                         n=eval_rollouts,
                         temperature=0.0,
                         samples=samples,
+                        summary_log_path=summary_log_path,
                     )
                     final_eval_reward = _mean_reward(samples[final_eval_start:])
                 model_ids_after = await _list_model_ids(model)
@@ -741,6 +802,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
         inference_engine_args=engine_args,
         runtime_command=command,
         runtime_log_path=str(runtime_log_path),
+        summary_log_path=str(summary_log_path),
         baseline_final_target_reward=baseline_final_target_reward,
         final_eval_reward=final_eval_reward,
         model_ids_after=model_ids_after,
