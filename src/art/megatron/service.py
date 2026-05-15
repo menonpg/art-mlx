@@ -33,7 +33,12 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
+    get_external_vllm_runtime_config,
     get_vllm_runtime_working_dir,
+    is_external_vllm_runtime,
+    map_checkpoint_path_for_vllm,
+    normalize_vllm_server_url,
+    wait_for_vllm_http_runtime,
     wait_for_vllm_runtime,
 )
 from .lora import LORA_ALPHA, LORA_RANK
@@ -168,6 +173,7 @@ class MegatronService:
     _vllm_log_path: str | None = None
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _vllm_external_base_url: str | None = None
     _vllm_api_key: str | None = None
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
     _active_megatron_topology: MegatronTopologyConfig | None = None
@@ -198,6 +204,10 @@ class MegatronService:
         return is_dedicated_mode(self.config)
 
     @property
+    def is_external_vllm(self) -> bool:
+        return is_external_vllm_runtime(self.config)
+
+    @property
     def rollout_weights_mode(self) -> Literal["lora", "merged"]:
         mode = self.config.get("rollout_weights_mode", "lora")
         assert mode in {"lora", "merged"}
@@ -205,6 +215,8 @@ class MegatronService:
 
     @property
     def _vllm_base_url(self) -> str:
+        if self._vllm_external_base_url is not None:
+            return self._vllm_external_base_url
         return f"http://{self._vllm_host}:{self._vllm_port}"
 
     def _megatron_random_state(self) -> int | None:
@@ -339,6 +351,9 @@ class MegatronService:
     def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
+
+    def _checkpoint_path_for_vllm(self, checkpoint_path: str) -> str:
+        return map_checkpoint_path_for_vllm(self.config, checkpoint_path)
 
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
@@ -541,6 +556,34 @@ class MegatronService:
         )
         return self._vllm_host, self._vllm_port
 
+    async def _attach_external_vllm(
+        self,
+        config: dev.OpenAIServerConfig | None,
+    ) -> tuple[str, int]:
+        import httpx
+
+        runtime_config = get_external_vllm_runtime_config(self.config)
+        assert runtime_config is not None
+        server_args = self._runtime_server_args(config)
+        api_key = server_args.get("api_key") or runtime_config.api_key
+        self._vllm_api_key = api_key if isinstance(api_key, str) else None
+        self._vllm_external_base_url = normalize_vllm_server_url(
+            runtime_config.server_url
+        )
+        await wait_for_vllm_http_runtime(
+            base_url=self._vllm_base_url,
+            timeout=runtime_config.health_timeout_s,
+            headers=self._runtime_headers(),
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self._vllm_base_url}/v1/models",
+                **self._runtime_request_kwargs(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+        return self._vllm_base_url, 0
+
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         import httpx
 
@@ -550,7 +593,7 @@ class MegatronService:
                 f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": f"{self.model_name}@{step}",
-                    "lora_path": checkpoint_path,
+                    "lora_path": self._checkpoint_path_for_vllm(checkpoint_path),
                     "load_inplace": True,
                 },
                 **self._runtime_request_kwargs(),
@@ -578,7 +621,9 @@ class MegatronService:
         self._loaded_adapter_steps.discard(step)
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
-        if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+        if self.rollout_weights_mode != "lora" or (
+            self._vllm_port == 0 and self._vllm_external_base_url is None
+        ):
             return
         for step in sorted(self._loaded_adapter_steps - retain_steps):
             if step == self._latest_step:
@@ -678,8 +723,8 @@ class MegatronService:
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
         env = os.environ.copy()
-        if self.is_dedicated:
-            trainer_gpu_ids = self.config["trainer_gpu_ids"]
+        trainer_gpu_ids = self.config.get("trainer_gpu_ids")
+        if self.is_dedicated and trainer_gpu_ids:
             num_gpus = len(trainer_gpu_ids)
             env["CUDA_VISIBLE_DEVICES"] = ",".join(
                 str(gpu_id) for gpu_id in trainer_gpu_ids
@@ -817,6 +862,12 @@ class MegatronService:
             )
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
+        if self.is_external_vllm:
+            if self.rollout_weights_mode != "lora":
+                raise ValueError("External vLLM runtime only supports LoRA serving")
+            location = await self._attach_external_vllm(config)
+            await self._reload_adapter(lora_path, self._latest_step)
+            return location
         location = await self._start_vllm_subprocess(lora_path, port, config)
         if self.rollout_weights_mode == "lora":
             self._loaded_adapter_steps.add(self._latest_step)

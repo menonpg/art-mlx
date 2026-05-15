@@ -30,7 +30,12 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
+    get_external_vllm_runtime_config,
     get_vllm_runtime_working_dir,
+    is_external_vllm_runtime,
+    map_checkpoint_path_for_vllm,
+    normalize_vllm_server_url,
+    wait_for_vllm_http_runtime,
     wait_for_vllm_runtime,
 )
 from ..weight_transfer import (
@@ -133,6 +138,7 @@ class UnslothService:
     _vllm_log_path: str | None = None
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _vllm_external_base_url: str | None = None
     _vllm_api_key: str | None = None
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _lifecycle: ServiceLifecycle = field(
@@ -157,6 +163,10 @@ class UnslothService:
         return is_dedicated_mode(self.config)
 
     @property
+    def is_external_vllm(self) -> bool:
+        return is_external_vllm_runtime(self.config)
+
+    @property
     def rollout_weights_mode(self) -> Literal["lora", "merged"]:
         mode = self.config["rollout_weights_mode"]
         assert mode in {"lora", "merged"}
@@ -164,6 +174,8 @@ class UnslothService:
 
     @property
     def _vllm_base_url(self) -> str:
+        if self._vllm_external_base_url is not None:
+            return self._vllm_external_base_url
         return f"http://{self._vllm_host}:{self._vllm_port}"
 
     def _runtime_cuda_visible_devices(self) -> str:
@@ -213,6 +225,9 @@ class UnslothService:
     def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
         headers = self._runtime_headers()
         return {"headers": headers} if headers else {}
+
+    def _checkpoint_path_for_vllm(self, checkpoint_path: str) -> str:
+        return map_checkpoint_path_for_vllm(self.config, checkpoint_path)
 
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
@@ -320,6 +335,34 @@ class UnslothService:
             self._runtime_cuda_visible_devices(),
         )
         return self._vllm_host, self._vllm_port
+
+    async def _attach_external_vllm(
+        self,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, int]:
+        import httpx
+
+        runtime_config = get_external_vllm_runtime_config(self.config)
+        assert runtime_config is not None
+        server_args = self._runtime_server_args(config)
+        api_key = server_args.get("api_key") or runtime_config.api_key
+        self._vllm_api_key = api_key if isinstance(api_key, str) else None
+        self._vllm_external_base_url = normalize_vllm_server_url(
+            runtime_config.server_url
+        )
+        await wait_for_vllm_http_runtime(
+            base_url=self._vllm_base_url,
+            timeout=runtime_config.health_timeout_s,
+            headers=self._runtime_headers(),
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self._vllm_base_url}/v1/models",
+                **self._runtime_request_kwargs(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+        return self._vllm_base_url, 0
 
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
@@ -542,10 +585,10 @@ class UnslothService:
         )
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"http://{self._vllm_host}:{self._vllm_port}/v1/load_lora_adapter",
+                f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": lora_name,
-                    "lora_path": checkpoint_path,
+                    "lora_path": self._checkpoint_path_for_vllm(checkpoint_path),
                     "load_inplace": True,
                 },
                 **self._runtime_request_kwargs(),
@@ -601,10 +644,14 @@ class UnslothService:
             self._state.offload_to_cpu()
 
         port = (config or {}).get("server_args", {}).get("port", 8000)
+        if self.is_external_vllm:
+            if self.rollout_weights_mode != "lora":
+                raise ValueError("External vLLM runtime only supports LoRA serving")
+            vllm_location = await self._attach_external_vllm(config=config)
+            await self._reload_adapter(lora_path, self._latest_step)
+            return vllm_location
         vllm_location = await self._start_vllm_subprocess(
-            lora_path,
-            port,
-            config=config,
+            lora_path, port, config=config
         )
         try:
             if self.rollout_weights_mode == "merged":
