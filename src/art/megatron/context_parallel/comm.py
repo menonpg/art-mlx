@@ -15,38 +15,10 @@ from .range_ops import (
 from .types import DkvReducePlan, KvFetchPlan, TokenRange
 
 _DIST = cast(Any, dist)
+
+
 class _Waitable(Protocol):
     def wait(self) -> Any: ...
-
-
-def _active_peer_ranks(
-    *,
-    send_splits: tuple[int, ...],
-    recv_splits: tuple[int, ...],
-) -> tuple[int, ...]:
-    return tuple(
-        peer_rank
-        for peer_rank, (send_split, recv_split) in enumerate(
-            zip(send_splits, recv_splits, strict=True)
-        )
-        if int(send_split) > 0 or int(recv_split) > 0
-    )
-
-
-def _collective_mode(
-    *,
-    send_splits: tuple[int, ...],
-    recv_splits: tuple[int, ...],
-) -> str:
-    active_peers = _active_peer_ranks(
-        send_splits=send_splits,
-        recv_splits=recv_splits,
-    )
-    if not active_peers:
-        return "none"
-    # Every rank participating in one peer exchange must choose the same collective.
-    # Local heuristics can disagree across edge and middle ranks for the same wave.
-    return "a2a"
 
 
 def _launch_peer_exchange(
@@ -58,25 +30,20 @@ def _launch_peer_exchange(
     group: Any,
     async_op: bool,
 ) -> _Waitable | None:
-    collective_mode = _collective_mode(
-        send_splits=tuple(int(split // 2) for split in input_split_sizes),
-        recv_splits=tuple(int(split // 2) for split in output_split_sizes),
+    # CP exchange waves are globally scheduled: every rank in the CP group must
+    # enter the wave's collective in the same order, even when this rank's local
+    # split sizes are all zero.
+    return cast(
+        _Waitable | None,
+        _DIST.all_to_all_single(
+            recv_buffer,
+            send_buffer,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+            async_op=async_op,
+        ),
     )
-    if collective_mode == "a2a":
-        return cast(
-            _Waitable | None,
-            _DIST.all_to_all_single(
-                recv_buffer,
-                send_buffer,
-                output_split_sizes=output_split_sizes,
-                input_split_sizes=input_split_sizes,
-                group=group,
-                async_op=async_op,
-            ),
-        )
-    if collective_mode == "none":
-        return None
-    raise RuntimeError(f"Unsupported peer-exchange mode: {collective_mode}")
 
 
 @dataclass

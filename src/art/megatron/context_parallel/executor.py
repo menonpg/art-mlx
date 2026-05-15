@@ -1004,15 +1004,6 @@ def _stage_q_is_full(
     )
 
 
-def _stage_requires_comm(stage_plan: StagePlan) -> bool:
-    if stage_plan.kv_fetch_plan is None:
-        return False
-    return bool(
-        sum(stage_plan.kv_fetch_plan.send_splits)
-        or sum(stage_plan.kv_fetch_plan.recv_splits)
-    )
-
-
 def _stage_requires_reduce(stage_plan: StagePlan) -> bool:
     if stage_plan.dkv_reduce_plan is None:
         return False
@@ -1031,10 +1022,7 @@ def _remote_comm_launch_enabled(
     state: ArtContextParallelState,
     remote_stages: list[StagePlan],
 ) -> bool:
-    remote_comm_stage_count = sum(
-        1 for stage_plan in remote_stages if _stage_requires_comm(stage_plan)
-    )
-    if remote_comm_stage_count <= 0:
+    if not remote_stages:
         return False
     if not _distributed_cp_comm_enabled(state):
         raise RuntimeError(
@@ -1469,8 +1457,6 @@ def _forward_stage_records(
     remote_query_works_by_stage_index: dict[int, _StageQueryGatherWork] = {}
     if wave_pipeline_enabled:
         for stage_plan in remote_stages:
-            if not _stage_requires_comm(stage_plan):
-                continue
             remote_fetch_works_by_stage_index[int(stage_plan.stage_index)] = (
                 _COMMUNICATOR.launch_kv_fetch(
                     k_local=k_source,
@@ -1972,13 +1958,8 @@ def _run_context_parallel_backward(
     dk_flat = torch.zeros(k_flat.shape, device=k_flat.device, dtype=grad_accum_dtype)
     dv_flat = torch.zeros(v_flat.shape, device=v_flat.device, dtype=grad_accum_dtype)
     reduce_works: list[Any] = []
-    needs_remote_reduce = bool(
-        sum(state.rank_plan.remote_dkv_reduce_plan.send_splits)
-        or sum(state.rank_plan.remote_dkv_reduce_plan.recv_splits)
-        or any(
-            (not stage_plan.is_local_stage) and _stage_requires_reduce(stage_plan)
-            for stage_plan in state.rank_plan.stage_plans
-        )
+    needs_remote_reduce = any(
+        not stage_plan.is_local_stage for stage_plan in state.rank_plan.stage_plans
     )
     if needs_remote_reduce and not comm_async_enabled:
         raise RuntimeError(
@@ -2016,7 +1997,7 @@ def _run_context_parallel_backward(
         stage_plan = state.rank_plan.stage_plans[int(stage_index)]
         stage_record = records_by_stage_index.get(int(stage_plan.stage_index))
         if stage_record is None:
-            if stage_plan.is_local_stage or not _stage_requires_reduce(stage_plan):
+            if stage_plan.is_local_stage:
                 continue
             empty = k_flat.new_empty((k_flat.shape[0], 0, k_flat.shape[2]))
             reduce_works.append(
@@ -2107,7 +2088,7 @@ def _run_context_parallel_backward(
             _release_replay_record_tensors(stage_record)
             stage_record.clear()
             continue
-        if _stage_requires_reduce(stage_plan):
+        if not stage_plan.is_local_stage:
             dk_remote = cast(torch.Tensor | None, grad_map.get("k_input"))
             dv_remote = cast(torch.Tensor | None, grad_map.get("v_input"))
             if dk_remote is None:
