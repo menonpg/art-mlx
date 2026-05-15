@@ -248,7 +248,7 @@ def _free_port() -> int:
 
 
 def _target_tokens() -> int:
-    return _env_int("ART_EXTERNAL_VLLM_LENGTH_TARGET_TOKENS", 20)
+    return _env_int("ART_EXTERNAL_VLLM_LENGTH_TARGET_TOKENS", 10)
 
 
 def _word_count(text: str) -> int:
