@@ -992,56 +992,6 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
         return base_out + adapter_out, bias_out
 
 
-class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
-    def __init__(
-        self,
-        adapter_model_prefix: str,
-        linear_fc1: TEColumnParallelGroupedLinear,
-        rank: int,
-        alpha: float,
-        num_local_experts: int,
-    ) -> None:
-        super().__init__()
-        assert linear_fc1 is not None
-        assert isinstance(linear_fc1.weight0, torch.Tensor)
-        self.linear_fc1 = linear_fc1
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="expert_tp",
-            sharded=False,
-            shard_dim=None,
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_SUM,
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": True,
-                "shard_dim": -1,
-                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
-                "grad_sync_op": GRAD_SYNC_OP_NONE,
-            }
-        )
-        self.lora = LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
-            in_features=linear_fc1.in_features,
-            out_features=linear_fc1.out_features,
-            rank=rank,
-            alpha=alpha,
-            dtype=linear_fc1.weight0.dtype,
-            device=linear_fc1.weight0.device,
-            num_local_experts=num_local_experts,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            allreduce=False,
-        )
-
-    def forward(
-        self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
-        adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
-        return base_out + adapter_out, bias_out
-
-
 class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     def __init__(
         self,
@@ -1381,41 +1331,6 @@ def wrap_grouped_moe_experts_3d(
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
             lora_dtype=provider.art_lora_dtype,
-        )
-
-
-def wrap_grouped_moe_experts_3d(
-    experts: TEGroupedMLP,
-    *,
-    adapter_model_prefix: str,
-    target_modules: set[str],
-    rank: int,
-    alpha: int,
-) -> None:
-    if _targets_include(target_modules, "experts"):
-        mlp_experts_linear_fc1 = _unwrap_attr(
-            experts.linear_fc1,
-            "linear_fc1",
-            TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
-        )
-        experts.linear_fc1 = MLPExpertsLinearFC1FusedLoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-            linear_fc1=mlp_experts_linear_fc1,
-            rank=rank,
-            alpha=alpha,
-            num_local_experts=experts.num_local_experts,
-        )
-        mlp_experts_linear_fc2 = _unwrap_attr(
-            experts.linear_fc2,
-            "linear_fc2",
-            TERowParallelGroupedLinear,  # type: ignore[arg-type]
-        )
-        experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-            linear_fc2=mlp_experts_linear_fc2,
-            rank=rank,
-            alpha=alpha,
-            num_local_experts=experts.num_local_experts,
         )
 
 
