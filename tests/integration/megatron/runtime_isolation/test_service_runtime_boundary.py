@@ -14,6 +14,8 @@ from art.unsloth.service import UnslothService
 
 
 class _AsyncOkResponse:
+    status_code = 200
+
     def raise_for_status(self) -> None:
         return None
 
