@@ -964,6 +964,18 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
             sample_uid_span=int(active_step_routes.global_token_uids.numel()),
             num_experts=int(getattr(self, "num_experts", 1)),
         )
+        if (
+            isinstance(expert_probs, torch.Tensor)
+            and expert_probs.ndim > 0
+            and int(expert_probs.shape[0]) == int(trace_row_uids.numel())
+        ):
+            padding_rows = (
+                expert_probs.detach().reshape(trace_row_uids.numel(), -1) == 0
+            ).all(dim=1)
+            if bool(padding_rows.any().item()):
+                trace_row_uids = trace_row_uids.masked_fill(
+                    padding_rows.to(device=trace_row_uids.device), -1
+                )
         _attach_trace_row_uids(
             expert_inputs,
             row_token_uids=trace_row_uids,

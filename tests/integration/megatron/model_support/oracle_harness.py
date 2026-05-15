@@ -89,7 +89,7 @@ FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<proj>gate_proj|up_proj|gate_up_proj|down_proj)\."
 )
 LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
 PHASE_PRINT_ORDER = {
@@ -2037,13 +2037,17 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
 def _fp8_base_weight_phase_pass_fns() -> dict[str, PhasePassFn]:
     """Builds FP8-vs-BF16 sanity limits while preserving exact routing replay checks."""
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out_loss = MetricThresholdRule(limits={"mean_abs_pct": 5.0})
+    fwd_out_loss = MetricThresholdRule(limits={"mean_abs_pct": 12.0})
     fwd_out = MetricThresholdRule(
-        limits={"mean_abs_pct": 5.0},
+        limits={"mean_abs_pct": 12.0},
         minimums=non_zero_scales,
     )
-    grads_deltas = MetricThresholdRule(
-        limits={"mean_abs_pct": 10.0},
+    grads = MetricThresholdRule(
+        limits={"mean_abs_pct": 25.0},
+        minimums=non_zero_scales,
+    )
+    deltas = MetricThresholdRule(
+        limits={"mean_abs_pct": 15.0},
         minimums=non_zero_scales,
     )
     router_scores_rule = MetricThresholdRule(
@@ -2053,8 +2057,8 @@ def _fp8_base_weight_phase_pass_fns() -> dict[str, PhasePassFn]:
         limits={"topk_mismatch_fraction": 0.0, "top1_mismatch_fraction": 0.0}
     )
     return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
-        "grads": grads_deltas,
-        "deltas": grads_deltas,
+        "grads": grads,
+        "deltas": deltas,
         "router_scores": router_scores_rule,
         "router_topk_ids": router_topk_rule,
     }

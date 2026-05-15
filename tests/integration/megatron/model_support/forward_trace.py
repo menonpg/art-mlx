@@ -795,6 +795,22 @@ class ForwardTraceCapture:
                 trace_item["micro_sample_index"] = ordered_sample_ids[0]
             return [trace_item]
 
+        if isinstance(trace_item.get("micro_sample_index"), int):
+            padding_rows = row_token_uids < 0
+            if bool(padding_rows.any().item()):
+                sample_ids = sample_ids.clone()
+                sample_ids[padding_rows] = int(trace_item["micro_sample_index"])
+                ordered_sample_ids = []
+                seen_sample_ids = set()
+                for sample_id in sample_ids.tolist():
+                    sample_id_int = int(sample_id)
+                    if sample_id_int in seen_sample_ids:
+                        continue
+                    seen_sample_ids.add(sample_id_int)
+                    ordered_sample_ids.append(sample_id_int)
+                if len(ordered_sample_ids) <= 1:
+                    return [trace_item]
+
         split_items: list[dict[str, Any]] = []
         for sample_id in ordered_sample_ids:
             row_indices = (sample_ids == sample_id).nonzero(as_tuple=False).reshape(-1)
