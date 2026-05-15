@@ -243,11 +243,8 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _target_tokens_for_step(step: int) -> int:
-    return _env_int("ART_EXTERNAL_VLLM_LENGTH_TARGET_START", 16) + step * _env_int(
-        "ART_EXTERNAL_VLLM_LENGTH_TARGET_INCREMENT",
-        4,
-    )
+def _target_tokens() -> int:
+    return _env_int("ART_EXTERNAL_VLLM_LENGTH_TARGET_TOKENS", 20)
 
 
 def _word_count(text: str) -> int:
@@ -280,7 +277,7 @@ def _prompt_for_index(index: int) -> tuple[str, int]:
 
 def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
     resolved_target_step = index if target_step is None else target_step
-    target_tokens = _target_tokens_for_step(resolved_target_step)
+    target_tokens = _target_tokens()
     max_tokens = max(
         target_tokens + 1,
         math.ceil(
