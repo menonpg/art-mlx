@@ -286,7 +286,8 @@ def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
         math.ceil(
             target_tokens
             * _env_float("ART_EXTERNAL_VLLM_LENGTH_MAX_TOKENS_MULTIPLIER", 1.4)
-        ),
+        )
+        + 128,
     )
     prompt, prompt_word_count = _prompt_for_index(index)
     return LengthScenario(
