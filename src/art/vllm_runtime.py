@@ -362,7 +362,7 @@ def _runtime_command_prefix() -> list[str]:
         and not (_bundled_runtime_dir() / "manifest.json").exists()
     ):
         raise RuntimeError(
-            "vLLM runtime env is not built. Run `uv sync` in "
+            "vLLM runtime env is not built. Run `bash setup.sh` in "
             f"{runtime_root} or set ART_VLLM_RUNTIME_BIN."
         )
     return [str(ensure_vllm_runtime())]
