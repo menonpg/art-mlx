@@ -448,6 +448,11 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
     trainer_gpu_ids, inference_gpu_ids = _resolve_gpu_ids()
     max_steps = _env_int("ART_EXTERNAL_VLLM_LENGTH_MAX_STEPS", 10)
     rollouts_per_prompt = _env_int("ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT", 4)
+    if rollouts_per_prompt < 2:
+        raise RuntimeError(
+            "ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT must be at least 2 "
+            "so reward groups can have non-zero variance."
+        )
     eval_rollouts = _env_int("ART_EXTERNAL_VLLM_LENGTH_EVAL_ROLLOUTS", 1)
     rollout_workers = _env_int(
         "ART_EXTERNAL_VLLM_LENGTH_ROLLOUT_WORKERS",
