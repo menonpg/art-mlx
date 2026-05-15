@@ -17,14 +17,15 @@ apply_flash_flex_dlse_patch()
 
 
 # Integration tests patch this module in-process when they need a non-default
-# backend; production ART always uses FLASH here.
+# backend. Production ART uses FLASH except on SM100/SM110, where current FA4
+# FLASH block-sparse coverage is not sufficient for Qwen3.5 CP attention.
 _FORCED_FLEX_BACKEND = "FLASH"
 _FLASH_LSE_RESCALE = math.log(2.0)
 SparseBlockSize: TypeAlias = int | tuple[int, int]
 
 
 def normalize_flex_lse(lse: torch.Tensor) -> torch.Tensor:
-    if _FORCED_FLEX_BACKEND != "FLASH":
+    if _runtime_flex_backend(lse.device) != "FLASH":
         return lse
     return lse / _FLASH_LSE_RESCALE
 
@@ -54,6 +55,30 @@ _FORCED_FLEX_KERNEL_OPTIONS = cast(
 )
 
 
+def _cuda_device_major(device: torch.device) -> int | None:
+    if device.type != "cuda":
+        return None
+    with torch.cuda.device(device):
+        major, _minor = torch.cuda.get_device_capability(device)
+    return int(major)
+
+
+def _runtime_flex_backend(device: torch.device) -> str:
+    if _FORCED_FLEX_BACKEND != "FLASH":
+        return _FORCED_FLEX_BACKEND
+    major = _cuda_device_major(device)
+    if major in {10, 11}:
+        return "TRITON"
+    return _FORCED_FLEX_BACKEND
+
+
+def _runtime_flex_kernel_options(device: torch.device) -> FlexKernelOptions:
+    backend = _runtime_flex_backend(device)
+    if backend == _FORCED_FLEX_BACKEND:
+        return _FORCED_FLEX_KERNEL_OPTIONS
+    return cast(FlexKernelOptions, {"BACKEND": backend})
+
+
 def normalize_sparse_block_size(block_size: SparseBlockSize) -> tuple[int, int]:
     if isinstance(block_size, tuple):
         if len(block_size) != 2:
@@ -69,11 +94,11 @@ def flash_sparse_block_size_for_head_dim(
     head_dim_v: int,
     device: torch.device,
 ) -> tuple[int, int]:
-    if _FORCED_FLEX_BACKEND != "FLASH":
+    if _runtime_flex_backend(device) != "FLASH":
         return (128, 128)
     if device.type != "cuda":
         return (128, 128)
-    major, _minor = torch.cuda.get_device_capability(device)
+    major = _cuda_device_major(device)
     if major != 9:
         return (128, 128)
     del head_dim_v
@@ -101,7 +126,7 @@ def _forced_flex_attention_dense(
         block_mask=block_mask,
         scale=scale,
         enable_gqa=enable_gqa,
-        kernel_options=_FORCED_FLEX_KERNEL_OPTIONS,
+        kernel_options=_runtime_flex_kernel_options(q.device),
         return_aux=return_aux,
     )
 
@@ -123,7 +148,7 @@ def _forced_flex_attention_sparse(
         block_mask=block_mask,
         scale=scale,
         enable_gqa=enable_gqa,
-        kernel_options=_FORCED_FLEX_KERNEL_OPTIONS,
+        kernel_options=_runtime_flex_kernel_options(q.device),
         return_aux=return_aux,
     )
 
