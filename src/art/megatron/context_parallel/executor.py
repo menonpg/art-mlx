@@ -1431,8 +1431,6 @@ def _forward_stage_records(
     enable_gqa: bool,
     record_for_backward: bool,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
-    if q_flat.numel() == 0:
-        return q_flat.new_empty((q_flat.shape[0], 0, q_flat.shape[2])), []
     q_source = q_flat.detach() if record_for_backward else q_flat
     k_source = k_flat.detach() if record_for_backward else k_flat
     v_source = v_flat.detach() if record_for_backward else v_flat
@@ -1738,6 +1736,10 @@ def _forward_stage_records(
     )
 
     if not produced_output:
+        if int(q_flat.shape[1]) == 0:
+            return q_flat.new_empty(
+                (q_flat.shape[0], 0, q_flat.shape[2])
+            ), replay_records
         raise RuntimeError("Sparse attention produced no stage outputs")
     if accum_out is None:
         raise RuntimeError("Sparse attention produced no accumulated output")
@@ -1775,8 +1777,6 @@ def _run_context_parallel_forward(
         value=value,
         state=state,
     )
-    if q_flat.numel() == 0:
-        return query.new_zeros(query.shape)
     accum_out, _ = _forward_stage_records(
         q_flat=q_flat,
         k_flat=k_flat,
@@ -1811,9 +1811,6 @@ def _run_context_parallel_forward_recorded(
         value=value,
         state=state,
     )
-    if q_flat.numel() == 0:
-        empty_output = query.new_zeros(query.shape)
-        return empty_output, query.new_empty((query.shape[2], 0, query.shape[3])), []
     accum_out, replay_records = _forward_stage_records(
         q_flat=q_flat,
         k_flat=k_flat,
@@ -1917,9 +1914,6 @@ def _run_context_parallel_backward(
         grad_output,
         state.rank_plan.local_valid_lengths,
     )
-    if q_flat.numel() == 0:
-        zeros = torch.zeros_like(query)
-        return zeros, torch.zeros_like(key), torch.zeros_like(value)
     if replay_records is None:
         _, replay_records = _forward_stage_records(
             q_flat=q_flat,

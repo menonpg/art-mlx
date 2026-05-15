@@ -644,12 +644,6 @@ def _run_cp_planned_prefixes_and_completions(
         raise ValueError(
             f"unsupported GDN CP layouts: {input_layout=} {output_layout=}"
         )
-    if (
-        plan.sequence_length == 0
-        and plan.remote_prefix_tail_exchange is None
-        and not plan.remote_prefix_tail_state_transfers
-    ):
-        return _run_empty_cp_rank(gdn, hidden_states, plan, group), None
     if input_layout == "attention":
         gdn_hidden, _original_shape = gdn_cp_attention_to_gdn_layout(
             hidden_states,
@@ -1115,30 +1109,6 @@ def gdn_cp_attention_to_gdn_layout(
             backward_plan=backward_plan,
         )
     return gdn_flat.unsqueeze(1).contiguous(), original_shape
-
-
-def _run_empty_cp_rank(
-    gdn: Any,
-    hidden_states: Tensor,
-    plan: GdnRankExecutionPlan,
-    group: Any,
-) -> Tensor:
-    if not plan.parent_state_exchange_family_indices:
-        return hidden_states * 0
-    if not plan.parent_state_transfers:
-        raise ValueError("CP parent-state exchange requires planned transfers")
-    conv_table = _zero_conv_state(gdn, hidden_states, batch_size=plan.family_count)
-    rec_table = _zero_recurrent_state(gdn, hidden_states, batch_size=plan.family_count)
-    conv_table = conv_table.detach().requires_grad_(True)
-    rec_table = rec_table.detach().requires_grad_(True)
-    with _nvtx_range("art_gdn_cp_parent_state_exchange", conv_table):
-        _, _, dependency = _exchange_parent_state_rows(
-            conv_table,
-            rec_table,
-            transfers=plan.parent_state_transfers,
-            group=group,
-        )
-    return hidden_states * 0 + dependency.to(dtype=hidden_states.dtype)
 
 
 @torch.compiler.disable
