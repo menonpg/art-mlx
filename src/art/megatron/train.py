@@ -492,10 +492,12 @@ def run_megatron_worker_loop(
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
 
+        job_completed = False
         try:
             _run_megatron_job(runtime, job)
+            job_completed = True
         finally:
-            if after_job is not None:
+            if job_completed and after_job is not None:
                 after_job()
 
         finalize_megatron_job(
@@ -515,6 +517,7 @@ def run_megatron_rl_job(
     template = None
     zero_template = None
 
+    job_completed = False
     try:
         configure_moe_routing_replay(
             runtime,
@@ -612,6 +615,7 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
+        job_completed = True
     finally:
         if packed_tensors is not None:
             del packed_tensors
@@ -623,8 +627,9 @@ def run_megatron_rl_job(
             del zero_template
         if "micro_inputs" in locals():
             del micro_inputs
-        gc.collect()
-        torch.cuda.empty_cache()
+        if job_completed:
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 def _flush_param_grads_to_main_grads(model_chunks: ModelChunks) -> None:
@@ -655,6 +660,7 @@ def run_megatron_sft_job(
 ) -> None:
     adapter_model = None
 
+    job_completed = False
     try:
         configure_moe_routing_replay(runtime)
         adapter_model = _load_lora_and_optimizer(
@@ -765,11 +771,13 @@ def run_megatron_sft_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
+        job_completed = True
     finally:
         if adapter_model is not None:
             del adapter_model
-        gc.collect()
-        torch.cuda.empty_cache()
+        if job_completed:
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
