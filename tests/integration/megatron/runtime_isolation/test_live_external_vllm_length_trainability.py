@@ -93,6 +93,34 @@ def _parse_gpu_ids(name: str) -> list[int] | None:
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
 
+def _nvidia_smi_lines(*query_fields: str) -> list[str]:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--query-gpu={','.join(query_fields)}",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        pytest.skip(f"nvidia-smi is required for live CUDA GPU discovery: {exc}")
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _gpu_memory_info_by_index() -> dict[int, tuple[int, int]]:
+    info: dict[int, tuple[int, int]] = {}
+    for line in _nvidia_smi_lines("index", "memory.free", "memory.total"):
+        raw_index, raw_free_mib, raw_total_mib = [
+            part.strip() for part in line.split(",")
+        ]
+        info[int(raw_index)] = (
+            int(raw_free_mib) * 1024**2,
+            int(raw_total_mib) * 1024**2,
+        )
+    return info
+
+
 def _resolve_gpu_ids() -> tuple[list[int], list[int]]:
     trainer_ids = _parse_gpu_ids("ART_EXTERNAL_VLLM_LENGTH_TRAINER_GPU_IDS")
     inference_ids = _parse_gpu_ids("ART_EXTERNAL_VLLM_LENGTH_INFERENCE_GPU_IDS")
@@ -103,7 +131,8 @@ def _resolve_gpu_ids() -> tuple[list[int], list[int]]:
                 "ART_EXTERNAL_VLLM_LENGTH_INFERENCE_GPU_IDS must both be set"
             )
     else:
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 4:
+        gpu_count = len(_gpu_memory_info_by_index())
+        if gpu_count < 4:
             pytest.skip(
                 "Need at least 4 visible CUDA GPUs for local external-vLLM "
                 "length trainability: 2 training GPUs and 2 inference GPUs."
@@ -121,7 +150,7 @@ def _resolve_gpu_ids() -> tuple[list[int], list[int]]:
     overlap = set(trainer_ids) & set(inference_ids)
     if overlap:
         raise RuntimeError(f"Trainer and inference GPU IDs overlap: {sorted(overlap)}")
-    visible = torch.cuda.device_count()
+    visible = len(_gpu_memory_info_by_index())
     invalid = [gpu_id for gpu_id in [*trainer_ids, *inference_ids] if gpu_id >= visible]
     if invalid:
         raise RuntimeError(
@@ -131,11 +160,12 @@ def _resolve_gpu_ids() -> tuple[list[int], list[int]]:
 
 
 def _safe_gpu_memory_utilization(device_ids: list[int]) -> float:
-    requested = _env_float("ART_EXTERNAL_VLLM_LENGTH_GPU_MEMORY_UTILIZATION", 0.85)
+    requested = _env_float("ART_EXTERNAL_VLLM_LENGTH_GPU_MEMORY_UTILIZATION", 0.45)
     min_free_gib = _env_float("ART_EXTERNAL_VLLM_LENGTH_MIN_FREE_GPU_GIB", 20.0)
+    memory_info = _gpu_memory_info_by_index()
     free_ratios: list[float] = []
     for device_id in device_ids:
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
+        free_bytes, total_bytes = memory_info[device_id]
         free_gib = free_bytes / (1024**3)
         if free_gib < min_free_gib:
             pytest.skip(
@@ -405,10 +435,6 @@ def _internal_config(
     }
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
-    reason="Need at least 4 CUDA GPUs for local external-vLLM length trainability",
-)
 @pytest.mark.parametrize(
     "max_steps_off_policy", [0, 3], ids=["off_policy_0", "off_policy_3"]
 )
