@@ -32,6 +32,7 @@ TRAINING_TOPOLOGY = Topology(tp=1, cp=2, ep=2, etp=1, dp=1, sp=False)
 
 class LengthScenario(BaseModel):
     scenario_index: int
+    target_step: int
     target_tokens: int
     max_tokens: int
     metadata: dict[str, int] = Field(default_factory=dict)
@@ -41,6 +42,7 @@ class LengthSampleReport(BaseModel):
     split: Literal["train", "eval", "baseline"]
     step: int | None
     scenario_index: int
+    target_step: int
     target_tokens: int
     max_tokens: int
     generated_tokens: int
@@ -179,15 +181,16 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _target_tokens_for_index(index: int) -> int:
-    return _env_int("ART_EXTERNAL_VLLM_LENGTH_TARGET_START", 16) + index * _env_int(
+def _target_tokens_for_step(step: int) -> int:
+    return _env_int("ART_EXTERNAL_VLLM_LENGTH_TARGET_START", 16) + step * _env_int(
         "ART_EXTERNAL_VLLM_LENGTH_TARGET_INCREMENT",
         4,
     )
 
 
-def _scenario(index: int) -> LengthScenario:
-    target_tokens = _target_tokens_for_index(index)
+def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
+    resolved_target_step = index if target_step is None else target_step
+    target_tokens = _target_tokens_for_step(resolved_target_step)
     max_tokens = max(
         target_tokens + 1,
         math.ceil(
@@ -197,19 +200,42 @@ def _scenario(index: int) -> LengthScenario:
     )
     return LengthScenario(
         scenario_index=index,
+        target_step=resolved_target_step,
         target_tokens=target_tokens,
         max_tokens=max_tokens,
         metadata={
             "scenario_index": index,
+            "target_step": resolved_target_step,
             "target_tokens": target_tokens,
             "max_tokens": max_tokens,
         },
     )
 
 
-async def _scenario_iter(count: int) -> AsyncIterator[LengthScenario]:
+def _scenario_input(index: int, *, target_step: int = 0) -> dict[str, object]:
+    return _scenario(index, target_step=target_step).model_dump()
+
+
+async def _scenario_iter(count: int) -> AsyncIterator[dict[str, object]]:
     for index in range(count):
-        yield _scenario(index)
+        yield _scenario_input(index)
+
+
+def _scenario_for_training_step(
+    scenario: LengthScenario | dict[str, object],
+    step: int,
+) -> LengthScenario:
+    parsed = LengthScenario.model_validate(scenario)
+    return _scenario(parsed.scenario_index, target_step=step)
+
+
+def _step_from_model_name(model_name: str) -> int | None:
+    if "@" not in model_name:
+        return None
+    try:
+        return int(model_name.rsplit("@", 1)[1])
+    except ValueError:
+        return None
 
 
 def _messages(scenario: LengthScenario) -> art.Messages:
@@ -258,6 +284,7 @@ def _sample_report(
         split=split,
         step=step,
         scenario_index=scenario.scenario_index,
+        target_step=scenario.target_step,
         target_tokens=scenario.target_tokens,
         max_tokens=scenario.max_tokens,
         generated_tokens=generated_tokens,
@@ -311,6 +338,7 @@ async def _length_group(
                     "length/abs_error": report.abs_error,
                 },
                 metadata={
+                    "target_step": scenario.target_step,
                     "target_tokens": scenario.target_tokens,
                     "max_tokens": scenario.max_tokens,
                     "scenario_index": scenario.scenario_index,
@@ -449,7 +477,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
     base_model = _base_model()
     trainer_gpu_ids, inference_gpu_ids = _resolve_gpu_ids()
     max_steps = _env_int("ART_EXTERNAL_VLLM_LENGTH_MAX_STEPS", 10)
-    rollouts_per_prompt = _env_int("ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT", 8)
+    rollouts_per_prompt = _env_int("ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT", 4)
     if rollouts_per_prompt < 2:
         raise RuntimeError(
             "ART_EXTERNAL_VLLM_LENGTH_ROLLOUTS_PER_PROMPT must be at least 2 "
@@ -508,15 +536,23 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
 
                 async def rollout_fn(
                     rollout_model: art.TrainableModel,
-                    scenario: LengthScenario,
+                    scenario: dict[str, object],
                     _config: None,
                 ) -> art.TrajectoryGroup:
+                    model_name = rollout_model.get_inference_name()
+                    target_step = _step_from_model_name(model_name)
+                    if target_step is None:
+                        target_step = await rollout_model.get_step()
+                    step_scenario = _scenario_for_training_step(
+                        scenario,
+                        target_step,
+                    )
                     return await _length_group(
                         rollout_model,
-                        scenario=scenario,
-                        model_name=rollout_model.get_inference_name(),
+                        scenario=step_scenario,
+                        model_name=model_name,
                         split="train",
-                        step=None,
+                        step=target_step,
                         n=rollouts_per_prompt,
                         temperature=_env_float(
                             "ART_EXTERNAL_VLLM_LENGTH_ROLLOUT_TEMPERATURE",
