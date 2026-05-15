@@ -131,6 +131,15 @@ class InternalModelConfig(TypedDict, total=False):
             - "merged": keep training LoRA adapters, but push merged weights
               into vLLM for inference
         megatron_topology: Fixed Megatron parallel topology for this model.
+        chat_template_kwargs: Extra keyword arguments passed to chat-template
+            rendering for both rollout inference and local training tokenization.
+        chat_template: Raw chat template text used by rollout inference and
+            local training tokenization.
+        chat_template_path: Path to a chat template file used by rollout
+            inference and local training tokenization.
+        chat_template_content_format: vLLM chat template content format.
+        chat_template_tool_schema_format: Tool schema rendering format used for
+            local training tokenization.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -145,6 +154,11 @@ class InternalModelConfig(TypedDict, total=False):
     inference_gpu_ids: list[int]
     rollout_weights_mode: "RolloutWeightsMode"
     megatron_topology: "MegatronTopologyConfig | dict[str, int | None]"
+    chat_template_kwargs: dict[str, object]
+    chat_template: str
+    chat_template_path: str
+    chat_template_content_format: str
+    chat_template_tool_schema_format: Literal["default", "vllm_openai"]
     allow_unvalidated_arch: bool
 
 

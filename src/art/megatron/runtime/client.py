@@ -35,6 +35,7 @@ async def stream_megatron_job(
     job: MegatronJob,
     *,
     job_path: str,
+    merge_output_path: str | None = None,
     process: Any | None = None,
     process_log_path: str | None = None,
     poll_interval: float = 0.1,
@@ -62,6 +63,7 @@ async def stream_megatron_job(
                     if not isinstance(job, MegatronSyncJob):
                         merge_lora_adapter(
                             job.lora_path,
+                            output_dir=merge_output_path,
                             allow_unvalidated_arch=job.allow_unvalidated_arch,
                         )
                     return

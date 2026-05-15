@@ -512,3 +512,51 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
     )
     assert "language_model.model.layers.0.mlp.experts" in loaded_modules
     assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(
+    tmp_path: Path,
+):
+    prefix = "base_model.model.model.layers.0.mlp.experts.0"
+    full = {
+        f"{prefix}.gate_up_proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+        f"{prefix}.gate_up_proj.lora_B.weight": torch.arange(
+            8,
+            dtype=torch.float32,
+        ).reshape(8, 1),
+        f"{prefix}.down_proj.lora_A.weight": torch.arange(
+            4,
+            dtype=torch.float32,
+        ).reshape(1, 4),
+        f"{prefix}.down_proj.lora_B.weight": torch.arange(
+            2,
+            dtype=torch.float32,
+        ).reshape(2, 1),
+    }
+    shard_dir = tmp_path / "staging"
+    publish_dir = tmp_path / "published"
+    shard_dir.mkdir()
+    (shard_dir / "adapter_config.json").write_text(
+        json.dumps(_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1)),
+        encoding="utf-8",
+    )
+    save_file(full, shard_dir / "adapter_model-01-of-01.safetensors")
+    (shard_dir / "adapter_manifest-01-of-01.json").write_text(
+        json.dumps(
+            {
+                key: {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
+                for key in full
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    merge_lora_adapter(str(shard_dir), output_dir=publish_dir)
+
+    assert not (shard_dir / "adapter_model.safetensors").exists()
+    assert (publish_dir / "adapter_model.safetensors").exists()
+    roundtrip = load_lora_adapter_state_dict(
+        str(publish_dir),
+        handler=QWEN3_5_MOE_HANDLER,
+    )
+    _assert_tensors_equal(roundtrip, full)

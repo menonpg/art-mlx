@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 import art
 from art.local import LocalBackend
+from art.local.backend import _tokenizer_cache_key
 from art.preprocessing.pack import PackedTensors
 from art.preprocessing.tokenize import (
     TokenizedResult,
@@ -95,18 +96,22 @@ class ChatTemplateRolloutReport(BaseModel):
 def run_chat_template_rollout(base_model: str) -> ChatTemplateRolloutReport:
     output_dir = _artifact_dir(base_model)
     backend = LocalBackend(path=str(output_dir))
+    internal_config = art.dev.InternalModelConfig(
+        {"init_args": {"max_seq_length": 2048}}
+    )
     model = art.TrainableModel(
         name="model-support-chat-template",
         project="model-support-validation",
         base_model=base_model,
-        _internal_config={"init_args": {"max_seq_length": 2048}},
+        _internal_config=internal_config,
     )
-    tokenizer = backend._tokenizers.get(base_model)
+    tokenizer_key = _tokenizer_cache_key(base_model, internal_config)
+    tokenizer = backend._tokenizers.get(tokenizer_key)
     if tokenizer is None:
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(base_model)
-        backend._tokenizers[base_model] = tokenizer
+        backend._tokenizers[tokenizer_key] = tokenizer
 
     inputs = build_chat_template_conformance_inputs(tokenizer)
     scenarios: list[ChatTemplateScenarioReport] = []

@@ -22,6 +22,9 @@ class Qwen3MoeHandler(DefaultMoeHandler):
     key = "qwen3_moe"
     native_vllm_lora_status = "validated"
 
+    def configure_provider_for_runtime(self, provider: Any) -> None:
+        provider.moe_shared_expert_overlap = False
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_qwen3_text_preprocess_patch(model_chunks)
 

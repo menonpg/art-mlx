@@ -1,4 +1,6 @@
+from contextlib import asynccontextmanager
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -59,6 +61,7 @@ from ..preprocessing.pack import (
     plot_packed_tensors,
 )
 from ..preprocessing.tokenize import (
+    ChatTemplateToolSchemaFormat,
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
@@ -71,10 +74,76 @@ from ..types import (
     TrainSFTConfig,
 )
 from ..utils import format_message, get_model_step
+from .adapter_leases import (
+    AdapterLeaseManager,
+    pin_inference_step,
+    pinned_inference_step,
+)
 from .checkpoints import (
     delete_checkpoints,
 )
 from .service import ModelService
+
+
+def _configured_chat_template_value(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    if chat_template_path is not None:
+        with open(chat_template_path, encoding="utf-8") as handle:
+            return handle.read()
+    return chat_template
+
+
+def _configured_chat_template_server_arg(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    return chat_template_path or chat_template
+
+
+def _apply_configured_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is not None:
+        tokenizer.chat_template = chat_template
+
+
+def _apply_configured_chat_template_server_args(
+    config_dict: dict,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None:
+        return
+    server_args = dict(config_dict.get("server_args", {}))
+    server_args.setdefault("chat_template", chat_template)
+    if chat_template_content_format := internal_config.get(
+        "chat_template_content_format"
+    ):
+        server_args.setdefault(
+            "chat_template_content_format",
+            chat_template_content_format,
+        )
+    config_dict["server_args"] = server_args
+
+
+def _tokenizer_cache_key(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> tuple[str, str | None]:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is None:
+        return (base_model, None)
+    return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
 
 
 class LocalBackend(Backend):
@@ -109,11 +178,15 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
-        self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
+        self._adapter_leases: dict[str, AdapterLeaseManager] = {}
+        self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
+        self._default_chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = (
+            "default"
+        )
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -166,6 +239,18 @@ class LocalBackend(Backend):
             return 0
         return torch.cuda.device_count()
 
+    def _chat_template_tool_schema_format(
+        self,
+        internal_config: dev.InternalModelConfig,
+    ) -> ChatTemplateToolSchemaFormat:
+        return cast(
+            ChatTemplateToolSchemaFormat,
+            internal_config.get(
+                "chat_template_tool_schema_format",
+                self._default_chat_template_tool_schema_format,
+            ),
+        )
+
     def __enter__(self) -> Self:
         return self
 
@@ -202,6 +287,7 @@ class LocalBackend(Backend):
                 await aclose()
             close_proxy(service)
         self._services.clear()
+        self._adapter_leases.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -214,6 +300,7 @@ class LocalBackend(Backend):
                 close()
             close_proxy(service)
         self._services.clear()
+        self._adapter_leases.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -265,6 +352,9 @@ class LocalBackend(Backend):
 
         requested_step = step
 
+        if step is None:
+            step = pinned_inference_step(model.name)
+
         if step is None and isinstance(model, TrainableModel):
             from ..dev.validate import is_dedicated_mode
 
@@ -286,6 +376,39 @@ class LocalBackend(Backend):
             f"actual_step={step} -> {name}"
         )
         return name
+
+    def _adapter_lease_manager(self, model_name: str) -> AdapterLeaseManager:
+        manager = self._adapter_leases.get(model_name)
+        if manager is None:
+            manager = AdapterLeaseManager()
+            self._adapter_leases[model_name] = manager
+        return manager
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with pin_inference_step(model.name, step), manager.lease(step):
+            yield
+
+    async def prune_model_adapters(
+        self,
+        model: AnyTrainableModel,
+        *,
+        retain_steps: set[int],
+    ) -> None:
+        service = self._services.get(model.name)
+        if service is None:
+            return
+        manager = self._adapter_leases.get(model.name)
+        if manager is not None:
+            retain_steps = set(retain_steps) | manager.active_steps()
+        prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
+        if prune_loaded_adapters is not None:
+            await prune_loaded_adapters(retain_steps=retain_steps)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -342,10 +465,12 @@ class LocalBackend(Backend):
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
     ) -> PackedTensors | None:
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+            _apply_configured_chat_template(tokenizer, internal_config)
+            self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
                 self._image_processors[model.base_model] = (
@@ -353,7 +478,11 @@ class LocalBackend(Backend):
                 )
             except Exception:
                 self._image_processors[model.base_model] = None
-        tokenizer = self._tokenizers[model.base_model]
+        tokenizer = self._tokenizers[tokenizer_key]
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -361,14 +490,14 @@ class LocalBackend(Backend):
                 allow_training_without_logprobs,
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
+                chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
             )
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = (
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768)
+        model_max_sequence_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         if packed_sequence_length is None:
             assert not self._requires_explicit_packed_sequence_length, (
@@ -481,6 +610,8 @@ class LocalBackend(Backend):
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        _apply_configured_chat_template_server_args(config_dict, internal_config)
         server_args = dict(config_dict.get("server_args", {}))
 
         # Avoid binding collisions on busy hosts when no explicit port is provided.
@@ -570,8 +701,9 @@ class LocalBackend(Backend):
                 "cispo" and "ppo".
             loss_fn_config: Additional loss-function config. Not supported by
                 LocalBackend.
-            normalize_advantages: Whether to normalize advantages. LocalBackend
-                currently requires True.
+            normalize_advantages: Backward-compatible alias for reward std scaling.
+                When False, LocalBackend centers rewards but does not divide by
+                group reward std dev.
             adam_params: Custom optimizer params. Not supported by
                 LocalBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
@@ -637,7 +769,7 @@ class LocalBackend(Backend):
         if loss_fn_config is not None:
             raise ValueError("LocalBackend requires loss_fn_config=None.")
         if not normalize_advantages:
-            raise ValueError("LocalBackend requires normalize_advantages=True.")
+            scale_rewards = False
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
         if (
@@ -878,12 +1010,13 @@ class LocalBackend(Backend):
         if verbose:
             print("Starting _train_sft")
 
-        # Get tokenizer
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
-        tokenizer = self._tokenizers[model.base_model]
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+            _apply_configured_chat_template(tokenizer, internal_config)
+            self._tokenizers[tokenizer_key] = tokenizer
+        tokenizer = self._tokenizers[tokenizer_key]
 
         from ..utils.sft import resolve_sft_batch_size
 
@@ -899,15 +1032,17 @@ class LocalBackend(Backend):
         instruction_part, response_part = get_instruction_response_parts(
             model.base_model, tokenizer
         )
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
 
         if verbose:
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
-        max_seq_length = (
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768)
+        max_seq_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         max_seq_length = int(max_seq_length) if max_seq_length is not None else None
 
@@ -933,6 +1068,8 @@ class LocalBackend(Backend):
                     tokenizer=tokenizer,
                     instruction_part=instruction_part,
                     response_part=response_part,
+                    chat_template_kwargs=chat_template_kwargs,
+                    chat_template_tool_schema_format=chat_template_tool_schema_format,
                     max_seq_length=max_seq_length,
                 )
             )
