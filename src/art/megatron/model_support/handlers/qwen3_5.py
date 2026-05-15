@@ -28,7 +28,11 @@ _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dispatch_preprocess",
     "deepep_dispatch_combine",
     "deepep_permute_restore",
+    "flex_token_dispatch_preprocess",
     "te_triton_permute_with_mask_map",
+)
+_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS = (
+    "flex_token_dispatch_preprocess",
 )
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
@@ -471,6 +475,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         if bool(getattr(provider, "moe_shared_expert_overlap", False)):
             return CompileWorkaroundConfig(
                 flags=("moe_forward",),
+                unconditional_flags=_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS,
                 shared_expert_state="shared_expert_overlap",
                 disable_compile=True,
             )
@@ -479,6 +484,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
                 provider,
                 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS,
             ),
+            unconditional_flags=_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS,
             shared_expert_state="shared_experts",
             disable_compile=False,
         )

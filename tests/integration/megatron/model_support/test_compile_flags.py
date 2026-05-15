@@ -6,6 +6,7 @@ _QWEN_MOE_BASE_COMPILE_FLAGS = (
     "alltoall_dispatch_preprocess",
     "deepep_dispatch_combine",
     "deepep_permute_restore",
+    "flex_token_dispatch_preprocess",
     "te_triton_permute_with_mask_map",
 )
 
@@ -14,9 +15,11 @@ def test_qwen3_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
     provider = type("Provider", (), {"context_parallel_size": 1})()
     config = QWEN3_MOE_HANDLER.compile_workaround_config(provider)
     assert config.flags == _QWEN_MOE_BASE_COMPILE_FLAGS
+    assert config.unconditional_flags == ("flex_token_dispatch_preprocess",)
 
 
 def test_qwen35_moe_compile_workarounds_cover_deepep_permute_restore() -> None:
     provider = type("Provider", (), {"moe_shared_expert_overlap": False})()
     config = QWEN3_5_MOE_HANDLER.compile_workaround_config(provider)
     assert config.flags == _QWEN_MOE_BASE_COMPILE_FLAGS
+    assert config.unconditional_flags == ("flex_token_dispatch_preprocess",)

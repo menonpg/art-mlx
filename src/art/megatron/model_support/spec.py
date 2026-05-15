@@ -62,6 +62,7 @@ class ValidationReport(BaseModel):
 
 class CompileWorkaroundConfig(BaseModel):
     flags: tuple[str, ...] = ()
+    unconditional_flags: tuple[str, ...] = ()
     shared_expert_state: SharedExpertCompileState = "none"
     disable_compile: bool = False
 

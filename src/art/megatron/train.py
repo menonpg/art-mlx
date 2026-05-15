@@ -445,8 +445,17 @@ def build_training_runtime(
     compile_workaround_config = provider_bundle.handler.compile_workaround_config(
         provider
     )
-    if _compile_enabled() and not compile_workaround_config.disable_compile:
-        install_torch_compile_workarounds(compile_workaround_config)
+    compile_enabled = _compile_enabled()
+    flags = (
+        compile_workaround_config.flags
+        if compile_enabled and not compile_workaround_config.disable_compile
+        else compile_workaround_config.unconditional_flags
+    )
+    if flags:
+        install_torch_compile_workarounds(
+            compile_workaround_config.model_copy(update={"flags": flags})
+        )
+    if compile_enabled and not compile_workaround_config.disable_compile:
         for chunk in model:
             _compile_transformer_layers(chunk)
     install_debug_wrappers_if_requested()

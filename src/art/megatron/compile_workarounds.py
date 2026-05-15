@@ -22,6 +22,7 @@ _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG = (
 def _disable(fn):
     if getattr(fn, "__art_compile_disabled__", False):
         return fn
+    fn = getattr(fn, "_torchdynamo_orig_callable", fn)
     wrapped = torch.compiler.disable(fn)
     setattr(wrapped, "__art_compile_disabled__", True)
     return wrapped
@@ -781,6 +782,10 @@ def install_torch_compile_workarounds(
         )
         token_dispatcher.MoEFlexTokenDispatcher.token_combine = _disable(
             token_dispatcher.MoEFlexTokenDispatcher.token_combine
+        )
+    if "flex_token_dispatch_preprocess" in flags:
+        token_dispatcher.MoEFlexTokenDispatcher.dispatch_preprocess = _disable(
+            token_dispatcher.MoEFlexTokenDispatcher.dispatch_preprocess
         )
     if "moe_preprocess" in flags:
         moe_layer.MoELayer.preprocess = _disable(moe_layer.MoELayer.preprocess)
