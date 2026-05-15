@@ -4,13 +4,13 @@ from typing import Callable
 
 import pytest
 
+from .fp8_oracle import run_fp8_base_weight_suite
 from .oracle_harness import (
     LIVE_TRAINING_LOG_PATH,
     TEST_DEFAULT_FLEX_BACKEND,
     available_gpu_count,
     case_config,
     oracle_topology,
-    run_fp8_base_weight_suite,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
