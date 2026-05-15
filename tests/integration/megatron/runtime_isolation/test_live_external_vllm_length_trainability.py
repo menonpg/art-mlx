@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import socket
 import subprocess
 from typing import AsyncIterator, Literal
@@ -28,6 +29,8 @@ torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 LIVE_ENV = "ART_RUN_LIVE_MEGATRON_EXTERNAL_VLLM_LENGTH_SMOKE"
+REPO_ROOT = Path(__file__).resolve().parents[4]
+LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "external_vllm_length_trainability.log"
 TRAINING_TOPOLOGY = Topology(tp=1, cp=2, ep=2, etp=1, dp=1, sp=False)
 BASE_PROMPT = (
     "Write a plain answer about a quiet harbor. Use the unrelated notes below "
@@ -124,6 +127,7 @@ class LengthTrainabilityReport(BaseModel):
     runtime_command: list[str]
     runtime_log_path: str
     summary_log_path: str
+    latest_summary_log_path: str
     baseline_final_target_reward: float
     final_eval_reward: float | None
     model_ids_after: list[str]
@@ -464,6 +468,12 @@ def _init_summary_log(path: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
+    _copy_latest_summary_log(path)
+
+
+def _copy_latest_summary_log(path: Path) -> None:
+    LATEST_SUMMARY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, LATEST_SUMMARY_LOG_PATH)
 
 
 def _append_step_summary(
@@ -495,6 +505,7 @@ def _append_step_summary(
             f"{int(max(generated)):>7} {min(rewards):>10.4f} "
             f"{max(rewards):>10.4f}\n"
         )
+    _copy_latest_summary_log(path)
 
 
 def _inference_engine_args(base_model: str, inference_gpu_ids: list[int]) -> dict:
@@ -802,6 +813,7 @@ async def test_megatron_pipeline_external_vllm_length_trainability_live(
         runtime_command=command,
         runtime_log_path=str(runtime_log_path),
         summary_log_path=str(summary_log_path),
+        latest_summary_log_path=str(LATEST_SUMMARY_LOG_PATH),
         baseline_final_target_reward=baseline_final_target_reward,
         final_eval_reward=final_eval_reward,
         model_ids_after=model_ids_after,
