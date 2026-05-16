@@ -40,11 +40,11 @@ backend = [
     "gql<4",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
-    "vllm @ https://github.com/vivekkalyan/vllm/releases/download/v0.17.0-art1/vllm-0.17.0%2Bart1-cp38-abi3-manylinux_2_31_x86_64.whl ; sys_platform == 'linux'",
 ]
 megatron = [
     "numpy<2",
     "torch==2.10.0",
+    "quack-kernels==0.2.5",
     "apex @ git+https://github.com/NVIDIA/apex.git@25.09",
     "transformer-engine==2.11.0",
     "transformer-engine-cu12==2.11.0",
@@ -83,9 +83,6 @@ tinker = [
 [project.scripts]
 art = "art.cli:app"
 
-[project.entry-points."vllm.general_plugins"]
-art = "art.vllm.patches:patch_transformers_v5_compat"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -103,17 +100,30 @@ packages = ["src/art", "src/mp_actors"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
+sources = []
+only-include = [
+    ".agents/skills",
+    "LICENSE",
+    "README.md",
+    "THIRD-PARTY-NOTICES",
+    "pyproject.toml",
+    "src",
+]
 exclude = [
     "/dev",
     "/wandb",
     "/.art",
+    "/.local",
     "/.ruff_cache",
     "/.venv",
     "/dist",
+    "/scratch",
+    "/unsloth_compiled_cache",
     "/.git",
     "/.github",
     "/examples/*/data",
     "/examples/*/wandb",
+    "/tests/unsloth_compiled_cache",
     "**/__pycache__",
     "**/*.pyc",
 ]
@@ -217,7 +227,6 @@ allowed-unresolved-imports = [
     "unsloth.**",
     "unsloth_zoo.**",
     "uvicorn.**",
-    "vllm.**",
     "wandb.**",
     # langgraph deps
     "langchain_core.**",

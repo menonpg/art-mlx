@@ -1,18 +1,21 @@
+import importlib
 import sys
-import types
-from typing import cast
+from typing import Any, cast
 
 from openai.types.chat.chat_completion import Choice
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-import art
-from art.preprocessing.tokenize import (
-    tokenize_sft_batch,
-    tokenize_trajectory,
-)
+from art.preprocessing.tokenize import tokenize_trajectory
 from art.trajectories import History, Trajectory
 from art.types import MessagesAndChoices
+
+if "tests" not in sys.path:
+    sys.path.insert(0, "tests")
+
+build_chat_template_conformance_inputs = importlib.import_module(
+    "support.chat_template_conformance_cases"
+).build_chat_template_conformance_inputs
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
@@ -24,6 +27,9 @@ class _FakeTokenizer:
     eos_token = "\x00"
     eos_token_id = 0
 
+    def __init__(self) -> None:
+        self.apply_chat_template_kwargs: list[dict[str, Any]] = []
+
     def apply_chat_template(
         self,
         messages,
@@ -32,10 +38,18 @@ class _FakeTokenizer:
         return_dict=None,
         **kwargs,
     ):
-        del tools, kwargs
-        rendered = "".join(
-            f"<{message['role']}>{message.get('content', '')}" for message in messages
-        )
+        del tools
+        self.apply_chat_template_kwargs.append(dict(kwargs))
+        rendered_parts = []
+        for message in messages:
+            tool_calls = "".join(
+                f"<tool>{tool_call['function']['name']}:{tool_call['function']['arguments']}"
+                for tool_call in message.get("tool_calls", [])
+            )
+            rendered_parts.append(
+                f"<{message['role']}>{tool_calls}{message.get('content', '')}"
+            )
+        rendered = "".join(rendered_parts)
         if not tokenize:
             return rendered
         token_ids = self.encode(rendered, add_special_tokens=False)
@@ -78,7 +92,6 @@ class _Qwen3_5FakeTokenizer(_FakeTokenizer):
         return_dict=None,
         **kwargs,
     ):
-        del kwargs
         for message in messages:
             tool_calls = message.get("tool_calls")
             if tool_calls is None:
@@ -94,6 +107,32 @@ class _Qwen3_5FakeTokenizer(_FakeTokenizer):
             tools=tools,
             tokenize=tokenize,
             return_dict=return_dict,
+            **kwargs,
+        )
+
+
+class _ContinueFinalMessageRejectingTokenizer(_FakeTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize=True,
+        return_dict=None,
+        **kwargs,
+    ):
+        if kwargs.get("continue_final_message") is True and messages[-1].get(
+            "content", ""
+        ).startswith("<think>"):
+            raise ValueError(
+                "continue_final_message is set but the final message does not appear "
+                "in the chat after applying the chat template!"
+            )
+        return super().apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=tokenize,
+            return_dict=return_dict,
+            **kwargs,
         )
 
 
@@ -127,75 +166,109 @@ def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> Non
     assert assistant_ids == tokenizer.encode("OK", add_special_tokens=False)
 
 
-def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_tokenize_trajectory_passes_chat_template_kwargs() -> None:
     tokenizer = _FakeTokenizer()
-
-    fake_unsloth = types.ModuleType("unsloth")
-    fake_unsloth_zoo = types.ModuleType("unsloth_zoo")
-    fake_dataset_utils = types.ModuleType("unsloth_zoo.dataset_utils")
-
-    def _train_on_responses_only(**kwargs):
-        del kwargs
-
-        def _labels_fn(batch):
-            return {"labels": [list(batch["input_ids"][0])]}
-
-        return _labels_fn
-
-    fake_dataset_utils.train_on_responses_only = _train_on_responses_only  # type: ignore[attr-defined]
-    fake_unsloth_zoo.dataset_utils = fake_dataset_utils  # type: ignore[attr-defined]
-
-    monkeypatch.setitem(sys.modules, "unsloth", fake_unsloth)
-    monkeypatch.setitem(sys.modules, "unsloth_zoo", fake_unsloth_zoo)
-    monkeypatch.setitem(sys.modules, "unsloth_zoo.dataset_utils", fake_dataset_utils)
-
-    trajectory = Trajectory(
-        messages_and_choices=[
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "World"},
-        ]
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "OK"},
+        ],
     )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
 
-    batch = tokenize_sft_batch(
-        trajectory_batch=[trajectory],
-        learning_rate=1e-5,
+    result = tokenize_trajectory(
         tokenizer=tokenizer,  # type: ignore[arg-type]
-        instruction_part="<user>",
-        response_part="<assistant>",
+        image_processor=None,
+        history=history,
+        advantage=1.0,
+        allow_training_without_logprobs=True,
+        trajectory=trajectory,
+        chat_template_kwargs={
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
     )
 
-    expected_ids = tokenizer.encode(
-        tokenizer.apply_chat_template(
-            trajectory.messages_and_choices,
-            tokenize=False,
-            add_generation_prompt=False,
-        ),
-        add_special_tokens=False,
+    assert result is not None
+    assert tokenizer.apply_chat_template_kwargs
+    assert all(
+        call.get("enable_thinking") is False and call.get("preserve_thinking") is True
+        for call in tokenizer.apply_chat_template_kwargs
     )
 
-    assert batch.trajectory_tensors[0]["input_ids"].tolist() == [expected_ids]
-    assert batch.trajectory_tensors[0]["attention_mask"].tolist() == [
-        [1] * len(expected_ids)
+
+def test_tokenize_trajectory_does_not_continue_real_completion_with_thinking() -> None:
+    tokenizer = _ContinueFinalMessageRejectingTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:79",
+                        "bytes": [79],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    },
+                    {
+                        "token": "token_id:75",
+                        "bytes": [75],
+                        "logprob": -0.2,
+                        "top_logprobs": [],
+                    },
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "<think>\nreasoning\n</think>\n\nOK",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": None,
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            choice,
+        ],
+    )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
+
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=history,
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=trajectory,
+        chat_template_kwargs={
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
+    )
+
+    assert result is not None
+    assistant_ids = [
+        token_id
+        for token_id, mask in zip(result.token_ids, result.assistant_mask)
+        if mask
     ]
-    assert batch.num_dropped_trajectories == 0
-    assert batch.num_tokens == len(expected_ids)
-    assert batch.num_trainable_tokens == len(expected_ids)
-
-    dropped_batch = tokenize_sft_batch(
-        trajectory_batch=[trajectory],
-        learning_rate=1e-5,
-        tokenizer=tokenizer,  # type: ignore[arg-type]
-        instruction_part="<user>",
-        response_part="<assistant>",
-        max_seq_length=len(expected_ids) - 1,
-    )
-    assert dropped_batch.trajectory_tensors == []
-    assert dropped_batch.num_trajectories == 0
-    assert dropped_batch.num_tokens == 0
-    assert dropped_batch.num_trainable_tokens == 0
-    assert dropped_batch.num_dropped_trajectories == 1
+    assert assistant_ids == [79, 75]
+    continue_values = [
+        call.get("continue_final_message")
+        for call in tokenizer.apply_chat_template_kwargs
+    ]
+    assert continue_values[:2] == [False, False]
+    assert continue_values[-1] is True
 
 
 def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template() -> (
@@ -257,3 +330,122 @@ def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template
     )
 
     assert result is not None
+
+
+def test_tokenize_trajectory_uses_exact_tokens_for_malformed_final_tool_call() -> None:
+    tokenizer = _Qwen3_5FakeTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "tool_calls",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:65",
+                        "bytes": [65],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    }
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "prefix",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "arguments": '{"offer_id": None}',
+                            "name": "create_booking",
+                        },
+                        "type": "function",
+                    }
+                ],
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Book it."},
+            choice,
+        ],
+    )
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(messages_and_choices=messages),
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=Trajectory(messages_and_choices=messages, reward=1.0),
+    )
+
+    assert result is not None
+    assistant_ids = [
+        token_id
+        for token_id, mask in zip(result.token_ids, result.assistant_mask)
+        if mask
+    ]
+    assert assistant_ids == [65]
+
+
+def test_tokenize_trajectory_non_final_tool_call_mutation_changes_prefill_tokens() -> (
+    None
+):
+    tokenizer = _Qwen3_5FakeTokenizer()
+    inputs = build_chat_template_conformance_inputs(tokenizer)  # type: ignore[arg-type]
+
+    base = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(
+            messages_and_choices=inputs.non_final_tool_call_base.messages_and_choices,
+            tools=inputs.non_final_tool_call_base.tools,
+        ),
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=inputs.non_final_tool_call_base,
+    )
+    mutated = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(
+            messages_and_choices=inputs.non_final_tool_call_mutated.messages_and_choices,
+            tools=inputs.non_final_tool_call_mutated.tools,
+        ),
+        advantage=1.0,
+        allow_training_without_logprobs=False,
+        trajectory=inputs.non_final_tool_call_mutated,
+    )
+
+    assert base is not None
+    assert mutated is not None
+    assert len(base.choice_offsets) >= 2
+    assert len(mutated.choice_offsets) >= 2
+    assert (
+        base.token_ids[: base.choice_offsets[-1]]
+        != mutated.token_ids[: mutated.choice_offsets[-1]]
+    )
+
+
+def test_tokenize_trajectory_rejects_assistant_tool_calls_without_logprobs() -> None:
+    tokenizer = _Qwen3_5FakeTokenizer()
+    inputs = build_chat_template_conformance_inputs(tokenizer)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Assistant message has tool_calls"):
+        tokenize_trajectory(
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            image_processor=None,
+            history=History(
+                messages_and_choices=inputs.unsupported_assistant_tool_calls.messages_and_choices,
+                tools=inputs.unsupported_assistant_tool_calls.tools,
+            ),
+            advantage=1.0,
+            allow_training_without_logprobs=True,
+            trajectory=inputs.unsupported_assistant_tool_calls,
+        )

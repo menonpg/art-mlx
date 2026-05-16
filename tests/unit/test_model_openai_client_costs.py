@@ -5,6 +5,7 @@ import pytest
 
 from art import TrainableModel
 from art.costs import build_cost_calculator, get_model_pricing
+from art.model import _OpenAIChatCompletionsProxy
 
 
 class _FakeUsage:
@@ -152,3 +153,59 @@ class TestModelOpenAIClientCosts:
 
         assert metrics["costs/train/tinker_prefill"] == pytest.approx(0.00012)
         assert metrics["costs/train/tinker_sample"] == pytest.approx(0.0006)
+
+    @pytest.mark.asyncio
+    async def test_openai_chat_proxy_adds_default_extra_body(self) -> None:
+        class _Recorder:
+            def __init__(self) -> None:
+                self.kwargs: dict[str, Any] = {}
+
+            async def create(self, *args: Any, **kwargs: Any) -> _FakeResponse:
+                del args
+                self.kwargs = kwargs
+                return _FakeResponse(0, 0)
+
+        recorder = _Recorder()
+        proxy = _OpenAIChatCompletionsProxy(
+            recorder,
+            lambda _response: None,
+            {
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                    "preserve_thinking": True,
+                }
+            },
+        )
+
+        await proxy.create(
+            model="test-model",
+            messages=[],
+            extra_body={"chat_template_kwargs": {"preserve_thinking": False}},
+        )
+
+        assert recorder.kwargs["extra_body"] == {
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+                "preserve_thinking": False,
+            }
+        }
+
+    def test_trainable_model_uses_configured_chat_template_kwargs(self) -> None:
+        model = TrainableModel(
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+            _internal_config={
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                    "preserve_thinking": True,
+                }
+            },
+        )
+
+        assert model._default_chat_completion_extra_body() == {
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+                "preserve_thinking": True,
+            }
+        }

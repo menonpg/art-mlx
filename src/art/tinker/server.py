@@ -34,7 +34,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
 
 from art.tinker.prefix_cache import LRUTrieCache
-from art.tinker.renderers import get_renderer_name
+from art.tinker.renderers import get_renderer_name, is_qwen3_dot_family_model
 from art.types import Message, Tools
 from mp_actors import close_proxy, move_to_child_process
 
@@ -72,11 +72,11 @@ def _normalize_message_or_choice(
     return cast(Message, _MESSAGE_ADAPTER.validate_python(message_or_choice))
 
 
-def _normalize_qwen3_5_messages(
+def _normalize_qwen3_dot_messages(
     base_model: str, messages: list[ChatCompletionMessageParam]
 ) -> list[dict[str, Any]]:
     normalized_messages = [cast(dict[str, Any], message) for message in messages]
-    if not base_model.startswith("Qwen/Qwen3."):
+    if not is_qwen3_dot_family_model(base_model):
         return normalized_messages
     for i, message in enumerate(normalized_messages):
         tool_calls = message.get("tool_calls")
@@ -114,7 +114,7 @@ def _normalize_qwen3_5_messages(
 
 
 def _chat_template_disables_thinking(base_model: str) -> bool:
-    return base_model.startswith("Qwen/Qwen3.")
+    return is_qwen3_dot_family_model(base_model)
 
 
 @dataclass
@@ -145,36 +145,47 @@ class OpenAICompatibleTinkerServer:
     async def start(self) -> tuple[str, int]:
         host = self.host or "0.0.0.0"
         port = self.port or get_free_port(host)
-        self._workers = [
-            move_to_child_process(
-                OpenAICompatibleTinkerServerWorker(),
-                process_name=f"openai-compatible-tinker-server-worker-{i}",
-            )
-            for i in range(self.num_workers or self._default_num_workers())
-        ]
-        self._task = asyncio.create_task(self._run(host, port))
-        client = AsyncOpenAI(api_key="default", base_url=f"http://{host}:{port}/v1")
-        start = time.time()
-        while True:
-            timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
-            if time.time() - start > timeout:
-                raise TimeoutError(
-                    f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+        try:
+            self._workers = []
+            for i in range(self.num_workers or self._default_num_workers()):
+                self._workers.append(
+                    move_to_child_process(
+                        OpenAICompatibleTinkerServerWorker(),
+                        process_name=f"openai-compatible-tinker-server-worker-{i}",
+                    )
                 )
-            try:
-                await client.completions.create(model="", prompt="")
-                break  # Server is ready
-            except Exception:
-                await asyncio.sleep(0.1)
-        return host, port
+            self._task = asyncio.create_task(self._run(host, port))
+            client = AsyncOpenAI(api_key="default", base_url=f"http://{host}:{port}/v1")
+            start = time.time()
+            while True:
+                timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
+                if time.time() - start > timeout:
+                    raise TimeoutError(
+                        f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+                    )
+                try:
+                    await client.completions.create(model="", prompt="")
+                    break  # Server is ready
+                except Exception:
+                    await asyncio.sleep(0.1)
+            return host, port
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await self._task
-            self._task = None
-        for worker in self._workers:
-            close_proxy(worker)
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                try:
+                    await self._task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._task = None
+        finally:
+            for worker in self._workers:
+                close_proxy(worker)
+            self._workers.clear()
 
     def _get_request_tenant(
         self, request: Request
@@ -543,7 +554,7 @@ class OpenAICompatibleTinkerServerWorker:
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolUnionParam] | None,
     ) -> list[int]:
-        normalized_messages = _normalize_qwen3_5_messages(base_model, messages)
+        normalized_messages = _normalize_qwen3_dot_messages(base_model, messages)
         tokenizer = self._get_renderer(base_model).tokenizer
         if _chat_template_disables_thinking(base_model):
             encoding = tokenizer.apply_chat_template(

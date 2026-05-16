@@ -72,6 +72,7 @@ class EngineArgs(TypedDict, total=False):
     max_prompt_adapters: int
     max_prompt_adapter_token: int
     fully_sharded_loras: bool
+    lora_target_modules: list[str]
     lora_extra_vocab_size: int
     long_lora_scaling_factors: Tuple[float] | None
     lora_dtype: str | None
@@ -123,6 +124,7 @@ class EngineArgs(TypedDict, total=False):
     generation_config: str | None
     override_generation_config: dict[str, Any] | None
     enable_sleep_mode: bool
+    enable_expert_parallel: bool
     model_impl: str
 
     calculate_kv_scales: bool | None

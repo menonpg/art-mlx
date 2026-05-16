@@ -1,31 +1,11 @@
+from ..megatron.model_support import default_target_modules_for_model
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
-from .validate import QWEN3_5_MOE_MODELS, is_dedicated_mode
+from .validate import is_dedicated_mode
 
 
 def default_target_modules(base_model: str) -> list[str]:
-    if base_model in QWEN3_5_MOE_MODELS:
-        return [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "in_proj_qkv",
-            "in_proj_z",
-            "out_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
-    return [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
+    return default_target_modules_for_model(base_model, allow_unvalidated_arch=True)
 
 
 def get_model_config(
@@ -51,10 +31,7 @@ def get_model_config(
         max_seq_length=32768,
         model_name=base_model,
     )
-    # fast_inference triggers in-process vLLM via Unsloth; dedicated mode runs vLLM as a subprocess
-    if not dedicated:
-        init_args["fast_inference"] = False
-
+    target_modules = default_target_modules(base_model)
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,
@@ -69,10 +46,14 @@ def get_model_config(
         lora_alpha=16,
         r=8,
         random_state=3407,
-        target_modules=default_target_modules(base_model),
+        target_modules=target_modules,
         use_gradient_checkpointing="unsloth",
     )
     peft_args.update(config.get("peft_args", {}))
+    if rollout_weights_mode == "lora" and "lora_target_modules" not in config.get(
+        "engine_args", {}
+    ):
+        engine_args["lora_target_modules"] = peft_args["target_modules"]
     trainer_args = TrainerArgs(
         adam_beta1=0.9,
         adam_beta2=0.99,
@@ -100,6 +81,8 @@ def get_model_config(
         tinker_args=config.get("tinker_args"),
         trainer_args=trainer_args,
     )
+    if "allow_unvalidated_arch" in config:
+        result["allow_unvalidated_arch"] = config["allow_unvalidated_arch"]
     if "trainer_gpu_ids" in config:
         result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
     if "inference_gpu_ids" in config:

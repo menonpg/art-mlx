@@ -38,12 +38,41 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
 
 
+def _merge_extra_body_defaults(
+    defaults: dict[str, Any],
+    provided: Any,
+) -> Any:
+    if provided is None:
+        return {**defaults}
+    if not isinstance(provided, dict):
+        return provided
+
+    merged = {**defaults}
+    for key, value in provided.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
 class _OpenAIChatCompletionsProxy:
-    def __init__(self, completions: Any, record_costs: Any) -> None:
+    def __init__(
+        self,
+        completions: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+    ) -> None:
         self._completions = completions
         self._record_costs = record_costs
+        self._default_extra_body = default_extra_body
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
+        if self._default_extra_body is not None:
+            kwargs["extra_body"] = _merge_extra_body_defaults(
+                self._default_extra_body,
+                kwargs.get("extra_body"),
+            )
         response = await self._completions.create(*args, **kwargs)
         self._record_costs(response)
         return response
@@ -53,24 +82,40 @@ class _OpenAIChatCompletionsProxy:
 
 
 class _OpenAIChatProxy:
-    def __init__(self, chat: Any, record_costs: Any) -> None:
+    def __init__(
+        self,
+        chat: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+    ) -> None:
         self._chat = chat
-        self.completions = _OpenAIChatCompletionsProxy(chat.completions, record_costs)
+        self.completions = _OpenAIChatCompletionsProxy(
+            chat.completions,
+            record_costs,
+            default_extra_body,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._chat, name)
 
 
 class _OpenAIClientProxy:
-    def __init__(self, client: Any, record_costs: Any) -> None:
+    def __init__(
+        self,
+        client: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+    ) -> None:
         self._client = client
         self._record_costs = record_costs
-        self.chat = _OpenAIChatProxy(client.chat, record_costs)
+        self._default_extra_body = default_extra_body
+        self.chat = _OpenAIChatProxy(client.chat, record_costs, default_extra_body)
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
         return _OpenAIClientProxy(
             self._client.with_options(*args, **kwargs),
             self._record_costs,
+            self._default_extra_body,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -307,9 +352,22 @@ class Model(
         # manually.
         self._openai_client = cast(
             AsyncOpenAI,
-            _OpenAIClientProxy(raw_client, self._record_openai_completion_costs),
+            _OpenAIClientProxy(
+                raw_client,
+                self._record_openai_completion_costs,
+                self._default_chat_completion_extra_body(),
+            ),
         )
         return self._openai_client
+
+    def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
+        internal_config = getattr(self, "_internal_config", None)
+        if internal_config is None:
+            return None
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        if chat_template_kwargs is None:
+            return None
+        return {"chat_template_kwargs": dict(chat_template_kwargs)}
 
     def litellm_completion_params(self, step: int | None = None) -> dict:
         """Return the parameters that should be sent to litellm.completion.

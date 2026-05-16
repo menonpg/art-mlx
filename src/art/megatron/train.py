@@ -1,5 +1,5 @@
 # isort: off
-from art.megatron.runtime_env import configure_megatron_runtime_env
+from art.megatron.runtime.runtime_env import configure_megatron_runtime_env
 
 configure_megatron_runtime_env()
 # isort: on
@@ -12,69 +12,68 @@ Public cross-repo API consumed by serverless-training:
 - merge_lora_adapter
 """
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 import gc
 import importlib
 import json
 import math
 import os
 import random
-import re
 import shutil
 import time
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
-from torch.distributed import all_reduce
 
 from art import dev, types
-from art.dev.validate import QWEN3_5_MOE_MODELS
 from art.loss import loss_fn, shift_tensor
-from art.megatron.bridge_adapter_compat import build_adapter_weights_by_base
+from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
+
+install_art_bridge_runtime_patches()
+
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
-from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
-from art.megatron.jobs import (
+from art.megatron.lora import apply_lora_adapters
+from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
+from art.megatron.provider_common import ProviderBundle
+from art.megatron.routing_replay import (
+    MoeRoutingReplayBundle,
+    MoeRoutingReplayController,
+)
+from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronJob,
-    MegatronMergedTrainJob,
+    MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
     MegatronSyncJob,
     MegatronTrainingJob,
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
+    load_megatron_job,
 )
-from art.megatron.lora import (
-    apply_lora_adapters,
-)
-from art.megatron.merge import load_lora_adapter_state_dict, merge_lora_adapter
-from art.megatron.model_chunks import (
+from art.megatron.training.finalize_grads import finalize_model_grads_extended
+from art.megatron.training.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
-    unwrap_megatron_chunk,
     validate_model_chunks,
 )
-from art.megatron.offload import (
+from art.megatron.training.offload import (
     OffloadState,
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import _env_flag, get_provider_bundle
-from art.megatron.routing_replay import (
-    MoeRoutingReplayBundle,
-    MoeRoutingReplayController,
+from art.megatron.training.sft_batches import load_sft_batch_from_disk
+from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.weights.merged_weight_export import (
+    sync_merged_weights_to_vllm,
 )
-from art.megatron.sft_batches import load_sft_batch_from_disk
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.pack import (
     PackedTensors,
@@ -104,8 +103,8 @@ __all__ = [
 class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    provider_bundle: ProviderBundle
     provider: Any
-    bridge: Any
     model: ModelChunks
     optimizer: Any | None
     optimizer_config: OptimizerConfig
@@ -121,6 +120,18 @@ class TrainingRuntime(BaseModel):
         validate_model_chunks(value)
         return value
 
+    @property
+    def bridge(self) -> Any:
+        return self.provider_bundle.bridge
+
+    @property
+    def model_support_handler(self) -> Any:
+        return self.provider_bundle.handler
+
+    @property
+    def model_support_spec(self) -> Any:
+        return self.provider_bundle.spec
+
 
 class TrainStepResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -133,15 +144,6 @@ class TrainStepResult(BaseModel):
     num_zeros_in_grad: int | None
 
 
-@dataclass
-class MergedWeightExport:
-    bridge: Any
-    model: list[MegatronModule]
-    model_config: Any
-    conversion_tasks: list[Any]
-    adapter_weights_by_base: dict[str, list[Any]]
-
-
 def print0(rank: int, *values: Any) -> None:
     if rank == 0:
         print(*values)
@@ -152,6 +154,25 @@ def freeze_model(model_chunks: list[MegatronModule]) -> list[MegatronModule]:
         for param in module.parameters():
             param.requires_grad = False
     return model_chunks
+
+
+def _register_trainable_parameter_mode(
+    provider: Any,
+    *,
+    trainable_parameter_mode: Literal["lora", "base_model"],
+) -> None:
+    if trainable_parameter_mode == "lora":
+        provider.register_pre_wrap_hook(freeze_model)
+        provider.register_pre_wrap_hook(
+            lambda chunks: apply_lora_adapters(chunks, provider)
+        )
+        return
+    if trainable_parameter_mode == "base_model":
+        return
+    raise ValueError(
+        "trainable_parameter_mode must be 'lora' or 'base_model', got "
+        f"{trainable_parameter_mode!r}"
+    )
 
 
 def _frozen_linear_grad_input(
@@ -178,7 +199,10 @@ def _install_fast_frozen_output_backward() -> None:
         (weight,) = ctx.saved_tensors
         grad_input = _frozen_linear_grad_input(grad_output, weight)
         if ctx.allreduce_dgrad:
-            all_reduce(grad_input, group=ctx.tp_group)
+            torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+                grad_input,
+                group=ctx.tp_group,
+            )
         return grad_input, None, None, None, None
 
     setattr(_fast_backward, "__art_fast_output_backward__", True)
@@ -197,44 +221,12 @@ def _eager_initialize_optimizer_state(optimizer: Any) -> None:
         init_state_fn(inner_optimizer, getattr(optimizer, "config", None))
 
 
-def _compile_enabled(model_identifier: str) -> bool:
-    disabled = _env_flag("ART_DISABLE_MEGATRON_COMPILE")
-    if disabled is not None:
-        return disabled is not True
-    return model_identifier not in QWEN3_5_MOE_MODELS
-
-
-def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
-    for chunk in model_chunks:
-        module: Any = unwrap_megatron_chunk(chunk)
-        while not isinstance(module, GPTModel) and hasattr(module, "module"):
-            module = module.module
-        if not isinstance(module, GPTModel):
-            module = getattr(module, "language_model", None)
-        if not isinstance(module, GPTModel):
-            continue
-        preprocess = module._preprocess
-
-        def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
-            preproc_output = list(_preprocess(*args, **kwargs))
-            preproc_output[0].requires_grad = True  # type: ignore[index]
-            table = preproc_output[1]  # [S, B, 1, D]  # type: ignore[index]
-            embedding_dim = table.size(-1)
-            table_flat = table.view(table.size(0), embedding_dim)
-            position_ids = kwargs["position_ids"]  # [B, S]
-            if position_ids.ndim != 2:
-                return tuple(preproc_output)
-            batch_size, sequence_length = position_ids.shape
-            gathered = table_flat.index_select(0, position_ids.reshape(-1))
-            gathered = (
-                gathered.view(batch_size, sequence_length, embedding_dim)
-                .permute(1, 0, 2)
-                .contiguous()
-            )
-            preproc_output[1] = gathered.unsqueeze(2)  # [S, B, 1, D]
-            return tuple(preproc_output)
-
-        module._preprocess = preprocess_hook  # type: ignore[attr-defined]
+def _compile_enabled() -> bool:
+    return os.environ.get("ART_DISABLE_MEGATRON_COMPILE", "0") in {
+        "0",
+        "false",
+        "False",
+    }
 
 
 def _default_optimizer_config() -> OptimizerConfig:
@@ -322,6 +314,7 @@ def build_training_runtime(
     *,
     model_identifier: str | None = None,
     provider_torch_dtype: torch.dtype = torch.bfloat16,
+    provider_bundle_configure: Callable[[ProviderBundle], None] | None = None,
     provider_configure: Callable[[Any], None] | None = None,
     optimizer_config: OptimizerConfig | None = None,
     moe_routing_replay_path: str | None = None,
@@ -329,10 +322,9 @@ def build_training_runtime(
     moe_routing_replay_strict: bool = True,
     print_env: bool = True,
     build_optimizer: bool = True,
+    trainable_parameter_mode: Literal["lora", "base_model"] = "lora",
+    allow_unvalidated_arch: bool = False,
 ) -> TrainingRuntime:
-    resolved_model_identifier = model_identifier or os.environ.get(
-        "MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER
-    )
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
         random.seed(seed)
@@ -340,16 +332,21 @@ def build_training_runtime(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     _install_fast_frozen_output_backward()
-    provider_bundle = get_provider_bundle(
-        resolved_model_identifier,
+    provider_bundle = prepare_provider_bundle(
+        model_identifier
+        or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    if provider_bundle_configure is not None:
+        provider_bundle_configure(provider_bundle)
     provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
-    provider.register_pre_wrap_hook(freeze_model)
-    provider.register_pre_wrap_hook(
-        lambda chunks: apply_lora_adapters(chunks, provider)
+    finalize_provider_bundle(provider_bundle)
+    _register_trainable_parameter_mode(
+        provider,
+        trainable_parameter_mode=trainable_parameter_mode,
     )
 
     model = cast(
@@ -361,6 +358,7 @@ def build_training_runtime(
                 average_in_collective=False,
             ),
             data_parallel_random_init=False,
+            init_model_with_meta_device=True,
         ),
     )
 
@@ -376,37 +374,21 @@ def build_training_runtime(
         print("Resolved inductor cache_dir():", inductor_cache_dir())
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
-    _install_gpt_preprocess_hook(model)
-    if _compile_enabled(resolved_model_identifier):
-        if rank == 0:
-            print("Enabling torch.compile for", resolved_model_identifier)
-        install_torch_compile_workarounds()
+    provider_bundle.handler.install_preprocess_patch(model)
+    compile_workaround_config = provider_bundle.handler.compile_workaround_config(
+        provider
+    )
+    if _compile_enabled() and not compile_workaround_config.disable_compile:
+        install_torch_compile_workarounds(compile_workaround_config)
         for chunk in model:
             _compile_transformer_layers(chunk)
-    elif (
-        rank == 0
-        and _env_flag("ART_DISABLE_MEGATRON_COMPILE") is None
-        and resolved_model_identifier in QWEN3_5_MOE_MODELS
-    ):
-        print(
-            "Disabling torch.compile for",
-            resolved_model_identifier,
-            "because Qwen3.5 MoE currently fails in PyTorch compiled backward stream ops.",
-        )
 
     optimizer_config = optimizer_config or _default_optimizer_config()
-    optimizer = (
-        _build_optimizer(
-            model,
-            optimizer_config,
-        )
-        if build_optimizer
-        else None
-    )
+    optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
 
     runtime = TrainingRuntime(
+        provider_bundle=provider_bundle,
         provider=provider,
-        bridge=provider_bundle.bridge,
         model=model,
         optimizer=optimizer,
         optimizer_config=optimizer_config,
@@ -467,7 +449,7 @@ def run_megatron_worker_loop(
 
 def run_megatron_rl_job(
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainJob,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob,
 ) -> None:
     packed_tensors = None
     adapter_model = None
@@ -512,6 +494,7 @@ def run_megatron_rl_job(
             )
             step_result = run_training_step(
                 model_chunks=runtime.model,
+                model_support_handler=runtime.model_support_handler,
                 optimizer=runtime.optimizer,
                 learning_rate=job.config.learning_rate,
                 inputs=micro_inputs,
@@ -547,12 +530,6 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
-        if isinstance(job, MegatronMergedTrainJob):
-            _sync_merged_weights_to_vllm(
-                runtime,
-                job.merged_weight_transfer,
-                pause_generation=True,
-            )
     finally:
         if packed_tensors is not None:
             del packed_tensors
@@ -564,29 +541,6 @@ def run_megatron_rl_job(
             del zero_template
         if "micro_inputs" in locals():
             del micro_inputs
-        gc.collect()
-        torch.cuda.empty_cache()
-
-
-def run_megatron_sync_job(
-    runtime: TrainingRuntime,
-    job: MegatronSyncJob,
-) -> None:
-    adapter_model = None
-    try:
-        adapter_model = maybe_load_adapter_into_model(
-            runtime.model,
-            f"{job.lora_path}/adapter_model.safetensors",
-            rank=runtime.rank,
-        )
-        _sync_merged_weights_to_vllm(
-            runtime,
-            job.merged_weight_transfer,
-            pause_generation=False,
-        )
-    finally:
-        if adapter_model is not None:
-            del adapter_model
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -672,6 +626,7 @@ def run_megatron_sft_job(
                 )
                 step_result = run_megatron_sft_step(
                     model_chunks=runtime.model,
+                    model_support_handler=runtime.model_support_handler,
                     optimizer=runtime.optimizer,
                     learning_rate=job.learning_rates[batch_idx],
                     inputs=micro_inputs,
@@ -710,9 +665,9 @@ def run_megatron_sft_job(
                             "learning_rate": job.learning_rates[batch_idx],
                             "grad_norm": grad_norm,
                             "num_trajectories": float(num_trajectories),
+                            "num_dropped_trajectories": float(num_dropped_trajectories),
                             "num_tokens": float(global_tokens),
                             "num_trainable_tokens": float(global_trainable_tokens),
-                            "num_dropped_trajectories": float(num_dropped_trajectories),
                             "tokens_per_second": tokens_per_second,
                         }
                     )
@@ -734,34 +689,44 @@ def run_megatron_sft_job(
 
 def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
     with open(job_path, "rb") as handle:
-        job_data = json.loads(handle.read())
-    job_type = job_data.get("job_type")
-    if job_type == "sft":
-        if not supports_sft:
-            raise NotImplementedError("SFT jobs are not supported in this worker loop")
-        return MegatronSFTTrainingJob.model_validate(job_data)
-    if job_type == "merged":
-        return MegatronMergedTrainJob.model_validate(job_data)
-    if job_type == "sync":
-        return MegatronSyncJob.model_validate(job_data)
-    return MegatronTrainingJob.model_validate(job_data)
+        job = load_megatron_job(handle.read())
+    if isinstance(job, MegatronSFTTrainingJob) and not supports_sft:
+        raise NotImplementedError("SFT jobs are not supported in this worker loop")
+    return job
 
 
 def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
+    if isinstance(job, MegatronSyncJob):
+        adapter_model = _load_adapter_into_model(
+            runtime.model,
+            job.lora_path,
+            runtime.rank,
+            handler=runtime.model_support_handler,
+        )
+        del adapter_model
+        _sync_merged_weights_to_vllm(
+            runtime,
+            job.merged_weight_transfer,
+            pause_generation=False,
+        )
+        return
     if isinstance(job, MegatronSFTTrainingJob):
         run_megatron_sft_job(runtime, job)
         return
-    if isinstance(job, MegatronSyncJob):
-        run_megatron_sync_job(runtime, job)
-        return
     run_megatron_rl_job(runtime, job)
+    if isinstance(job, MegatronMergedTrainingJob):
+        _sync_merged_weights_to_vllm(
+            runtime,
+            job.merged_weight_transfer,
+            pause_generation=True,
+        )
 
 
 def _job_cleanup_path(job: MegatronJob) -> str | None:
-    if isinstance(job, MegatronSFTTrainingJob):
-        return job.sft_data_dir
     if isinstance(job, MegatronSyncJob):
         return None
+    if isinstance(job, MegatronSFTTrainingJob):
+        return job.sft_data_dir
     return job.disk_packed_tensors["dir"]
 
 
@@ -771,9 +736,12 @@ def _load_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
-    print0(runtime.rank, "Loading adapter model from", lora_path)
-    adapter_model = load_lora_adapter_state_dict(lora_path)
-    load_adapter_into_model(runtime.model, adapter_model)
+    adapter_model = _load_adapter_into_model(
+        runtime.model,
+        lora_path,
+        runtime.rank,
+        handler=runtime.model_support_handler,
+    )
     runtime.optimizer = _build_optimizer(
         runtime.model,
         runtime.optimizer_config,
@@ -795,6 +763,20 @@ def _load_lora_and_optimizer(
             "- resetting optimizer for new run",
         )
         _eager_initialize_optimizer_state(runtime.optimizer)
+    return adapter_model
+
+
+def _load_adapter_into_model(
+    model_chunks: ModelChunks,
+    lora_path: str,
+    rank: int,
+    *,
+    handler: Any | None = None,
+    optimizer: Any | None = None,
+) -> dict[str, torch.Tensor]:
+    print0(rank, "Loading adapter model from", lora_path)
+    adapter_model = load_lora_adapter_state_dict(lora_path, handler=handler)
+    load_adapter_into_model(model_chunks, adapter_model, optimizer)
     return adapter_model
 
 
@@ -892,18 +874,6 @@ def iter_modules(model_chunks: ModelChunks) -> Any:
             yield module
 
 
-def iter_named_modules(model_chunks: list[MegatronModule]) -> Any:
-    for chunk in model_chunks:
-        for module_name, module in chunk.named_modules():
-            yield module_name, module
-
-
-def _is_language_transformer_layer_name(module_name: str) -> bool:
-    while module_name.startswith("module."):
-        module_name = module_name.removeprefix("module.")
-    return module_name.startswith(("decoder.layers.", "language_model.decoder.layers."))
-
-
 def load_adapter_into_model(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
@@ -917,25 +887,6 @@ def load_adapter_into_model(
     if optimizer is None:
         return
     optimizer.reload_model_params()
-
-
-def maybe_load_adapter_into_model(
-    model_chunks: ModelChunks,
-    adapter_model_path: str,
-    optimizer: Any | None = None,
-    *,
-    rank: int,
-) -> dict[str, torch.Tensor]:
-    if not os.path.exists(adapter_model_path):
-        print0(rank, "No adapter model found at", adapter_model_path)
-        return {}
-    print0(rank, "Loading adapter model from", adapter_model_path)
-    with safe_open(adapter_model_path, framework="pt") as adapter_file:
-        adapter_model = {
-            key: adapter_file.get_tensor(key) for key in adapter_file.keys()
-        }
-    load_adapter_into_model(model_chunks, adapter_model, optimizer)
-    return adapter_model
 
 
 def collect_sharded_lora_state(
@@ -1101,18 +1052,6 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
             inputs[key] = value.to(device)  # type: ignore[index]
 
 
-def _attention_block_kwargs(
-    model_chunk: torch.nn.Module,
-    attention_state: Any,
-) -> dict[str, Any]:
-    model = model_chunk
-    while hasattr(model, "module"):
-        model = model.module  # type: ignore[assignment]
-    if type(model).__name__ == "Qwen3VLModel":
-        return {"extra_block_kwargs": {"attention_bias": attention_state}}
-    return {"attention_bias": attention_state}
-
-
 def _optimizer_step(
     optimizer: Any,
     learning_rate: float,
@@ -1191,6 +1130,7 @@ def _prepare_sft_micro_inputs(
 def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
+    model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
@@ -1214,8 +1154,6 @@ def run_megatron_sft_step(
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
 
-    device = next(model_chunks[0].parameters()).device
-
     if moe_routing_replay_controller is not None:
         resolved_global_grad_accumulation_sequences = (
             resolve_global_grad_accumulation_sequences(
@@ -1228,13 +1166,20 @@ def run_megatron_sft_step(
             global_grad_accumulation_sequences=resolved_global_grad_accumulation_sequences,
         )
 
+    device = next(model_chunks[0].parameters()).device
+
     for chunk in model_chunks:
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
 
     raw_loss_sum: torch.Tensor | None = None
     num_tokens = _local_trainable_sft_token_count_tensor(micro_inputs, device=device)
 
-    for micro in micro_inputs:
+    for micro_order, micro in enumerate(micro_inputs):
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(
+                micro_sample_indices[micro_order],
+                micro_order,
+            )
         input_ids, position_ids, shifted_labels, mask, seq_len = (
             _prepare_sft_micro_inputs(micro, device)
         )
@@ -1243,9 +1188,10 @@ def run_megatron_sft_step(
             position_ids=position_ids,
             attention_mask=_placeholder_attention_mask(device),
             labels=shifted_labels,
-            extra_block_kwargs={
-                "attention_bias": _causal_attention_state(seq_len, device),
-            },
+            **model_support_handler.get_forward_kwargs(
+                model_chunks[0],
+                attention_bias=_causal_attention_state(seq_len, device),
+            ),
         )
         masked_loss = per_token_loss[mask].sum()
         masked_loss.backward()
@@ -1289,6 +1235,7 @@ def run_megatron_sft_step(
 def run_training_step(
     *,
     model_chunks: ModelChunks,
+    model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],
@@ -1337,25 +1284,36 @@ def run_training_step(
     probs_corr_sum = 0.0
     new_logprobs_list: list[torch.Tensor] = []
 
-    for micro in micro_inputs:
+    for micro_order, micro in enumerate(micro_inputs):
+        if moe_routing_replay_controller is not None:
+            moe_routing_replay_controller.begin_micro(
+                micro_sample_indices[micro_order],
+                micro_order,
+            )
         _move_inputs_to_device(micro, device)
         attention_state = create_shared_prefix_attention_state(
             group_ids=micro["group_ids"],
             parent_ids=micro["parent_ids"],
         )
         attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
+        shifted_labels = shift_tensor(micro["tokens"], -100)
+        shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
+        shifted_labels = torch.where(
+            shifted_assistant_mask,
+            shifted_labels,
+            torch.full_like(shifted_labels, -100),
+        )
 
-        model_output = model_chunks[0](
+        new_logprobs = -model_chunks[0](
             input_ids=micro["tokens"],
             position_ids=micro["input_pos"],
             attention_mask=attention_mask,
-            labels=shift_tensor(micro["tokens"], 0),
-            extra_block_kwargs=_attention_block_kwargs(
+            labels=shifted_labels,
+            **model_support_handler.get_forward_kwargs(
                 model_chunks[0],
-                attention_state,
+                attention_bias=attention_state,
             ),
         )
-        new_logprobs = -model_output
 
         loss_info = loss_fn(
             micro,  # ty: ignore[invalid-argument-type]
@@ -1366,6 +1324,15 @@ def run_training_step(
             reduction="sum",
         )
         micro_loss = loss_info.policy_loss
+        if not micro_loss.requires_grad:
+            raise RuntimeError(
+                "RL micro_loss is detached before backward: "
+                f"new_logprobs.requires_grad={new_logprobs.requires_grad}, "
+                f"policy_loss_sum_requires_grad={loss_info.policy_loss_sum.requires_grad}, "
+                f"assistant_tokens={int(shift_tensor(micro['assistant_mask'], False).sum().item())}, "
+                f"nonzero_weights={int(torch.count_nonzero(shift_tensor(micro['weights'], 0.0)).item())}, "
+                f"nonzero_advantages={int(torch.count_nonzero(shift_tensor(micro['advantages'], 0.0)).item())}"
+            )
         micro_loss.backward()
         probs_corr_sum += float(loss_info.probs_corr.item())
         detached_micro_loss = micro_loss.detach()
@@ -1414,289 +1381,26 @@ def run_training_step(
     )
 
 
-def _is_art_adapter_param_name(name: str) -> bool:
-    return any(
-        segment in name
-        for segment in (
-            ".lora.",
-            ".q_proj_lora.",
-            ".k_proj_lora.",
-            ".v_proj_lora.",
-            ".qkv_lora.",
-            ".z_lora.",
-            ".gate_lora.",
-            ".up_lora.",
-        )
-    )
-
-
-def _canonical_art_param_name(name: str) -> str:
-    while name.startswith("module."):
-        name = name[len("module.") :]
-    while name.startswith("_orig_mod."):
-        name = name[len("_orig_mod.") :]
-    while "._orig_mod." in name:
-        name = name.replace("._orig_mod.", ".")
-    if name.endswith("._orig_mod"):
-        name = name[: -len("._orig_mod")]
-    segments = name.split(".")
-    canonical: list[str] = []
-    i = 0
-    while i < len(segments):
-        if i + 1 < len(segments):
-            current = segments[i]
-            nxt = segments[i + 1]
-            if (
-                current
-                in {
-                    "linear_proj",
-                    "linear_qkv",
-                    "in_proj",
-                    "linear_fc1",
-                    "linear_fc2",
-                }
-                and nxt == current
-            ):
-                canonical.append(current)
-                i += 2
-                continue
-            if current == "out_proj" and nxt == "linear_proj":
-                canonical.append(current)
-                i += 2
-                continue
-            if current == "row_parallel_lora" and nxt == "linear_proj":
-                i += 2
-                continue
-        canonical.append(segments[i])
-        i += 1
-    return ".".join(canonical)
-
-
-def _unwrap_art_wrapper_name(name: str) -> str:
-    return _canonical_art_param_name(name)
-
-
-def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
-    if getattr(mapping, "allow_hf_name_mismatch", False):
-        return True
-    hf_param = mapping.hf_param
-    if isinstance(hf_param, str):
-        return hf_param in hf_keys
-    if isinstance(hf_param, dict):
-        return all(param in hf_keys for param in hf_param.values())
-    return False
-
-
-def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
-    from itertools import chain
-
-    from megatron.bridge.models.conversion.model_bridge import (
-        WeightConversionTask,
-        _megatron_local_name_to_global,
-    )
-    from megatron.bridge.models.conversion.utils import (
-        get_module_and_param_from_name,
-        persistent_buffers,
-    )
-
-    bridge = runtime.bridge
-    mapping_registry = bridge._model_bridge.mapping_registry()
-    hf_source = bridge.hf_pretrained.state.source
-    hf_keys = set(hf_source.get_all_keys())
-    megatron_chunks = as_megatron_api_chunks(runtime.model)
-    model_config = megatron_chunks[0].config
-    tasks: list[Any] = []
-    for vp_stage, model in enumerate(megatron_chunks):
-        for local_name, _ in chain(model.named_parameters(), persistent_buffers(model)):
-            if "_extra_state" in local_name or _is_art_adapter_param_name(local_name):
-                continue
-            global_name = _megatron_local_name_to_global(
-                megatron_chunks,
-                model_config,
-                _canonical_art_param_name(local_name),
-                vp_stage,
-            )
-            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-            if mapping is None or not _mapping_hf_weights_exist(mapping, hf_keys):
-                continue
-            module_and_param = get_module_and_param_from_name(
-                megatron_chunks,
-                local_name,
-                vp_stage,
-            )
-            local_module = module_and_param[0]
-            local_weights = module_and_param[1]
-            if local_module is not None and not hasattr(local_module, "config"):
-                setattr(local_module, "config", model_config)
-            tasks.append(
-                WeightConversionTask(
-                    pp_rank=0,
-                    vp_stage=vp_stage,
-                    param_name=local_name,
-                    global_param_name=global_name,
-                    megatron_module=local_module,
-                    param_weight=local_weights,
-                    mapping=mapping,
-                )
-            )
-    return tasks
-
-
-def _build_merged_weight_export(runtime: TrainingRuntime) -> MergedWeightExport:
-    megatron_chunks = as_megatron_api_chunks(runtime.model)
-    return MergedWeightExport(
-        bridge=runtime.bridge,
-        model=megatron_chunks,
-        model_config=megatron_chunks[0].config,
-        conversion_tasks=_build_art_conversion_tasks(runtime),
-        adapter_weights_by_base=build_adapter_weights_by_base(megatron_chunks),
-    )
-
-
-def _iter_merged_vllm_weights(weight_export: MergedWeightExport) -> Any:
-    # vLLM expects HF checkpoint names, but Megatron only has live trainer weights.
-    # Convert through Bridge here, then merge ART's LoRA deltas into those tensors.
-    bridge = weight_export.bridge
-    model_bridge = bridge._model_bridge
-    hf_state_dict = bridge.hf_pretrained.state
-    grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
-    for task in weight_export.conversion_tasks:
-        converted_weights_dict = task.mapping.megatron_to_hf(
-            task.param_weight,
-            task.megatron_module,
-        )
-        adapter_weights = weight_export.adapter_weights_by_base.get(
-            task.global_param_name
-        )
-        if adapter_weights is not None:
-            converted_weights_dict = model_bridge._merge_lora_adapter_weights(
-                weight_export.model,
-                converted_weights_dict,
-                adapter_weights,
-            )
-        if getattr(task.mapping, "is_grouped_export", False):
-            merged_result = model_bridge._accumulate_grouped_export(
-                task,
-                converted_weights_dict,
-                weight_export.model_config,
-                grouped_buffers,
-                hf_state_dict,
-            )
-            if merged_result is None:
-                continue
-            converted_weights_dict = merged_result
-        else:
-            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
-                task,
-                converted_weights_dict,
-                hf_state_dict,
-            )
-        for hf_name, tensor in converted_weights_dict.items():
-            yield hf_name, tensor
-
-
-def _ensure_merged_weight_transfer_group(
-    runtime: TrainingRuntime,
-    spec: MergedWeightTransferSpec,
-) -> None:
-    assert runtime.rank == 0
-    assert runtime.world_size == 1
-    if runtime.merged_weight_transfer_init_info == spec.init_info:
-        assert runtime.merged_weight_transfer_group is not None
-        return
-    import httpx
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-    def _remote_init() -> None:
-        response = httpx.post(
-            f"{spec.vllm_base_url}/init_weight_transfer_engine",
-            json={"init_info": spec.init_info.model_dump()},
-            timeout=300.0,
-        )
-        response.raise_for_status()
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        remote_future = executor.submit(_remote_init)
-        time.sleep(1.0)
-        runtime.merged_weight_transfer_group = NCCLWeightTransferEngine.trainer_init(
-            {
-                "master_address": spec.init_info.master_address,
-                "master_port": spec.init_info.master_port,
-                "world_size": spec.init_info.world_size,
-            }
-        )
-        remote_future.result()
-    runtime.merged_weight_transfer_init_info = spec.init_info
-
-
 def _sync_merged_weights_to_vllm(
     runtime: TrainingRuntime,
     spec: MergedWeightTransferSpec,
     *,
     pause_generation: bool,
 ) -> None:
-    assert runtime.rank == 0
-    assert runtime.world_size == 1
-
-    import httpx
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-    _ensure_merged_weight_transfer_group(runtime, spec)
-    weight_export = _build_merged_weight_export(runtime)
-
-    def _send_weights() -> None:
-        NCCLWeightTransferEngine.trainer_send_weights(
-            _iter_merged_vllm_weights(weight_export),
-            {"group": runtime.merged_weight_transfer_group},
-        )
-
-    with httpx.Client() as client:
-        if pause_generation:
-            response = client.post(
-                f"{spec.vllm_base_url}/pause",
-                params={"mode": "wait"},
-                timeout=300.0,
-            )
-            response.raise_for_status()
-        try:
-            torch.cuda.synchronize()
-            names: list[str] = []
-            dtype_names: list[str] = []
-            shapes: list[list[int]] = []
-            for name, tensor in _iter_merged_vllm_weights(weight_export):
-                names.append(name)
-                dtype_names.append(str(tensor.dtype).removeprefix("torch."))
-                shapes.append(list(tensor.shape))
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                send_future = executor.submit(_send_weights)
-                response = client.post(
-                    f"{spec.vllm_base_url}/update_weights",
-                    json={
-                        "update_info": {
-                            "names": names,
-                            "dtype_names": dtype_names,
-                            "shapes": shapes,
-                            "is_checkpoint_format": True,
-                        }
-                    },
-                    timeout=600.0,
-                )
-                response.raise_for_status()
-                send_future.result()
-            response = client.post(
-                f"{spec.vllm_base_url}/art/set_served_model_name",
-                json={"name": spec.served_model_name},
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            torch.cuda.synchronize()
-        finally:
-            if pause_generation:
-                response = client.post(
-                    f"{spec.vllm_base_url}/resume",
-                    timeout=30.0,
-                )
-                response.raise_for_status()
+    (
+        runtime.merged_weight_transfer_group,
+        runtime.merged_weight_transfer_init_info,
+    ) = sync_merged_weights_to_vllm(
+        bridge=runtime.bridge,
+        model=runtime.model,
+        model_support_handler=runtime.model_support_handler,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        merged_weight_transfer_group=runtime.merged_weight_transfer_group,
+        merged_weight_transfer_init_info=runtime.merged_weight_transfer_init_info,
+        spec=spec,
+        pause_generation=pause_generation,
+    )
 
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
@@ -1732,6 +1436,10 @@ def main() -> None:
     runtime = build_training_runtime(
         model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         build_optimizer=False,
+        allow_unvalidated_arch=os.environ.get(
+            "ART_MEGATRON_ALLOW_UNVALIDATED_ARCH", ""
+        ).lower()
+        in {"1", "true", "yes", "on"},
     )
     _run_service_loop(runtime)
 

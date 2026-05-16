@@ -1,11 +1,12 @@
-import asyncio
+from contextlib import asynccontextmanager
+import gc
+import hashlib
 import json
 import logging
 import math
 import os
 import shutil
 import socket
-import subprocess
 import time
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
@@ -17,7 +18,6 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
 }
 
-import aiohttp
 import numpy as np
 import polars as pl
 import torch
@@ -61,16 +61,83 @@ from ..preprocessing.pack import (
     plot_packed_tensors,
 )
 from ..preprocessing.tokenize import (
+    ChatTemplateToolSchemaFormat,
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
 from ..utils import format_message, get_model_step
+from .adapter_leases import (
+    AdapterLeaseManager,
+    pin_inference_step,
+    pinned_inference_step,
+)
 from .checkpoints import (
     delete_checkpoints,
 )
 from .service import ModelService
+
+
+def _configured_chat_template_value(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    if chat_template_path is not None:
+        with open(chat_template_path, encoding="utf-8") as handle:
+            return handle.read()
+    return chat_template
+
+
+def _configured_chat_template_server_arg(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    return chat_template_path or chat_template
+
+
+def _apply_configured_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is not None:
+        tokenizer.chat_template = chat_template
+
+
+def _apply_configured_chat_template_server_args(
+    config_dict: dict,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None:
+        return
+    server_args = dict(config_dict.get("server_args", {}))
+    server_args.setdefault("chat_template", chat_template)
+    if chat_template_content_format := internal_config.get(
+        "chat_template_content_format"
+    ):
+        server_args.setdefault(
+            "chat_template_content_format",
+            chat_template_content_format,
+        )
+    config_dict["server_args"] = server_args
+
+
+def _tokenizer_cache_key(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> tuple[str, str | None]:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is None:
+        return (base_model, None)
+    return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
 
 
 class LocalBackend(Backend):
@@ -105,12 +172,15 @@ class LocalBackend(Backend):
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
-        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
-        self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
+        self._adapter_leases: dict[str, AdapterLeaseManager] = {}
+        self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
+        self._default_chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = (
+            "default"
+        )
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -163,6 +233,15 @@ class LocalBackend(Backend):
             return 0
         return torch.cuda.device_count()
 
+    def _chat_template_tool_schema_format(
+        self,
+        internal_config: dev.InternalModelConfig,
+    ) -> ChatTemplateToolSchemaFormat:
+        return internal_config.get(
+            "chat_template_tool_schema_format",
+            self._default_chat_template_tool_schema_format,
+        )
+
     def __enter__(self) -> Self:
         return self
 
@@ -189,16 +268,7 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        tasks = list(self._monitor_tasks.values())
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._monitor_tasks.clear()
-        for service in list(self._services.values()):
+        for service in self._services.values():
             aclose = getattr(service, "aclose", None)
             if aclose is None:
                 close = getattr(service, "close", None)
@@ -207,16 +277,25 @@ class LocalBackend(Backend):
             else:
                 await aclose()
             close_proxy(service)
+        self._services.clear()
+        self._adapter_leases.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def _close(self) -> None:
-        for task in list(self._monitor_tasks.values()):
-            task.cancel()
-        self._monitor_tasks.clear()
-        for service in list(self._services.values()):
+        for service in self._services.values():
             close = getattr(service, "close", None)
             if close is not None:
                 close()
             close_proxy(service)
+        self._services.clear()
+        self._adapter_leases.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     async def register(
         self,
@@ -264,6 +343,9 @@ class LocalBackend(Backend):
 
         requested_step = step
 
+        if step is None:
+            step = pinned_inference_step(model.name)
+
         if step is None and isinstance(model, TrainableModel):
             from ..dev.validate import is_dedicated_mode
 
@@ -285,6 +367,39 @@ class LocalBackend(Backend):
             f"actual_step={step} -> {name}"
         )
         return name
+
+    def _adapter_lease_manager(self, model_name: str) -> AdapterLeaseManager:
+        manager = self._adapter_leases.get(model_name)
+        if manager is None:
+            manager = AdapterLeaseManager()
+            self._adapter_leases[model_name] = manager
+        return manager
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with pin_inference_step(model.name, step), manager.lease(step):
+            yield
+
+    async def prune_model_adapters(
+        self,
+        model: AnyTrainableModel,
+        *,
+        retain_steps: set[int],
+    ) -> None:
+        service = self._services.get(model.name)
+        if service is None:
+            return
+        manager = self._adapter_leases.get(model.name)
+        if manager is not None:
+            retain_steps = set(retain_steps) | manager.active_steps()
+        prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
+        if prune_loaded_adapters is not None:
+            await prune_loaded_adapters(retain_steps=retain_steps)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -324,8 +439,6 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
             if not dedicated and not self._in_process:
-                # Kill all "model-service" processes to free up GPU memory
-                subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
                     self._services[model.name],
                     process_name="tinker-service" if is_tinker else "model-service",
@@ -343,10 +456,12 @@ class LocalBackend(Backend):
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
     ) -> PackedTensors | None:
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+            _apply_configured_chat_template(tokenizer, internal_config)
+            self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
                 self._image_processors[model.base_model] = (
@@ -354,7 +469,11 @@ class LocalBackend(Backend):
                 )
             except Exception:
                 self._image_processors[model.base_model] = None
-        tokenizer = self._tokenizers[model.base_model]
+        tokenizer = self._tokenizers[tokenizer_key]
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -362,14 +481,14 @@ class LocalBackend(Backend):
                 allow_training_without_logprobs,
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
+                chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
             )
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = (
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768)
+        model_max_sequence_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         if packed_sequence_length is None:
             assert not self._requires_explicit_packed_sequence_length, (
@@ -482,6 +601,8 @@ class LocalBackend(Backend):
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        _apply_configured_chat_template_server_args(config_dict, internal_config)
         server_args = dict(config_dict.get("server_args", {}))
 
         # Avoid binding collisions on busy hosts when no explicit port is provided.
@@ -498,85 +619,7 @@ class LocalBackend(Backend):
         base_url = f"http://{host}:{port}/v1"
         api_key = server_args.get("api_key") or "default"
 
-        def done_callback(_: asyncio.Task[None]) -> None:
-            self._monitor_tasks.pop(model.name, None)
-            close_proxy(self._services.pop(model.name))
-
-        task = asyncio.create_task(
-            self._monitor_openai_server(model, base_url, api_key)
-        )
-        task.add_done_callback(done_callback)
-        self._monitor_tasks[model.name] = task
-
         return base_url, api_key
-
-    async def _monitor_openai_server(
-        self, model: AnyTrainableModel, base_url: str, api_key: str
-    ) -> None:
-        model_name = model.name
-        consecutive_failures = 0
-        max_consecutive_failures = 3
-        async with aiohttp.ClientSession() as session:
-            while True:
-                # Wait 30 seconds before checking again
-                await asyncio.sleep(30)
-                try:
-                    # If the server is sleeping, skip the check
-                    if await self._services[model_name].vllm_engine_is_sleeping():
-                        consecutive_failures = 0
-                        continue
-                    # Check the metrics with a timeout
-                    async with session.get(
-                        f"{base_url.split('/v1')[0]}/metrics",
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as response:
-                        metrics = await response.text()
-                    # Parse Prometheus metrics for running requests
-                    running_requests = 0
-                    pending_requests = 0
-                    for line in metrics.split("\n"):
-                        if line.startswith("vllm:num_requests_running"):
-                            running_requests = int(float(line.split()[1]))
-                        elif line.startswith("vllm:num_requests_waiting"):
-                            pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, send a cheap liveness
-                    # probe rather than a real generation request. Large models can take
-                    # longer than a short completion-based probe while still being healthy.
-                    if running_requests == 0 and pending_requests == 0:
-                        try:
-                            async with session.get(
-                                f"{base_url.split('/v1')[0]}/health",
-                                timeout=float(
-                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
-                                ),
-                            ) as health_response:
-                                if health_response.status >= 400:
-                                    raise RuntimeError(
-                                        "OpenAI server health check failed with "
-                                        f"status {health_response.status}"
-                                    )
-                        except Exception as e:
-                            # If the server is sleeping, a failed health check is okay
-                            if await self._services[
-                                model_name
-                            ].vllm_engine_is_sleeping():
-                                consecutive_failures = 0
-                                continue
-                            raise e
-                    # Reset failure counter on success
-                    consecutive_failures = 0
-                except Exception:
-                    # If the server is sleeping during an exception, it's okay
-                    try:
-                        if await self._services[model_name].vllm_engine_is_sleeping():
-                            consecutive_failures = 0
-                            continue
-                    except Exception:
-                        pass  # If we can't check sleeping status, count it as a failure
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        raise
-                    # Otherwise, continue and try again
 
     # Note: _log() method has been moved to the Model class (frontend)
 
@@ -648,8 +691,9 @@ class LocalBackend(Backend):
                 "cispo" and "ppo".
             loss_fn_config: Additional loss-function config. Not supported by
                 LocalBackend.
-            normalize_advantages: Whether to normalize advantages. LocalBackend
-                currently requires True.
+            normalize_advantages: Backward-compatible alias for reward std scaling.
+                When False, LocalBackend centers rewards but does not divide by
+                group reward std dev.
             adam_params: Custom optimizer params. Not supported by
                 LocalBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
@@ -712,7 +756,7 @@ class LocalBackend(Backend):
         if loss_fn_config is not None:
             raise ValueError("LocalBackend requires loss_fn_config=None.")
         if not normalize_advantages:
-            raise ValueError("LocalBackend requires normalize_advantages=True.")
+            scale_rewards = False
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
         if (
@@ -952,12 +996,13 @@ class LocalBackend(Backend):
         if verbose:
             print("Starting _train_sft")
 
-        # Get tokenizer
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
-        tokenizer = self._tokenizers[model.base_model]
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+            _apply_configured_chat_template(tokenizer, internal_config)
+            self._tokenizers[tokenizer_key] = tokenizer
+        tokenizer = self._tokenizers[tokenizer_key]
 
         from ..utils.sft import resolve_sft_batch_size
 
@@ -973,15 +1018,17 @@ class LocalBackend(Backend):
         instruction_part, response_part = get_instruction_response_parts(
             model.base_model, tokenizer
         )
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
 
         if verbose:
             print(f"Using instruction_part: {instruction_part!r}")
             print(f"Using response_part: {response_part!r}")
 
-        max_seq_length = (
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768)
+        max_seq_length = internal_config.get("init_args", {}).get(
+            "max_seq_length", 32_768
         )
         max_seq_length = int(max_seq_length) if max_seq_length is not None else None
 
@@ -1007,6 +1054,8 @@ class LocalBackend(Backend):
                     tokenizer=tokenizer,
                     instruction_part=instruction_part,
                     response_part=response_part,
+                    chat_template_kwargs=chat_template_kwargs,
+                    chat_template_tool_schema_format=chat_template_tool_schema_format,
                     max_seq_length=max_seq_length,
                 )
             )
@@ -1035,6 +1084,7 @@ class LocalBackend(Backend):
                 **result,
                 "data/step_num_trajectories": float(total_trajectories),
                 "data/step_trainer_tokens": float(total_trainable_tokens),
+                "data/step_num_dropped_trajectories": float(total_dropped_trajectories),
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
             }
 

@@ -15,7 +15,7 @@ fi
 rm -rf dist
 
 # Build the package
-uv run hatch build
+python scripts/build_package.py
 
 
 # If the token is set, proceed with publishing

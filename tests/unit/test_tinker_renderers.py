@@ -1,8 +1,9 @@
 import json
 from typing import cast
 
-from art.tinker.cookbook_v import renderers
-from art.tinker.cookbook_v.tokenizer_utils import Tokenizer
+from tinker_cookbook import renderers
+from tinker_cookbook.tokenizer_utils import Tokenizer
+
 from art.tinker.renderers import get_renderer_name
 from art.tinker_native.data import convert_openai_messages_to_renderer_format
 

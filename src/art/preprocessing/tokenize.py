@@ -5,7 +5,7 @@ from itertools import takewhile
 import json
 import math
 import random
-from typing import Any, Generator, cast
+from typing import Any, Generator, Literal, cast
 
 from openai.types.chat.chat_completion import Choice
 from PIL import Image
@@ -14,8 +14,10 @@ from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
+from ..types import MessagesAndChoices
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
+ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
 
 
 def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool:
@@ -23,17 +25,64 @@ def _chat_template_disables_thinking(tokenizer: PreTrainedTokenizerBase) -> bool
     return isinstance(chat_template, str) and "enable_thinking" in chat_template
 
 
-def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | None:
+def _chat_template_kwargs(
+    tokenizer: PreTrainedTokenizerBase,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    kwargs = (
+        {"enable_thinking": False}
+        if _chat_template_disables_thinking(tokenizer)
+        else {}
+    )
+    kwargs.update(chat_template_kwargs or {})
+    return kwargs
+
+
+def _normalize_tool_for_vllm_openai(tool: ChatTemplateTool) -> ChatTemplateTool:
+    if callable(tool) or not isinstance(tool, dict):
+        return tool
+    if tool.get("type") != "function":
+        return tool
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        return tool
+
+    ordered_function = {
+        key: function[key]
+        for key in ("name", "description", "parameters", "strict")
+        if key in function
+    }
+    ordered_function.update(
+        {key: value for key, value in function.items() if key not in ordered_function}
+    )
+    ordered_tool = {"type": "function", "function": ordered_function}
+    ordered_tool.update(
+        {key: value for key, value in tool.items() if key not in ordered_tool}
+    )
+    return ordered_tool
+
+
+def _normalize_tools_for_chat_template(
+    tools: Any,
+    tool_schema_format: ChatTemplateToolSchemaFormat = "default",
+) -> list[ChatTemplateTool] | None:
     if tools is None:
         return None
+    if tool_schema_format not in ("default", "vllm_openai"):
+        raise ValueError(
+            f"Unknown chat template tool schema format: {tool_schema_format}"
+        )
     normalized_tools: list[ChatTemplateTool] = []
     for tool in tools:
         if callable(tool):
-            normalized_tools.append(tool)
+            normalized_tool = tool
         elif isinstance(tool, dict) and "type" in tool:
-            normalized_tools.append(cast(dict[Any, Any], tool))
+            normalized_tool = cast(dict[Any, Any], tool)
         else:
-            normalized_tools.append({"type": "function", "function": tool})
+            normalized_tool = {"type": "function", "function": tool}
+        if tool_schema_format == "vllm_openai":
+            normalized_tool = _normalize_tool_for_vllm_openai(normalized_tool)
+        normalized_tools.append(normalized_tool)
     return normalized_tools
 
 
@@ -69,6 +118,26 @@ def _normalize_tool_call_arguments_for_chat_template(
         normalized_messages.append({**message, "tool_calls": normalized_tool_calls})
 
     return normalized_messages
+
+
+def _messages_for_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    messages_and_choices: MessagesAndChoices,
+    *,
+    final_trainable_choice_index: int | None = None,
+) -> list[dict[str, Any]]:
+    messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
+    if (
+        final_trainable_choice_index is not None
+        and 0 <= final_trainable_choice_index < len(messages)
+    ):
+        message = messages[final_trainable_choice_index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            messages[final_trainable_choice_index] = {
+                "role": "assistant",
+                "content": message.get("content") or "",
+            }
+    return _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
 
 
 @dataclass
@@ -171,6 +240,8 @@ def tokenize_trajectory_groups(
     shuffle_group_trajectories: bool = True,
     drop_zero_advantage_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -204,6 +275,8 @@ def tokenize_trajectory_groups(
                     advantage,
                     allow_training_without_logprobs,
                     trajectory,
+                    chat_template_kwargs=chat_template_kwargs,
+                    chat_template_tool_schema_format=chat_template_tool_schema_format,
                 ):
                     trajectory_results.append(result)
             weight = 1 / (
@@ -253,6 +326,8 @@ def tokenize_trajectory(
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
 ) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -274,35 +349,37 @@ def tokenize_trajectory(
     if last_assistant_index == -1:
         return None
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
-    messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
-    # Qwen3.5's chat template uses `tool_call.arguments|items`, so it needs a
-    # mapping here instead of the OpenAI JSON string.
-    messages = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
-    tools = _normalize_tools_for_chat_template(history.tools)
+    messages = _messages_for_chat_template(
+        tokenizer,
+        messages_and_choices,
+        final_trainable_choice_index=(
+            len(messages_and_choices) - 1
+            if isinstance(messages_and_choices[-1], Choice)
+            and messages_and_choices[-1].logprobs is not None
+            else None
+        ),
+    )
+    tools = _normalize_tools_for_chat_template(
+        history.tools,
+        tool_schema_format=chat_template_tool_schema_format,
+    )
+    template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
     chat = cast(
         str,
-        tokenizer.apply_chat_template(
+        cast(Any, tokenizer).apply_chat_template(
             messages,
             tools=tools,
-            continue_final_message=True,
+            continue_final_message=False,
             tokenize=False,
-            **(
-                {"enable_thinking": False}
-                if _chat_template_disables_thinking(tokenizer)
-                else {}
-            ),  # type: ignore[arg-type]
+            **template_kwargs,
         ),
     )
     original_token_ids = _apply_chat_template_token_ids(
         tokenizer,
         messages,
         tools=tools,
-        continue_final_message=True,
-        **(
-            {"enable_thinking": False}
-            if _chat_template_disables_thinking(tokenizer)
-            else {}
-        ),
+        continue_final_message=False,
+        **template_kwargs,
     )
     sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinel_token = tokenizer.decode(sentinel_token_id)
@@ -334,11 +411,7 @@ def tokenize_trajectory(
         token_template_messages,
         tools=tools,
         continue_final_message=True,
-        **(
-            {"enable_thinking": False}
-            if _chat_template_disables_thinking(tokenizer)
-            else {}
-        ),
+        **template_kwargs,
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
@@ -494,6 +567,8 @@ def tokenize_sft_batch(
     tokenizer: PreTrainedTokenizerBase,
     instruction_part: str,
     response_part: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     max_seq_length: int | None = None,
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
@@ -529,16 +604,24 @@ def tokenize_sft_batch(
     num_trainable_tokens = 0
     num_dropped_trajectories = 0
     for trajectory in trajectory_batch:
-        messages = trajectory.messages_and_choices
-        tools = trajectory.tools
+        messages = _messages_for_chat_template(
+            tokenizer,
+            trajectory.messages_and_choices,
+        )
+        tools = _normalize_tools_for_chat_template(
+            trajectory.tools,
+            tool_schema_format=chat_template_tool_schema_format,
+        )
+        template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
 
         # Single-step tokenization: apply_chat_template with tokenize=True
         input_ids = _apply_chat_template_token_ids(
             tokenizer,
-            cast(Any, messages),
-            tools=cast(Any, tools),
+            messages,
+            tools=tools,
             tokenize=True,
             add_generation_prompt=False,
+            **template_kwargs,
         )
         if max_seq_length is not None and len(input_ids) > max_seq_length:
             num_dropped_trajectories += 1

@@ -98,9 +98,7 @@ def test_trainer_not_contiguous():
 
 
 def test_dedicated_rejects_fast_inference():
-    with pytest.raises(
-        ValueError, match="fast_inference is incompatible with dedicated"
-    ):
+    with pytest.raises(ValueError, match="fast_inference is no longer supported"):
         validate_dedicated_config(
             InternalModelConfig(
                 trainer_gpu_ids=[0],
@@ -123,15 +121,16 @@ def test_dedicated_rejects_enable_sleep_mode():
         )
 
 
-def test_dedicated_allows_fast_inference_false():
-    """fast_inference=False is fine in dedicated mode (it's the intended state)."""
-    validate_dedicated_config(
-        InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            init_args={"fast_inference": False},  # type: ignore[typeddict-item]
+def test_dedicated_rejects_fast_inference_false():
+    """fast_inference config is removed; vLLM always lives in its own runtime."""
+    with pytest.raises(ValueError, match="fast_inference is no longer supported"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1],
+                init_args={"fast_inference": False},  # type: ignore[typeddict-item]
+            )
         )
-    )
 
 
 def test_get_model_config_shared_mode():
@@ -142,7 +141,7 @@ def test_get_model_config_shared_mode():
         assert "trainer_gpu_ids" not in result
         assert "inference_gpu_ids" not in result
         assert result["engine_args"]["enable_sleep_mode"] is True
-        assert result["init_args"].get("fast_inference") is False
+        assert "fast_inference" not in result["init_args"]
         assert result["rollout_weights_mode"] == "lora"
         assert result["peft_args"]["target_modules"] == [
             "q_proj",
@@ -172,9 +171,7 @@ def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
             "in_proj_qkv",
             "in_proj_z",
             "out_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
+            "experts",
         ]
 
 
@@ -252,18 +249,14 @@ def test_merged_rollout_weights_requires_dedicated_mode():
         validate_dedicated_config(InternalModelConfig(rollout_weights_mode="merged"))
 
 
-def test_qwen3_5_moe_requires_merged_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
-            )
+def test_qwen3_5_moe_allows_default_lora_rollout_weights():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
         )
+    )
 
 
 def test_qwen3_5_moe_allows_merged_rollout_weights():
@@ -277,15 +270,11 @@ def test_qwen3_5_moe_allows_merged_rollout_weights():
     )
 
 
-def test_other_qwen3_5_moe_requires_merged_rollout_weights():
-    with pytest.raises(
-        ValueError,
-        match="Qwen3.5-MoE models require rollout_weights_mode='merged'",
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(
-                trainer_gpu_ids=[0],
-                inference_gpu_ids=[1],
-                engine_args={"model": "Qwen/Qwen3.5-397B-A17B"},  # type: ignore[typeddict-item]
-            )
+def test_other_qwen3_5_moe_allows_default_lora_rollout_weights():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            engine_args={"model": "Qwen/Qwen3.5-397B-A17B"},  # type: ignore[typeddict-item]
         )
+    )

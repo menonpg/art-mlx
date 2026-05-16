@@ -3,18 +3,14 @@
 import asyncio
 from dataclasses import dataclass, field
 from functools import cached_property
-import json
 import logging
 import os
+import socket
 import subprocess
-import sys
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
 import torch
 from trl import GRPOTrainer
-from vllm import AsyncEngineArgs
-from vllm.lora.request import LoRARequest
-from vllm.v1.engine.async_llm import AsyncLLM
 
 from .. import dev, types
 from ..dev.validate import is_dedicated_mode
@@ -24,9 +20,26 @@ from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
-from ..utils.network import find_free_tcp_port
+from ..utils.lifecycle import (
+    ChildProcessSupervisor,
+    ServiceLifecycle,
+    managed_process_cmd,
+    terminate_popen_process_group,
+)
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
+from ..vllm_runtime import (
+    VllmRuntimeLaunchConfig,
+    build_vllm_runtime_server_cmd,
+    get_vllm_runtime_nccl_so_path,
+    get_vllm_runtime_working_dir,
+    wait_for_vllm_runtime,
+)
+from ..weight_transfer import (
+    DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+    DEFAULT_PACKED_NUM_BUFFERS,
+    trainer_init,
+    trainer_send_weights,
+)
 from .train import (
     UnslothTrainContext,
     create_unsloth_train_context,
@@ -36,6 +49,10 @@ from .train import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _RuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
 
 
 def save_checkpoint(
@@ -83,6 +100,12 @@ def save_checkpoint(
     return checkpoint_dir
 
 
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _normalize_merged_checkpoint_name(name: str) -> str:
     # PEFT wraps adapted modules under `.base_layer`, but vLLM expects the
     # original checkpoint parameter names during update_weights().
@@ -90,9 +113,6 @@ def _normalize_merged_checkpoint_name(name: str) -> str:
     while ".base_layer." in normalized:
         normalized = normalized.replace(".base_layer.", ".")
     return normalized
-
-
-_find_free_tcp_port = find_free_tcp_port
 
 
 # ============================================================================
@@ -108,16 +128,31 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
-    _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
     # Dedicated mode subprocess state
     _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
     _vllm_log_file: Any = field(default=None, repr=False)
+    _vllm_log_path: str | None = None
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _vllm_api_key: str | None = None
+    _vllm_nccl_so_path: str | None = None
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
-    _server_task: asyncio.Task[None] | None = field(
-        default=None, init=False, repr=False
+    _lifecycle: ServiceLifecycle = field(
+        default_factory=ServiceLifecycle,
+        init=False,
+        repr=False,
     )
+    _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
+
+    def _on_child_process_exit(self, error: RuntimeError) -> None:
+        logger.error("%s", error)
+        self.close()
+
+    def _raise_if_child_failed(self) -> None:
+        self._child_processes.raise_if_failed()
 
     @property
     def is_dedicated(self) -> bool:
@@ -133,22 +168,61 @@ class UnslothService:
     def _vllm_base_url(self) -> str:
         return f"http://{self._vllm_host}:{self._vllm_port}"
 
-    def _next_lora_id(self) -> int:
-        """Return a new unique LoRA ID to avoid collisions in vLLM."""
-        self._lora_id_counter += 1
-        return self._lora_id_counter
+    def _runtime_cuda_visible_devices(self) -> str:
+        if self.is_dedicated:
+            return ",".join(str(gpu_id) for gpu_id in self.config["inference_gpu_ids"])
+        if visible := os.environ.get("CUDA_VISIBLE_DEVICES"):
+            return visible
+        return ",".join(str(index) for index in range(torch.cuda.device_count()))
+
+    def _runtime_engine_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        engine_args = dict(self.config.get("engine_args", {}))
+        if config and "engine_args" in config:
+            engine_args.update(dict(config["engine_args"]))
+        engine_args.setdefault("generation_config", "vllm")
+        if self.rollout_weights_mode == "merged":
+            engine_args["weight_transfer_config"] = {"backend": "nccl"}
+            engine_args.pop("enable_lora", None)
+            engine_args.pop("max_loras", None)
+        else:
+            engine_args["enable_lora"] = True
+            engine_args.setdefault("max_loras", 2)
+        for key in ("model", "served_model_name"):
+            engine_args.pop(key, None)
+        return engine_args
+
+    def _runtime_server_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        server_args: dict[str, object] = {
+            "return_tokens_as_token_ids": True,
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+        }
+        if config and "server_args" in config:
+            server_args.update(dict(config["server_args"]))
+        for key in ("port", "host", "lora_modules"):
+            server_args.pop(key, None)
+        return server_args
+
+    def _runtime_headers(self) -> dict[str, str]:
+        if self._vllm_api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self._vllm_api_key}"}
+
+    def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
+        headers = self._runtime_headers()
+        return {"headers": headers} if headers else {}
+
+    def _sleep_mode_enabled(self) -> bool:
+        return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
 
     async def aclose(self) -> None:
         state = self.__dict__.get("_state")
         if isinstance(state, UnslothTrainContext):
             await state.stop_background_training()
-        if self._server_task is not None:
-            self._server_task.cancel()
-            try:
-                await self._server_task
-            except asyncio.CancelledError:
-                pass
-            self._server_task = None
         self.close()
 
     # =========================================================================
@@ -161,107 +235,109 @@ class UnslothService:
         port: int,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, int]:
-        """Launch vLLM as a subprocess on inference GPUs. Returns (host, port)."""
-        import atexit
-
-        inference_gpu_ids = self.config["inference_gpu_ids"]
-        cuda_devices = ",".join(str(g) for g in inference_gpu_ids)
-
-        # Build server_args: ART defaults, then user overrides, strip CLI-handled keys
-        server_args: dict[str, object] = {
-            "return_tokens_as_token_ids": True,
-            "enable_auto_tool_choice": True,
-            "tool_call_parser": "hermes",
-        }
-        if config and "server_args" in config:
-            server_args.update(dict(config["server_args"]))
-        for key in ("port", "host", "lora_modules", "api_key"):
-            server_args.pop(key, None)
-
-        # Build engine_args: model-level config, then user server overrides,
-        # add dedicated-mode defaults, strip CLI-handled keys
-        engine_args = dict(self.config.get("engine_args", {}))
-        if config and "engine_args" in config:
-            engine_args.update(dict(config["engine_args"]))
-        engine_args.setdefault("generation_config", "vllm")
-        if self.rollout_weights_mode == "merged":
-            engine_args["weight_transfer_config"] = {"backend": "nccl"}
-            engine_args.pop("enable_lora", None)
-            engine_args.pop("max_loras", None)
-        else:
-            engine_args["enable_lora"] = True
-            engine_args.setdefault("max_loras", 2)
-        for key in ("model", "served_model_name", "enable_sleep_mode"):
-            engine_args.pop(key, None)
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "art.vllm.dedicated_server",
-            f"--model={self.base_model}",
-            f"--port={port}",
-            f"--host={self._vllm_host}",
-            f"--cuda-visible-devices={cuda_devices}",
-            f"--lora-path={lora_path}",
-            f"--served-model-name={self.model_name}@{self._latest_step}",
-            f"--rollout-weights-mode={self.rollout_weights_mode}",
-            f"--engine-args-json={json.dumps(engine_args)}",
-            f"--server-args-json={json.dumps(server_args)}",
-        ]
+        self._raise_if_child_failed()
+        server_args = self._runtime_server_args(config)
+        api_key = server_args.get("api_key")
+        self._vllm_api_key = api_key if isinstance(api_key, str) else None
+        self._vllm_nccl_so_path = (
+            str(get_vllm_runtime_nccl_so_path())
+            if self.rollout_weights_mode == "merged"
+            else None
+        )
+        cmd = build_vllm_runtime_server_cmd(
+            VllmRuntimeLaunchConfig(
+                base_model=self.base_model,
+                port=port,
+                host=self._vllm_host,
+                cuda_visible_devices=self._runtime_cuda_visible_devices(),
+                lora_path=lora_path,
+                served_model_name=f"{self.model_name}@{self._latest_step}",
+                rollout_weights_mode=self.rollout_weights_mode,
+                engine_args=self._runtime_engine_args(config),
+                server_args=server_args,
+            )
+        )
+        self._lifecycle.install_parent_cleanup(self.close)
 
         log_dir = os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_file = open(
-            os.path.join(log_dir, "vllm-dedicated.log"), "w", buffering=1
-        )
+        self._vllm_log_path = os.path.join(log_dir, "vllm-runtime.log")
+        self._vllm_log_file = open(self._vllm_log_path, "w", buffering=1)
 
         self._vllm_process = subprocess.Popen(
-            cmd, stdout=self._vllm_log_file, stderr=subprocess.STDOUT, bufsize=1
+            managed_process_cmd(cmd),
+            cwd=str(get_vllm_runtime_working_dir()),
+            env=os.environ.copy(),
+            stdout=self._vllm_log_file,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            start_new_session=True,
         )
         self._vllm_port = port
 
         import httpx
 
-        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 600))
-        poll_interval = 1.0
-        elapsed = 0.0
+        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
         async with httpx.AsyncClient() as client:
-            while elapsed < timeout:
-                if self._vllm_process.poll() is not None:
-                    raise RuntimeError(
-                        f"vLLM subprocess exited with code {self._vllm_process.returncode}. "
-                        f"Check logs at {log_dir}/vllm-dedicated.log"
-                    )
-                try:
-                    resp = await client.get(
-                        f"http://{self._vllm_host}:{self._vllm_port}/v1/models",
-                        timeout=5.0,
-                    )
-                    if resp.status_code == 200:
-                        break
-                except (httpx.ConnectError, httpx.ReadTimeout):
-                    pass
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-            else:
+            try:
+                await wait_for_vllm_runtime(
+                    process=self._vllm_process,
+                    host=self._vllm_host,
+                    port=self._vllm_port,
+                    timeout=timeout,
+                )
+            except TimeoutError as exc:
                 self.close()
                 raise TimeoutError(
                     f"vLLM subprocess did not become ready within {timeout}s. "
-                    f"Check logs at {log_dir}/vllm-dedicated.log"
-                )
+                    f"Check logs at {log_dir}/vllm-runtime.log"
+                ) from exc
+            except RuntimeError as exc:
+                returncode = self._vllm_process.returncode
+                self.close()
+                raise RuntimeError(
+                    f"vLLM subprocess exited with code {returncode}. "
+                    f"Check logs at {log_dir}/vllm-runtime.log"
+                ) from exc
 
-        atexit.register(self.close)
-        logger.info("vLLM subprocess ready on port %d (GPUs: %s)", port, cuda_devices)
+            try:
+                resp = await client.get(
+                    f"http://{self._vllm_host}:{self._vllm_port}/v1/models",
+                    **self._runtime_request_kwargs(),
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                self.close()
+                raise RuntimeError(
+                    "vLLM passed /health but /v1/models was not reachable. "
+                    f"Check logs at {log_dir}/vllm-runtime.log"
+                ) from exc
+
+        assert self._vllm_process is not None
+        assert self._vllm_log_path is not None
+        self._child_processes.watch_popen(
+            "vLLM runtime",
+            self._vllm_process,
+            log_path=self._vllm_log_path,
+        )
+        logger.info(
+            "vLLM runtime ready on port %d (GPUs: %s)",
+            port,
+            self._runtime_cuda_visible_devices(),
+        )
         return self._vllm_host, self._vllm_port
 
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
 
+        self._raise_if_child_failed()
         served_model_name = f"{self.model_name}@{step}"
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/art/set_served_model_name",
                 json={"name": served_model_name},
+                **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             response.raise_for_status()
@@ -272,16 +348,15 @@ class UnslothService:
 
     async def _init_merged_weight_transfer(self) -> None:
         import httpx
-        from vllm.distributed.weight_transfer.nccl_engine import (
-            NCCLWeightTransferEngine,
-        )
 
+        self._raise_if_child_failed()
         if self._weight_transfer_group is not None:
             return
 
         async with httpx.AsyncClient() as client:
             world_size_response = await client.get(
                 f"{self._vllm_base_url}/get_world_size",
+                **self._runtime_request_kwargs(),
                 timeout=30.0,
             )
             try:
@@ -292,8 +367,10 @@ class UnslothService:
                     "/get_world_size endpoint"
                 ) from exc
             inference_world_size = int(world_size_response.json()["world_size"])
+            if self._vllm_nccl_so_path is None:
+                raise RuntimeError("vLLM runtime NCCL path is not initialized")
 
-            master_port = find_free_tcp_port()
+            master_port = _find_free_tcp_port()
             init_info = {
                 "master_address": "127.0.0.1",
                 "master_port": master_port,
@@ -305,17 +382,17 @@ class UnslothService:
                 client.post(
                     f"{self._vllm_base_url}/init_weight_transfer_engine",
                     json={"init_info": init_info},
+                    **self._runtime_request_kwargs(),
                     timeout=300.0,
                 )
             )
-            # TODO: replace this with a real readiness handshake if this ever flakes.
-            await asyncio.sleep(1.0)
             self._weight_transfer_group = await asyncio.to_thread(
-                NCCLWeightTransferEngine.trainer_init,
+                trainer_init,
                 {
                     "master_address": init_info["master_address"],
                     "master_port": init_info["master_port"],
                     "world_size": init_info["world_size"],
+                    "nccl_so_path": self._vllm_nccl_so_path,
                 },
             )
             remote_init_response = await remote_init_task
@@ -359,10 +436,8 @@ class UnslothService:
         pause_generation: bool,
     ) -> None:
         import httpx
-        from vllm.distributed.weight_transfer.nccl_engine import (
-            NCCLWeightTransferEngine,
-        )
 
+        self._raise_if_child_failed()
         assert self._weight_transfer_group is not None
 
         peft_model = self._state.peft_model
@@ -376,6 +451,7 @@ class UnslothService:
                     response = await client.post(
                         f"{self._vllm_base_url}/pause",
                         params={"mode": "wait"},
+                        **self._runtime_request_kwargs(),
                         timeout=300.0,
                     )
                     response.raise_for_status()
@@ -385,6 +461,13 @@ class UnslothService:
                 torch.cuda.synchronize()
 
                 weights = self._merged_checkpoint_weights_for_vllm()
+                response = await client.post(
+                    f"{self._vllm_base_url}/start_weight_update",
+                    json={"is_checkpoint_format": True},
+                    **self._runtime_request_kwargs(),
+                    timeout=300.0,
+                )
+                response.raise_for_status()
                 update_info = {
                     "names": [name for name, _ in weights],
                     "dtype_names": [
@@ -392,18 +475,26 @@ class UnslothService:
                         for _, tensor in weights
                     ],
                     "shapes": [list(tensor.shape) for _, tensor in weights],
-                    "is_checkpoint_format": True,
+                    "packed": True,
+                    "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                    "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
                 }
 
                 _, update_response = await asyncio.gather(
                     asyncio.to_thread(
-                        NCCLWeightTransferEngine.trainer_send_weights,
+                        trainer_send_weights,
                         iter(weights),
-                        {"group": self._weight_transfer_group},
+                        {
+                            "group": self._weight_transfer_group,
+                            "packed": True,
+                            "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                            "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+                        },
                     ),
                     client.post(
                         f"{self._vllm_base_url}/update_weights",
                         json={"update_info": update_info},
+                        **self._runtime_request_kwargs(),
                         timeout=600.0,
                     ),
                 )
@@ -414,6 +505,12 @@ class UnslothService:
                         "Merged rollout weights require a vLLM build with the "
                         "/update_weights endpoint"
                     ) from exc
+                response = await client.post(
+                    f"{self._vllm_base_url}/finish_weight_update",
+                    **self._runtime_request_kwargs(),
+                    timeout=600.0,
+                )
+                response.raise_for_status()
                 self._latest_step = step
                 await self._set_served_model_name(step)
             except Exception as exc:
@@ -427,6 +524,7 @@ class UnslothService:
                     try:
                         response = await client.post(
                             f"{self._vllm_base_url}/resume",
+                            **self._runtime_request_kwargs(),
                             timeout=30.0,
                         )
                         response.raise_for_status()
@@ -446,6 +544,7 @@ class UnslothService:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
         import httpx
 
+        self._raise_if_child_failed()
         lora_name = f"{self.model_name}@{step}"
         logger.info(
             f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
@@ -459,6 +558,7 @@ class UnslothService:
                     "lora_path": checkpoint_path,
                     "load_inplace": True,
                 },
+                **self._runtime_request_kwargs(),
                 timeout=60.0,
             )
             response.raise_for_status()
@@ -468,23 +568,22 @@ class UnslothService:
         )
 
     def close(self) -> None:
-        """Terminate vLLM subprocess and cancel server task if running."""
-        self._weight_transfer_group = None
-        if self._server_task is not None:
-            self._server_task.cancel()
-            self._server_task = None
-        if self._vllm_process is None:
+        """Terminate vLLM subprocess if running."""
+        if not self._lifecycle.begin_close():
             return
-        self._vllm_process.terminate()
+        self._weight_transfer_group = None
         try:
-            self._vllm_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._vllm_process.kill()
-            self._vllm_process.wait()
-        self._vllm_process = None
-        if self._vllm_log_file is not None:
-            self._vllm_log_file.close()
-            self._vllm_log_file = None
+            self._child_processes.close()
+            if self._vllm_process is not None:
+                terminate_popen_process_group(self._vllm_process)
+                self._vllm_process = None
+            if self._vllm_log_file is not None:
+                self._vllm_log_file.close()
+                self._vllm_log_file = None
+            self._vllm_log_path = None
+            self._vllm_nccl_so_path = None
+        finally:
+            self._lifecycle.restore_parent_cleanup()
 
     # =========================================================================
     # start_openai_server
@@ -493,6 +592,7 @@ class UnslothService:
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
+        self._raise_if_child_failed()
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
@@ -503,73 +603,66 @@ class UnslothService:
         else:
             self._latest_step = get_step_from_dir(self.output_dir)
 
-        if self.is_dedicated:
-            port = (config or {}).get("server_args", {}).get("port", 8000)
-            vllm_location = await self._start_vllm_subprocess(
-                lora_path,
-                port,
-                config=config,
-            )
+        if not self.is_dedicated:
+            if not self._sleep_mode_enabled():
+                raise ValueError(
+                    "Shared-GPU mode requires engine_args.enable_sleep_mode=True "
+                    "for the external vLLM runtime"
+                )
+            self._state.offload_to_cpu()
+
+        port = (config or {}).get("server_args", {}).get("port", 8000)
+        vllm_location = await self._start_vllm_subprocess(
+            lora_path,
+            port,
+            config=config,
+        )
+        try:
             if self.rollout_weights_mode == "merged":
                 _ = self._state
                 await self._init_merged_weight_transfer()
                 await self._sync_merged_weights(self._latest_step, False)
-            return vllm_location
-
-        # Shared mode: in-process vLLM
-        self._state.offload_to_cpu()
-
-        server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path,
-            config=config,
-        )
-        self._server_task = await openai_server_task(
-            engine=await self.llm,
-            config=server_config,
-        )
-        return server_config.get("server_args", {}).get(
-            "host"
-        ) or "0.0.0.0", server_config.get("server_args", {}).get("port", 8000)
+        except BaseException:
+            await self.aclose()
+            raise
+        return vllm_location
 
     async def vllm_engine_is_sleeping(self) -> bool:
-        if self.is_dedicated:
-            return False
         return self._is_sleeping
 
-    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
-        """Register a LoRA adapter for a specific checkpoint step.
-        This is called when training is skipped but the checkpoint is renamed.
-        """
-        logger.info(
-            f"[DEDICATED] register_lora_for_step called: step={step} "
-            f"checkpoint_dir={checkpoint_dir} is_dedicated={self.is_dedicated}"
-        )
-        if self.is_dedicated:
-            if self.rollout_weights_mode == "merged":
-                await self._set_served_model_name(step)
-            else:
-                await self._reload_adapter(checkpoint_dir, step)
-            self._latest_step = step
-            return
+    async def _sleep_runtime(self) -> None:
+        import httpx
 
-        llm = await self.llm
-        await llm.pause_generation()
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/sleep",
+                params={"level": 1, "mode": "wait"},
+                **self._runtime_request_kwargs(),
+                timeout=300.0,
             )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {step} at {checkpoint_dir}"
+            response.raise_for_status()
+        self._is_sleeping = True
+
+    async def _wake_runtime(self) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/wake_up",
+                **self._runtime_request_kwargs(),
+                timeout=300.0,
             )
+            response.raise_for_status()
+        self._is_sleeping = False
+
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
+        if self.rollout_weights_mode == "merged":
+            await self._set_served_model_name(step)
+        else:
+            await self._reload_adapter(checkpoint_dir, step)
         self._latest_step = step
-        await llm.resume_generation()
 
     async def train(
         self,
@@ -578,17 +671,22 @@ class UnslothService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        if self.is_dedicated:
-            async for result in self._train_dedicated(
+        try:
+            self._raise_if_child_failed()
+            if self.is_dedicated:
+                async for result in self._train_dedicated(
+                    disk_packed_tensors, config, _config, verbose
+                ):
+                    yield result
+                return
+
+            async for result in self._train_shared(
                 disk_packed_tensors, config, _config, verbose
             ):
                 yield result
-            return
-
-        async for result in self._train_shared(
-            disk_packed_tensors, config, _config, verbose
-        ):
-            yield result
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def _train_dedicated(
         self,
@@ -638,29 +736,8 @@ class UnslothService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Train in shared mode — sleep/wake cycle with in-process vLLM."""
-        llm = await self.llm
-
-        # Pause generation to prevent new requests during training
-        await llm.pause_generation()
-
-        # Determine sleep level based on outstanding requests:
-        # - level 1: offload KV cache to CPU (can resume with existing KV state)
-        # - level 2: discard KV cache (fresh start after wake)
-        has_unfinished = llm.output_processor.has_unfinished_requests()
-        if has_unfinished:
-            sleep_level = 1
-        else:
-            # Reset prefix cache before discarding KV cache
-            await llm.reset_prefix_cache()
-            sleep_level = 2
-
-        # Put workers to sleep
-        await run_on_workers(llm, do_sleep, level=sleep_level)
-        self._is_sleeping = True
+        await self._sleep_runtime()
         gc_and_empty_cuda_cache()
-
-        # Reload training model to GPU (after vLLM is asleep)
         self._state.reload_to_gpu()
 
         async for result in run_unsloth_rl_training(
@@ -672,47 +749,20 @@ class UnslothService:
         ):
             yield result
 
-        # Save checkpoint after training
         checkpoint_dir = save_checkpoint(
             trainer=self._state.trainer,
             output_dir=self.output_dir,
             verbose=verbose,
         )
 
-        # Offload training model to CPU before waking vLLM
         self._state.offload_to_cpu()
-
-        # Free memory before waking up vLLM
         gc_and_empty_cuda_cache()
-        await asyncio.sleep(
-            0.5
-        )  # Longer delay to allow memory cleanup and pending ops to complete
+        await asyncio.sleep(0.5)
+        await self._wake_runtime()
 
-        # Wake up workers
-        await run_on_workers(llm, do_wake_up)
-        self._is_sleeping = False
-
-        # Determine the new step from the checkpoint directory
-        # checkpoint_dir format is: {output_dir}/checkpoints/{step:04d}
         new_step = int(os.path.basename(checkpoint_dir))
-
-        # Add the new LoRA adapter
-        # We keep old LoRAs loaded - vLLM will page them out as needed
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{new_step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {new_step} at {checkpoint_dir}"
-            )
+        await self._reload_adapter(checkpoint_dir, new_step)
         self._latest_step = new_step
-
-        # Resume generation after LoRA add is complete
-        await llm.resume_generation()
 
         if verbose:
             print("UnslothService.train complete")
@@ -737,223 +787,58 @@ class UnslothService:
         Yields:
             Dictionary containing training metrics for each batch.
         """
-        if self.is_dedicated:
-            raise NotImplementedError(
-                "train_sft is not yet supported in dedicated mode"
+        try:
+            self._raise_if_child_failed()
+            if self.is_dedicated:
+                raise NotImplementedError(
+                    "train_sft is not yet supported in dedicated mode"
+                )
+
+            await self._sleep_runtime()
+            gc_and_empty_cuda_cache()
+            self._state.reload_to_gpu()
+            if verbose:
+                print("SFT training started")
+
+            async for result in run_unsloth_sft_training(
+                self._state,
+                batches,
+                verbose=verbose,
+                max_grad_norm=1.0,
+            ):
+                yield {
+                    "loss/train": result["loss"],
+                    "loss/learning_rate": result["learning_rate"],
+                    "loss/grad_norm": result["grad_norm"],
+                }
+
+            checkpoint_dir = save_checkpoint(
+                trainer=self._state.trainer,
+                output_dir=self.output_dir,
+                verbose=verbose,
             )
-        import time
 
-        llm = await self.llm
+            self._state.offload_to_cpu()
+            gc_and_empty_cuda_cache()
+            await asyncio.sleep(0.5)
+            await self._wake_runtime()
+            new_step = int(os.path.basename(checkpoint_dir))
+            await self._reload_adapter(checkpoint_dir, new_step)
+            self._latest_step = new_step
 
-        # === Setup ===
-        # Pause generation to prevent new requests during training
-        await llm.pause_generation()
-
-        # Determine sleep level based on outstanding requests
-        has_unfinished = llm.output_processor.has_unfinished_requests()
-        if has_unfinished:
-            sleep_level = 1
-        else:
-            await llm.reset_prefix_cache()
-            sleep_level = 2
-
-        # Put workers to sleep
-        await run_on_workers(llm, do_sleep, level=sleep_level)
-        self._is_sleeping = True
-        gc_and_empty_cuda_cache()
-
-        # Reload training model to GPU (after vLLM is asleep)
-        self._state.reload_to_gpu()
-        if verbose:
-            print("SFT training started")
-
-        async for result in run_unsloth_sft_training(
-            self._state,
-            batches,
-            verbose=verbose,
-            max_grad_norm=1.0,
-        ):
-            yield {
-                "loss/train": result["loss"],
-                "loss/learning_rate": result["learning_rate"],
-                "loss/grad_norm": result["grad_norm"],
-            }
-
-        # === Cleanup ===
-        # Save checkpoint after training
-        checkpoint_dir = save_checkpoint(
-            trainer=self._state.trainer,
-            output_dir=self.output_dir,
-            verbose=verbose,
-        )
-
-        # Offload training model to CPU before waking vLLM
-        self._state.offload_to_cpu()
-
-        # Free memory before waking up vLLM
-        gc_and_empty_cuda_cache()
-        await asyncio.sleep(0.5)
-
-        # Wake up workers
-        await run_on_workers(llm, do_wake_up)
-        self._is_sleeping = False
-
-        # Add the new LoRA adapter
-        new_step = int(os.path.basename(checkpoint_dir))
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{new_step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
-            )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {new_step} at {checkpoint_dir}"
-            )
-        self._latest_step = new_step
-
-        # Resume generation after LoRA swap is complete
-        await llm.resume_generation()
-
-        if verbose:
-            print("SFT training finished")
+            if verbose:
+                print("SFT training finished")
+        except BaseException:
+            await self.aclose()
+            raise
 
     @cached_property
     def _state(self) -> UnslothTrainContext:
         init_args = dict(self.config.get("init_args", {}))
         checkpoint_dir = get_last_checkpoint_dir(self.output_dir)
-        if checkpoint_dir:
-            init_args["model_name"] = checkpoint_dir
-        else:
-            init_args["model_name"] = self.base_model
+        init_args["model_name"] = checkpoint_dir or self.base_model
         return create_unsloth_train_context(
             init_args=init_args,
             peft_args=cast(dict[str, Any], self.config.get("peft_args", {})),
             trainer_args=cast(dict[str, Any], self.config.get("trainer_args", {})),
         )
-
-    @cached_property
-    def llm(self) -> asyncio.Task[AsyncLLM]:
-        # Filter engine args to remove incompatible boolean flags
-        engine_args = {
-            **self.config.get("engine_args", {}),
-            "enable_lora": True,
-            "max_loras": self.config.get("engine_args", {}).get("max_loras", 2),
-        }
-        # Remove boolean flags that vLLM's argparse doesn't accept as =False
-        for key in ["enable_log_requests", "disable_log_requests"]:
-            engine_args.pop(key, None)
-        return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))  # ty:ignore[invalid-argument-type]
-
-
-# ============================================================================
-# Worker Sleep/Wake Functions
-# ============================================================================
-
-
-def do_sleep(*, level: int) -> None:
-    """
-    Put the worker to sleep, offloading both weights and KV cache.
-
-    Args:
-        level: The sleep level:
-            - 1: offload KV cache to CPU (can resume with existing KV state)
-            - 2: discard KV cache (fresh start after wake)
-    """
-    import ctypes
-    import gc
-
-    import torch
-    from vllm.device_allocator.cumem import (
-        CuMemAllocator,
-        libcudart,
-        unmap_and_release,
-    )
-
-    try:
-        from vllm.utils.platform_utils import is_pin_memory_available
-    except ImportError:
-        from vllm.utils import is_pin_memory_available
-
-    worker = get_worker()
-    allocator = CuMemAllocator.get_instance()
-
-    # Determine what to offload based on level:
-    # level=1: offload both weights and kv_cache to CPU
-    # level=2: offload weights, discard kv_cache
-    offload_to = "cpu" if level == 1 else "none"
-    tags_to_process = {"weights", "kv_cache"}
-
-    # Save buffers before level 2 sleep (like vLLM does)
-    if level == 2:
-        model = worker.model_runner.model
-        worker._sleep_saved_buffers = {
-            name: buffer.cpu().clone() for name, buffer in model.named_buffers()
-        }
-
-    for ptr, data in allocator.pointer_to_data.items():
-        if data.tag not in tags_to_process:
-            continue
-        handle = data.handle
-        size_in_bytes = handle[1]
-
-        # Always backup weights; backup kv_cache only at level 1
-        if offload_to != "none" or data.tag == "weights":
-            cpu_backup_tensor = torch.empty(
-                size_in_bytes,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=is_pin_memory_available(),
-            )
-            cpu_ptr = cpu_backup_tensor.data_ptr()
-            libcudart.cudaMemcpy(  # ty:ignore[possibly-missing-attribute]
-                ctypes.c_void_p(cpu_ptr), ctypes.c_void_p(ptr), size_in_bytes
-            )
-            data.cpu_backup_tensor = cpu_backup_tensor
-
-        unmap_and_release(handle)
-
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def do_wake_up() -> None:
-    """
-    Wake up the worker from sleep, restoring offloaded weights and KV cache.
-    """
-    import ctypes
-
-    from vllm.device_allocator.cumem import (
-        CuMemAllocator,
-        create_and_map,
-        libcudart,
-    )
-
-    worker = get_worker()
-    allocator = CuMemAllocator.get_instance()
-
-    tags_to_process = {"weights", "kv_cache"}
-
-    for ptr, data in allocator.pointer_to_data.items():
-        if data.tag not in tags_to_process:
-            continue
-        create_and_map(data.handle)
-        if data.cpu_backup_tensor is not None:
-            cpu_backup_tensor = data.cpu_backup_tensor
-            size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
-            cpu_ptr = cpu_backup_tensor.data_ptr()
-            libcudart.cudaMemcpy(  # ty:ignore[possibly-missing-attribute]
-                ctypes.c_void_p(ptr),
-                ctypes.c_void_p(cpu_ptr),
-                size_in_bytes,
-            )
-            data.cpu_backup_tensor = None
-
-    # Restore buffers after level 2 sleep (like vLLM does)
-    if hasattr(worker, "_sleep_saved_buffers") and worker._sleep_saved_buffers:
-        model = worker.model_runner.model
-        for name, buffer in model.named_buffers():
-            if name in worker._sleep_saved_buffers:
-                buffer.copy_(worker._sleep_saved_buffers[name].to(buffer.device))
-        worker._sleep_saved_buffers = {}

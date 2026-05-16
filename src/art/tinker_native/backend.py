@@ -175,9 +175,14 @@ class TinkerNativeBackend(Backend):
         )
 
     async def close(self) -> None:
+        tasks: list[asyncio.Task[None]] = []
         for state in self._model_state.values():
             if state.server_task is not None:
                 state.server_task.cancel()
+                tasks.append(state.server_task)
+                state.server_task = None
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def register(self, model: Model) -> None:
         model.base_path = self._path

@@ -13,6 +13,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
@@ -23,7 +24,10 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
 
-from .cute_grouped_lora_quack import quack_grouped_lora, quack_grouped_lora_dual
+from .kernels.cute_grouped_lora_quack import (
+    quack_grouped_lora,
+    quack_grouped_lora_dual,
+)
 
 LORA_RANK = 1
 LORA_ALPHA = 32
@@ -98,12 +102,46 @@ def _normalize_axis(axis: int, ndim: int) -> int:
     return axis
 
 
+def _shard_weight_by_components(
+    weight: torch.Tensor,
+    *,
+    axis: int,
+    component_sizes: Sequence[int],
+    world_size: int,
+    rank: int,
+) -> torch.Tensor:
+    if sum(component_sizes) != weight.shape[axis]:
+        raise ValueError(
+            f"Component sizes {tuple(component_sizes)} do not match axis {axis} "
+            f"extent {weight.shape[axis]}"
+        )
+    local_components: list[torch.Tensor] = []
+    for component in torch.split(weight, list(component_sizes), dim=axis):
+        if component.shape[axis] % world_size != 0:
+            raise ValueError(
+                f"Component shape {tuple(component.shape)} is not divisible by "
+                f"world size {world_size} on axis {axis}"
+            )
+        local_size = component.shape[axis] // world_size
+        local_components.append(component.narrow(axis, rank * local_size, local_size))
+    return torch.cat(local_components, dim=axis).contiguous()
+
+
 def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
-    # Shared experts can keep TP-sharded weights while deferring TP comm to the
-    # overlap path by setting parallel_mode=None / explicit_expert_comm=True.
     return getattr(linear, "parallel_mode", "") is None or getattr(
         linear, "explicit_expert_comm", False
     )
+
+
+def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
+    if _linear_disables_tensor_parallel_comm(linear):
+        return x
+    if (
+        bool(getattr(linear, "sequence_parallel", False))
+        and int(getattr(linear, "tp_size", 1)) > 1
+    ):
+        return gather_from_sequence_parallel_region(x)
+    return x
 
 
 def _set_lora_parallel_metadata(
@@ -151,6 +189,37 @@ def _set_lora_parallel_metadata(
         setattr(param, "tensor_model_parallel", False)
         setattr(param, "partition_dim", -1)
         setattr(param, "partition_stride", 1)
+
+
+def _set_lora_shard_strategy_metadata(
+    param: torch.nn.Parameter,
+    *,
+    strategy: str,
+    component_sizes: Sequence[int] | None = None,
+) -> None:
+    setattr(param, "lora_tp_shard_strategy", strategy)
+    if component_sizes is not None:
+        setattr(
+            param,
+            "lora_tp_component_sizes",
+            tuple(int(size) for size in component_sizes),
+        )
+
+
+def _exported_shard_dim(param: torch.nn.Parameter) -> int:
+    axis = _normalize_axis(param.lora_tp_shard_dim, param.ndim)  # ty: ignore[unresolved-attribute]
+    # LoRA exports always serialize a 2D tensor:
+    # - non-expert params export `param.T`
+    # - expert params export `param[expert].T`
+    if param.ndim == 3:
+        if axis == 0:
+            raise ValueError("LoRA expert shard_dim cannot reference the expert axis")
+        axis -= 1
+    if axis not in (0, 1):
+        raise ValueError(
+            f"Unsupported exported LoRA shard axis {axis} for ndim={param.ndim}"
+        )
+    return 1 - axis
 
 
 class LoRA(torch.nn.Module):
@@ -284,20 +353,46 @@ class LoRA(torch.nn.Module):
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
-            if weight.shape[axis] % world_size != 0:
-                raise ValueError(
-                    f"{self.adapter_model_prefix}: weight shape {tuple(weight.shape)} is not divisible by world size "
-                    f"{world_size} on axis {axis}"
+            strategy = getattr(into, "lora_tp_shard_strategy", "uniform")
+            if strategy == "componentwise":
+                component_sizes = tuple(
+                    int(size) for size in getattr(into, "lora_tp_component_sizes", ())
                 )
-            local_size = weight.shape[axis] // world_size
-            if into.shape[axis] != local_size:
-                raise ValueError(
-                    f"{self.adapter_model_prefix}: expected local shard size {into.shape[axis]}, got {local_size}"
+                if not component_sizes:
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: missing component sizes for shard strategy={strategy}"
+                    )
+                weight = _shard_weight_by_components(
+                    weight,
+                    axis=axis,
+                    component_sizes=component_sizes,
+                    world_size=world_size,
+                    rank=rank,
                 )
-            weight = weight.narrow(axis, rank * local_size, local_size)
+            elif strategy == "uniform":
+                if weight.shape[axis] % world_size != 0:
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: weight shape {tuple(weight.shape)} is not divisible by world size "
+                        f"{world_size} on axis {axis}"
+                    )
+                local_size = weight.shape[axis] // world_size
+                if into.shape[axis] != local_size:
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: expected local shard size {into.shape[axis]}, got {local_size}"
+                    )
+                weight = weight.narrow(axis, rank * local_size, local_size)
+            else:
+                raise ValueError(
+                    f"{self.adapter_model_prefix}: unsupported shard strategy={strategy}"
+                )
         elif tuple(weight.shape) != tuple(into.shape):
             raise ValueError(
                 f"{self.adapter_model_prefix}: unsharded load shape mismatch, got {tuple(weight.shape)} "
+                f"expected {tuple(into.shape)}"
+            )
+        if tuple(weight.shape) != tuple(into.shape):
+            raise ValueError(
+                f"{self.adapter_model_prefix}: sharded load shape mismatch, got {tuple(weight.shape)} "
                 f"expected {tuple(into.shape)}"
             )
         into.data.copy_(weight)
@@ -323,7 +418,7 @@ class LoRA(torch.nn.Module):
         return _get_shard_rank(param.lora_shard_domain) == 0  # ty: ignore[unresolved-attribute]
 
     def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
-        return {
+        manifest = {
             "domain": param.lora_shard_domain,  # ty: ignore[unresolved-attribute]
             "sharded": param.lora_tp_sharded,  # ty: ignore[unresolved-attribute]
             "shard_dim": param.lora_tp_shard_dim,  # ty: ignore[unresolved-attribute]
@@ -334,6 +429,17 @@ class LoRA(torch.nn.Module):
             if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
             else 0,
         }
+        if param.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
+            manifest["export_shard_dim"] = _exported_shard_dim(param)
+            manifest["export_shard_strategy"] = getattr(
+                param,
+                "lora_tp_shard_strategy",
+                "uniform",
+            )
+            component_sizes = list(getattr(param, "lora_tp_component_sizes", ()))
+            if component_sizes:
+                manifest["component_sizes"] = component_sizes
+        return manifest
 
     def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
         return [
@@ -368,6 +474,22 @@ class LoRA(torch.nn.Module):
             state[key] = param.data[expert].T if expert is not None else param.data.T
         return state
 
+    def sharded_lora_grad_dict(self) -> dict[str, torch.Tensor]:
+        grads: dict[str, torch.Tensor] = {}
+        for key, param, expert in self._export_items():
+            if not hasattr(param, "main_grad"):
+                raise RuntimeError(
+                    f"LoRA param missing main_grad attribute for key '{key}'"
+                )
+            grad = cast(torch.Tensor, param.main_grad)
+            if grad is None:
+                raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
+            if hasattr(grad, "_local_tensor"):
+                grad = cast(Any, grad)._local_tensor
+            local_grad = grad[expert] if expert is not None else grad
+            grads[key] = local_grad.T
+        return grads
+
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -378,8 +500,7 @@ class LoRA(torch.nn.Module):
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
-            # If no tokens routed locally, return zeros.
-            if isinstance(bsz, torch.Tensor) and int(torch.count_nonzero(bsz)) == 0:
+            if x.shape[0] == 0:
                 return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
             return quack_grouped_lora(x, self.A_T, self.B_T, bsz, scale=self.scale)
         out = (x @ self.A_T) @ self.B_T
@@ -466,8 +587,9 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             raise ValueError(
                 "num_attention_heads must be divisible by num_query_groups for QKV LoRA"
             )
-        linear_qkv_weight = cast(torch.Tensor, linear_qkv.weight)
-        total_out_features_per_rank = linear_qkv_weight.shape[0]
+        weight = linear_qkv.weight
+        assert isinstance(weight, torch.Tensor)
+        total_out_features_per_rank = int(weight.shape[0])
         kv_out_features = self.provider.kv_channels * self.provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
         assert kv_out_features % tp_world_size == 0, (
@@ -498,7 +620,6 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             self.provider.num_attention_heads // self.provider.num_query_groups
         )
         self.hidden_size_per_attention_head = self.provider.kv_channels
-        assert isinstance(linear_qkv.weight, torch.Tensor)
         self.q_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
             linear_qkv=linear_qkv,
@@ -572,8 +693,6 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         query_and_gate = self.q_proj_lora(layernorm_output)
         key = self.k_proj_lora(layernorm_output)
         value = self.v_proj_lora(layernorm_output)
-        # Qwen3 packs [query, key, value] per group, while Qwen3.5 packs
-        # [query, gate, key, value].
         query_and_gate_5d = query_and_gate.reshape(
             query_and_gate.shape[0],
             query_and_gate.shape[1],
@@ -632,6 +751,15 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             alpha=alpha,
             out_features=qkv_out_features_per_partition,
         )
+        _set_lora_shard_strategy_metadata(
+            self.qkv_lora.B_T,
+            strategy="componentwise",
+            component_sizes=(
+                gated_delta_net.qk_dim,
+                gated_delta_net.qk_dim,
+                gated_delta_net.v_dim,
+            ),
+        )
         self.z_lora = self._build_in_proj_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.in_proj_z",
             in_proj=in_proj,
@@ -678,10 +806,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        (
-            linear_output_and_layernorm_output,
-            bias,
-        ) = self.in_proj(x)
+        linear_output_and_layernorm_output, bias = self.in_proj(x)
         linear_output, layernorm_output = linear_output_and_layernorm_output
         assert isinstance(linear_output, torch.Tensor)
         assert isinstance(layernorm_output, torch.Tensor)
@@ -775,7 +900,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         counts = tokens_per_expert
         if isinstance(counts, list):
             counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
-        if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
+        if x.shape[0] == 0:
             adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
         else:
             adapter_out = quack_grouped_lora_dual(
@@ -791,71 +916,53 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         return base_out + adapter_out, bias_out
 
 
-class SharedExpertsLinearFC1LoRA(torch.nn.Module):
+class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
     def __init__(
         self,
         adapter_model_prefix: str,
-        linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
+        linear_fc1: TEColumnParallelGroupedLinear,
         rank: int,
         alpha: float,
+        num_local_experts: int,
     ) -> None:
         super().__init__()
+        assert linear_fc1 is not None
+        assert isinstance(linear_fc1.weight0, torch.Tensor)
         self.linear_fc1 = linear_fc1
-        self.gate_lora = self._build_fc1_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.gate_proj",
-            linear_fc1=linear_fc1,
-            rank=rank,
-            alpha=alpha,
-        )
-        self.up_lora = self._build_fc1_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
-            linear_fc1=linear_fc1,
-            rank=rank,
-            alpha=alpha,
-        )
-
-    @staticmethod
-    def _build_fc1_lora(
-        *,
-        adapter_model_prefix: str,
-        linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
-        rank: int,
-        alpha: float,
-    ) -> LoRA:
-        assert isinstance(linear_fc1.weight, torch.Tensor)
         a_parallel_spec = LoRAParallelSpec(
-            shard_domain="tp",
+            shard_domain="expert_tp",
             sharded=False,
             shard_dim=None,
-            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             grad_sync_op=GRAD_SYNC_OP_SUM,
         )
         b_parallel_spec = a_parallel_spec.model_copy(
             update={
                 "sharded": True,
                 "shard_dim": -1,
+                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
                 "grad_sync_op": GRAD_SYNC_OP_NONE,
             }
         )
-        return LoRA(
-            adapter_model_prefix=adapter_model_prefix,
+        self.lora = LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
             in_features=linear_fc1.in_features,
-            out_features=linear_fc1.out_features // 2,
+            out_features=linear_fc1.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight.dtype,
-            device=linear_fc1.weight.device,
+            dtype=linear_fc1.weight0.dtype,
+            device=linear_fc1.weight0.device,
+            num_local_experts=num_local_experts,
             a_parallel_spec=a_parallel_spec,
             b_parallel_spec=b_parallel_spec,
-            allreduce=True,
+            allreduce=False,
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = self.linear_fc1(x)
-        adapter_out = torch.cat(
-            [self.gate_lora(x), self.up_lora(x)],
-            dim=-1,
-        )
+    def forward(
+        self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
+        adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
         return base_out + adapter_out, bias_out
 
 
@@ -912,6 +1019,89 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         return base_out + adapter_out, bias_out
 
 
+class SharedExpertsLinearFC1LoRA(torch.nn.Module):
+    def __init__(
+        self,
+        adapter_model_prefix: str,
+        linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
+        rank: int,
+        alpha: float,
+    ) -> None:
+        super().__init__()
+        if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
+            linear_fc1.return_layernorm_output = True
+            linear_fc1.return_layernorm_output_gathered = True
+        self.linear_fc1 = linear_fc1
+        self.gate_lora = self._build_fc1_lora(
+            adapter_model_prefix=f"{adapter_model_prefix}.gate_proj",
+            linear_fc1=linear_fc1,
+            rank=rank,
+            alpha=alpha,
+        )
+        self.up_lora = self._build_fc1_lora(
+            adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
+            linear_fc1=linear_fc1,
+            rank=rank,
+            alpha=alpha,
+        )
+
+    @staticmethod
+    def _build_fc1_lora(
+        *,
+        adapter_model_prefix: str,
+        linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
+        rank: int,
+        alpha: float,
+    ) -> LoRA:
+        assert isinstance(linear_fc1.weight, torch.Tensor)
+        a_parallel_spec = LoRAParallelSpec(
+            shard_domain="tp",
+            sharded=False,
+            shard_dim=None,
+            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
+            grad_sync_op=GRAD_SYNC_OP_SUM,
+        )
+        b_parallel_spec = a_parallel_spec.model_copy(
+            update={
+                "sharded": True,
+                "shard_dim": -1,
+                "grad_sync_op": GRAD_SYNC_OP_NONE,
+            }
+        )
+        return LoRA(
+            adapter_model_prefix=adapter_model_prefix,
+            in_features=linear_fc1.in_features,
+            out_features=linear_fc1.out_features // 2,
+            rank=rank,
+            alpha=alpha,
+            dtype=linear_fc1.weight.dtype,
+            device=linear_fc1.weight.device,
+            a_parallel_spec=a_parallel_spec,
+            b_parallel_spec=b_parallel_spec,
+            allreduce=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base_output, bias_out = self.linear_fc1(x)
+        if isinstance(base_output, tuple):
+            base_out, lora_input = base_output
+        else:
+            base_out = base_output
+            lora_input = _column_parallel_lora_input(x, self.linear_fc1)
+        adapter_out = torch.cat(
+            [self.gate_lora(lora_input), self.up_lora(lora_input)],
+            dim=-1,
+        )
+        if adapter_out.shape != base_out.shape:
+            adapter_model_prefix = self.gate_lora.adapter_model_prefix.rsplit(".", 1)[0]
+            raise RuntimeError(
+                f"{adapter_model_prefix}: LoRA adapter output shape "
+                f"{tuple(adapter_out.shape)} does not match base output shape "
+                f"{tuple(base_out.shape)}"
+            )
+        return base_out + adapter_out, bias_out
+
+
 class SharedExpertsLinearFC2LoRA(torch.nn.Module):
     def __init__(
         self,
@@ -935,166 +1125,262 @@ class SharedExpertsLinearFC2LoRA(torch.nn.Module):
         return self.row_parallel_lora(x)
 
 
+def _unwrap_attr(
+    value: Any,
+    attr_name: str,
+    expected_type: type[Any] | tuple[type[Any], ...],
+) -> Any:
+    if isinstance(value, expected_type):
+        return value
+    unwrapped = getattr(value, attr_name)
+    assert isinstance(unwrapped, expected_type)
+    return unwrapped
+
+
+def _adapter_model_prefix(module: TransformerLayer) -> str:
+    return f"base_model.model.model.layers.{module.layer_number - 1}"
+
+
+def _is_language_transformer_layer_name(module_name: str) -> bool:
+    while module_name.startswith("module."):
+        module_name = module_name.removeprefix("module.")
+    return module_name.startswith(("decoder.layers.", "language_model.decoder.layers."))
+
+
+def _targets_include(target_modules: set[str], *names: str) -> bool:
+    return not target_modules or any(name in target_modules for name in names)
+
+
+def wrap_standard_self_attention(
+    self_attention: SelfAttention,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "o_proj"):
+        self_attention_linear_proj = _unwrap_attr(
+            self_attention.linear_proj,
+            "linear_proj",
+            TERowParallelLinear,
+        )
+        self_attention.linear_proj = SelfAttentionLinearProjLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
+            linear_proj=self_attention_linear_proj,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
+    if _targets_include(target_modules, "q_proj", "k_proj", "v_proj"):
+        self_attention_linear_qkv = _unwrap_attr(
+            self_attention.linear_qkv,
+            "linear_qkv",
+            TELayerNormColumnParallelLinear,
+        )
+        self_attention.linear_qkv = SelfAttentionLinearQKVLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
+            linear_qkv=self_attention_linear_qkv,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
+
+
+def wrap_gated_delta_net_attention(
+    self_attention: GatedDeltaNet,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "out_proj"):
+        gated_delta_net_out_proj = _unwrap_attr(
+            self_attention.out_proj,
+            "out_proj",
+            TERowParallelLinear,
+        )
+        self_attention.out_proj = SelfAttentionLinearProjLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.linear_attn.out_proj",
+            linear_proj=gated_delta_net_out_proj,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
+    if _targets_include(target_modules, "in_proj_qkv", "in_proj_z"):
+        gated_delta_net_in_proj = _unwrap_attr(
+            self_attention.in_proj,
+            "in_proj",
+            TELayerNormColumnParallelLinear,
+        )
+        self_attention.in_proj = GatedDeltaNetInProjLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.linear_attn",
+            in_proj=gated_delta_net_in_proj,
+            gated_delta_net=self_attention,
+            rank=rank,
+            alpha=alpha,
+        )
+
+
+def wrap_grouped_moe_experts(
+    experts: TEGroupedMLP,
+    *,
+    adapter_model_prefix: str,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "gate_proj", "up_proj"):
+        mlp_experts_linear_fc1 = _unwrap_attr(
+            experts.linear_fc1,
+            "linear_fc1",
+            TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
+        )
+        experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+            linear_fc1=mlp_experts_linear_fc1,
+            rank=rank,
+            alpha=alpha,
+            num_local_experts=experts.num_local_experts,
+        )
+    if _targets_include(target_modules, "down_proj"):
+        mlp_experts_linear_fc2 = _unwrap_attr(
+            experts.linear_fc2,
+            "linear_fc2",
+            TERowParallelGroupedLinear,  # type: ignore[arg-type]
+        )
+        experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+            linear_fc2=mlp_experts_linear_fc2,
+            rank=rank,
+            alpha=alpha,
+            num_local_experts=experts.num_local_experts,
+        )
+
+
+def wrap_grouped_moe_experts_3d(
+    experts: TEGroupedMLP,
+    *,
+    adapter_model_prefix: str,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "experts"):
+        mlp_experts_linear_fc1 = _unwrap_attr(
+            experts.linear_fc1,
+            "linear_fc1",
+            TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
+        )
+        experts.linear_fc1 = MLPExpertsLinearFC1FusedLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+            linear_fc1=mlp_experts_linear_fc1,
+            rank=rank,
+            alpha=alpha,
+            num_local_experts=experts.num_local_experts,
+        )
+        mlp_experts_linear_fc2 = _unwrap_attr(
+            experts.linear_fc2,
+            "linear_fc2",
+            TERowParallelGroupedLinear,  # type: ignore[arg-type]
+        )
+        experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+            linear_fc2=mlp_experts_linear_fc2,
+            rank=rank,
+            alpha=alpha,
+            num_local_experts=experts.num_local_experts,
+        )
+
+
+def wrap_dense_mlp(
+    mlp: Any,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "gate_proj", "up_proj"):
+        mlp_linear_fc1 = _unwrap_attr(
+            mlp.linear_fc1,
+            "linear_fc1",
+            (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
+        )
+        mlp.linear_fc1 = SharedExpertsLinearFC1LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp",
+            linear_fc1=mlp_linear_fc1,
+            rank=rank,
+            alpha=alpha,
+        )
+    if _targets_include(target_modules, "down_proj"):
+        mlp_linear_fc2 = _unwrap_attr(
+            mlp.linear_fc2,
+            "linear_fc2",
+            TERowParallelLinear,
+        )
+        mlp.linear_fc2 = SharedExpertsLinearFC2LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp",
+            linear_fc2=mlp_linear_fc2,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
+
+
+def wrap_shared_experts_mlp(
+    shared_experts: SharedExpertMLP,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "gate_proj", "up_proj"):
+        shared_experts_linear_fc1 = _unwrap_attr(
+            shared_experts.linear_fc1,
+            "linear_fc1",
+            (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
+        )
+        shared_experts.linear_fc1 = SharedExpertsLinearFC1LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
+            linear_fc1=shared_experts_linear_fc1,
+            rank=rank,
+            alpha=alpha,
+        )
+    if _targets_include(target_modules, "down_proj"):
+        shared_experts_linear_fc2 = _unwrap_attr(
+            shared_experts.linear_fc2,
+            "linear_fc2",
+            TERowParallelLinear,
+        )
+        shared_experts.linear_fc2 = SharedExpertsLinearFC2LoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
+            linear_fc2=shared_experts_linear_fc2,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
+
+
 def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,
 ) -> list[torch.nn.Module]:
-    def _is_language_transformer_layer(module_name: str) -> bool:
-        while module_name.startswith("module."):
-            module_name = module_name.removeprefix("module.")
-        return module_name.startswith(
-            ("decoder.layers.", "language_model.decoder.layers.")
-        )
-
-    def _unwrap_attr(
-        value: Any,
-        attr_name: str,
-        expected_type: type[Any] | tuple[type[Any], ...],
-    ) -> Any:
-        if isinstance(value, expected_type):
-            return value
-        unwrapped = getattr(value, attr_name)
-        assert isinstance(unwrapped, expected_type)
-        return unwrapped
-
-    for chunk in model:
-        for module_name, module in chunk.named_modules():
-            if isinstance(module, TransformerLayer):
-                if not _is_language_transformer_layer(module_name):
-                    continue
-                adapter_model_prefix = (
-                    f"base_model.model.model.layers.{module.layer_number - 1}"
-                )
-                if isinstance(module.self_attention, SelfAttention):
-                    self_attention_linear_proj = _unwrap_attr(
-                        module.self_attention.linear_proj,
-                        "linear_proj",
-                        TERowParallelLinear,
-                    )
-                    module.self_attention.linear_proj = SelfAttentionLinearProjLoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
-                        linear_proj=self_attention_linear_proj,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        provider=provider,
-                    )
-                    self_attention_linear_qkv = _unwrap_attr(
-                        module.self_attention.linear_qkv,
-                        "linear_qkv",
-                        TELayerNormColumnParallelLinear,
-                    )
-                    module.self_attention.linear_qkv = SelfAttentionLinearQKVLoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
-                        linear_qkv=self_attention_linear_qkv,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        provider=provider,
-                    )
-                elif isinstance(module.self_attention, GatedDeltaNet):
-                    gated_delta_net_out_proj = _unwrap_attr(
-                        module.self_attention.out_proj,
-                        "out_proj",
-                        TERowParallelLinear,
-                    )
-                    module.self_attention.out_proj = SelfAttentionLinearProjLoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.linear_attn.out_proj",
-                        linear_proj=gated_delta_net_out_proj,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        provider=provider,
-                    )
-                    gated_delta_net_in_proj = _unwrap_attr(
-                        module.self_attention.in_proj,
-                        "in_proj",
-                        TELayerNormColumnParallelLinear,
-                    )
-                    module.self_attention.in_proj = GatedDeltaNetInProjLoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.linear_attn",
-                        in_proj=gated_delta_net_in_proj,
-                        gated_delta_net=module.self_attention,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                    )
-                else:
-                    raise TypeError(
-                        "Unsupported self_attention module type for Megatron LoRA: "
-                        f"{type(module.self_attention)}"
-                    )
-                experts = getattr(module.mlp, "experts", None)
-                if experts is not None:
-                    assert isinstance(experts, TEGroupedMLP)
-                    mlp_experts_linear_fc1 = _unwrap_attr(
-                        experts.linear_fc1,
-                        "linear_fc1",
-                        TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
-                    )
-                    experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-                        linear_fc1=mlp_experts_linear_fc1,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        num_local_experts=experts.num_local_experts,
-                    )
-                    mlp_experts_linear_fc2 = _unwrap_attr(
-                        experts.linear_fc2,
-                        "linear_fc2",
-                        TERowParallelGroupedLinear,  # type: ignore[arg-type]
-                    )
-                    experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-                        linear_fc2=mlp_experts_linear_fc2,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        num_local_experts=experts.num_local_experts,
-                    )
-                else:
-                    mlp_linear_fc1 = _unwrap_attr(
-                        module.mlp.linear_fc1,
-                        "linear_fc1",
-                        (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
-                    )
-                    module.mlp.linear_fc1 = SharedExpertsLinearFC1LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp",
-                        linear_fc1=mlp_linear_fc1,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                    )
-                    mlp_linear_fc2 = _unwrap_attr(
-                        module.mlp.linear_fc2,
-                        "linear_fc2",
-                        TERowParallelLinear,
-                    )
-                    module.mlp.linear_fc2 = SharedExpertsLinearFC2LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp",
-                        linear_fc2=mlp_linear_fc2,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        provider=provider,
-                    )
-                shared_experts = getattr(module.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    assert isinstance(shared_experts, SharedExpertMLP)
-                    shared_experts_linear_fc1 = _unwrap_attr(
-                        shared_experts.linear_fc1,
-                        "linear_fc1",
-                        (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
-                    )
-                    shared_experts.linear_fc1 = SharedExpertsLinearFC1LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
-                        linear_fc1=shared_experts_linear_fc1,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                    )
-                    shared_experts_linear_fc2 = _unwrap_attr(
-                        shared_experts.linear_fc2,
-                        "linear_fc2",
-                        TERowParallelLinear,
-                    )
-                    shared_experts.linear_fc2 = SharedExpertsLinearFC2LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
-                        linear_fc2=shared_experts_linear_fc2,
-                        rank=LORA_RANK,
-                        alpha=LORA_ALPHA,
-                        provider=provider,
-                    )
+    provider = cast(Any, provider)
+    handler = provider._art_model_support_handler
+    spec = provider._art_model_support_spec
+    target_modules = list(spec.default_target_modules)
+    handler.apply_lora_adapters(
+        model,
+        provider,
+        target_modules=target_modules,
+        rank=LORA_RANK,
+        alpha=LORA_ALPHA,
+    )
     return list(model)

@@ -1,8 +1,7 @@
 """Flex attention plumbing for ART's Megatron backend."""
 
-from collections.abc import Callable
 import math
-from typing import Any, ClassVar, TypeAlias, cast
+from typing import Any, ClassVar, cast
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -25,32 +24,19 @@ class SharedPrefixAttentionState(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     block_mask: BlockMask
-
-
-CompileOptions: TypeAlias = dict[str, str | int | bool | Callable[..., Any]]
+    group_ids: Tensor
+    parent_ids: Tensor
 
 
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
-    # Torchtitan inductor options for compiling flex attention.
-    _compile_options: ClassVar[CompileOptions] = {
-        "max_autotune": True,
-        "coordinate_descent_tuning": True,
-        "triton.cudagraphs": False,
-    }
-    # Skip Inductor's flex_decoding specialization: it has triggered both
-    # shared-memory OOMs (triton_flex_decoding) and symbolic-shape assertion
-    # failures (create_flex_decoding_kernel). The regular flex_attention
-    # kernel autotunes against the actual hardware smem budget, so this
-    # stays GPU-agnostic.
+    # Force the regular flex kernel. The flex-decoding specialization has hit
+    # shared-memory OOMs and symbolic-shape assertions on long packed training sequences.
     _kernel_options: ClassVar[FlexKernelOptions] = {
         "FORCE_USE_FLEX_ATTENTION": True,
     }
-    _compiled_flex_attention: ClassVar = torch.compile(
-        flex_attention,
-        options=_compile_options,
-    )
+    _compiled_flex_attention: ClassVar = torch.compile(flex_attention)
 
     def forward(
         self,
@@ -117,7 +103,11 @@ def create_shared_prefix_attention_state(
         group_ids.shape[1],
         device=group_ids.device,
     )
-    return SharedPrefixAttentionState(block_mask=block_mask)
+    return SharedPrefixAttentionState(
+        block_mask=block_mask,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    )
 
 
 class FlexDotProductAttention(torch.nn.Module):
