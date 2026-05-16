@@ -20,8 +20,8 @@ class StreamingWeightOffloadConfig(BaseModel):
 
     enabled: bool = False
     num_layers: int = Field(default=0, ge=0)
-    num_slots: int = Field(default=2, ge=2)
-    resident_layers: int = Field(default=1, ge=1)
+    num_slots: int = Field(default=4, ge=2)
+    resident_layers: int = Field(default=2, ge=1)
 
 
 class _ParamSpec:
@@ -356,9 +356,9 @@ def streaming_weight_offload_config_from_env() -> StreamingWeightOffloadConfig:
     config = StreamingWeightOffloadConfig(
         enabled=_env_flag("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD"),
         num_layers=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_LAYERS", 0),
-        num_slots=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS", 2),
+        num_slots=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS", 4),
         resident_layers=_env_int(
-            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_RESIDENT_LAYERS", 1
+            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_RESIDENT_LAYERS", 2
         ),
     )
     if config.resident_layers > config.num_slots:
@@ -369,13 +369,13 @@ def streaming_weight_offload_config_from_env() -> StreamingWeightOffloadConfig:
     return config
 
 
-def maybe_install_streaming_weight_offload(
+def install_streaming_weight_offload(
     *,
     model: ModelChunks,
     rank: int,
     compile_enabled: bool,
+    config: StreamingWeightOffloadConfig,
 ) -> StreamingWeightOffloader | None:
-    config = streaming_weight_offload_config_from_env()
     if not config.enabled:
         return None
     if compile_enabled:
@@ -389,6 +389,20 @@ def maybe_install_streaming_weight_offload(
     offloader = StreamingWeightOffloader(layers=layers, rank=rank, config=config)
     offloader.install()
     return offloader
+
+
+def maybe_install_streaming_weight_offload(
+    *,
+    model: ModelChunks,
+    rank: int,
+    compile_enabled: bool,
+) -> StreamingWeightOffloader | None:
+    return install_streaming_weight_offload(
+        model=model,
+        rank=rank,
+        compile_enabled=compile_enabled,
+        config=streaming_weight_offload_config_from_env(),
+    )
 
 
 def _validate_checkpoint_shape(layer: torch.nn.Module) -> None:

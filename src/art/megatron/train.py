@@ -78,17 +78,8 @@ from art.megatron.training.model_chunks import (
     as_megatron_api_chunks,
     validate_model_chunks,
 )
-from art.megatron.training.offload import (
-    OffloadState,
-    offload_to_cpu,
-    offload_trainable_buffers_to_cpu,
-    reload_to_gpu,
-    reload_trainable_buffers_to_gpu,
-)
 from art.megatron.training.sft_batches import load_sft_batch_from_disk
-from art.megatron.training.streaming_weight_offload import (
-    maybe_install_streaming_weight_offload,
-)
+from art.megatron.training.weight_offload import WeightOffloadManager
 from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
 from art.megatron.weights.merged_weight_export import (
     sync_merged_weights_to_vllm,
@@ -2217,12 +2208,12 @@ def _sync_merged_weights_to_vllm(
 
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
-    offload_state = OffloadState()
-    streaming_weight_offloader = maybe_install_streaming_weight_offload(
+    weight_offload = WeightOffloadManager.from_env(
         model=runtime.model,
         rank=runtime.rank,
         compile_enabled=_compile_enabled(),
     )
+    weight_offload.install()
     wake_lock_path = os.environ.get(
         "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
     )
@@ -2232,23 +2223,11 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             time.sleep(0.2)
 
     def before_job() -> None:
-        if streaming_weight_offloader is None:
-            reload_to_gpu(runtime.model, runtime.rank, offload_state)
-        else:
-            reload_trainable_buffers_to_gpu(runtime.model, runtime.rank)
-            streaming_weight_offloader.begin_job()
+        weight_offload.before_job()
 
     def after_job() -> None:
         runtime.optimizer = None
-        if streaming_weight_offloader is None:
-            gc.collect()
-            torch.cuda.empty_cache()
-            offload_to_cpu(runtime.model, runtime.rank, offload_state)
-        else:
-            streaming_weight_offloader.finish_job()
-            offload_trainable_buffers_to_cpu(runtime.model, runtime.rank)
-            gc.collect()
-            torch.cuda.empty_cache()
+        weight_offload.after_job()
 
     after_job()
     run_megatron_worker_loop(

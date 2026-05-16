@@ -1310,6 +1310,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
     from art import dev, types
     from art.megatron import train as megatron_train
+    from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -1361,6 +1362,16 @@ def _worker_run(request: WorkerRunRequest) -> None:
         strict=request.moe_routing_replay_strict,
     )
     _assert_runtime_configuration(model_chunks, request.case_config, request.topology)
+    weight_offload = WeightOffloadManager.from_config(
+        model=model_chunks,
+        rank=torch.distributed.get_rank(),  # ty: ignore[possibly-missing-attribute]
+        compile_enabled=False,
+        offload_between_jobs=request.offload_between_jobs,
+        streaming_config=request.streaming_weight_offload,
+    )
+    weight_offload.install()
+    weight_offload.after_job()
+    weight_offload.before_job()
 
     topology_dir = Path(request.topology_dir)
     traces_dir = topology_dir / "traces"
@@ -1608,9 +1619,12 @@ def _worker_run(request: WorkerRunRequest) -> None:
             seed=request.case_config.seed,
             num_steps=request.case_config.num_steps,
             packed_tensors=request.packed_tensors,
+            offload_between_jobs=request.offload_between_jobs,
+            streaming_weight_offload=request.streaming_weight_offload,
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
+    weight_offload.after_job()
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
     flex_patch_stack.close()
     torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]

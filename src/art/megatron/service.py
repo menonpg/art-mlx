@@ -55,6 +55,7 @@ from .training.sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
+OFFLOAD_BETWEEN_JOBS_ENV = "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS"
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
@@ -649,6 +650,7 @@ class MegatronService:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
+        env[OFFLOAD_BETWEEN_JOBS_ENV] = "0" if self.is_dedicated else "1"
         master_addr = env.get("MASTER_ADDR", "127.0.0.1")
         master_port = str(self._allocate_master_port())
         env["MASTER_ADDR"] = master_addr

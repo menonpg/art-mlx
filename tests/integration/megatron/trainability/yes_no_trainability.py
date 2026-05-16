@@ -309,6 +309,23 @@ def _wandb_disabled() -> Iterator[None]:
                 os.environ[name] = value
 
 
+@contextmanager
+def _temporary_env(updates: dict[str, str] | None) -> Iterator[None]:
+    if not updates:
+        yield
+        return
+    saved = {name: os.environ.get(name) for name in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _artifact_dir(base_model: str, variant_name: _VARIANT_NAME) -> Path:
     path = (
         _TRAINABILITY_ROOT / _slugify(base_model) / variant_name / uuid.uuid4().hex[:8]
@@ -454,8 +471,9 @@ async def _backend_context(
     variant: _TrainabilityVariant,
     *,
     backend_root: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> AsyncIterator[LocalBackend | MegatronBackend]:
-    with _wandb_disabled():
+    with _wandb_disabled(), _temporary_env(extra_env):
         topology_context = (
             provider_topology_env(variant.topology)
             if variant.topology is not None
@@ -649,6 +667,7 @@ async def run_yes_no_trainability_async(
     artifact_root: Path | None = None,
     rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> YesNoTrainabilityReport:
     variant = _build_variant(
         variant_name,
@@ -679,7 +698,9 @@ async def run_yes_no_trainability_async(
     )
     train_kwargs = _variant_train_kwargs(variant)
 
-    async with _backend_context(variant, backend_root=backend_root) as backend:
+    async with _backend_context(
+        variant, backend_root=backend_root, extra_env=extra_env
+    ) as backend:
         await model.register(backend)
         output_dir = Path(model.base_path) / model.project / "models" / model.name
         await _warmup_model(model, base_model=base_model, prompt=prompts[0])

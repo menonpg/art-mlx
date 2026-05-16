@@ -16,6 +16,8 @@ from rich.console import Console
 from rich.table import Table
 import torch
 
+from art.megatron.training.streaming_weight_offload import StreamingWeightOffloadConfig
+
 from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD, mean_abs_pct_from_sums
 from .forward_trace import ForwardTraceCapture
 
@@ -374,6 +376,10 @@ class WorkerRunRequest(BaseModel):
     moe_routing_replay_strict: bool = True
     capture_moe_routing_bundle_path: str | None = None
     flex_backend: FlexBackend | None = None
+    offload_between_jobs: bool = True
+    streaming_weight_offload: StreamingWeightOffloadConfig = Field(
+        default_factory=StreamingWeightOffloadConfig
+    )
 
 
 class StepTrace(BaseModel):
@@ -403,6 +409,10 @@ class RunManifest(BaseModel):
     seed: int
     num_steps: int
     packed_tensors: DiskPackedTensorsSpec
+    offload_between_jobs: bool = True
+    streaming_weight_offload: StreamingWeightOffloadConfig = Field(
+        default_factory=StreamingWeightOffloadConfig
+    )
     steps: list[StepTrace]
 
 
@@ -444,6 +454,10 @@ class VariantSpec(BaseModel):
     expected_signal: Literal["pass", "fail"] = "pass"
     force_regenerate: bool = True
     flex_backend: FlexBackend | None = None
+    offload_between_jobs: bool = True
+    streaming_weight_offload: StreamingWeightOffloadConfig = Field(
+        default_factory=StreamingWeightOffloadConfig
+    )
 
     def resolved_output_slug(self) -> str:
         """Resolves the artifact slug for this run, including mutation suffix when present."""
@@ -1151,6 +1165,10 @@ class VariantRunner:
         case_config: OracleCaseConfig,
         oracle_flex_backend: FlexBackend | None = None,
         variant_flex_backend: FlexBackend | None = None,
+        oracle_topology_override: Topology | None = None,
+        oracle_slug_override: str | None = None,
+        oracle_offload_between_jobs: bool = True,
+        oracle_streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
         console: Console | None = None,
     ) -> None:
         self.objective = objective
@@ -1158,11 +1176,19 @@ class VariantRunner:
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
-        self.oracle_topology = oracle_topology(is_moe=case_config.is_moe)
-        self.oracle_slug = oracle_output_slug(objective, self.oracle_topology)
+        self.oracle_topology = oracle_topology_override or oracle_topology(
+            is_moe=case_config.is_moe
+        )
+        self.oracle_slug = oracle_slug_override or oracle_output_slug(
+            objective, self.oracle_topology
+        )
         self.oracle_dir = self.case_dir / self.oracle_slug
         self.oracle_routing_bundle_dir = (
             self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
+        )
+        self.oracle_offload_between_jobs = oracle_offload_between_jobs
+        self.oracle_streaming_weight_offload = (
+            oracle_streaming_weight_offload or StreamingWeightOffloadConfig()
         )
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
         self.oracle_flex_backend = _resolve_test_flex_backend(
@@ -1332,6 +1358,8 @@ class VariantRunner:
         capture_bundle_dir: Path | None,
         regenerate: bool,
         flex_backend: FlexBackend | None = None,
+        offload_between_jobs: bool = True,
+        streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
     ) -> Path:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
@@ -1357,6 +1385,10 @@ class VariantRunner:
                 None if capture_bundle_dir is None else str(capture_bundle_dir)
             ),
             flex_backend=flex_backend,
+            offload_between_jobs=offload_between_jobs,
+            streaming_weight_offload=(
+                streaming_weight_offload or StreamingWeightOffloadConfig()
+            ),
         )
         from .oracle_worker import run_worker_subprocess
 
@@ -1382,6 +1414,8 @@ class VariantRunner:
             topology=self.oracle_topology,
             mutation=None,
             flex_backend=self.oracle_flex_backend,
+            offload_between_jobs=self.oracle_offload_between_jobs,
+            streaming_weight_offload=self.oracle_streaming_weight_offload,
             regenerate=True,
         )
         if self.case_config.is_moe and need_capture:
@@ -1420,6 +1454,8 @@ class VariantRunner:
             output_slug=output_slug,
             mutation=variant.mutation,
             flex_backend=variant.flex_backend or self.variant_flex_backend,
+            offload_between_jobs=variant.offload_between_jobs,
+            streaming_weight_offload=variant.streaming_weight_offload,
             replay_bundle_dir=(
                 self.oracle_routing_bundle_dir if self.case_config.is_moe else None
             ),
