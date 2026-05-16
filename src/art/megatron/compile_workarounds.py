@@ -795,10 +795,6 @@ def install_torch_compile_workarounds(
         moe_layer.MoELayer.routed_experts_compute = _disable(
             moe_layer.MoELayer.routed_experts_compute
         )
-    if "grouped_mlp_forward" in flags:
-        moe_experts.GroupedMLP.forward = _disable(moe_experts.GroupedMLP.forward)
-    if "te_grouped_mlp_forward" in flags:
-        moe_experts.TEGroupedMLP.forward = _disable(moe_experts.TEGroupedMLP.forward)
     if _env_enabled("ART_MEGATRON_MOE_DEBUG"):
         _install_moe_debug_wrappers(moe_experts)
     _INSTALLED_CONFIG = installed_config

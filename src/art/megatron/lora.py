@@ -509,6 +509,41 @@ class LoRA(torch.nn.Module):
         return out * self.scale
 
 
+@torch.compiler.disable
+def _expert_grouped_lora_forward(
+    lora: LoRA,
+    x: torch.Tensor,
+    tokens_per_expert: list[int] | torch.Tensor,
+    out_features: int,
+) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return x.new_zeros((x.shape[0], out_features))
+    return lora(x, tokens_per_expert=tokens_per_expert)
+
+
+@torch.compiler.disable
+def _expert_grouped_lora_dual_forward(
+    module: "MLPExpertsLinearFC1LoRA",
+    x: torch.Tensor,
+    tokens_per_expert: list[int] | torch.Tensor,
+) -> torch.Tensor:
+    counts = tokens_per_expert
+    if isinstance(counts, list):
+        counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+    if x.shape[0] == 0:
+        return x.new_zeros((x.shape[0], module.linear_fc1.out_features))
+    return quack_grouped_lora_dual(
+        x,
+        module.gate_lora.A_T,
+        module.gate_lora.B_T,
+        module.up_lora.A_T,
+        module.up_lora.B_T,
+        counts,
+        scale_gate=module.gate_lora.scale,
+        scale_up=module.up_lora.scale,
+    )
+
+
 class SelfAttentionLinearProjLoRA(torch.nn.Module):
     def __init__(
         self,
@@ -897,22 +932,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
-        counts = tokens_per_expert
-        if isinstance(counts, list):
-            counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
-        if x.shape[0] == 0:
-            adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
-        else:
-            adapter_out = quack_grouped_lora_dual(
-                x,
-                self.gate_lora.A_T,
-                self.gate_lora.B_T,
-                self.up_lora.A_T,
-                self.up_lora.B_T,
-                counts,
-                scale_gate=self.gate_lora.scale,
-                scale_up=self.up_lora.scale,
-            )
+        adapter_out = _expert_grouped_lora_dual_forward(self, x, tokens_per_expert)
         return base_out + adapter_out, bias_out
 
 
@@ -962,7 +982,9 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
-        adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
+        adapter_out = _expert_grouped_lora_forward(
+            self.lora, x, tokens_per_expert, self.linear_fc1.out_features
+        )
         return base_out + adapter_out, bias_out
 
 
@@ -1013,7 +1035,9 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc2(x, tokens_per_expert)
-        adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
+        adapter_out = _expert_grouped_lora_forward(
+            self.lora, x, tokens_per_expert, self.linear_fc2.out_features
+        )
         # the reason there is no TP comm here is because the MoE token routing handles
         # expert TP comm externally
         return base_out + adapter_out, bias_out
