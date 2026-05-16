@@ -28,12 +28,12 @@ _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dispatch_preprocess",
     "deepep_dispatch_combine",
     "deepep_permute_restore",
+    "flex_token_dispatch_combine",
     "flex_token_dispatch_preprocess",
+    "te_grouped_mlp_forward",
     "te_triton_permute_with_mask_map",
 )
-_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS = (
-    "flex_token_dispatch_preprocess",
-)
+_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS = ("flex_token_dispatch_preprocess",)
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
 _ART_MOE_EXPERT_KEY_RE = re.compile(
