@@ -46,6 +46,7 @@ _TOPOLOGY_ENV_VARS = {
     "etp": "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
 }
 _ORACLE_DEBUG_ENV = "ART_ORACLE_DEBUG"
+_ATTACH_TOKEN_UIDS_ENV = "ART_MEGATRON_ATTACH_TOKEN_UIDS"
 _ORACLE_DEBUG_START_TIME = time.perf_counter()
 
 
@@ -1305,6 +1306,7 @@ def _mutation_hook(
 
 def _worker_run(request: WorkerRunRequest) -> None:
     """Executes one full distributed training trace generation worker run."""
+    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
     from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
     import torch
 

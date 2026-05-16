@@ -1678,6 +1678,7 @@ def build_bundle_from_forward_trace_dir(
 
         step_routers: dict[str, StepRouterRoutes] = {}
         step_global_tokens: int | None = None
+        token_count_by_call_key: dict[tuple[str, int], int] = {}
         for module_name in sorted(step_trace.keys()):
             if ROUTER_NAME_TOKEN not in module_name:
                 continue
@@ -1695,14 +1696,32 @@ def build_bundle_from_forward_trace_dir(
                 router_calls[call_index] = compact_route
                 max_topk = max(max_topk, compact_route.max_topk)
                 token_count = compact_route.num_global_tokens
-                if step_global_tokens is None:
-                    step_global_tokens = token_count
-                elif step_global_tokens != token_count:
+                call_key = (
+                    ("sample", int(sample_index))
+                    if sample_index is not None
+                    else (
+                        ("dummy_micro_slot", int(micro_slot))
+                        if micro_slot is not None
+                        else ("call_index", int(call_index))
+                    )
+                )
+                previous_token_count = token_count_by_call_key.get(call_key)
+                if (
+                    previous_token_count is not None
+                    and previous_token_count != token_count
+                ):
                     raise RuntimeError(
-                        "Inconsistent token count across routers within step: "
-                        f"step={step_index}, expected={step_global_tokens}, got={token_count}, "
+                        "Inconsistent token count across routers for the same micro: "
+                        f"step={step_index}, call_key={call_key}, "
+                        f"expected={previous_token_count}, got={token_count}, "
                         f"router='{router_key}', call={call_index}"
                     )
+                token_count_by_call_key[call_key] = token_count
+                step_global_tokens = (
+                    token_count
+                    if step_global_tokens is None
+                    else max(step_global_tokens, token_count)
+                )
 
             if not router_calls:
                 raise RuntimeError(
