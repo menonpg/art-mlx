@@ -81,6 +81,7 @@ def test_streaming_weight_offload_matches_no_offload_oracle(
         oracle_streaming_weight_offload=StreamingWeightOffloadConfig(enabled=False),
         oracle_flex_backend=None,
         variant_flex_backend=None,
+        use_fp32_lora_reference=False,
     )
     variant = VariantSpec(
         name="streaming_weight_offload_resident2_slots4",

@@ -1457,17 +1457,20 @@ def _worker_run(request: WorkerRunRequest) -> None:
         nonlocal captured_grads
         captured_grads = _collect_lora_grads(model_chunks)
 
-    with (
-        _mutation_hook(
-            megatron_train,
-            model_chunks,
-            request.mutation,
-            request.topology,
-            pre_optimizer_step_hook=_capture_lora_grads,
-            loss_scale=request.case_config.loss_scale,
-        ),
-        _patch_lora_for_fp32(model_chunks, optimizer),
-    ):
+    with ExitStack() as training_stack:
+        training_stack.enter_context(
+            _mutation_hook(
+                megatron_train,
+                model_chunks,
+                request.mutation,
+                request.topology,
+                pre_optimizer_step_hook=_capture_lora_grads,
+                loss_scale=request.case_config.loss_scale,
+            )
+        )
+        if request.use_fp32_lora_reference:
+            training_stack.enter_context(_patch_lora_for_fp32(model_chunks, optimizer))
+
         _debug("starting training loop")
         for step_index in range(request.case_config.num_steps):
             micro_sample_indices = megatron_train.build_micro_sample_indices(
@@ -1623,6 +1626,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
             packed_tensors=request.packed_tensors,
             offload_between_jobs=request.offload_between_jobs,
             streaming_weight_offload=request.streaming_weight_offload,
+            use_fp32_lora_reference=request.use_fp32_lora_reference,
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
@@ -1635,7 +1639,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
 def run_worker_cli(run_request_path: Path) -> None:
     """Loads a worker request and dispatches worker execution."""
     request = WorkerRunRequest.model_validate(_read_json(run_request_path))
-    _worker_run(request)
+    try:
+        _worker_run(request)
+    finally:
+        if _oracle_debug_enabled():
+            faulthandler.cancel_dump_traceback_later()
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

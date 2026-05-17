@@ -91,7 +91,7 @@ FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<proj>gate_proj|up_proj|gate_up_proj|down_proj)\."
 )
 LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
 PHASE_PRINT_ORDER = {
@@ -380,6 +380,7 @@ class WorkerRunRequest(BaseModel):
     streaming_weight_offload: StreamingWeightOffloadConfig = Field(
         default_factory=StreamingWeightOffloadConfig
     )
+    use_fp32_lora_reference: bool = True
 
 
 class StepTrace(BaseModel):
@@ -413,6 +414,7 @@ class RunManifest(BaseModel):
     streaming_weight_offload: StreamingWeightOffloadConfig = Field(
         default_factory=StreamingWeightOffloadConfig
     )
+    use_fp32_lora_reference: bool = True
     steps: list[StepTrace]
 
 
@@ -1169,6 +1171,7 @@ class VariantRunner:
         oracle_slug_override: str | None = None,
         oracle_offload_between_jobs: bool = True,
         oracle_streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
+        use_fp32_lora_reference: bool = True,
         console: Console | None = None,
     ) -> None:
         self.objective = objective
@@ -1190,6 +1193,7 @@ class VariantRunner:
         self.oracle_streaming_weight_offload = (
             oracle_streaming_weight_offload or StreamingWeightOffloadConfig()
         )
+        self.use_fp32_lora_reference = use_fp32_lora_reference
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
         self.oracle_flex_backend = _resolve_test_flex_backend(
             case_config, oracle_flex_backend
@@ -1389,6 +1393,7 @@ class VariantRunner:
             streaming_weight_offload=(
                 streaming_weight_offload or StreamingWeightOffloadConfig()
             ),
+            use_fp32_lora_reference=self.use_fp32_lora_reference,
         )
         from .oracle_worker import run_worker_subprocess
 
