@@ -153,6 +153,7 @@ async def _rollout(
     model: Any,
     prompt: str,
     max_completion_tokens: int,
+    reward: float,
 ) -> Any:
     import art
 
@@ -169,7 +170,7 @@ async def _rollout(
         )
         if trajectory := art.auto_trajectory():
             logprobs = response.choices[0].logprobs
-            trajectory.reward = 1.0
+            trajectory.reward = reward
             trajectory.metrics["completion_tokens"] = (
                 len(logprobs.content or []) if logprobs is not None else 0
             )
@@ -184,6 +185,8 @@ async def _collect_real_trajectory_groups(
 ) -> list[Any]:
     import art
 
+    if config.rollouts_per_prompt < 2:
+        raise ValueError("real-path mismatch requires at least two rollouts per prompt")
     prompts = _build_prompts(config)
     groups = [
         art.TrajectoryGroup(
@@ -192,8 +195,9 @@ async def _collect_real_trajectory_groups(
                     model=model,
                     prompt=prompt,
                     max_completion_tokens=config.max_completion_tokens,
+                    reward=float(rollout_index % 2),
                 )
-                for _ in range(config.rollouts_per_prompt)
+                for rollout_index in range(config.rollouts_per_prompt)
             ]
         )
         for prompt in prompts
