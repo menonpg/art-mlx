@@ -125,6 +125,7 @@ class EngineArgs(TypedDict, total=False):
     override_generation_config: dict[str, Any] | None
     enable_sleep_mode: bool
     enable_expert_parallel: bool
+    enable_return_routed_experts: bool
     model_impl: str
 
     calculate_kv_scales: bool | None

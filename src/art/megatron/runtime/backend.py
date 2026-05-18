@@ -12,8 +12,13 @@ class MegatronBackend(LocalBackend):
         *,
         in_process: bool = False,
         path: str | None = None,
+        enable_expert_replay: bool = True,
     ) -> None:
-        super().__init__(in_process=in_process, path=path)
+        super().__init__(
+            in_process=in_process,
+            path=path,
+            enable_expert_replay=enable_expert_replay,
+        )
         self._requires_explicit_packed_sequence_length = True
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True

@@ -78,6 +78,7 @@ class LocalBackend(Backend):
         in_process: bool = False,
         path: str | None = None,
         gpu_cost_per_hour_usd: float | None = None,
+        enable_expert_replay: bool = True,
     ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
@@ -93,12 +94,15 @@ class LocalBackend(Backend):
                 automatic `costs/gpu` accounting on train steps. When unset,
                 ART auto-detects supported GPU types (H200 at $3/hr today) and
                 skips GPU cost logging for unknown devices instead of guessing.
+            enable_expert_replay: For supported MoE Megatron training, capture
+                vLLM routed experts and replay them in Megatron. Defaults to True.
         """
         self._in_process = in_process
         self._path = path or get_default_art_path()
         self._gpu_cost_per_hour_usd = (
             float(gpu_cost_per_hour_usd) if gpu_cost_per_hour_usd is not None else None
         )
+        self._enable_expert_replay = enable_expert_replay
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
@@ -108,6 +112,27 @@ class LocalBackend(Backend):
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
+
+    def _model_uses_expert_replay(self, model: AnyTrainableModel) -> bool:
+        if not self._enable_expert_replay or not self._supports_result_packing:
+            return False
+        from ..megatron.model_support.registry import (
+            UnsupportedModelArchitectureError,
+            model_uses_expert_parallel,
+        )
+
+        allow_unvalidated_arch = bool(
+            (model._internal_config or dev.InternalModelConfig()).get(
+                "allow_unvalidated_arch", False
+            )
+        )
+        try:
+            return model_uses_expert_parallel(
+                model.base_model,
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            )
+        except UnsupportedModelArchitectureError:
+            return False
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -477,6 +502,10 @@ class LocalBackend(Backend):
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
+        if self._model_uses_expert_replay(model):
+            engine_args = dict(config_dict.get("engine_args", {}))
+            engine_args["enable_return_routed_experts"] = True
+            config_dict["engine_args"] = engine_args
         server_args = dict(config_dict.get("server_args", {}))
 
         # Avoid binding collisions on busy hosts when no explicit port is provided.
@@ -545,7 +574,6 @@ class LocalBackend(Backend):
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
-        moe_routing_replay_from_trajectories: bool = False,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -605,9 +633,6 @@ class LocalBackend(Backend):
             packed_sequence_length: Packed sequence length to use for training.
                 When unset, Unsloth keeps the current max-length-rounded-to-2048
                 behavior. Required for Megatron.
-            moe_routing_replay_from_trajectories: Build Megatron MoE routing
-                replay from vLLM route metadata attached to trajectories.
-                Requires vLLM engine_args.enable_return_routed_experts=True.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -672,7 +697,6 @@ class LocalBackend(Backend):
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
-            moe_routing_replay_from_trajectories=moe_routing_replay_from_trajectories,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )
@@ -732,17 +756,16 @@ class LocalBackend(Backend):
             summary,
             include_trainable_groups=True,
         )
+        include_moe_routing = self._model_uses_expert_replay(model)
         if (
-            dev_config.get("moe_routing_replay_from_trajectories")
+            include_moe_routing
             and dev_config.get("moe_routing_replay_path") is not None
         ):
             raise RuntimeError(
-                "Set only one of moe_routing_replay_from_trajectories and "
-                "moe_routing_replay_path"
+                "Expert replay is enabled on the backend, but "
+                "dev_config.moe_routing_replay_path was also set. Use only one "
+                "routing replay source."
             )
-        include_moe_routing = bool(
-            dev_config.get("moe_routing_replay_from_trajectories", False)
-        )
 
         packed_tensors = self._get_packed_tensors(
             model,
@@ -825,7 +848,7 @@ class LocalBackend(Backend):
         if include_moe_routing:
             if config.grad_accumulation_sequences is None:
                 raise RuntimeError(
-                    "moe_routing_replay_from_trajectories requires explicit "
+                    "enable_expert_replay requires explicit "
                     "TrainConfig.grad_accumulation_sequences"
                 )
             from ..megatron.routing_replay_pack import (

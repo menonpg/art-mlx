@@ -26,7 +26,6 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     mask_prob_ratio: bool
     max_negative_advantage_importance_sampling_weight: float
     moe_routing_replay_bundle: "MoeRoutingReplayBundle | None"
-    moe_routing_replay_from_trajectories: bool
     moe_routing_replay_path: str | None
     moe_routing_replay_strict: bool
     num_trajectories_learning_rate_multiplier_power: float

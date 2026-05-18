@@ -36,7 +36,6 @@ def build_rl_train_configs(
     packed_sequence_length: int | None = None,
     num_trajectories_learning_rate_multiplier_power: float | None = None,
     kl_ref_adapter_path: str | None = None,
-    moe_routing_replay_from_trajectories: bool | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
     config = TrainConfig(
         learning_rate=learning_rate,
@@ -82,10 +81,6 @@ def build_rl_train_configs(
         dev_config["kimi_k2_tau"] = kimi_k2_tau
     if kl_ref_adapter_path is not None:
         dev_config["kl_ref_adapter_path"] = kl_ref_adapter_path
-    if moe_routing_replay_from_trajectories is not None:
-        dev_config["moe_routing_replay_from_trajectories"] = (
-            moe_routing_replay_from_trajectories
-        )
 
     return config, dev_config
 
