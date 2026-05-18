@@ -20,6 +20,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .artifacts import REPO_ROOT
 
+# These gates are intentionally bf16-scale, not fp32 oracle-scale. A 2026-05-18
+# Qwen/Qwen3.5-35B-A3B diagnostic on the exact same real generated tokens found:
+# vLLM generation vs Megatron: 2.916% mean_abs_pct, 0.0123 MAE, 0.883 top1,
+# 0.976 top20; vLLM prompt_logprobs vs Megatron: 7.896%, 0.0334 MAE, 0.969
+# top1, 0.941 top20; vLLM generation vs vLLM prompt_logprobs: 7.517%, 0.0322
+# MAE, 0.879 top1, 0.941 top20. The real ART path also canonicalizes shared
+# prefix routes when vLLM produced different routes for the same prefix. Do not
+# tighten these thresholds without rechecking both vLLM self-mismatch and shared
+# prefix route-conflict behavior on the measured path.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
