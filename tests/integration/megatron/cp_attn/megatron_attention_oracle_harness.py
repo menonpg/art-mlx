@@ -13,6 +13,7 @@ from ..model_support.oracle_harness import (
     PhasePassFn,
     SensitivityMutation,
     StepTrace,
+    StreamingWeightOffloadConfig,
     Topology,
     VariantReport,
     VariantRunner,
@@ -160,6 +161,8 @@ class AttentionVariantRunner(VariantRunner):
         capture_bundle_dir: Path | None,
         regenerate: bool,
         flex_backend: FlexBackend | None = None,
+        offload_between_jobs: bool = True,
+        streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
     ) -> Path:
         del replay_bundle_dir, capture_bundle_dir
         topology_dir = self.case_dir / output_slug
@@ -182,6 +185,10 @@ class AttentionVariantRunner(VariantRunner):
             moe_routing_replay_strict=True,
             capture_moe_routing_bundle_path=None,
             flex_backend=flex_backend,
+            offload_between_jobs=offload_between_jobs,
+            streaming_weight_offload=(
+                streaming_weight_offload or StreamingWeightOffloadConfig()
+            ),
         )
         run_attention_worker_subprocess(request, topology_dir, repo_root=REPO_ROOT)
         return topology_dir
