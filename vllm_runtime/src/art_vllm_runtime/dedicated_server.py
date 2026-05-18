@@ -101,7 +101,9 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
     match value:
         case True:
             vllm_args.append(cli_key)
-        case False | None:
+        case False:
+            vllm_args.append(f"--no-{key.replace('_', '-')}")
+        case None:
             return
         case str() | int() | float():
             vllm_args.append(f"{cli_key}={value}")
