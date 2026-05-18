@@ -52,22 +52,18 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
         packed_tensors.get("moe_routing_num_experts", 0)
         or int(expert_indices.max().item()) + 1
     )
-    non_padding = packed_tensors["group_ids"] != -1
-    positions = torch.arange(sequence_length, device=token_mask.device)
-    target_positions = torch.where(
-        packed_tensors["assistant_mask"],
-        positions.unsqueeze(0),
-        torch.full_like(packed_tensors["input_pos"], -1),
+    group_ids = packed_tensors["group_ids"]
+    parent_ids = packed_tensors["parent_ids"]
+    non_padding = group_ids != -1
+    next_group_ids = torch.nn.functional.pad(group_ids[:, 1:], (0, 1), value=-1)
+    terminal_completion = (
+        non_padding & (group_ids != parent_ids) & (group_ids != next_group_ids)
     )
-    last_target_position = target_positions.max(dim=1).values
-    required_route_mask = non_padding & (
-        positions.unsqueeze(0) < last_target_position.unsqueeze(1)
-    )
-    missing = required_route_mask & ~token_mask
-    if bool(missing.any().item()):
+    unexpected_missing = non_padding & ~token_mask & ~terminal_completion
+    if bool(unexpected_missing.any().item()):
         raise RuntimeError(
-            "Packed tensors are missing MoE routes for non-padding tokens: "
-            f"missing_rows={int(missing.sum().item())}"
+            "Packed tensors are missing MoE routes outside terminal completion "
+            f"tokens: missing_rows={int(unexpected_missing.sum().item())}"
         )
 
     router_keys = [
@@ -85,9 +81,12 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
             for offset, sample_index in enumerate(range(start, end)):
                 if sample_index < num_sequences:
                     route_indices = expert_indices[sample_index, :, layer_index, :]
+                    route_mask = token_mask[sample_index, :, None].expand_as(
+                        route_indices
+                    )
                     calls[offset] = RouterCallRoute(
                         expert_indices=route_indices,
-                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
+                        expert_mask=route_mask,
                         num_experts=num_experts,
                         sample_index=sample_index,
                     )

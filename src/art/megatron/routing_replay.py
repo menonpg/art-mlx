@@ -445,7 +445,9 @@ class MoeRoutingReplayController:
         self._router_reuse_counts: dict[str, int] = {}
         self._local_router_keys: set[str] = set()
         self._router_bindings: dict[str, dict[str, Any]] = {}
-        self._preloaded_targets: dict[tuple[str, int], torch.Tensor] = {}
+        self._preloaded_targets: dict[
+            tuple[str, int], tuple[torch.Tensor, torch.Tensor, bool]
+        ] = {}
 
     def _target_device(self) -> torch.device:
         if self._device is not None:
@@ -510,13 +512,26 @@ class MoeRoutingReplayController:
                     _context_parallel_size: int = context_parallel_size,
                     _original_get_replay_topk: Any = original_get_replay_topk,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-                    target = self._target_for_router_call(
+                    target, target_mask, has_missing = self._target_for_router_call(
                         router_key=_router_key,
                         scores=scores,
                         topk=int(topk_arg),
                         sequence_parallel=_sequence_parallel,
                         context_parallel_size=_context_parallel_size,
                     )
+                    if has_missing:
+                        if default_compute_topk is None:
+                            raise RuntimeError(
+                                "Routing replay needs default_compute_topk to fill "
+                                "terminal completion rows missing from vLLM routes"
+                            )
+                        _live_probs, live_indices = default_compute_topk(
+                            scores,
+                            topk_arg,
+                            num_groups=num_groups,
+                            group_topk=group_topk,
+                        )
+                        target = torch.where(target_mask, target, live_indices)
                     _router_replay.set_target_indices(target)
                     _router_replay.set_router_replay_action(
                         _router_replay_classes()[1].REPLAY_FORWARD
@@ -603,12 +618,6 @@ class MoeRoutingReplayController:
                         "Replay route topk does not match Megatron router topk: "
                         f"step={step_index}, router='{router_key}', call={call_index}, "
                         f"route_topk={route.max_topk}, router_topk={binding_topk}"
-                    )
-                if not bool(route.expert_mask.all().item()):
-                    raise RuntimeError(
-                        "Megatron Core RouterReplay requires every row to contain "
-                        "exactly router_topk expert ids; masked slots are unsupported: "
-                        f"step={step_index}, router='{router_key}', call={call_index}"
                     )
             self._router_call_cursors[router_key] = 0
             self._router_call_sequences[router_key] = self._build_call_sequence(
@@ -898,10 +907,18 @@ class MoeRoutingReplayController:
         if self._active_step_routes is None:
             raise RuntimeError("Routing replay target preload called before set_step")
         route = self._active_step_routes.routers[router_key].calls[call_index]
-        self._preloaded_targets[key] = route.expert_indices.to(
-            device=self._target_device(),
-            dtype=torch.long,
-            non_blocking=True,
+        self._preloaded_targets[key] = (
+            route.expert_indices.to(
+                device=self._target_device(),
+                dtype=torch.long,
+                non_blocking=True,
+            ),
+            route.expert_mask.to(
+                device=self._target_device(),
+                dtype=torch.bool,
+                non_blocking=True,
+            ),
+            not bool(route.expert_mask.all().item()),
         )
 
     def _target_for_router_call(
@@ -912,7 +929,7 @@ class MoeRoutingReplayController:
         topk: int,
         sequence_parallel: bool,
         context_parallel_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         call_index = self._next_route_call_index(router_key)
         key = (router_key, call_index)
         if key not in self._preloaded_targets:
@@ -921,7 +938,7 @@ class MoeRoutingReplayController:
                 f"step={self._active_step_index}, router='{router_key}', "
                 f"call={call_index}. begin_micro must be called before forward."
             )
-        target = self._preloaded_targets[key]
+        target, target_mask, has_missing = self._preloaded_targets[key]
         if int(target.shape[1]) != topk:
             raise RuntimeError(
                 "Routing replay target topk mismatch at router call: "
@@ -934,9 +951,17 @@ class MoeRoutingReplayController:
             sequence_parallel=sequence_parallel,
             context_parallel_size=context_parallel_size,
         )
+        target_mask = self._slice_target_for_router_rows(
+            target_mask,
+            num_router_rows=int(scores.shape[0]),
+            sequence_parallel=sequence_parallel,
+            context_parallel_size=context_parallel_size,
+        )
         if target.device != scores.device:
             target = target.to(device=scores.device, non_blocking=True)
-        return target
+        if target_mask.device != scores.device:
+            target_mask = target_mask.to(device=scores.device, non_blocking=True)
+        return target, target_mask, has_missing
 
     @staticmethod
     def _slice_target_for_router_rows(
