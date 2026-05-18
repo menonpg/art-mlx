@@ -40,7 +40,9 @@ class Topology(BaseModel):
     pp: int = 1
 
     def world_size(self) -> int:
-        return self.tp * self.dp * self.cp * self.pp
+        dense_model_size = self.tp * self.cp * self.pp
+        expert_model_size = self.etp * self.ep * self.pp
+        return math.lcm(dense_model_size, expert_model_size) * self.dp
 
     def env(self) -> dict[str, str]:
         return {
