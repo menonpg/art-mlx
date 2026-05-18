@@ -762,7 +762,7 @@ def _run_logits(
         parent_ids=parent_ids,
     )
     with torch.no_grad():
-        return runtime.model[0](
+        logits = runtime.model[0](
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
@@ -772,6 +772,14 @@ def _run_logits(
                 attention_bias=attention_state,
             ),
         )
+        from megatron.core import parallel_state, tensor_parallel
+
+        if (
+            parallel_state.model_parallel_is_initialized()
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ):
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+        return logits
 
 
 def _extract_scores_from_logits(
