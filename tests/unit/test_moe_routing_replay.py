@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -20,62 +20,25 @@ from art.megatron.routing_replay import (
 )
 
 
-def _dense_from_compact(
-    route: RouterCallRoute,
+def _make_route(
+    rows: list[list[int]],
     *,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = route.expert_indices.shape[0]
-    num_experts = route.num_experts
-    probs = torch.zeros((num_tokens, num_experts), dtype=dtype)
-    routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool)
-    for token_idx in range(num_tokens):
-        for slot in range(route.expert_indices.shape[1]):
-            if not bool(route.expert_mask[token_idx, slot]):
-                continue
-            expert_idx = int(route.expert_indices[token_idx, slot].item())
-            probs[token_idx, expert_idx] = route.expert_probs[token_idx, slot].to(dtype)
-            routing_map[token_idx, expert_idx] = True
-    return probs, routing_map
-
-
-def _assert_probs_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    max_diff = (actual - expected).abs().max().item()
-    assert max_diff < 1e-6
+    sample_index: int | None = None,
+    micro_slot: int | None = None,
+) -> RouterCallRoute:
+    indices = torch.tensor(rows, dtype=torch.int32)
+    return RouterCallRoute(
+        expert_indices=indices,
+        expert_mask=torch.ones_like(indices, dtype=torch.bool),
+        num_experts=3,
+        sample_index=sample_index,
+        micro_slot=micro_slot,
+    )
 
 
 def _make_bundle() -> tuple[MoeRoutingReplayBundle, RouterCallRoute]:
     router_key = "chunk_00.layer_0000.mlp.router"
-    route = RouterCallRoute(
-        expert_indices=torch.tensor(
-            [
-                [0, 2],
-                [1, 0],
-                [2, 1],
-                [1, 0],
-            ],
-            dtype=torch.int32,
-        ),
-        expert_probs=torch.tensor(
-            [
-                [0.70, 0.30],
-                [1.00, 0.00],
-                [0.65, 0.35],
-                [1.00, 0.00],
-            ],
-            dtype=torch.float32,
-        ),
-        expert_mask=torch.tensor(
-            [
-                [True, True],
-                [True, False],
-                [True, True],
-                [True, False],
-            ],
-            dtype=torch.bool,
-        ),
-        num_experts=3,
-    )
+    route = _make_route([[0, 2], [1, 0], [2, 1], [1, 0]], sample_index=0)
     bundle = MoeRoutingReplayBundle(
         topology=ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=1, vpp=1),
         num_steps=1,
@@ -93,57 +56,6 @@ def _make_bundle() -> tuple[MoeRoutingReplayBundle, RouterCallRoute]:
 
 def _make_sampled_bundle() -> MoeRoutingReplayBundle:
     router_key = "chunk_00.layer_0000.mlp.router"
-    route0 = RouterCallRoute(
-        expert_indices=torch.tensor([[0, 2], [1, 0]], dtype=torch.int32),
-        expert_probs=torch.tensor([[0.70, 0.30], [1.00, 0.00]], dtype=torch.float32),
-        expert_mask=torch.tensor([[True, True], [True, False]], dtype=torch.bool),
-        num_experts=3,
-        sample_index=0,
-    )
-    route1 = RouterCallRoute(
-        expert_indices=torch.tensor([[2, 1], [0, 1]], dtype=torch.int32),
-        expert_probs=torch.tensor([[0.60, 0.40], [1.00, 0.00]], dtype=torch.float32),
-        expert_mask=torch.tensor([[True, True], [True, False]], dtype=torch.bool),
-        num_experts=3,
-        sample_index=1,
-    )
-    return MoeRoutingReplayBundle(
-        topology=ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=1, vpp=1),
-        num_steps=1,
-        max_topk=2,
-        router_keys=[router_key],
-        steps={
-            0: StepRoutes(
-                routers={router_key: StepRouterRoutes(calls={0: route0, 1: route1})},
-                global_token_uids=torch.arange(2, dtype=torch.int64),
-            )
-        },
-    )
-
-
-def _make_multi_call_bundle() -> MoeRoutingReplayBundle:
-    router_key = "chunk_00.layer_0000.mlp.router"
-    route0 = RouterCallRoute(
-        expert_indices=torch.tensor([[0, 2]], dtype=torch.int32),
-        expert_probs=torch.tensor([[0.70, 0.30]], dtype=torch.float32),
-        expert_mask=torch.tensor([[True, True]], dtype=torch.bool),
-        num_experts=3,
-        sample_index=0,
-    )
-    route1 = RouterCallRoute(
-        expert_indices=torch.tensor([[1, 0]], dtype=torch.int32),
-        expert_probs=torch.tensor([[1.00, 0.00]], dtype=torch.float32),
-        expert_mask=torch.tensor([[True, False]], dtype=torch.bool),
-        num_experts=3,
-        sample_index=0,
-    )
-    route2 = RouterCallRoute(
-        expert_indices=torch.tensor([[2, 1]], dtype=torch.int32),
-        expert_probs=torch.tensor([[0.55, 0.45]], dtype=torch.float32),
-        expert_mask=torch.tensor([[True, True]], dtype=torch.bool),
-        num_experts=3,
-        sample_index=1,
-    )
     return MoeRoutingReplayBundle(
         topology=ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=1, vpp=1),
         num_steps=1,
@@ -153,28 +65,40 @@ def _make_multi_call_bundle() -> MoeRoutingReplayBundle:
             0: StepRoutes(
                 routers={
                     router_key: StepRouterRoutes(
-                        calls={0: route0, 1: route1, 2: route2}
+                        calls={
+                            0: _make_route([[0, 2], [1, 0]], sample_index=0),
+                            1: _make_route([[2, 1], [0, 1]], sample_index=1),
+                        }
+                    )
+                },
+                global_token_uids=torch.arange(2, dtype=torch.int64),
+            )
+        },
+    )
+
+
+def _make_multi_call_bundle() -> MoeRoutingReplayBundle:
+    router_key = "chunk_00.layer_0000.mlp.router"
+    return MoeRoutingReplayBundle(
+        topology=ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=1, vpp=1),
+        num_steps=1,
+        max_topk=2,
+        router_keys=[router_key],
+        steps={
+            0: StepRoutes(
+                routers={
+                    router_key: StepRouterRoutes(
+                        calls={
+                            0: _make_route([[0, 2]], sample_index=0),
+                            1: _make_route([[1, 0]], sample_index=0),
+                            2: _make_route([[2, 1]], sample_index=1),
+                        }
                     )
                 },
                 global_token_uids=torch.arange(1, dtype=torch.int64),
             )
         },
     )
-
-
-class _IdentityIndexer:
-    def build_local_token_uids(
-        self,
-        *,
-        global_token_uids: torch.Tensor,
-        num_local_tokens: int,
-        sequence_parallel: bool,
-        context_parallel_size: int,
-    ) -> torch.Tensor:
-        del sequence_parallel, context_parallel_size
-        if int(global_token_uids.numel()) < num_local_tokens:
-            raise RuntimeError("num_local_tokens exceeds global token count")
-        return global_token_uids[:num_local_tokens].clone()
 
 
 class _FakeParallelState:
@@ -199,43 +123,114 @@ class _FakeParallelState:
         return self._tp_rank
 
 
-class _FakeRouter(nn.Module):
+class _FakeRouterReplay:
     def __init__(self) -> None:
+        self.target_topk_idx: torch.Tensor | None = None
+        self.action: Any = None
+        self.targets_seen: list[torch.Tensor] = []
+
+    def set_target_indices(self, topk_indices: torch.Tensor) -> None:
+        self.target_topk_idx = topk_indices
+        self.targets_seen.append(topk_indices.detach().cpu().clone())
+
+    def set_router_replay_action(self, action: Any) -> None:
+        self.action = action
+
+    def get_replay_topk(
+        self,
+        scores: torch.Tensor,
+        topk: int,
+        num_groups: int | None = None,
+        group_topk: int | None = None,
+        default_compute_topk: Any = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del num_groups, group_topk
+        if self.target_topk_idx is None:
+            return default_compute_topk(scores, topk, None, None)
+        indices = self.target_topk_idx.to(device=scores.device, dtype=torch.long)
+        return scores.gather(1, indices), indices
+
+
+class _FakeRouter(nn.Module):
+    def __init__(self, *, topk: int = 2, router_replay: Any | None = None) -> None:
         super().__init__()
+        self.topk = topk
+        self.router_replay = (
+            router_replay if router_replay is not None else _FakeRouterReplay()
+        )
         self.config = type(
             "Config",
             (),
-            {"sequence_parallel": False, "context_parallel_size": 1},
+            {
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "moe_router_fusion": False,
+            },
         )()
 
     def routing(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        probs = torch.softmax(logits, dim=-1)
-        routing_map = torch.zeros_like(logits, dtype=torch.bool)
+        scores = torch.softmax(logits, dim=-1)
+
+        def _default_topk(
+            local_scores: torch.Tensor,
+            topk: int,
+            num_groups: int | None = None,
+            group_topk: int | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del num_groups, group_topk
+            return torch.topk(local_scores, k=topk, dim=1)
+
+        selected_probs, selected_indices = self.router_replay.get_replay_topk(
+            scores,
+            self.topk,
+            None,
+            None,
+            _default_topk,
+        )
+        probs = torch.zeros_like(scores)
+        routing_map = torch.zeros_like(scores, dtype=torch.bool)
+        rows = torch.arange(scores.shape[0], device=scores.device).unsqueeze(1)
+        probs[rows, selected_indices] = selected_probs
+        routing_map[rows, selected_indices] = True
         return probs, routing_map
 
 
 class _FakeMlp(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, router: _FakeRouter | None = None) -> None:
         super().__init__()
-        self.router = _FakeRouter()
+        self.router = router if router is not None else _FakeRouter()
 
 
 class _FakeLayer(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, router: _FakeRouter | None = None) -> None:
         super().__init__()
-        self.mlp = _FakeMlp()
+        self.mlp = _FakeMlp(router)
 
 
 class _FakeDecoder(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, router: _FakeRouter | None = None) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([_FakeLayer()])
+        self.layers = nn.ModuleList([_FakeLayer(router)])
 
 
 class _FakeChunk(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, router: _FakeRouter | None = None) -> None:
         super().__init__()
-        self.decoder = _FakeDecoder()
+        self.decoder = _FakeDecoder(router)
+
+
+def _fake_chunk_router(chunk: _FakeChunk) -> _FakeRouter:
+    layer = cast(_FakeLayer, chunk.decoder.layers[0])
+    return cast(_FakeRouter, layer.mlp.router)
+
+
+def _assert_target(
+    replay: _FakeRouterReplay,
+    expected: torch.Tensor,
+    *,
+    index: int = -1,
+) -> None:
+    assert torch.equal(replay.targets_seen[index], expected.to(torch.long))
 
 
 def test_build_router_key_from_compiled_module_name() -> None:
@@ -304,31 +299,26 @@ def test_bundle_roundtrip_disk() -> None:
     assert loaded.router_keys == bundle.router_keys
     loaded_route = loaded.steps[0].routers[bundle.router_keys[0]].calls[0]
     assert torch.equal(loaded_route.expert_indices, route.expert_indices)
-    assert torch.equal(loaded_route.expert_probs, route.expert_probs)
     assert torch.equal(loaded_route.expert_mask, route.expert_mask)
 
 
-def test_controller_patches_router_and_replays() -> None:
+def test_controller_uses_native_router_replay_target_indices() -> None:
     bundle, route = _make_bundle()
-    controller = MoeRoutingReplayController(
-        bundle=bundle,
-        strict=True,
-        local_token_indexer=_IdentityIndexer(),
-    )
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
     chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
     controller.install_router_patches([chunk])
-    controller.set_step(step_index=0, sample_index=0)
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    _probs, routing_map = router.routing(torch.randn((4, 3), dtype=torch.float32))
 
-    logits = torch.randn((4, 3), dtype=torch.float32)
-    router = cast(
-        _FakeRouter,
-        chunk.decoder.layers[0].mlp.router,  # ty: ignore[possibly-missing-attribute]
-    )
-    replay_probs, replay_map = router.routing(logits)
-    expected_probs, expected_map = _dense_from_compact(route, dtype=logits.dtype)
-
-    assert torch.equal(replay_map.cpu(), expected_map)
-    _assert_probs_close(replay_probs.cpu(), expected_probs)
+    expected_map = torch.zeros((4, 3), dtype=torch.bool)
+    rows = torch.arange(4).unsqueeze(1)
+    expected_map[rows, route.expert_indices.to(torch.long)] = True
+    assert torch.equal(routing_map.cpu(), expected_map)
+    _assert_target(replay, route.expert_indices)
 
     controller.finalize_step()
     controller.remove_router_patches()
@@ -336,55 +326,33 @@ def test_controller_patches_router_and_replays() -> None:
 
 def test_controller_finalize_fails_when_unconsumed_calls_remain() -> None:
     bundle, _route = _make_bundle()
-    controller = MoeRoutingReplayController(
-        bundle=bundle,
-        strict=True,
-        local_token_indexer=_IdentityIndexer(),
-    )
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
     chunk = _FakeChunk()
     controller.install_router_patches([chunk])
-    controller.set_step(step_index=0, sample_index=0)
+    controller.set_step(step_index=0, sample_index=[0])
     with pytest.raises(RuntimeError, match="consumption mismatch"):
         controller.finalize_step()
 
 
 def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
     bundle = _make_sampled_bundle()
-    controller = MoeRoutingReplayController(
-        bundle=bundle,
-        strict=True,
-        local_token_indexer=_IdentityIndexer(),
-    )
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
     chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
     controller.install_router_patches([chunk])
     controller.set_step(step_index=0, sample_index=[0, 1])
-    router = cast(
-        _FakeRouter,
-        chunk.decoder.layers[0].mlp.router,  # ty: ignore[possibly-missing-attribute]
-    )
-    logits = torch.randn((2, 3), dtype=torch.float32)
 
     controller.begin_micro(0, 0)
-    first_probs, first_map = router.routing(logits)
-    recompute_probs, recompute_map = router.routing(logits)
+    router.routing(torch.randn((2, 3), dtype=torch.float32))
+    router.routing(torch.randn((2, 3), dtype=torch.float32))
     controller.begin_micro(1, 1)
-    second_probs, second_map = router.routing(logits)
+    router.routing(torch.randn((2, 3), dtype=torch.float32))
 
-    expected_first_probs, expected_first_map = _dense_from_compact(
-        bundle.steps[0].routers[bundle.router_keys[0]].calls[0],
-        dtype=logits.dtype,
-    )
-    expected_second_probs, expected_second_map = _dense_from_compact(
-        bundle.steps[0].routers[bundle.router_keys[0]].calls[1],
-        dtype=logits.dtype,
-    )
-
-    assert torch.equal(first_map.cpu(), expected_first_map)
-    _assert_probs_close(first_probs.cpu(), expected_first_probs)
-    assert torch.equal(recompute_map.cpu(), expected_first_map)
-    _assert_probs_close(recompute_probs.cpu(), expected_first_probs)
-    assert torch.equal(second_map.cpu(), expected_second_map)
-    _assert_probs_close(second_probs.cpu(), expected_second_probs)
+    calls = bundle.steps[0].routers[bundle.router_keys[0]].calls
+    _assert_target(replay, calls[0].expert_indices, index=0)
+    _assert_target(replay, calls[0].expert_indices, index=1)
+    _assert_target(replay, calls[1].expert_indices, index=2)
 
     controller.finalize_step()
     controller.remove_router_patches()
@@ -392,46 +360,56 @@ def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
 
 def test_controller_consumes_multiple_captured_calls_before_recompute_reuse() -> None:
     bundle = _make_multi_call_bundle()
-    controller = MoeRoutingReplayController(
-        bundle=bundle,
-        strict=True,
-        local_token_indexer=_IdentityIndexer(),
-    )
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
     chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
     controller.install_router_patches([chunk])
     controller.set_step(step_index=0, sample_index=[0, 1])
-    router = cast(
-        _FakeRouter,
-        chunk.decoder.layers[0].mlp.router,  # ty: ignore[possibly-missing-attribute]
-    )
-    logits = torch.randn((1, 3), dtype=torch.float32)
 
     controller.begin_micro(0, 0)
-    first_probs, first_map = router.routing(logits)
-    second_probs, second_map = router.routing(logits)
-    recompute_probs, recompute_map = router.routing(logits)
+    router.routing(torch.randn((1, 3), dtype=torch.float32))
+    router.routing(torch.randn((1, 3), dtype=torch.float32))
+    router.routing(torch.randn((1, 3), dtype=torch.float32))
     controller.begin_micro(1, 1)
-    next_probs, next_map = router.routing(logits)
+    router.routing(torch.randn((1, 3), dtype=torch.float32))
 
     calls = bundle.steps[0].routers[bundle.router_keys[0]].calls
-    expected_first_probs, expected_first_map = _dense_from_compact(
-        calls[0], dtype=logits.dtype
-    )
-    expected_second_probs, expected_second_map = _dense_from_compact(
-        calls[1], dtype=logits.dtype
-    )
-    expected_next_probs, expected_next_map = _dense_from_compact(
-        calls[2], dtype=logits.dtype
-    )
-
-    assert torch.equal(first_map.cpu(), expected_first_map)
-    _assert_probs_close(first_probs.cpu(), expected_first_probs)
-    assert torch.equal(second_map.cpu(), expected_second_map)
-    _assert_probs_close(second_probs.cpu(), expected_second_probs)
-    assert torch.equal(recompute_map.cpu(), expected_second_map)
-    _assert_probs_close(recompute_probs.cpu(), expected_second_probs)
-    assert torch.equal(next_map.cpu(), expected_next_map)
-    _assert_probs_close(next_probs.cpu(), expected_next_probs)
+    _assert_target(replay, calls[0].expert_indices, index=0)
+    _assert_target(replay, calls[1].expert_indices, index=1)
+    _assert_target(replay, calls[1].expert_indices, index=2)
+    _assert_target(replay, calls[2].expert_indices, index=3)
 
     controller.finalize_step()
     controller.remove_router_patches()
+
+
+def test_controller_rejects_missing_native_router_replay() -> None:
+    bundle, _route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk(router=_FakeRouter(router_replay=None))
+    _fake_chunk_router(chunk).router_replay = None
+
+    with pytest.raises(RuntimeError, match="moe_enable_routing_replay=True"):
+        controller.install_router_patches([chunk])
+
+
+def test_controller_rejects_masked_slots() -> None:
+    bundle, route = _make_bundle()
+    route.expert_mask[0, 1] = False
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    controller.install_router_patches([chunk])
+
+    with pytest.raises(RuntimeError, match="masked slots are unsupported"):
+        controller.set_step(step_index=0, sample_index=[0])
+
+
+def test_controller_rejects_topk_mismatch() -> None:
+    bundle, _route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk(router=_FakeRouter(topk=1))
+    controller.install_router_patches([chunk])
+
+    with pytest.raises(RuntimeError, match="topk does not match"):
+        controller.set_step(step_index=0, sample_index=[0])

@@ -310,6 +310,33 @@ def configure_moe_routing_replay(
     runtime.moe_routing_replay_controller = controller
 
 
+def _moe_routing_replay_requested(
+    *,
+    replay_bundle_path: str | None,
+    replay_bundle: MoeRoutingReplayBundle | None,
+) -> bool:
+    if replay_bundle_path is not None or replay_bundle is not None:
+        return True
+    return os.environ.get("ART_MEGATRON_ENABLE_MOE_ROUTING_REPLAY", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _enable_native_moe_routing_replay(provider: Any) -> None:
+    if bool(getattr(provider, "moe_router_fusion", False)):
+        raise RuntimeError(
+            "MoE routing replay requires provider.moe_router_fusion=False because "
+            "Megatron Core fused routing bypasses RouterReplay"
+        )
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    RouterReplay.clear_global_router_replay_instances()
+    provider.moe_enable_routing_replay = True
+
+
 def build_training_runtime(
     *,
     model_identifier: str | None = None,
@@ -343,6 +370,11 @@ def build_training_runtime(
     provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
+    if _moe_routing_replay_requested(
+        replay_bundle_path=moe_routing_replay_path,
+        replay_bundle=moe_routing_replay_bundle,
+    ):
+        _enable_native_moe_routing_replay(provider)
     finalize_provider_bundle(provider_bundle)
     _register_trainable_parameter_mode(
         provider,

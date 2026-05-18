@@ -3,7 +3,7 @@ name = "openpipe-art"
 version = "0.5.17"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "openai>=2.14.0",
     "typer>=0.15.2",
@@ -50,13 +50,14 @@ megatron = [
     "transformer-engine==2.11.0",
     "transformer-engine-cu12==2.11.0",
     "transformer-engine-torch @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.11#subdirectory=transformer_engine/pytorch",
-    "megatron-core==0.16.0rc0",
+    "megatron-core==0.17.0",
     "pybind11>=2.13.6",
     "megatron-bridge @ git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@v1.2.1 ; sys_platform == 'linux'",
     "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "nvidia-ml-py==13.580.82",
+    "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
     "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
@@ -150,6 +151,7 @@ markers = [
 required-version = ">=0.11.7"
 override-dependencies = [
     "flashinfer-python==0.6.1",
+    "megatron-core==0.17.0",
     "numpy<2",
     "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5",
@@ -157,12 +159,12 @@ override-dependencies = [
     "transformer-engine==2.11.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
+no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.8.0"]
 deep-ep = ["torch>=2.8.0"]
-megatron-core = ["pybind11"]
+megatron-core = ["pybind11", "setuptools"]
 nv-grouped-gemm = ["torch>=2.8.0"]
 transformer-engine-torch = ["torch>=2.8.0"]
 

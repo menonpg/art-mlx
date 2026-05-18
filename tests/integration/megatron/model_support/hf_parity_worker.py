@@ -156,7 +156,6 @@ class _HfMoeRoutingCapture:
                 )
             route = RouterCallRoute(
                 expert_indices=router_indices.detach().cpu().to(torch.int32),
-                expert_probs=router_scores.detach().cpu().to(torch.float32),
                 expert_mask=torch.ones_like(
                     router_indices.detach().cpu(), dtype=torch.bool
                 ),
@@ -497,6 +496,8 @@ def _run_hf_sft_step(
 
 def _build_megatron_runtime(
     request: HfParityRunRequest,
+    *,
+    moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> megatron_train.TrainingRuntime:
     return megatron_train.build_training_runtime(
         model_identifier=request.case_config.base_model,
@@ -506,6 +507,8 @@ def _build_megatron_runtime(
             provider, ORACLE_TOPOLOGY, request.case_config
         ),
         optimizer_config=_build_optimizer_config(request.case_config),
+        moe_routing_replay_bundle=moe_routing_replay_bundle,
+        moe_routing_replay_strict=True,
         print_env=False,
         trainable_parameter_mode="base_model",
         allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
@@ -629,15 +632,13 @@ def _run_megatron_sft_step(
     device: torch.device,
     moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    runtime = _build_megatron_runtime(request)
+    runtime = _build_megatron_runtime(
+        request,
+        moe_routing_replay_bundle=moe_routing_replay_bundle,
+    )
     _assert_runtime_configuration(runtime.model, request.case_config)
     assert runtime.optimizer is not None
     if moe_routing_replay_bundle is not None:
-        megatron_train.configure_moe_routing_replay(
-            runtime,
-            replay_bundle=moe_routing_replay_bundle,
-            strict=True,
-        )
         controller = runtime.moe_routing_replay_controller
         if controller is None:
             raise RuntimeError(
