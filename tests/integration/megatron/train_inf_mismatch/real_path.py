@@ -154,12 +154,16 @@ async def _rollout(
     prompt: str,
     max_completion_tokens: int,
     reward: float,
+    extra_body: dict[str, Any] | None,
 ) -> Any:
     import art
 
     messages = [{"role": "user", "content": prompt}]
 
     async def _request() -> None:
+        request_kwargs: dict[str, Any] = {}
+        if extra_body is not None:
+            request_kwargs["extra_body"] = extra_body
         response = await model.openai_client().chat.completions.create(
             model=model.get_inference_name(),
             messages=messages,
@@ -167,6 +171,7 @@ async def _rollout(
             temperature=0.8,
             logprobs=True,
             top_logprobs=TOP_K,
+            **request_kwargs,
         )
         if trajectory := art.auto_trajectory():
             logprobs = response.choices[0].logprobs
@@ -183,10 +188,19 @@ async def _collect_real_trajectory_groups(
     model: Any,
     config: RealPathConfig,
 ) -> list[Any]:
+    from transformers import AutoTokenizer
+
     import art
+    from art.preprocessing.tokenize import _chat_template_disables_thinking
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
+    tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    extra_body = (
+        {"chat_template_kwargs": {"enable_thinking": False}}
+        if _chat_template_disables_thinking(tokenizer)
+        else None
+    )
     prompts = _build_prompts(config)
     groups = [
         art.TrajectoryGroup(
@@ -196,6 +210,7 @@ async def _collect_real_trajectory_groups(
                     prompt=prompt,
                     max_completion_tokens=config.max_completion_tokens,
                     reward=float(rollout_index % 2),
+                    extra_body=extra_body,
                 )
                 for rollout_index in range(config.rollouts_per_prompt)
             ]
