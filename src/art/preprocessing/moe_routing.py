@@ -135,7 +135,10 @@ def align_choice_routes_to_tokenized_result(
                 "prompt_routed_experts length does not match prompt_token_ids: "
                 f"{len(prompt_routes)} != {len(prompt_token_ids)}"
             )
-        if len(completion_routes) != len(completion_token_ids):
+        if len(completion_routes) not in {
+            len(completion_token_ids),
+            max(len(completion_token_ids) - 1, 0),
+        }:
             raise RuntimeError(
                 "completion_routed_experts length does not match completion_token_ids: "
                 f"{len(completion_routes)} != {len(completion_token_ids)}"

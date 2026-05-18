@@ -53,7 +53,17 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
         or int(expert_indices.max().item()) + 1
     )
     non_padding = packed_tensors["group_ids"] != -1
-    missing = non_padding & ~token_mask
+    positions = torch.arange(sequence_length, device=token_mask.device)
+    target_positions = torch.where(
+        packed_tensors["assistant_mask"],
+        positions.unsqueeze(0),
+        torch.full_like(packed_tensors["input_pos"], -1),
+    )
+    last_target_position = target_positions.max(dim=1).values
+    required_route_mask = non_padding & (
+        positions.unsqueeze(0) < last_target_position.unsqueeze(1)
+    )
+    missing = required_route_mask & ~token_mask
     if bool(missing.any().item()):
         raise RuntimeError(
             "Packed tensors are missing MoE routes for non-padding tokens: "
