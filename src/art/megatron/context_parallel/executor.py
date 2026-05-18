@@ -1361,7 +1361,10 @@ def _merge_stage_output_grads_from_tape(
     if not replay_records:
         return [], []
     accum_dtype = _accum_output_dtype(grad_output_flat.dtype)
-    grad_accum_out = grad_output_flat.to(dtype=accum_dtype)
+    grad_accum_out = grad_output_flat.to(
+        dtype=accum_dtype,
+        memory_format=torch.contiguous_format,
+    )
     grad_accum_lse = torch.zeros(
         (grad_output_flat.shape[0], grad_output_flat.shape[1]),
         device=grad_output_flat.device,
