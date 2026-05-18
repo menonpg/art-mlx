@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -12,13 +11,6 @@ from .real_path import (
 )
 
 torch = pytest.importorskip("torch")
-
-LIVE_ENV = "ART_RUN_TRAIN_INF_MISMATCH_REAL_PATH_LIVE"
-
-
-def _require_live_opt_in() -> None:
-    if os.environ.get(LIVE_ENV) != "1":
-        pytest.skip(f"set {LIVE_ENV}=1 to run real-path train/inf mismatch")
 
 
 def _require_visible_gpus(gpu_ids: list[int]) -> None:
@@ -35,7 +27,6 @@ def _require_visible_gpus(gpu_ids: list[int]) -> None:
 
 @pytest.mark.asyncio
 async def test_real_path_train_inf_mismatch_live(artifact_dir: Path) -> None:
-    _require_live_opt_in()
     config = config_from_env()
     parity_config = config.output_parity
     _require_visible_gpus(
