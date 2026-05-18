@@ -8,6 +8,7 @@ from openai.types.chat.chat_completion import ChatCompletion, Choice
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 from .openai import init_chat_completion, update_chat_completion
+from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from .trajectories import History, Trajectory
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,13 @@ class AutoTrajectoryContext:
                 chat_completion = parse_sse_to_chat_completion(content)
                 choice = chat_completion.choices[0]
             else:
-                choice = Choice(**json.loads(content)["choices"][0])
+                response_payload = json.loads(content)
+                choice = Choice(**response_payload["choices"][0])
+                attach_moe_routing_metadata_to_choice(
+                    choice=choice,
+                    response_payload=response_payload,
+                    choice_index=0,
+                )
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.debug(f"Failed to parse response content: {e}")
             return

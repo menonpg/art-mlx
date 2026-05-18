@@ -137,11 +137,15 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    engine_args = json.loads(args.engine_args_json)
+    server_args = json.loads(args.server_args_json)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     if args.rollout_weights_mode == "merged":
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
+    if engine_args.get("enable_return_routed_experts"):
+        os.environ["ART_VLLM_REQUIRE_ROUTE_TOKEN_IDS"] = "1"
 
     apply_vllm_runtime_patches()
 
@@ -151,9 +155,6 @@ def main(argv: list[str] | None = None) -> None:
         validate_parsed_serve_args,
     )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-    engine_args = json.loads(args.engine_args_json)
-    server_args = json.loads(args.server_args_json)
 
     _patch_art_runtime_routes()
 

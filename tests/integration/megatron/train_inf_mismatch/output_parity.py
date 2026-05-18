@@ -399,156 +399,6 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
     return LogicalTokenMap(prompts=prompts, tokens=logical_tokens)
 
 
-def _build_prompt_segment_map(
-    packed_tensors: dict[str, Any],
-    logical_map: LogicalTokenMap,
-) -> dict[int, list[int]]:
-    tokens = packed_tensors["tokens"]
-    group_ids = packed_tensors["group_ids"]
-    parent_ids = packed_tensors["parent_ids"]
-    prompt_id_by_tokens = {
-        tuple(int(token_id) for token_id in prompt.token_ids): prompt.prompt_id
-        for prompt in logical_map.prompts
-    }
-    prompt_segments_by_id: dict[int, list[int]] = {}
-    for sample_id in range(int(tokens.shape[0])):
-        families = _prompt_family_segments(group_ids[sample_id], parent_ids[sample_id])
-        for prompt_segment, completion_segments in families:
-            prompt_start, prompt_end = prompt_segment
-            prompt_positions = list(range(prompt_start, prompt_end))
-            for completion_start, completion_end in completion_segments:
-                if completion_end - completion_start < 2:
-                    continue
-                completion_positions = list(range(completion_start, completion_end))
-                flat_positions = prompt_positions + completion_positions
-                flat = tuple(
-                    int(value) for value in tokens[sample_id, flat_positions].tolist()
-                )
-                prompt_id = prompt_id_by_tokens.get(flat)
-                if prompt_id is None:
-                    raise RuntimeError(
-                        "Could not align packed prompt segment to logical prompt map"
-                    )
-                prompt_segments_by_id[prompt_id] = flat_positions
-    return prompt_segments_by_id
-
-
-def build_vllm_routing_replay_bundle(
-    *,
-    packed_tensors: dict[str, Any],
-    logical_map: LogicalTokenMap,
-    responses_by_prompt: dict[int | str, dict[str, Any]],
-    topology: Topology,
-    num_experts: int | None = None,
-) -> Any:
-    import torch
-
-    from art.megatron.routing_replay import (
-        MoeRoutingReplayBundle,
-        ParallelTopology,
-        RouterCallRoute,
-        StepRouterRoutes,
-        StepRoutes,
-    )
-
-    normalized_responses = {
-        int(prompt_id): response for prompt_id, response in responses_by_prompt.items()
-    }
-    first_prompt_id = logical_map.prompts[0].prompt_id
-    first_routes = normalized_responses[first_prompt_id]["prompt_routed_experts"]
-    if first_routes is None:
-        raise RuntimeError(
-            "vLLM response is missing prompt_routed_experts; set "
-            "engine_args.enable_return_routed_experts=True"
-        )
-    num_layers = len(first_routes[0])
-    topk = len(first_routes[0][0])
-    tokens = packed_tensors["tokens"]
-    batch_size = int(tokens.shape[0])
-    sequence_length = int(tokens.shape[1])
-    total_rows = batch_size * sequence_length
-    forced_ids = torch.zeros((num_layers, total_rows, topk), dtype=torch.int32)
-    valid_rows = torch.zeros((total_rows,), dtype=torch.bool)
-    prompt_segments = _build_prompt_segment_map(packed_tensors, logical_map)
-    prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
-
-    max_expert_id = 0
-    for prompt_id, flat_positions in prompt_segments.items():
-        prompt = prompt_by_id[prompt_id]
-        routes = normalized_responses[prompt_id]["prompt_routed_experts"]
-        if routes is None:
-            raise RuntimeError(
-                f"Missing prompt_routed_experts for prompt_id={prompt_id}"
-            )
-        if len(routes) < len(flat_positions):
-            raise RuntimeError(
-                f"vLLM routes shorter than prompt for prompt_id={prompt_id}: "
-                f"routes={len(routes)}, flat_positions={len(flat_positions)}"
-            )
-        for flat_index, packed_index in enumerate(flat_positions):
-            row = packed_index * batch_size + prompt.sample_id
-            route_tensor = torch.tensor(routes[flat_index], dtype=torch.int32)
-            if route_tensor.shape != (num_layers, topk):
-                raise RuntimeError(
-                    f"Unexpected route shape for prompt_id={prompt_id} "
-                    f"flat_index={flat_index}: {tuple(route_tensor.shape)}"
-                )
-            max_expert_id = max(max_expert_id, int(route_tensor.max().item()))
-            if bool(valid_rows[row]):
-                existing = forced_ids[:, row, :]
-                if not torch.equal(existing, route_tensor):
-                    raise RuntimeError(
-                        "Duplicate packed row has inconsistent vLLM routed experts: "
-                        f"prompt_id={prompt_id}, packed_index={packed_index}, row={row}"
-                    )
-                continue
-            forced_ids[:, row, :] = route_tensor
-            valid_rows[row] = True
-
-    non_padding_rows = packed_tensors["group_ids"].T.reshape(-1) != -1
-    missing_non_padding = non_padding_rows & ~valid_rows
-    if bool(missing_non_padding.any().item()):
-        missing_count = int(missing_non_padding.sum().item())
-        raise RuntimeError(
-            "vLLM routing replay bundle is missing non-padding packed rows: "
-            f"missing_rows={missing_count}"
-        )
-    replay_num_experts = int(num_experts or (max_expert_id + 1))
-    routers = {
-        f"chunk_00.layer_{layer_index:04d}.mlp.router": StepRouterRoutes(
-            calls={
-                0: RouterCallRoute(
-                    expert_indices=forced_ids[layer_index],
-                    expert_mask=torch.ones((total_rows, topk), dtype=torch.bool),
-                    num_experts=replay_num_experts,
-                )
-            }
-        )
-        for layer_index in range(num_layers)
-    }
-    return MoeRoutingReplayBundle(
-        topology=ParallelTopology(
-            tp=topology.tp,
-            ep=topology.ep,
-            etp=topology.etp,
-            dp=topology.dp,
-            sp=topology.tp > 1,
-            cp=topology.cp,
-            pp=topology.pp,
-            vpp=1,
-        ),
-        num_steps=1,
-        max_topk=topk,
-        router_keys=sorted(routers),
-        steps={
-            0: StepRoutes(
-                routers=routers,
-                global_token_uids=torch.arange(total_rows, dtype=torch.int64),
-            )
-        },
-    )
-
-
 def aggregate_mean_abs_pct(
     *,
     candidate: Any,
@@ -1432,10 +1282,11 @@ async def run_train_inf_output_parity(
     artifact_dir: Path,
 ) -> TrainInfOutputParityReport:
     _write_json(artifact_dir / "probe_config.json", config.model_dump(mode="json"))
-    if config.replay_vllm_routing and len(config.rollout_modes) != 1:
+    if config.replay_vllm_routing:
         raise RuntimeError(
-            "replay_vllm_routing currently requires exactly one rollout mode because "
-            "the report has one Megatron base/lora score pair"
+            "replay_vllm_routing must use ART's production trajectory route replay "
+            "path; the synthetic packed-token output parity probe does not build "
+            "test-side replay bundles"
         )
     lora_result = _run_megatron_worker(
         MegatronWorkerRequest(
@@ -1488,50 +1339,6 @@ async def run_train_inf_output_parity(
                 artifact_dir=artifact_dir,
             )
         _assert_lora_active(vllm_base, vllm_lora, side="vllm")
-        if config.replay_vllm_routing:
-            packed_tensors = _build_packed_tensors(config)
-            base_replay_path = artifact_dir / f"vllm_{rollout_mode}_base_routes"
-            lora_replay_path = artifact_dir / f"vllm_{rollout_mode}_lora_routes"
-            build_vllm_routing_replay_bundle(
-                packed_tensors=packed_tensors,
-                logical_map=logical_map,
-                responses_by_prompt=cast(
-                    dict[int | str, dict[str, Any]],
-                    _read_json(
-                        artifact_dir / f"vllm_{rollout_mode}_base_responses.json"
-                    ),
-                ),
-                topology=config.topology,
-            ).to_dir(base_replay_path)
-            build_vllm_routing_replay_bundle(
-                packed_tensors=packed_tensors,
-                logical_map=logical_map,
-                responses_by_prompt=cast(
-                    dict[int | str, dict[str, Any]],
-                    _read_json(
-                        artifact_dir / f"vllm_{rollout_mode}_lora_responses.json"
-                    ),
-                ),
-                topology=config.topology,
-            ).to_dir(lora_replay_path)
-            base_result = _run_megatron_worker(
-                MegatronWorkerRequest(
-                    config=config,
-                    artifact_dir=str(artifact_dir),
-                    weight_state="base",
-                    adapter_path=None,
-                    moe_routing_replay_path=str(base_replay_path),
-                )
-            )
-            lora_result = _run_megatron_worker(
-                MegatronWorkerRequest(
-                    config=config,
-                    artifact_dir=str(artifact_dir),
-                    weight_state="lora",
-                    adapter_path=adapter_path,
-                    moe_routing_replay_path=str(lora_replay_path),
-                )
-            )
         megatron_base = ScoreBundle.model_validate(
             _read_json(Path(base_result.score_path))
         )

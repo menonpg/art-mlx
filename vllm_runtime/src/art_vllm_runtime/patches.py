@@ -1,6 +1,7 @@
 """Monkey patches and bootstrap contract for the ART-owned vLLM runtime."""
 
 import ctypes
+import os
 from typing import Any
 
 
@@ -55,6 +56,8 @@ def subclass_chat_completion_request() -> None:
             self.logprobs = True
             if self.top_logprobs is None:
                 self.top_logprobs = 0
+            if os.environ.get("ART_VLLM_REQUIRE_ROUTE_TOKEN_IDS") == "1":
+                self.return_token_ids = True
 
     protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
     setattr(protocol, "_art_chat_completion_request_patched", True)

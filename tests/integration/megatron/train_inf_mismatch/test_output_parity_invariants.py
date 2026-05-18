@@ -12,12 +12,10 @@ from .output_parity import (
     EngineSide,
     ScoreBundle,
     TokenTopK,
-    Topology,
     TrainInfOutputParityConfig,
     WeightState,
     aggregate_mean_abs_pct,
     build_logical_token_map,
-    build_vllm_routing_replay_bundle,
     compare_rollout,
     compare_topk,
     config_from_env,
@@ -44,65 +42,6 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
         4,
         3,
         4,
-    ]
-
-
-def test_vllm_routing_replay_bundle_maps_unpacked_routes_to_packed_rows() -> None:
-    packed = {
-        "tokens": torch.tensor([[10, 11, 12, 13, 14, 12, 15, 16]]),
-        "group_ids": torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]]),
-        "parent_ids": torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0]]),
-    }
-    logical_map = build_logical_token_map(packed)
-    responses = {
-        0: {
-            "prompt_routed_experts": [
-                [[1, 2], [11, 12]],
-                [[3, 4], [13, 14]],
-                [[5, 6], [15, 16]],
-                [[7, 8], [17, 18]],
-                [[9, 10], [19, 20]],
-            ]
-        },
-        1: {
-            "prompt_routed_experts": [
-                [[1, 2], [11, 12]],
-                [[3, 4], [13, 14]],
-                [[21, 22], [31, 32]],
-                [[23, 24], [33, 34]],
-                [[25, 26], [35, 36]],
-            ]
-        },
-    }
-
-    bundle = build_vllm_routing_replay_bundle(
-        packed_tensors=packed,
-        logical_map=logical_map,
-        responses_by_prompt=responses,
-        topology=Topology(tp=2, ep=2),
-    )
-
-    layer0 = bundle.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
-    layer1 = bundle.steps[0].routers["chunk_00.layer_0001.mlp.router"].calls[0]
-    assert layer0.expert_indices.tolist() == [
-        [1, 2],
-        [3, 4],
-        [5, 6],
-        [7, 8],
-        [9, 10],
-        [21, 22],
-        [23, 24],
-        [25, 26],
-    ]
-    assert layer1.expert_indices.tolist() == [
-        [11, 12],
-        [13, 14],
-        [15, 16],
-        [17, 18],
-        [19, 20],
-        [31, 32],
-        [33, 34],
-        [35, 36],
     ]
 
 

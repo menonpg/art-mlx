@@ -335,6 +335,7 @@ class LocalBackend(Backend):
         plot_tensors: bool,
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
+        include_moe_routing: bool = False,
     ) -> PackedTensors | None:
         if model.base_model not in self._tokenizers:
             self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
@@ -421,6 +422,7 @@ class LocalBackend(Backend):
             truncate_long_results=False,
             advantage_balance=advantage_balance,
             pack_results=self._supports_result_packing,
+            include_moe_routing=include_moe_routing,
         )
         if (
             not allow_training_without_logprobs
@@ -725,6 +727,17 @@ class LocalBackend(Backend):
             summary,
             include_trainable_groups=True,
         )
+        if (
+            dev_config.get("moe_routing_replay_from_trajectories")
+            and dev_config.get("moe_routing_replay_path") is not None
+        ):
+            raise RuntimeError(
+                "Set only one of moe_routing_replay_from_trajectories and "
+                "moe_routing_replay_path"
+            )
+        include_moe_routing = bool(
+            dev_config.get("moe_routing_replay_from_trajectories", False)
+        )
 
         packed_tensors = self._get_packed_tensors(
             model,
@@ -739,6 +752,7 @@ class LocalBackend(Backend):
             logprob_calculation_chunk_size=dev_config.get(
                 "logprob_calculation_chunk_size", 1024
             ),
+            include_moe_routing=include_moe_routing,
         )
         if packed_tensors is None:
             print(
@@ -802,6 +816,46 @@ class LocalBackend(Backend):
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
+        service_dev_config = cast(dev.TrainConfig, {**dev_config})
+        if include_moe_routing:
+            if config.grad_accumulation_sequences is None:
+                raise RuntimeError(
+                    "moe_routing_replay_from_trajectories requires explicit "
+                    "TrainConfig.grad_accumulation_sequences"
+                )
+            from ..megatron.routing_replay_pack import (
+                build_moe_routing_replay_bundle_from_packed_tensors,
+            )
+
+            routing_replay_dir = (
+                f"{get_model_dir(model=model, art_path=self._path)}/tensors/"
+                "moe_routing_replay"
+            )
+            build_moe_routing_replay_bundle_from_packed_tensors(
+                packed_tensors=packed_tensors,
+                global_grad_accumulation_sequences=config.grad_accumulation_sequences,
+            ).to_dir(routing_replay_dir)
+            service_dev_config["moe_routing_replay_path"] = routing_replay_dir
+            service_dev_config["moe_routing_replay_strict"] = True
+            stats = packed_tensors.get("moe_routing_pack_stats")
+            if stats is not None:
+                base_metrics.update(
+                    {
+                        "data/moe_routing_packed_tokens": float(stats.packed_tokens),
+                        "data/moe_routing_shared_prefix_rows": float(
+                            stats.shared_prefix_rows
+                        ),
+                        "data/moe_routing_shared_prefix_conflict_rows": float(
+                            stats.shared_prefix_conflict_rows
+                        ),
+                        "data/moe_routing_shared_prefix_conflict_slots": float(
+                            stats.shared_prefix_conflict_slots
+                        ),
+                        "data/moe_routing_shared_prefix_compared_slots": float(
+                            stats.shared_prefix_compared_slots
+                        ),
+                    }
+                )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
         grad_accumulation_sequences = max(
             1, int(config.grad_accumulation_sequences or 1)
@@ -812,7 +866,7 @@ class LocalBackend(Backend):
         pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
         reported_gradient_steps: int | None = None
         async for result in service.train(
-            disk_packed_tensors, config, dev_config, verbose
+            disk_packed_tensors, config, service_dev_config, verbose
         ):
             raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
             if raw_num_gradient_steps is not None:
