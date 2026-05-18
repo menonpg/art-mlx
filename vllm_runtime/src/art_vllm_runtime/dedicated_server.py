@@ -146,9 +146,6 @@ def main(argv: list[str] | None = None) -> None:
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     if args.rollout_weights_mode == "merged":
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
-    if engine_args.get("enable_return_routed_experts"):
-        os.environ["ART_VLLM_REQUIRE_ROUTE_TOKEN_IDS"] = "1"
-
     apply_vllm_runtime_patches()
 
     from vllm.entrypoints.openai import api_server

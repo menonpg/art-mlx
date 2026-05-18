@@ -32,11 +32,11 @@ WeightState = Literal["base", "lora"]
 class Topology(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tp: int = 2
+    tp: int = 1
     ep: int = 2
     etp: int = 1
     dp: int = 1
-    cp: int = 1
+    cp: int = 2
     pp: int = 1
 
     def world_size(self) -> int:
@@ -47,6 +47,8 @@ class Topology(BaseModel):
             "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(self.tp),
             "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(self.ep),
             "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE": str(self.etp),
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(self.cp),
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE": str(self.pp),
         }
 
     def slug(self) -> str:
@@ -297,6 +299,15 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.packed.prefill_tokens = int(raw_prefill)
     if raw_decode := os.environ.get("ART_TRAIN_INF_MISMATCH_DECODE_TOKENS"):
         config.packed.decode_tokens = int(raw_decode)
+    for env_name, attr in (
+        ("ART_TRAIN_INF_MISMATCH_TP", "tp"),
+        ("ART_TRAIN_INF_MISMATCH_EP", "ep"),
+        ("ART_TRAIN_INF_MISMATCH_ETP", "etp"),
+        ("ART_TRAIN_INF_MISMATCH_CP", "cp"),
+        ("ART_TRAIN_INF_MISMATCH_PP", "pp"),
+    ):
+        if raw_value := os.environ.get(env_name):
+            config.topology = config.topology.model_copy(update={attr: int(raw_value)})
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
     return config
@@ -614,10 +625,47 @@ def _build_packed_tensors(config: TrainInfOutputParityConfig) -> dict[str, Any]:
 
 
 def _configure_provider(provider: Any, config: TrainInfOutputParityConfig) -> None:
+    provider.tensor_model_parallel_size = config.topology.tp
+    provider.expert_model_parallel_size = config.topology.ep
+    provider.expert_tensor_parallel_size = config.topology.etp
+    provider.context_parallel_size = config.topology.cp
+    provider.pipeline_model_parallel_size = config.topology.pp
     if hasattr(provider, "attention_dropout"):
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+
+
+def _gather_context_parallel_logits(logits: Any, *, full_sequence_length: int) -> Any:
+    from megatron.core import parallel_state as ps
+    import torch
+    import torch.distributed as dist
+
+    if int(ps.get_context_parallel_world_size()) <= 1:
+        return logits
+    if int(logits.shape[1]) == full_sequence_length:
+        return logits
+    cp_size = int(ps.get_context_parallel_world_size())
+    local_chunks = [torch.empty_like(logits) for _ in range(cp_size)]
+    dist.all_gather(  # ty: ignore[possibly-missing-attribute]
+        local_chunks, logits.contiguous(), group=ps.get_context_parallel_group()
+    )
+    local_sequence_length = int(logits.shape[1])
+    if local_sequence_length % 2 != 0:
+        raise RuntimeError(
+            "Cannot reconstruct context-parallel logits with odd local sequence "
+            f"length {local_sequence_length}"
+        )
+    half = local_sequence_length // 2
+    ordered = [chunk[:, :half] for chunk in local_chunks]
+    ordered.extend(chunk[:, half:] for chunk in reversed(local_chunks))
+    gathered = torch.cat(ordered, dim=1)
+    if int(gathered.shape[1]) != full_sequence_length:
+        raise RuntimeError(
+            "Context-parallel logit gather produced unexpected sequence length: "
+            f"{int(gathered.shape[1])} != {full_sequence_length}"
+        )
+    return gathered
 
 
 def _lora_target_modules(config: TrainInfOutputParityConfig) -> list[str]:
@@ -779,6 +827,10 @@ def _run_logits(
             and parallel_state.get_tensor_model_parallel_world_size() > 1
         ):
             logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+        logits = _gather_context_parallel_logits(
+            logits,
+            full_sequence_length=int(input_ids.shape[1]),
+        )
         return logits
 
 

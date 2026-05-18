@@ -5,7 +5,6 @@ import json
 import logging
 from pathlib import Path
 import re
-import types
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -445,9 +444,8 @@ class MoeRoutingReplayController:
         self._router_reuse_counts: dict[str, int] = {}
         self._local_router_keys: set[str] = set()
         self._router_bindings: dict[str, dict[str, Any]] = {}
-        self._preloaded_targets: dict[
-            tuple[str, int], tuple[torch.Tensor, torch.Tensor, bool]
-        ] = {}
+        self._preloaded_targets: dict[tuple[str, int], torch.Tensor] = {}
+        self._target_buffers: dict[str, torch.Tensor] = {}
 
     def _target_device(self) -> torch.device:
         if self._device is not None:
@@ -497,61 +495,9 @@ class MoeRoutingReplayController:
                 sequence_parallel = bool(getattr(config, "sequence_parallel", False))
                 context_parallel_size = int(getattr(config, "context_parallel_size", 1))
                 topk = int(getattr(module, "topk"))
-                original_get_replay_topk = router_replay.get_replay_topk
-
-                def get_replay_topk_wrapper(
-                    _router_replay: Any,
-                    scores: torch.Tensor,
-                    topk_arg: int,
-                    num_groups: int | None = None,
-                    group_topk: int | None = None,
-                    default_compute_topk: Any = None,
-                    *,
-                    _router_key: str = router_key,
-                    _sequence_parallel: bool = sequence_parallel,
-                    _context_parallel_size: int = context_parallel_size,
-                    _original_get_replay_topk: Any = original_get_replay_topk,
-                ) -> tuple[torch.Tensor, torch.Tensor]:
-                    target, target_mask, has_missing = self._target_for_router_call(
-                        router_key=_router_key,
-                        scores=scores,
-                        topk=int(topk_arg),
-                        sequence_parallel=_sequence_parallel,
-                        context_parallel_size=_context_parallel_size,
-                    )
-                    if has_missing:
-                        if default_compute_topk is None:
-                            raise RuntimeError(
-                                "Routing replay needs default_compute_topk to fill "
-                                "terminal completion rows missing from vLLM routes"
-                            )
-                        _live_probs, live_indices = default_compute_topk(
-                            scores,
-                            topk_arg,
-                            num_groups=num_groups,
-                            group_topk=group_topk,
-                        )
-                        target = torch.where(target_mask, target, live_indices)
-                    _router_replay.set_target_indices(target)
-                    _router_replay.set_router_replay_action(
-                        _router_replay_classes()[1].REPLAY_FORWARD
-                    )
-                    return _original_get_replay_topk(
-                        scores,
-                        topk_arg,
-                        num_groups,
-                        group_topk,
-                        default_compute_topk,
-                    )
-
-                router_replay.get_replay_topk = types.MethodType(
-                    get_replay_topk_wrapper, router_replay
-                )
-                router_replay._art_routing_replay_patched = True
                 self._router_bindings[router_key] = {
                     "module": module,
                     "router_replay": router_replay,
-                    "original_get_replay_topk": original_get_replay_topk,
                     "sequence_parallel": sequence_parallel,
                     "context_parallel_size": context_parallel_size,
                     "topk": topk,
@@ -559,13 +505,9 @@ class MoeRoutingReplayController:
                 self._local_router_keys.add(router_key)
 
     def remove_router_patches(self) -> None:
-        for binding in self._router_bindings.values():
-            router_replay = binding["router_replay"]
-            router_replay.get_replay_topk = binding["original_get_replay_topk"]
-            if hasattr(router_replay, "_art_routing_replay_patched"):
-                delattr(router_replay, "_art_routing_replay_patched")
         self._router_bindings.clear()
         self._local_router_keys.clear()
+        self._target_buffers.clear()
         self._clear_native_router_replay_state()
         self._reset_step_state()
 
@@ -573,8 +515,30 @@ class MoeRoutingReplayController:
         self._active_sample_index = sample_index
         self._active_micro_order = micro_order
         for router_key in sorted(self._local_router_keys):
-            for call_index in self._active_micro_call_indices(router_key):
-                self._preload_target(router_key, call_index)
+            call_indices = self._active_micro_call_indices(router_key)
+            if len(call_indices) != 1:
+                raise RuntimeError(
+                    "Routing replay expected exactly one router call per local "
+                    f"microbatch for router='{router_key}', got {call_indices}"
+                )
+            call_index = self._next_route_call_index(router_key)
+            if call_index != call_indices[0]:
+                raise RuntimeError(
+                    "Routing replay cursor mismatch while preparing native replay: "
+                    f"router='{router_key}', expected={call_indices[0]}, "
+                    f"actual={call_index}"
+                )
+            target = self._target_for_router_call(
+                router_key=router_key,
+                call_index=call_index,
+            )
+            router_replay = self._router_bindings[router_key]["router_replay"]
+            router_replay.set_target_indices(
+                self._copy_into_stable_target_buffer(router_key, target)
+            )
+            router_replay.set_router_replay_action(
+                _router_replay_classes()[1].REPLAY_FORWARD
+            )
 
     def set_step(
         self,
@@ -625,6 +589,8 @@ class MoeRoutingReplayController:
                 sample_index=sample_index,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
+            for call_index in self._router_call_sequences[router_key]:
+                self._preload_target(router_key, call_index)
         RouterReplay, RouterReplayAction = _router_replay_classes()
         RouterReplay.clear_global_indices()
         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
@@ -907,30 +873,25 @@ class MoeRoutingReplayController:
         if self._active_step_routes is None:
             raise RuntimeError("Routing replay target preload called before set_step")
         route = self._active_step_routes.routers[router_key].calls[call_index]
-        self._preloaded_targets[key] = (
-            route.expert_indices.to(
-                device=self._target_device(),
-                dtype=torch.long,
-                non_blocking=True,
-            ),
-            route.expert_mask.to(
-                device=self._target_device(),
-                dtype=torch.bool,
-                non_blocking=True,
-            ),
-            not bool(route.expert_mask.all().item()),
+        binding = self._router_bindings[router_key]
+        target = route.expert_indices.to(
+            device=self._target_device(),
+            dtype=torch.long,
+            non_blocking=True,
         )
+        target = self._slice_target_for_local_rank(
+            target,
+            sequence_parallel=bool(binding["sequence_parallel"]),
+            context_parallel_size=int(binding["context_parallel_size"]),
+        ).contiguous()
+        self._preloaded_targets[key] = target
 
     def _target_for_router_call(
         self,
         *,
         router_key: str,
-        scores: torch.Tensor,
-        topk: int,
-        sequence_parallel: bool,
-        context_parallel_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        call_index = self._next_route_call_index(router_key)
+        call_index: int,
+    ) -> torch.Tensor:
         key = (router_key, call_index)
         if key not in self._preloaded_targets:
             raise RuntimeError(
@@ -938,41 +899,37 @@ class MoeRoutingReplayController:
                 f"step={self._active_step_index}, router='{router_key}', "
                 f"call={call_index}. begin_micro must be called before forward."
             )
-        target, target_mask, has_missing = self._preloaded_targets[key]
+        target = self._preloaded_targets[key]
+        topk = int(self._router_bindings[router_key]["topk"])
         if int(target.shape[1]) != topk:
             raise RuntimeError(
                 "Routing replay target topk mismatch at router call: "
                 f"router='{router_key}', call={call_index}, "
                 f"target_topk={int(target.shape[1])}, router_topk={topk}"
             )
-        target = self._slice_target_for_router_rows(
-            target,
-            num_router_rows=int(scores.shape[0]),
-            sequence_parallel=sequence_parallel,
-            context_parallel_size=context_parallel_size,
-        )
-        target_mask = self._slice_target_for_router_rows(
-            target_mask,
-            num_router_rows=int(scores.shape[0]),
-            sequence_parallel=sequence_parallel,
-            context_parallel_size=context_parallel_size,
-        )
-        if target.device != scores.device:
-            target = target.to(device=scores.device, non_blocking=True)
-        if target_mask.device != scores.device:
-            target_mask = target_mask.to(device=scores.device, non_blocking=True)
-        return target, target_mask, has_missing
+        return target
+
+    def _copy_into_stable_target_buffer(
+        self, router_key: str, target: torch.Tensor
+    ) -> torch.Tensor:
+        buffer = self._target_buffers.get(router_key)
+        if (
+            buffer is None
+            or buffer.shape != target.shape
+            or buffer.device != target.device
+        ):
+            buffer = torch.empty_like(target)
+            self._target_buffers[router_key] = buffer
+        buffer.copy_(target, non_blocking=True)
+        return buffer
 
     @staticmethod
-    def _slice_target_for_router_rows(
+    def _slice_target_for_local_rank(
         target: torch.Tensor,
         *,
-        num_router_rows: int,
         sequence_parallel: bool,
         context_parallel_size: int,
     ) -> torch.Tensor:
-        if int(target.shape[0]) == num_router_rows:
-            return target
         candidate = target
         if context_parallel_size > 1:
             from megatron.core import parallel_state as ps
@@ -982,8 +939,6 @@ class MoeRoutingReplayController:
                 candidate = get_batch_on_this_cp_rank(
                     {"tokens": candidate.view(1, *candidate.shape)}
                 )["tokens"].reshape(-1, int(candidate.shape[1]))
-        if int(candidate.shape[0]) == num_router_rows:
-            return candidate
         if sequence_parallel:
             from megatron.core import parallel_state as ps
 
@@ -992,12 +947,6 @@ class MoeRoutingReplayController:
             total_rows = int(candidate.shape[0])
             if tp_size > 1 and total_rows % tp_size == 0:
                 rows_per_rank = total_rows // tp_size
-                if rows_per_rank == num_router_rows:
-                    start = tp_rank * rows_per_rank
-                    return candidate[start : start + rows_per_rank]
-        raise RuntimeError(
-            "Routing replay target row count does not match router scores: "
-            f"target_rows={int(target.shape[0])}, router_rows={num_router_rows}, "
-            f"sequence_parallel={sequence_parallel}, "
-            f"context_parallel_size={context_parallel_size}"
-        )
+                start = tp_rank * rows_per_rank
+                candidate = candidate[start : start + rows_per_rank]
+        return candidate
