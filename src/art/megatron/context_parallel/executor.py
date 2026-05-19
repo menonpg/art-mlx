@@ -1932,6 +1932,10 @@ def _run_context_parallel_backward(
         replay_records=replay_records,
         grad_output_flat=grad_output_flat,
     )
+    if stage_out_grads and stage_out_grads[0].is_cuda:
+        # Nested FLASH flex backward consumes these external grad_outputs on an
+        # internal stream; complete the merge-backward producers before the handoff.
+        torch.cuda.current_stream(stage_out_grads[0].device).synchronize()
     grad_by_stage_index: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for record, stage_out_grad, stage_lse_grad in zip(
         replay_records,
