@@ -8,7 +8,7 @@ from ..trainability.yes_no_trainability import run_yes_no_trainability_async
 
 torch = pytest.importorskip("torch")
 
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 LIVE_ENV = "ART_RUN_LIVE_YES_NO_TRAINABILITY"
 
 

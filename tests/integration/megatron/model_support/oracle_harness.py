@@ -706,7 +706,7 @@ def keep_topology_artifacts() -> bool:
     return _truthy(os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV))
 
 
-DEFAULT_ORACLE_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+DEFAULT_ORACLE_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 
 
 def case_config(base_model: str | None = None) -> OracleCaseConfig:

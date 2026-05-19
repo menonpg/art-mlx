@@ -51,7 +51,7 @@ ATTN_SENSITIVITY_TOPOLOGY_BY_MUTATION = {
 
 
 def attention_case_config(
-    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    base_model: str = "Qwen/Qwen3.5-35B-A3B",
 ) -> OracleCaseConfig:
     return OracleCaseConfig(
         base_model=base_model,
