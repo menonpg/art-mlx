@@ -6,52 +6,27 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from art.megatron.compiled_flex_attention import normalize_sparse_block_size
 
-from .types import AttnMaskKind, ExactMaskMetadata, FlexMaskSpec
+from .types import AttnMaskKind, FlexMaskSpec
 
 _INVALID_Q_GROUP = -(1 << 63)
 _INVALID_Q_PARENT = _INVALID_Q_GROUP + 1
 _INVALID_K_GROUP = _INVALID_Q_GROUP + 2
 
 
-def _index_select_with_invalid(
-    values: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    invalid_value: int,
-) -> torch.Tensor:
-    selected = torch.full_like(indices, invalid_value)
-    valid = indices >= 0
-    if bool(valid.any()):
-        selected[valid] = values.index_select(0, indices[valid])
-    return selected
-
-
 def _build_exact_mask_mod(
-    metadata: ExactMaskMetadata,
     *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
+    q_abs: np.ndarray,
+    k_abs: np.ndarray,
+    q_group: np.ndarray,
+    q_parent: np.ndarray,
+    k_group: np.ndarray,
     device: torch.device,
 ):
-    q_abs = metadata.q_token_indices.to(device=device, dtype=torch.int64)
-    k_abs = metadata.k_token_indices.to(device=device, dtype=torch.int64)
-    flat_group_ids = group_ids.to(device=device, dtype=torch.int64).reshape(-1)
-    flat_parent_ids = parent_ids.to(device=device, dtype=torch.int64).reshape(-1)
-    q_group = _index_select_with_invalid(
-        flat_group_ids,
-        q_abs,
-        invalid_value=_INVALID_Q_GROUP,
-    )
-    q_parent = _index_select_with_invalid(
-        flat_parent_ids,
-        q_abs,
-        invalid_value=_INVALID_Q_PARENT,
-    )
-    k_group = _index_select_with_invalid(
-        flat_group_ids,
-        k_abs,
-        invalid_value=_INVALID_K_GROUP,
-    )
+    q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=torch.int64)
+    k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=torch.int64)
+    q_group_tensor = torch.as_tensor(q_group, device=device, dtype=torch.int64)
+    q_parent_tensor = torch.as_tensor(q_parent, device=device, dtype=torch.int64)
+    k_group_tensor = torch.as_tensor(k_group, device=device, dtype=torch.int64)
 
     def mask_mod(
         batch_idx: torch.Tensor,
@@ -60,10 +35,10 @@ def _build_exact_mask_mod(
         kv_idx: torch.Tensor,
     ) -> torch.Tensor:
         del batch_idx, head_idx
-        q_abs_local = q_abs[query_idx]
-        k_abs_local = k_abs[kv_idx]
-        same_group = q_group[query_idx] == k_group[kv_idx]
-        parent_prefix = q_parent[query_idx] == k_group[kv_idx]
+        q_abs_local = q_abs_tensor[query_idx]
+        k_abs_local = k_abs_tensor[kv_idx]
+        same_group = q_group_tensor[query_idx] == k_group_tensor[kv_idx]
+        parent_prefix = q_parent_tensor[query_idx] == k_group_tensor[kv_idx]
         return (q_abs_local >= k_abs_local) & (same_group | parent_prefix)
 
     return mask_mod
@@ -84,53 +59,98 @@ def _dense_blocks_to_ordered(
     )
 
 
-def _select_with_invalid_cpu(
-    values: torch.Tensor,
-    indices: torch.Tensor,
+def _select_with_invalid_np(
+    values: np.ndarray,
+    indices: np.ndarray,
     *,
     invalid_value: int,
-) -> torch.Tensor:
-    selected = torch.full_like(indices, invalid_value)
+) -> np.ndarray:
+    selected = np.full(indices.shape, invalid_value, dtype=np.int64)
     valid = indices >= 0
     if bool(valid.any()):
-        selected[valid] = values.index_select(0, indices[valid])
+        selected[valid] = values[indices[valid]]
     return selected
+
+
+def _build_q_block_group_state(
+    *,
+    q_abs: np.ndarray,
+    q_group: np.ndarray,
+    q_parent: np.ndarray,
+    q_block: int,
+    q_blocks: int,
+) -> tuple[np.ndarray, list[dict[int, int]], list[frozenset[int]]]:
+    q_min_by_block = np.empty((q_blocks,), dtype=np.int64)
+    q_allowed_max_by_group: list[dict[int, int]] = []
+    q_all_allowed_groups: list[frozenset[int]] = []
+    for block_idx in range(q_blocks):
+        start = block_idx * q_block
+        end = min((block_idx + 1) * q_block, int(q_abs.size))
+        q = q_abs[start:end]
+        q_group_block = q_group[start:end]
+        q_parent_block = q_parent[start:end]
+        q_min_by_block[block_idx] = int(q.min()) if int(q.size) else 0
+        max_by_group: dict[int, int] = {}
+        all_groups: list[int] = []
+        for group_value in np.unique(np.concatenate((q_group_block, q_parent_block))):
+            allowed = (q_group_block == group_value) | (q_parent_block == group_value)
+            if bool(allowed.any()):
+                max_by_group[int(group_value)] = int(q[allowed].max())
+            if bool(allowed.all()):
+                all_groups.append(int(group_value))
+        q_allowed_max_by_group.append(max_by_group)
+        q_all_allowed_groups.append(frozenset(all_groups))
+    return q_min_by_block, q_allowed_max_by_group, q_all_allowed_groups
+
+
+def _build_k_block_group_state(
+    *,
+    k_abs: np.ndarray,
+    k_group: np.ndarray,
+    k_block: int,
+    k_blocks: int,
+) -> tuple[np.ndarray, list[dict[int, int]], list[tuple[int, ...]]]:
+    k_max_by_block = np.empty((k_blocks,), dtype=np.int64)
+    k_min_by_group: list[dict[int, int]] = []
+    k_groups_by_block: list[tuple[int, ...]] = []
+    for block_idx in range(k_blocks):
+        start = block_idx * k_block
+        end = min((block_idx + 1) * k_block, int(k_abs.size))
+        k = k_abs[start:end]
+        k_group_block = k_group[start:end]
+        k_max_by_block[block_idx] = int(k.max()) if int(k.size) else 0
+        min_by_group: dict[int, int] = {}
+        for group_value in np.unique(k_group_block):
+            min_by_group[int(group_value)] = int(k[k_group_block == group_value].min())
+        k_min_by_group.append(min_by_group)
+        k_groups_by_block.append(tuple(min_by_group))
+    return k_max_by_block, k_min_by_group, k_groups_by_block
 
 
 def _exact_block_state(
     *,
-    q_abs: torch.Tensor,
-    k_abs: torch.Tensor,
-    flat_group_ids: torch.Tensor,
-    flat_parent_ids: torch.Tensor,
-    q_start: int,
-    q_end: int,
-    k_start: int,
-    k_end: int,
+    q_idx: int,
+    k_idx: int,
+    q_min_by_block: np.ndarray,
+    q_allowed_max_by_group: list[dict[int, int]],
+    q_all_allowed_groups: list[frozenset[int]],
+    k_max_by_block: np.ndarray,
+    k_min_by_group: list[dict[int, int]],
+    k_groups_by_block: list[tuple[int, ...]],
 ) -> tuple[bool, bool]:
-    q = q_abs[q_start:q_end]
-    k = k_abs[k_start:k_end]
-    if int(q.numel()) == 0 or int(k.numel()) == 0:
+    q_allowed_max = q_allowed_max_by_group[q_idx]
+    k_min = k_min_by_group[k_idx]
+    if not any(
+        q_allowed_max.get(k_group_value, _INVALID_Q_GROUP) >= min_k
+        for k_group_value, min_k in k_min.items()
+    ):
         return False, False
-    q_group = _select_with_invalid_cpu(
-        flat_group_ids,
-        q,
-        invalid_value=_INVALID_Q_GROUP,
+    if int(q_min_by_block[q_idx]) < int(k_max_by_block[k_idx]):
+        return True, False
+    q_all_allowed = q_all_allowed_groups[q_idx]
+    return True, all(
+        k_group_value in q_all_allowed for k_group_value in k_groups_by_block[k_idx]
     )
-    q_parent = _select_with_invalid_cpu(
-        flat_parent_ids,
-        q,
-        invalid_value=_INVALID_Q_PARENT,
-    )
-    k_group = _select_with_invalid_cpu(
-        flat_group_ids,
-        k,
-        invalid_value=_INVALID_K_GROUP,
-    )
-    allowed = (q[:, None] >= k[None, :]) & (
-        (q_group[:, None] == k_group[None, :]) | (q_parent[:, None] == k_group[None, :])
-    )
-    return bool(allowed.any()), bool(allowed.all())
 
 
 def _build_sparse_block_mask(
@@ -139,7 +159,6 @@ def _build_sparse_block_mask(
     device: torch.device,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
-    mask_mod,
     block_size: tuple[int, int],
 ) -> BlockMask:
     q_block, k_block = block_size
@@ -161,6 +180,46 @@ def _build_sparse_block_mask(
     flat_group_ids = group_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
     flat_parent_ids = (
         parent_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    )
+    flat_group_ids_np = flat_group_ids.numpy()
+    flat_parent_ids_np = flat_parent_ids.numpy()
+    q_group = _select_with_invalid_np(
+        flat_group_ids_np,
+        q_abs,
+        invalid_value=_INVALID_Q_GROUP,
+    )
+    q_parent = _select_with_invalid_np(
+        flat_parent_ids_np,
+        q_abs,
+        invalid_value=_INVALID_Q_PARENT,
+    )
+    k_group = _select_with_invalid_np(
+        flat_group_ids_np,
+        k_abs,
+        invalid_value=_INVALID_K_GROUP,
+    )
+    mask_mod = _build_exact_mask_mod(
+        q_abs=q_abs,
+        k_abs=k_abs,
+        q_group=q_group,
+        q_parent=q_parent,
+        k_group=k_group,
+        device=device,
+    )
+    q_min_by_block, q_allowed_max_by_group, q_all_allowed_groups = (
+        _build_q_block_group_state(
+            q_abs=q_abs,
+            q_group=q_group,
+            q_parent=q_parent,
+            q_block=q_block,
+            q_blocks=q_blocks,
+        )
+    )
+    k_max_by_block, k_min_by_group, k_groups_by_block = _build_k_block_group_state(
+        k_abs=k_abs,
+        k_group=k_group,
+        k_block=k_block,
+        k_blocks=k_blocks,
     )
     if not spec.slices:
         raise RuntimeError(
@@ -234,19 +293,15 @@ def _build_sparse_block_mask(
 
     ambiguous = (touch_counts > 1) & partial_blocks & ~full_blocks
     for q_idx, k_idx in np.argwhere(ambiguous):
-        q_start = int(q_idx) * q_block
-        q_end = min((int(q_idx) + 1) * q_block, int(spec.q_len))
-        k_start = int(k_idx) * k_block
-        k_end = min((int(k_idx) + 1) * k_block, int(spec.k_len))
         has_any, is_full = _exact_block_state(
-            q_abs=q_abs_tensor,
-            k_abs=k_abs_tensor,
-            flat_group_ids=flat_group_ids,
-            flat_parent_ids=flat_parent_ids,
-            q_start=q_start,
-            q_end=q_end,
-            k_start=k_start,
-            k_end=k_end,
+            q_idx=int(q_idx),
+            k_idx=int(k_idx),
+            q_min_by_block=q_min_by_block,
+            q_allowed_max_by_group=q_allowed_max_by_group,
+            q_all_allowed_groups=q_all_allowed_groups,
+            k_max_by_block=k_max_by_block,
+            k_min_by_group=k_min_by_group,
+            k_groups_by_block=k_groups_by_block,
         )
         partial_blocks[q_idx, k_idx] = False
         full_blocks[q_idx, k_idx] = False
@@ -294,18 +349,11 @@ def build_block_mask(
             "Exact stage k-token metadata length mismatch: "
             f"{int(spec.exact_mask.k_token_indices.numel())} != {int(spec.k_len)}"
         )
-    mask_mod = _build_exact_mask_mod(
-        spec.exact_mask,
-        group_ids=group_ids,
-        parent_ids=parent_ids,
-        device=device,
-    )
     block_size = normalize_sparse_block_size(spec.block_size)
     return _build_sparse_block_mask(
         spec,
         device=device,
         group_ids=group_ids,
         parent_ids=parent_ids,
-        mask_mod=mask_mod,
         block_size=block_size,
     )
