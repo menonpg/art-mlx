@@ -937,7 +937,20 @@ def finalize_megatron_job(
     if job_path is not None and os.path.exists(job_path):
         os.remove(job_path)
     if cleanup_path is not None and os.path.exists(cleanup_path):
-        shutil.rmtree(cleanup_path)
+        for attempt in range(5):
+            try:
+                shutil.rmtree(cleanup_path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                if attempt == 4:
+                    print0(
+                        runtime.rank,
+                        f"Warning: failed to clean up {cleanup_path}: {exc}",
+                    )
+                    break
+                time.sleep(0.2)
     with open(log_path, "a+", encoding="utf-8") as log_file:
         log_file.write("all done\n")
 
