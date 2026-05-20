@@ -1367,7 +1367,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
     weight_offload = WeightOffloadManager.from_config(
         model=model_chunks,
         rank=torch.distributed.get_rank(),  # ty: ignore[possibly-missing-attribute]
-        compile_enabled=False,
+        compile_enabled=runtime.transformer_layers_compiled,
         offload_between_jobs=request.offload_between_jobs,
         streaming_config=request.streaming_weight_offload,
     )

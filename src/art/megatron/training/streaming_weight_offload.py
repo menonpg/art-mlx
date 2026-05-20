@@ -28,11 +28,13 @@ class _ParamSpec:
     def __init__(
         self,
         *,
+        name: str,
         param: torch.nn.Parameter,
         offset: int,
         numel: int,
         shape: torch.Size,
     ) -> None:
+        self.name = name
         self.param = param
         self.offset = offset
         self.numel = numel
@@ -115,6 +117,16 @@ class StreamingWeightOffloader:
             raise RuntimeError(
                 "Streaming weight offload found no transformer layers to manage"
             )
+        param_count = sum(
+            spec.numel
+            for layer in self.layers
+            for group in layer.groups
+            for spec in group.specs
+        )
+        if param_count == 0:
+            raise RuntimeError(
+                "Streaming weight offload found no frozen CUDA parameters to manage"
+            )
         self._worker.start()
         for layer_state in self.layers:
             self._hooks.append(
@@ -131,12 +143,6 @@ class StreamingWeightOffloader:
             )
         self.offload_all(wait=True)
         if self.rank == 0:
-            param_count = sum(
-                spec.numel
-                for layer in self.layers
-                for group in layer.groups
-                for spec in group.specs
-            )
             print(
                 "Installed streaming frozen weight offload for "
                 f"{len(self.layers)} layers ({param_count} rank-local params)"
@@ -335,6 +341,7 @@ class StreamingWeightOffloader:
     def _install_cpu_views(self, layer_state: _LayerState) -> None:
         for group in layer_state.groups:
             for spec in group.specs:
+                _validate_streamed_param(spec)
                 spec.param.data = group.cpu_flat[
                     spec.offset : spec.offset + spec.numel
                 ].view(spec.shape)
@@ -347,6 +354,7 @@ class StreamingWeightOffloader:
         for group in layer_state.groups:
             gpu_flat = layer_state.slot.gpu[group.dtype]
             for spec in group.specs:
+                _validate_streamed_param(spec)
                 spec.param.data = gpu_flat[spec.offset : spec.offset + spec.numel].view(
                     spec.shape
                 )
@@ -378,14 +386,12 @@ def install_streaming_weight_offload(
 ) -> StreamingWeightOffloader | None:
     if not config.enabled:
         return None
-    if compile_enabled:
-        raise RuntimeError(
-            "Streaming weight offload requires uncompiled transformer layers"
-        )
     layers = _transformer_layers(model)
     if not layers:
         raise RuntimeError("Streaming weight offload could not find transformer layers")
     _validate_checkpoint_shape(layers[0])
+    if rank == 0 and compile_enabled:
+        print("Streaming weight offload managing compiled transformer layers")
     offloader = StreamingWeightOffloader(layers=layers, rank=rank, config=config)
     offloader.install()
     return offloader
@@ -449,31 +455,36 @@ def _unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
     return current
 
 
-def _frozen_cuda_parameters(module: torch.nn.Module) -> list[torch.nn.Parameter]:
+def _frozen_cuda_parameters(
+    module: torch.nn.Module,
+) -> list[tuple[str, torch.nn.Parameter]]:
     return [
-        param
-        for param in module.parameters()
+        (name, param)
+        for name, param in module.named_parameters()
         if isinstance(param, torch.nn.Parameter)
         and not param.requires_grad
         and param.device.type == "cuda"
     ]
 
 
-def _build_tensor_groups(params: list[torch.nn.Parameter]) -> list[_TensorGroup]:
-    grouped: dict[torch.dtype, list[torch.nn.Parameter]] = {}
-    for param in params:
-        grouped.setdefault(param.dtype, []).append(param)
+def _build_tensor_groups(
+    params: list[tuple[str, torch.nn.Parameter]],
+) -> list[_TensorGroup]:
+    grouped: dict[torch.dtype, list[tuple[str, torch.nn.Parameter]]] = {}
+    for name, param in params:
+        grouped.setdefault(param.dtype, []).append((name, param))
     groups: list[_TensorGroup] = []
     for dtype, dtype_params in grouped.items():
-        total_numel = sum(param.numel() for param in dtype_params)
+        total_numel = sum(param.numel() for _name, param in dtype_params)
         cpu_flat = torch.empty(total_numel, dtype=dtype, device="cpu")
         specs: list[_ParamSpec] = []
         offset = 0
-        for param in dtype_params:
+        for name, param in dtype_params:
             numel = param.numel()
             cpu_flat[offset : offset + numel].copy_(param.detach().view(-1).cpu())
             specs.append(
                 _ParamSpec(
+                    name=name,
                     param=param,
                     offset=offset,
                     numel=numel,
@@ -483,6 +494,14 @@ def _build_tensor_groups(params: list[torch.nn.Parameter]) -> list[_TensorGroup]
             offset += numel
         groups.append(_TensorGroup(dtype=dtype, cpu_flat=cpu_flat, specs=specs))
     return groups
+
+
+def _validate_streamed_param(spec: _ParamSpec) -> None:
+    if spec.param.requires_grad:
+        raise RuntimeError(
+            "Streaming weight offload cannot manage trainable parameter "
+            f"{spec.name}; trainable parameters must remain owned by Megatron buffers"
+        )
 
 
 def _is_recompute_forward() -> bool:

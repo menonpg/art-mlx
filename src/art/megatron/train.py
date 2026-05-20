@@ -118,6 +118,7 @@ class TrainingRuntime(BaseModel):
     model: ModelChunks
     optimizer: Any | None
     optimizer_config: OptimizerConfig
+    transformer_layers_compiled: bool = False
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
@@ -446,7 +447,10 @@ def build_training_runtime(
         install_torch_compile_workarounds(
             compile_workaround_config.model_copy(update={"flags": flags})
         )
-    if compile_enabled and not compile_workaround_config.disable_compile:
+    transformer_layers_compiled = (
+        compile_enabled and not compile_workaround_config.disable_compile
+    )
+    if transformer_layers_compiled:
         for chunk in model:
             _compile_transformer_layers(chunk)
     install_debug_wrappers_if_requested()
@@ -460,6 +464,7 @@ def build_training_runtime(
         model=model,
         optimizer=optimizer,
         optimizer_config=optimizer_config,
+        transformer_layers_compiled=transformer_layers_compiled,
         rank=rank,
         world_size=world_size,
     )
@@ -2215,7 +2220,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
     weight_offload = WeightOffloadManager.from_env(
         model=runtime.model,
         rank=runtime.rank,
-        compile_enabled=_compile_enabled(),
+        compile_enabled=runtime.transformer_layers_compiled,
     )
     weight_offload.install()
     wake_lock_path = os.environ.get(
