@@ -20,8 +20,8 @@ class StreamingWeightOffloadConfig(BaseModel):
 
     enabled: bool = False
     num_layers: int = Field(default=0, ge=0)
-    num_slots: int = Field(default=8, ge=2)
-    resident_layers: int = Field(default=4, ge=1)
+    num_slots: int = Field(default=4, ge=2)
+    resident_layers: int = Field(default=2, ge=1)
 
 
 class _ParamSpec:
@@ -364,9 +364,9 @@ def streaming_weight_offload_config_from_env() -> StreamingWeightOffloadConfig:
     config = StreamingWeightOffloadConfig(
         enabled=_env_flag("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD"),
         num_layers=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_LAYERS", 0),
-        num_slots=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS", 8),
+        num_slots=_env_int("ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_NUM_SLOTS", 4),
         resident_layers=_env_int(
-            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_RESIDENT_LAYERS", 4
+            "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_RESIDENT_LAYERS", 2
         ),
     )
     if config.resident_layers > config.num_slots:
