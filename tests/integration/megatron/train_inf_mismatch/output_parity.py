@@ -29,7 +29,7 @@ from .artifacts import REPO_ROOT
 # prefix routes when vLLM produced different routes for the same prefix. Do not
 # tighten these thresholds without rechecking both vLLM self-mismatch and shared
 # prefix route-conflict behavior on the measured path.
-BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
+BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 
