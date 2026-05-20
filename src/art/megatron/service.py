@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
+import gc
 import importlib
 import os
 from pathlib import Path
@@ -18,7 +19,6 @@ from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
-from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
@@ -55,6 +55,13 @@ from .training.sft_batches import materialize_sft_batches
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
+
+
+def gc_and_empty_cuda_cache(n: int = 3) -> None:
+    for _ in range(n):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
