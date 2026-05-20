@@ -975,15 +975,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
     captured_grads: dict[str, Any] | None = None
     routing_replay_controller = runtime.moe_routing_replay_controller
     install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
-    micro_start_callback = (
-        routing_replay_controller.begin_micro
-        if routing_replay_controller is not None
-        else None
-    )
     forward_trace_capture = ForwardTraceCapture(
         model_chunks,
         enabled=True,
-        micro_start_callback=micro_start_callback,
         strict_output_match=request.mutation is None,
     )
 

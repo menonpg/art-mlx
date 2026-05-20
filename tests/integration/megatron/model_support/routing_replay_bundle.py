@@ -81,6 +81,14 @@ def _trace_call_route_metadata(
     return None, micro_order * dp_world_size + dp_rank
 
 
+def _same_route(left: RouterCallRoute, right: RouterCallRoute) -> bool:
+    return bool(
+        left.num_experts == right.num_experts
+        and torch.equal(left.expert_indices, right.expert_indices)
+        and torch.equal(left.expert_mask, right.expert_mask)
+    )
+
+
 def _compact_route_from_dense(
     _probs_2d: torch.Tensor,
     routing_map_2d: torch.Tensor,
@@ -145,6 +153,7 @@ def build_bundle_from_forward_trace_dir(
                 continue
             router_key = build_router_key_from_trace_name(module_name)
             router_calls: dict[int, RouterCallRoute] = {}
+            calls_by_micro_key: dict[tuple[str, int], int] = {}
             for call_index, call_entry in enumerate(step_trace[module_name]):
                 probs_2d, routing_map_2d = _extract_router_output_tensors(
                     call_entry.get("output")
@@ -153,7 +162,30 @@ def build_bundle_from_forward_trace_dir(
                 sample_index, micro_slot = _trace_call_route_metadata(call_entry)
                 compact_route.sample_index = sample_index
                 compact_route.micro_slot = micro_slot
-                router_calls[call_index] = compact_route
+                micro_key = (
+                    ("sample", int(sample_index))
+                    if sample_index is not None
+                    else (
+                        ("dummy_micro_slot", int(micro_slot))
+                        if micro_slot is not None
+                        else None
+                    )
+                )
+                if micro_key is not None and micro_key in calls_by_micro_key:
+                    existing_call_index = calls_by_micro_key[micro_key]
+                    existing_route = router_calls[existing_call_index]
+                    if not _same_route(existing_route, compact_route):
+                        raise RuntimeError(
+                            "Router trace contains conflicting duplicate routes for "
+                            f"router='{router_key}', step={step_index}, "
+                            f"micro_key={micro_key}, existing_call={existing_call_index}, "
+                            f"duplicate_call={call_index}"
+                        )
+                    continue
+                stored_call_index = len(router_calls)
+                if micro_key is not None:
+                    calls_by_micro_key[micro_key] = stored_call_index
+                router_calls[stored_call_index] = compact_route
                 max_topk = max(max_topk, compact_route.max_topk)
                 token_count = compact_route.num_global_tokens
                 if step_global_tokens is None:
