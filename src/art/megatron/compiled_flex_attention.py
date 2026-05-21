@@ -36,18 +36,6 @@ def _env_enabled(name: str, *, default: bool) -> bool:
     return str(value).strip().lower() not in {"0", "false", "off", "no"}
 
 
-_COMPILE_OPTIONS = {
-    # Keep autotune off during CP iteration. It appears to recover only a small
-    # fraction of the regression while materially slowing down iteration; we can
-    # re-enable it for final tuning once the flex-call shape/setup is fixed.
-    # "max_autotune": _env_enabled("ART_FLEX_MAX_AUTOTUNE", default=True),
-    # "coordinate_descent_tuning": _env_enabled(  # TEMPORARY, DO NOT REMOVE
-    #     "ART_FLEX_COORDINATE_DESCENT_TUNING",
-    #     default=True,
-    # ),
-    # "triton.cudagraphs": False,
-}
-
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
     {"BACKEND": _FORCED_FLEX_BACKEND},
