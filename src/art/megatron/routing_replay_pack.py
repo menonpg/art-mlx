@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 
 import torch
 
@@ -57,7 +58,6 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
             f"MoE routing topk cannot exceed num_experts: topk={topk}, "
             f"num_experts={num_experts}"
         )
-    replay_padding_row = torch.arange(topk, dtype=expert_indices.dtype)
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
     non_padding = group_ids != -1
@@ -93,11 +93,22 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                     if bool(missing_rows.any().item()):
                         # Megatron Core RouterReplay replays only top-k ids and does
                         # not consume expert_mask. Rows without vLLM routes are
-                        # allowed only for terminal completion tokens, which are not
-                        # scored, but they still flow through Megatron's forward.
-                        # Use valid unique fallback ids so Megatron's dense
-                        # routing_map keeps exactly topk entries per token.
-                        route_indices[missing_rows] = replay_padding_row
+                        # allowed only for padding or terminal completion query
+                        # positions, whose next-token logits are not scored. Use
+                        # deterministic unique sentinel ids so Megatron's dense
+                        # routing_map keeps exactly topk entries per token without
+                        # biasing every synthetic row toward the lowest experts.
+                        missing_positions = torch.nonzero(
+                            missing_rows, as_tuple=False
+                        ).flatten()
+                        route_indices[missing_rows] = _synthetic_replay_rows(
+                            row_positions=missing_positions,
+                            num_experts=num_experts,
+                            topk=topk,
+                            dtype=expert_indices.dtype,
+                            seed=(sample_index + 1) * 1_000_003
+                            + (layer_index + 1) * 97_003,
+                        )
                     route_mask = token_mask[sample_index, :, None].expand_as(
                         route_indices
                     )
@@ -108,12 +119,18 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                         sample_index=sample_index,
                     )
                 else:
-                    route_indices = replay_padding_row.expand(
-                        sequence_length, topk
-                    ).clone()
+                    route_indices = _synthetic_replay_rows(
+                        row_positions=torch.arange(sequence_length),
+                        num_experts=num_experts,
+                        topk=topk,
+                        dtype=expert_indices.dtype,
+                        seed=(step_index + 1) * 1_000_003
+                        + (layer_index + 1) * 97_003
+                        + (offset + 1) * 9_176,
+                    )
                     calls[offset] = RouterCallRoute(
                         expert_indices=route_indices,
-                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
+                        expert_mask=torch.zeros_like(route_indices, dtype=torch.bool),
                         num_experts=max(num_experts, 1),
                         micro_slot=offset,
                     )
@@ -146,3 +163,22 @@ def parallel_topology_from_env() -> ParallelTopology:
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return default if raw is None or raw == "" else int(raw)
+
+
+def _synthetic_replay_rows(
+    *,
+    row_positions: torch.Tensor,
+    num_experts: int,
+    topk: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    return torch.tensor(
+        [
+            random.Random(seed + (int(position) + 1) * 1_299_709).sample(
+                range(num_experts), topk
+            )
+            for position in row_positions.tolist()
+        ],
+        dtype=dtype,
+    )
