@@ -14,12 +14,9 @@ _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dispatch_preprocess",
     "deepep_dispatch_combine",
     "deepep_permute_restore",
-    "flex_token_dispatch_preprocess",
     "te_triton_permute_with_mask_map",
 )
-_QWEN3_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS = (
-    "flex_token_dispatch_preprocess",
-)
+_QWEN3_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
 
 
 class Qwen3MoeHandler(DefaultMoeHandler):

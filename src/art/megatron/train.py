@@ -38,10 +38,7 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 from art import dev, types
 from art.loss import Loss, shift_tensor
 from art.loss import loss_fn as base_loss_fn
-from art.megatron.compile_workarounds import (
-    install_debug_wrappers_if_requested,
-    install_torch_compile_workarounds,
-)
+from art.megatron.compile_workarounds import install_torch_compile_workarounds
 from art.megatron.context_parallel.loss import loss_fn_dispatched
 from art.megatron.context_parallel.runtime import prepare_cp_micro
 from art.megatron.context_parallel.types import (
@@ -453,7 +450,6 @@ def build_training_runtime(
     if transformer_layers_compiled:
         for chunk in model:
             _compile_transformer_layers(chunk)
-    install_debug_wrappers_if_requested()
 
     optimizer_config = optimizer_config or _default_optimizer_config()
     optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
