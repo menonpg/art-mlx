@@ -49,9 +49,15 @@ class Topology(BaseModel):
     pp: int = 1
 
     def world_size(self) -> int:
-        dense_model_size = self.tp * self.cp * self.pp
+        dense_world = self.tp * self.cp * self.pp * self.dp
         expert_model_size = self.etp * self.ep * self.pp
-        return math.lcm(dense_model_size, expert_model_size) * self.dp
+        if dense_world % expert_model_size != 0:
+            raise ValueError(
+                "Invalid Megatron MoE topology: "
+                f"tp*cp*pp*dp={dense_world} must be divisible by "
+                f"etp*ep*pp={expert_model_size}"
+            )
+        return dense_world
 
     def env(self) -> dict[str, str]:
         return {

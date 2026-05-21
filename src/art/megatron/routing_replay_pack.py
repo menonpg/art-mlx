@@ -52,6 +52,12 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
         packed_tensors.get("moe_routing_num_experts", 0)
         or int(expert_indices.max().item()) + 1
     )
+    if topk > num_experts:
+        raise RuntimeError(
+            f"MoE routing topk cannot exceed num_experts: topk={topk}, "
+            f"num_experts={num_experts}"
+        )
+    replay_padding_row = torch.arange(topk, dtype=expert_indices.dtype)
     group_ids = packed_tensors["group_ids"]
     parent_ids = packed_tensors["parent_ids"]
     non_padding = group_ids != -1
@@ -80,7 +86,18 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
             calls: dict[int, RouterCallRoute] = {}
             for offset, sample_index in enumerate(range(start, end)):
                 if sample_index < num_sequences:
-                    route_indices = expert_indices[sample_index, :, layer_index, :]
+                    route_indices = expert_indices[
+                        sample_index, :, layer_index, :
+                    ].clone()
+                    missing_rows = ~token_mask[sample_index]
+                    if bool(missing_rows.any().item()):
+                        # Megatron Core RouterReplay replays only top-k ids and does
+                        # not consume expert_mask. Rows without vLLM routes are
+                        # allowed only for terminal completion tokens, which are not
+                        # scored, but they still flow through Megatron's forward.
+                        # Use valid unique fallback ids so Megatron's dense
+                        # routing_map keeps exactly topk entries per token.
+                        route_indices[missing_rows] = replay_padding_row
                     route_mask = token_mask[sample_index, :, None].expand_as(
                         route_indices
                     )
@@ -91,10 +108,9 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                         sample_index=sample_index,
                     )
                 else:
-                    route_indices = torch.zeros(
-                        (sequence_length, topk),
-                        dtype=torch.int32,
-                    )
+                    route_indices = replay_padding_row.expand(
+                        sequence_length, topk
+                    ).clone()
                     calls[offset] = RouterCallRoute(
                         expert_indices=route_indices,
                         expert_mask=torch.ones_like(route_indices, dtype=torch.bool),

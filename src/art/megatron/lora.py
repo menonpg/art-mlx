@@ -957,6 +957,14 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
             b_parallel_spec=b_parallel_spec,
             allreduce=False,
         )
+        component_size = (
+            linear_fc1.out_features * _get_shard_world_size("expert_tp")
+        ) // 2
+        _set_lora_shard_strategy_metadata(
+            self.lora.B_T,
+            strategy="componentwise",
+            component_sizes=(component_size, component_size),
+        )
 
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
