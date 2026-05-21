@@ -1,7 +1,6 @@
 """Compiled flex attention entrypoints."""
 
 import math
-import os
 from typing import Any, TypeAlias, cast
 
 import torch
@@ -27,13 +26,6 @@ def normalize_flex_lse(lse: torch.Tensor) -> torch.Tensor:
     if _FORCED_FLEX_BACKEND != "FLASH":
         return lse
     return lse / _FLASH_LSE_RESCALE
-
-
-def _env_enabled(name: str, *, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return str(value).strip().lower() not in {"0", "false", "off", "no"}
 
 
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
@@ -141,10 +133,8 @@ def get_sparse_compiled_flex_attention(*, family_key: str) -> Any:
 
 dense_compiled_flex_attention = torch.compile(
     _forced_flex_attention_dense,
-    options=_COMPILE_OPTIONS,
 )
 
 sparse_compiled_flex_attention = torch.compile(
     _forced_flex_attention_sparse,
-    options=_COMPILE_OPTIONS,
 )
