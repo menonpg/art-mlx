@@ -190,7 +190,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
     def patch_bridge(self, bridge: Any) -> None:
         del bridge
-        _ensure_qwen35_text_only_bridge_registered()
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
@@ -1052,10 +1051,6 @@ class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
         return self._mapping.hf_to_megatron(aligned, megatron_module)
 
 
-def _ensure_qwen35_text_only_bridge_registered() -> None:
-    return None
-
-
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
     _QWEN3_5_DENSE_HF_CLASS_NAME,
@@ -1073,7 +1068,7 @@ from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
     source=_QWEN3_5_DENSE_HF_CLASS_NAME,
     target=GPTModel,
     provider=Qwen35VLModelProvider,
-    model_type="qwen3_5_moe",
+    model_type="qwen3_5",
 )
 class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
     def mapping_registry(self) -> Any:
