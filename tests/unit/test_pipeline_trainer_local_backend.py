@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -13,6 +15,11 @@ from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
 from art.megatron.train import load_adapter_into_model
+from art.pipeline_trainer import (
+    CHECKPOINT_CREATED_AT_METRIC,
+    CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CheckpointRetentionContext,
+)
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir
@@ -199,6 +206,164 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
     assert seen["dev_config"]["packed_sequence_length"] == 2048
 
 
+@pytest.mark.asyncio
+async def test_local_backend_train_maps_normalize_advantages_to_scale_rewards(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-normalize-advantages",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    seen: dict[str, Any] = {}
+
+    async def fake_train_model(
+        _model: TrainableModel,
+        _groups: list[TrajectoryGroup],
+        config: Any,
+        dev_config: dict[str, Any],
+        verbose: bool = False,
+    ):
+        seen["dev_config"] = dev_config
+        yield {}
+
+    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.train(
+            model,
+            [_make_group([0.0, 1.0])],
+            normalize_advantages=False,
+            save_checkpoint=False,
+        )
+
+    assert seen["dev_config"]["scale_rewards"] is False
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_steps(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    checkpoint_dir = Path(model._get_output_dir()) / "checkpoints"
+    for step in range(6):
+        (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
+    history_path = Path(model._get_output_dir()) / "history.jsonl"
+    history_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"step": 2, "val/reward": 1.0},
+                {"step": 2, "val/reward": 3.0},
+                {
+                    "step": 2,
+                    CHECKPOINT_CREATED_AT_METRIC: 123.0,
+                    CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0,
+                },
+                {"step": 3, "val/reward": 10.0},
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    backend = MagicMock()
+    backend._delete_checkpoint_files = AsyncMock()
+    contexts: list[CheckpointRetentionContext] = []
+
+    def strategy(context: CheckpointRetentionContext) -> set[int]:
+        contexts.append(context)
+        return {1, 4, 99}
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        checkpoint_retention_strategy=strategy,
+    )
+    trainer.state.completed_eval_steps = {2, 3}
+    trainer._checkpoint_lease_counts[3] = 1
+    trainer._scheduled_eval_steps.add(4)
+
+    await trainer._run_checkpoint_retention(5)
+
+    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [0, 1, 2]
+    step_two = contexts[0].checkpoints[2]
+    assert step_two.is_eval_step is True
+    assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
+    assert step_two.metrics["val/reward"] == 2.0
+    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
+        model,
+        [1, 3, 4, 5],
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_checkpoint_retention_honors_interval(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention-interval",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    checkpoint_dir = Path(model._get_output_dir()) / "checkpoints"
+    for step in range(3):
+        (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
+
+    backend = MagicMock()
+    backend._delete_checkpoint_files = AsyncMock()
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        checkpoint_retention_strategy=lambda _context: {0, 1, 2},
+        checkpoint_retention_interval=5,
+    )
+
+    await trainer._run_checkpoint_retention(4)
+
+    backend._delete_checkpoint_files.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_logs_checkpoint_retention_metadata(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-checkpoint-retention-metadata",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        report_metrics=[],
+    )
+    checkpoint_path = Path(model._get_output_dir()) / "checkpoints" / "0001"
+    checkpoint_path.mkdir(parents=True)
+    trainer = _make_trainer(model=model, backend=MagicMock())
+
+    await trainer._log_checkpoint_saved(
+        SimpleNamespace(step=1, checkpoint_path=str(checkpoint_path))
+    )
+    await trainer._log_checkpoint_eval_completed(1)
+
+    rows = [
+        json.loads(line)
+        for line in (Path(model._get_output_dir()) / "history.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert rows[0]["checkpoint/saved"] == 1.0
+    assert rows[0][CHECKPOINT_CREATED_AT_METRIC] > 0.0
+    assert rows[1][CHECKPOINT_EVAL_COMPLETED_METRIC] == 1.0
+
+
 def _make_tokenized_result(
     trajectory: Trajectory,
     token_ids: list[int],
@@ -360,7 +525,6 @@ async def test_local_backend_async_context_manager_awaits_async_cleanup(
     [
         ({"loss_fn": "dro"}, "loss_fn='cispo' or loss_fn='ppo'"),
         ({"loss_fn_config": {"clip": 0.2}}, "loss_fn_config=None"),
-        ({"normalize_advantages": False}, "normalize_advantages=True"),
         ({"adam_params": object()}, "adam_params=None"),
     ],
 )
@@ -422,3 +586,32 @@ def test_local_backend_inference_name_prefers_served_step_in_dedicated_mode(
 
     assert backend._model_inference_name(model) == f"{model.name}@2"
     assert backend._model_inference_name(model, step=3) == f"{model.name}@3"
+
+
+@pytest.mark.asyncio
+async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-adapter-lease",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+        ),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    service = SimpleNamespace(
+        _latest_step=5,
+        prune_loaded_adapters=AsyncMock(),
+    )
+    backend._services[model.name] = cast(Any, service)
+
+    async with backend.adapter_lease(model, 3):
+        assert backend._model_inference_name(model) == f"{model.name}@3"
+        await backend.prune_model_adapters(model, retain_steps={4, 5})
+
+    assert backend._model_inference_name(model) == f"{model.name}@5"
+    service.prune_loaded_adapters.assert_awaited_once_with(retain_steps={3, 4, 5})

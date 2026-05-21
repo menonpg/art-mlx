@@ -102,6 +102,12 @@ class RouterCallRoute(BaseModel):
                 "expert_mask shape must match expert_indices shape, got "
                 f"{tuple(self.expert_mask.shape)} vs {tuple(self.expert_indices.shape)}"
             )
+        if not bool(self.expert_mask.all().item()):
+            raise RuntimeError(
+                "masked slots are unsupported by Megatron native MoE routing replay; "
+                "route bundles must contain a valid full top-k expert id row for "
+                "every replayed token"
+            )
         if self.num_experts <= 0:
             raise RuntimeError(f"num_experts must be >0, got {self.num_experts}")
         selected = self.expert_indices[self.expert_mask]
@@ -577,6 +583,12 @@ class MoeRoutingReplayController:
             router_calls = step_routes.routers[router_key].calls
             binding_topk = int(self._router_bindings[router_key]["topk"])
             for call_index, route in router_calls.items():
+                if not bool(route.expert_mask.all().item()):
+                    raise RuntimeError(
+                        "masked slots are unsupported by Megatron native MoE routing "
+                        f"replay: step={step_index}, router='{router_key}', "
+                        f"call={call_index}"
+                    )
                 if route.max_topk != binding_topk:
                     raise RuntimeError(
                         "Replay route topk does not match Megatron router topk: "

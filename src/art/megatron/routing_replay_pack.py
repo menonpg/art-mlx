@@ -109,12 +109,9 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                             seed=(sample_index + 1) * 1_000_003
                             + (layer_index + 1) * 97_003,
                         )
-                    route_mask = token_mask[sample_index, :, None].expand_as(
-                        route_indices
-                    )
                     calls[offset] = RouterCallRoute(
                         expert_indices=route_indices,
-                        expert_mask=route_mask,
+                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
                         num_experts=num_experts,
                         sample_index=sample_index,
                     )
@@ -130,7 +127,7 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
                     )
                     calls[offset] = RouterCallRoute(
                         expert_indices=route_indices,
-                        expert_mask=torch.zeros_like(route_indices, dtype=torch.bool),
+                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
                         num_experts=max(num_experts, 1),
                         micro_slot=offset,
                     )

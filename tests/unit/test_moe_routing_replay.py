@@ -233,6 +233,15 @@ def _assert_target(
     assert torch.equal(replay.targets_seen[index], expected.to(torch.long))
 
 
+def _expected_routing_map(route: RouterCallRoute) -> torch.Tensor:
+    routing_map = torch.zeros(
+        (route.num_global_tokens, route.num_experts), dtype=torch.bool
+    )
+    rows = torch.arange(route.num_global_tokens).unsqueeze(1)
+    routing_map[rows, route.expert_indices.to(torch.long)] = True
+    return routing_map
+
+
 def test_build_router_key_from_compiled_module_name() -> None:
     assert (
         build_router_key_from_module_name(
@@ -344,15 +353,19 @@ def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
     controller.set_step(step_index=0, sample_index=[0, 1])
 
     controller.begin_micro(0, 0)
-    router.routing(torch.randn((2, 3), dtype=torch.float32))
-    router.routing(torch.randn((2, 3), dtype=torch.float32))
+    _probs, routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+    _probs, recompute_routing_map = router.routing(
+        torch.randn((2, 3), dtype=torch.float32)
+    )
     controller.begin_micro(1, 1)
-    router.routing(torch.randn((2, 3), dtype=torch.float32))
+    _probs, next_routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
 
     calls = bundle.steps[0].routers[bundle.router_keys[0]].calls
     _assert_target(replay, calls[0].expert_indices, index=0)
-    _assert_target(replay, calls[0].expert_indices, index=1)
-    _assert_target(replay, calls[1].expert_indices, index=2)
+    _assert_target(replay, calls[1].expert_indices, index=1)
+    assert torch.equal(routing_map.cpu(), _expected_routing_map(calls[0]))
+    assert torch.equal(recompute_routing_map.cpu(), _expected_routing_map(calls[0]))
+    assert torch.equal(next_routing_map.cpu(), _expected_routing_map(calls[1]))
 
     controller.finalize_step()
     controller.remove_router_patches()
@@ -367,20 +380,11 @@ def test_controller_consumes_multiple_captured_calls_before_recompute_reuse() ->
     controller.install_router_patches([chunk])
     controller.set_step(step_index=0, sample_index=[0, 1])
 
-    controller.begin_micro(0, 0)
-    router.routing(torch.randn((1, 3), dtype=torch.float32))
-    router.routing(torch.randn((1, 3), dtype=torch.float32))
-    router.routing(torch.randn((1, 3), dtype=torch.float32))
-    controller.begin_micro(1, 1)
-    router.routing(torch.randn((1, 3), dtype=torch.float32))
+    with pytest.raises(RuntimeError, match="exactly one router call"):
+        controller.begin_micro(0, 0)
 
-    calls = bundle.steps[0].routers[bundle.router_keys[0]].calls
-    _assert_target(replay, calls[0].expert_indices, index=0)
-    _assert_target(replay, calls[1].expert_indices, index=1)
-    _assert_target(replay, calls[1].expert_indices, index=2)
-    _assert_target(replay, calls[2].expert_indices, index=3)
+    assert replay.targets_seen == []
 
-    controller.finalize_step()
     controller.remove_router_patches()
 
 

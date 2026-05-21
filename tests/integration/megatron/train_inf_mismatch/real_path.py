@@ -191,15 +191,18 @@ async def _collect_real_trajectory_groups(
     from transformers import AutoTokenizer
 
     import art
-    from art.preprocessing.tokenize import _chat_template_disables_thinking
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
     tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    chat_template_kwargs: dict[str, Any] = {}
+    if isinstance(tokenizer.chat_template, str):
+        if "enable_thinking" in tokenizer.chat_template:
+            chat_template_kwargs["enable_thinking"] = False
+        if "preserve_thinking" in tokenizer.chat_template:
+            chat_template_kwargs["preserve_thinking"] = True
     extra_body = (
-        {"chat_template_kwargs": {"enable_thinking": False}}
-        if _chat_template_disables_thinking(tokenizer)
-        else None
+        {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else None
     )
     prompts = _build_prompts(config)
     groups = [

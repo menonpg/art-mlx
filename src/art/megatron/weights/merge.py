@@ -6,8 +6,11 @@ from typing import Any
 import torch
 
 from art.megatron.model_support.lora_disk import (
+    load_adapter_config,
     load_lora_tensors_for_megatron,
     normalize_lora_checkpoint_to_vllm,
+    resolve_lora_handler,
+    save_vllm_lora_tensors,
 )
 
 safetensors = importlib.import_module("safetensors")
@@ -173,17 +176,31 @@ def load_lora_adapter_state_dict(
 def merge_lora_adapter(
     lora_path: str,
     *,
+    output_dir: str | Path | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> None:
     base_dir = Path(lora_path)
     adapter_model, shard_filenames, manifest_filenames = _load_adapter_shards(base_dir)
+    target_dir = Path(output_dir) if output_dir is not None else base_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    adapter_model_path = base_dir / "adapter_model.safetensors"
-    save_file(adapter_model, adapter_model_path)
-    normalize_lora_checkpoint_to_vllm(
-        base_dir,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
+    if target_dir == base_dir:
+        save_file(adapter_model, base_dir / "adapter_model.safetensors")
+        normalize_lora_checkpoint_to_vllm(
+            base_dir,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+    else:
+        handler = resolve_lora_handler(
+            base_dir,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+        adapter_config = load_adapter_config(base_dir)
+        tensors, adapter_config = handler.to_vllm_lora_tensors(
+            adapter_model,
+            adapter_config=adapter_config,
+        )
+        save_vllm_lora_tensors(target_dir, tensors, adapter_config)
     for filename in shard_filenames:
         filename.unlink()
     for filename in manifest_filenames:
