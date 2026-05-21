@@ -15,6 +15,10 @@ from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokeni
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices
+from ..utils.chat_template import (
+    default_chat_template_kwargs_for_tokenizer,
+    merge_chat_template_kwargs,
+)
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
@@ -24,14 +28,10 @@ def _chat_template_kwargs(
     tokenizer: PreTrainedTokenizerBase,
     chat_template_kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {}
-    if isinstance(tokenizer.chat_template, str):
-        if "enable_thinking" in tokenizer.chat_template:
-            kwargs["enable_thinking"] = False
-        if "preserve_thinking" in tokenizer.chat_template:
-            kwargs["preserve_thinking"] = True
-    kwargs.update(chat_template_kwargs or {})
-    return kwargs
+    return merge_chat_template_kwargs(
+        default_chat_template_kwargs_for_tokenizer(tokenizer),
+        chat_template_kwargs,
+    )
 
 
 def _normalize_tool_for_vllm_openai(tool: ChatTemplateTool) -> ChatTemplateTool:

@@ -36,6 +36,7 @@ import uvicorn
 from art.tinker.prefix_cache import LRUTrieCache
 from art.tinker.renderers import get_renderer_name, is_qwen3_dot_family_model
 from art.types import Message, Tools
+from art.utils.chat_template import default_chat_template_kwargs_for_tokenizer
 from mp_actors import close_proxy, move_to_child_process
 
 
@@ -552,12 +553,7 @@ class OpenAICompatibleTinkerServerWorker:
     ) -> list[int]:
         normalized_messages = _normalize_qwen3_dot_messages(base_model, messages)
         tokenizer = self._get_renderer(base_model).tokenizer
-        chat_template_kwargs = {}
-        if isinstance(tokenizer.chat_template, str):
-            if "enable_thinking" in tokenizer.chat_template:
-                chat_template_kwargs["enable_thinking"] = False
-            if "preserve_thinking" in tokenizer.chat_template:
-                chat_template_kwargs["preserve_thinking"] = True
+        chat_template_kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
         encoding = tokenizer.apply_chat_template(
             cast(Any, normalized_messages),
             tools=cast(Any, tools),
