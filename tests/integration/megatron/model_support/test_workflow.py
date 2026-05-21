@@ -3,9 +3,9 @@ from types import SimpleNamespace
 from art.megatron.model_support.spec import (
     ArchitectureReport,
     LayerFamilyInstance,
-    ValidationStageResult,
 )
 
+from .validation_spec import ValidationStageResult
 from .workflow import (
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,

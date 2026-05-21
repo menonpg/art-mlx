@@ -8,8 +8,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from art.megatron.model_support.spec import MinimalLayerCoverageReport
-
 from .oracle_harness import (
     NON_FINITE_METRIC_VALUE,
     ORACLE_TOPOLOGY,
@@ -23,6 +21,7 @@ from .oracle_harness import (
     ensure_case_artifacts,
 )
 from .oracle_worker import provider_topology_env
+from .validation_spec import MinimalLayerCoverageReport
 from .workflow import assess_minimal_layer_coverage
 
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"

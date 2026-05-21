@@ -15,8 +15,11 @@ from art.megatron.model_support.registry import (
 )
 from art.megatron.model_support.spec import (
     ArchitectureReport,
-    MinimalLayerCoverageReport,
     NativeVllmLoraStatus,
+)
+
+from .validation_spec import (
+    MinimalLayerCoverageReport,
     ValidationReport,
     ValidationStageResult,
 )

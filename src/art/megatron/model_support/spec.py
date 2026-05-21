@@ -36,30 +36,6 @@ class ArchitectureReport(BaseModel):
     unresolved_risks: list[str] = Field(default_factory=list)
 
 
-class MinimalLayerCoverageReport(BaseModel):
-    base_model: str
-    model_key: str
-    requested_num_layers: int
-    recommended_min_layers: int
-    covered: bool
-    missing_layer_families: list[str] = Field(default_factory=list)
-    unresolved_risks: list[str] = Field(default_factory=list)
-
-
-class ValidationStageResult(BaseModel):
-    name: str
-    passed: bool = False
-    metrics: dict[str, Any] = Field(default_factory=dict)
-    artifact_dir: str | None = None
-
-
-class ValidationReport(BaseModel):
-    base_model: str
-    model_key: str
-    dependency_versions: dict[str, str] = Field(default_factory=dict)
-    stages: list[ValidationStageResult] = Field(default_factory=list)
-
-
 class CompileWorkaroundConfig(BaseModel):
     flags: tuple[str, ...] = ()
     unconditional_flags: tuple[str, ...] = ()
@@ -115,22 +91,6 @@ class ModelSupportHandler(Protocol):
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]: ...
-
-    def hf_tensor_map_to_art_canonical(
-        self,
-        hf_tensor_map: dict[str, Any],
-        *,
-        expected_keys: set[str],
-    ) -> dict[str, Any]:
-        """
-        Testing-only hook for canonicalizing raw HuggingFace tensor maps into the
-        ART tensor-map keyspace expected by model-support probes.
-
-        This currently exists to support validations such as HF parity, where the
-        raw HF model can expose fused parameter names or layouts that differ from
-        the canonical names ART compares against.
-        """
-        ...
 
     def to_vllm_lora_tensors(
         self,

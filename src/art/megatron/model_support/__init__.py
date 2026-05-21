@@ -26,13 +26,10 @@ from art.megatron.model_support.spec import (
     ArchitectureReport,
     DependencyFloor,
     LayerFamilyInstance,
-    MinimalLayerCoverageReport,
     ModelSupportHandler,
     ModelSupportSpec,
     NativeVllmLoraStatus,
     RolloutWeightsMode,
-    ValidationReport,
-    ValidationStageResult,
 )
 
 _LAZY_EXPORT_MODULES = {
@@ -58,7 +55,6 @@ __all__ = [
     "DEFAULT_DENSE_SPEC",
     "DependencyFloor",
     "LayerFamilyInstance",
-    "MinimalLayerCoverageReport",
     "ModelSupportHandler",
     "ModelSupportSpec",
     "NativeVllmLoraStatus",
@@ -73,8 +69,6 @@ __all__ = [
     "QWEN3_5_MOE_SPEC",
     "PROBE_ONLY_MODEL_SUPPORT_SPECS",
     "RolloutWeightsMode",
-    "ValidationReport",
-    "ValidationStageResult",
     "UnsupportedModelArchitectureError",
     "VALIDATED_MODEL_SUPPORT_SPECS",
     "default_target_modules_for_model",

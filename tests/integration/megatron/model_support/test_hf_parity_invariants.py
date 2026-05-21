@@ -4,9 +4,6 @@ from typing import Any, cast
 import pytest
 import torch
 
-from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER
-from art.megatron.model_support.spec import MinimalLayerCoverageReport
-
 from . import hf_parity as hf_parity_module
 from . import hf_parity_worker as hf_parity_worker_module
 from .hf_parity import (
@@ -28,6 +25,7 @@ from .hf_parity_worker import (
     _normalize_hf_tensor_map_for_bridge,
 )
 from .oracle_harness import DiskPackedTensorsSpec, OracleCaseConfig
+from .validation_spec import MinimalLayerCoverageReport
 
 
 def test_build_parity_sample_indices_pads_with_none() -> None:
@@ -275,7 +273,6 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
             "model.language_model.layers.0.input_layernorm.weight",
             "lm_head.weight",
         },
-        model_support_handler=QWEN3_5_MOE_HANDLER,
     )
 
     assert set(normalized) == {
