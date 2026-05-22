@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.5.17"
+version = "0.5.18"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -178,7 +178,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.11.0"
+version = "0.5.18"
 requires-dist = [
     "einops",
     "onnx",
