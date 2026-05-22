@@ -136,6 +136,55 @@ def _messages_for_chat_template(
     return _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
 
 
+def _token_ids_for_template_part(
+    tokenizer: PreTrainedTokenizerBase,
+    template_part: str,
+) -> list[int]:
+    return list(tokenizer(template_part, add_special_tokens=False).input_ids)
+
+
+def _find_subsequence(
+    values: list[int],
+    pattern: list[int],
+    *,
+    start: int = 0,
+) -> int | None:
+    if not pattern:
+        return None
+    last_start = len(values) - len(pattern)
+    for index in range(start, last_start + 1):
+        if values[index : index + len(pattern)] == pattern:
+            return index
+    return None
+
+
+def _response_only_labels(
+    input_ids: list[int],
+    *,
+    instruction_ids: list[int],
+    response_ids: list[int],
+) -> list[int]:
+    labels = [-100] * len(input_ids)
+    index = 0
+    while index < len(input_ids):
+        response_start = _find_subsequence(input_ids, response_ids, start=index)
+        if response_start is None:
+            break
+
+        trainable_start = response_start + len(response_ids)
+        next_instruction_start = _find_subsequence(
+            input_ids,
+            instruction_ids,
+            start=trainable_start,
+        )
+        trainable_end = (
+            len(input_ids) if next_instruction_start is None else next_instruction_start
+        )
+        labels[trainable_start:trainable_end] = input_ids[trainable_start:trainable_end]
+        index = trainable_end
+    return labels
+
+
 @dataclass
 class TokenizedResult:
     advantage: float
@@ -583,17 +632,8 @@ def tokenize_sft_batch(
     """
     _validate_max_seq_length(max_seq_length)
 
-    import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
-    from unsloth_zoo.dataset_utils import train_on_responses_only
-
-    train_on_responses_only_fn = train_on_responses_only(
-        trainer=None,
-        instruction_part=instruction_part,
-        response_part=response_part,
-        force_match=False,
-        tokenizer=tokenizer,
-        return_function=True,
-    )
+    instruction_ids = _token_ids_for_template_part(tokenizer, instruction_part)
+    response_ids = _token_ids_for_template_part(tokenizer, response_part)
     # Tokenize all trajectories (no padding — each keeps its natural length)
     trajectory_tensors = []
     num_tokens = 0
@@ -625,7 +665,11 @@ def tokenize_sft_batch(
 
         attention_mask = [1] * len(input_ids)
 
-        labels = train_on_responses_only_fn({"input_ids": [input_ids]})["labels"][0]
+        labels = _response_only_labels(
+            input_ids,
+            instruction_ids=instruction_ids,
+            response_ids=response_ids,
+        )
 
         trajectory_tensors.append(
             {

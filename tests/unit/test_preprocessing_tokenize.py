@@ -6,7 +6,7 @@ from openai.types.chat.chat_completion import Choice
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-from art.preprocessing.tokenize import tokenize_trajectory
+from art.preprocessing.tokenize import tokenize_sft_batch, tokenize_trajectory
 from art.trajectories import History, Trajectory
 from art.types import MessagesAndChoices
 
@@ -65,6 +65,13 @@ class _FakeTokenizer:
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
         return [ord(char) for char in text]
+
+    def __call__(self, text: str, add_special_tokens: bool = False):
+        return type(
+            "TokenizedText",
+            (),
+            {"input_ids": self.encode(text, add_special_tokens=add_special_tokens)},
+        )()
 
     def decode(self, token_ids):
         if isinstance(token_ids, int):
@@ -197,6 +204,30 @@ def test_tokenize_trajectory_passes_chat_template_kwargs() -> None:
         call.get("enable_thinking") is False and call.get("preserve_thinking") is True
         for call in tokenizer.apply_chat_template_kwargs
     )
+
+
+def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> None:
+    tokenizer = _FakeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "OK"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        instruction_part="<user>",
+        response_part="<assistant>",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    trainable_token_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(trainable_token_ids) == "OK"
+    assert batch.num_trainable_tokens == 2
 
 
 def test_tokenize_trajectory_does_not_continue_real_completion_with_thinking() -> None:
