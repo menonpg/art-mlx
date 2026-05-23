@@ -682,35 +682,28 @@ def _run_megatron_sft_step(
                 sample_indices[micro_order],
                 micro_order,
             )
-        input_ids, position_ids, shifted_labels, mask, seq_len = (
-            megatron_train._prepare_sft_micro_inputs(micro, device)
+        prepared_micro = megatron_train._prepare_dense_sft_micro(
+            micro,
+            device=device,
+            provider=runtime.provider,
+            model_support_handler=runtime.model_support_handler,
         )
         attention_mask = megatron_train._placeholder_attention_mask(device)
         forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
             runtime.model[0],
-            attention_bias=megatron_train._causal_attention_state(
-                seq_len,
-                device,
-                build_gdn_execution_spec=bool(
-                    getattr(
-                        runtime.model_support_handler,
-                        "build_gdn_execution_spec",
-                        False,
-                    )
-                ),
-            ),
+            attention_bias=prepared_micro.attention_state,
         )
         per_token_loss = runtime.model[0](
-            input_ids=input_ids,
-            position_ids=position_ids,
+            input_ids=prepared_micro.input_ids,
+            position_ids=prepared_micro.position_ids,
             attention_mask=attention_mask,
-            labels=shifted_labels,
+            labels=prepared_micro.labels,
             **forward_kwargs,
         )
-        masked_losses = per_token_loss[mask]
+        masked_losses = per_token_loss[prepared_micro.loss_mask]
         trainable_losses.append(masked_losses.detach().cpu())
         loss_sum = loss_sum + masked_losses.sum()
-        token_count += int(mask.sum().item())
+        token_count += int(prepared_micro.loss_mask.sum().item())
         masked_losses.sum().backward()
     _debug("finished Megatron forward/backward")
     num_tokens = megatron_train._local_trainable_sft_token_count_tensor(
