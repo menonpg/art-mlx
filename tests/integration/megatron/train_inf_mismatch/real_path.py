@@ -153,6 +153,7 @@ async def _rollout(
     model: Any,
     prompt: str,
     max_completion_tokens: int,
+    seed: int,
     reward: float,
     extra_body: dict[str, Any] | None,
 ) -> Any:
@@ -168,7 +169,8 @@ async def _rollout(
             model=model.get_inference_name(),
             messages=messages,
             max_tokens=max_completion_tokens,
-            temperature=0.3,
+            temperature=0.8,
+            seed=seed,
             logprobs=True,
             top_logprobs=TOP_K,
             **request_kwargs,
@@ -179,6 +181,7 @@ async def _rollout(
             trajectory.metrics["completion_tokens"] = (
                 len(logprobs.content or []) if logprobs is not None else 0
             )
+            trajectory.metrics["seed"] = seed
 
     return await art.capture_auto_trajectory(_request())
 
@@ -212,13 +215,18 @@ async def _collect_real_trajectory_groups(
                     model=model,
                     prompt=prompt,
                     max_completion_tokens=config.max_completion_tokens,
+                    seed=(
+                        config.output_parity.seed
+                        + prompt_index * 1_000_003
+                        + rollout_index
+                    ),
                     reward=float(rollout_index % 2),
                     extra_body=extra_body,
                 )
                 for rollout_index in range(config.rollouts_per_prompt)
             ]
         )
-        for prompt in prompts
+        for prompt_index, prompt in enumerate(prompts)
     ]
     return await art.gather_trajectory_groups(
         cast(Any, groups),
