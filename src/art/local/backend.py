@@ -883,16 +883,6 @@ class LocalBackend(Backend):
             include_trainable_groups=True,
         )
         include_moe_routing = self._model_uses_expert_replay(model)
-        if (
-            include_moe_routing
-            and dev_config.get("moe_routing_replay_path") is not None
-        ):
-            raise RuntimeError(
-                "Expert replay is enabled on the backend, but "
-                "dev_config.moe_routing_replay_path was also set. Use only one "
-                "routing replay source."
-            )
-
         packed_tensors = self._get_packed_tensors(
             model,
             trajectory_groups,
@@ -991,26 +981,6 @@ class LocalBackend(Backend):
             ).to_dir(routing_replay_dir)
             service_dev_config["moe_routing_replay_path"] = routing_replay_dir
             service_dev_config["moe_routing_replay_strict"] = True
-            routing_replay = packed_tensors.get("moe_routing_replay")
-            if routing_replay is not None:
-                stats = routing_replay.pack_stats
-                base_metrics.update(
-                    {
-                        "data/moe_routing_packed_tokens": float(stats.packed_tokens),
-                        "data/moe_routing_shared_prefix_rows": float(
-                            stats.shared_prefix_rows
-                        ),
-                        "data/moe_routing_shared_prefix_conflict_rows": float(
-                            stats.shared_prefix_conflict_rows
-                        ),
-                        "data/moe_routing_shared_prefix_conflict_slots": float(
-                            stats.shared_prefix_conflict_slots
-                        ),
-                        "data/moe_routing_shared_prefix_compared_slots": float(
-                            stats.shared_prefix_compared_slots
-                        ),
-                    }
-                )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
         grad_accumulation_sequences = max(
             1, int(config.grad_accumulation_sequences or 1)
