@@ -10,7 +10,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from art.megatron.flash_flex_dlse_patch import apply_flash_flex_dlse_patch
+from art.megatron.flex_attn.flash_dlse_patch import apply_flash_flex_dlse_patch
 
 apply_flash_flex_dlse_patch()
 

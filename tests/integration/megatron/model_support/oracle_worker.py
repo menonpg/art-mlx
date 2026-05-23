@@ -481,7 +481,7 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
         yield
         return
 
-    import art.megatron.compiled_flex_attention as compiled_flex_attention
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
 
     original_dense = compiled_flex_attention.dense_compiled_flex_attention
     original_sparse = compiled_flex_attention.sparse_compiled_flex_attention
@@ -530,7 +530,7 @@ def _apply_test_flex_inner_fp32_patch(flex_backend: str | None):
 
     from torch.nn.attention.flex_attention import AuxRequest, flex_attention
 
-    import art.megatron.compiled_flex_attention as compiled_flex_attention
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
 
     original_dense = compiled_flex_attention.dense_compiled_flex_attention
     original_sparse = compiled_flex_attention.sparse_compiled_flex_attention
@@ -590,7 +590,7 @@ def _apply_test_attention_full_fp32_patch(flex_backend: str | None):
     from megatron.core.transformer.attention import Attention
     from torch.nn.attention.flex_attention import AuxRequest, flex_attention
 
-    import art.megatron.compiled_flex_attention as compiled_flex_attention
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
 
     original_dense = compiled_flex_attention.dense_compiled_flex_attention
     original_sparse = compiled_flex_attention.sparse_compiled_flex_attention
@@ -1040,8 +1040,8 @@ def _apply_attention_lse_normalize_mutation(mutation: SensitivityMutation | None
         yield
         return
 
-    import art.megatron.compiled_flex_attention as compiled_flex_attention
     from art.megatron.context_parallel import executor
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
 
     original_compiled = compiled_flex_attention.normalize_flex_lse
     original_executor = executor.normalize_flex_lse

@@ -9,7 +9,7 @@ from torch.nn.attention.flex_attention import AuxOutput, AuxRequest, BlockMask
 import triton
 import triton.language as tl
 
-from art.megatron.compiled_flex_attention import (
+from art.megatron.flex_attn.compiled import (
     SparseBlockSize,
     flash_sparse_block_size_for_head_dim,
     get_sparse_compiled_flex_attention,

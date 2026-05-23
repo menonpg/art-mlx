@@ -1185,7 +1185,7 @@ def _run_flex_attention_baseline_iterations(
     rebuild_mask: bool,
     iters: int,
 ) -> list[float]:
-    from art.megatron.flex_attention import FlexAttentionWrapper
+    from art.megatron.flex_attn.attention import FlexAttentionWrapper
     from art.megatron.shared_prefix_state import create_shared_prefix_state
 
     wrapper = FlexAttentionWrapper().cuda()

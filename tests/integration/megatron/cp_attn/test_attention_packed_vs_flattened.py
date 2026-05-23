@@ -8,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from art.megatron.flex_attention import FlexAttentionWrapper
+from art.megatron.flex_attn.attention import FlexAttentionWrapper
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 from tests.integration.megatron.gdn_shared_prefix.cases import default_phase0_cases
 from tests.integration.megatron.gdn_shared_prefix.metrics import (

@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from art.megatron.compiled_flex_attention import dense_compiled_flex_attention
+from art.megatron.flex_attn.compiled import dense_compiled_flex_attention
 
 
 class SharedPrefixAttentionState(BaseModel):

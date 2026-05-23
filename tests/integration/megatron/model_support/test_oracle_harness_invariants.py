@@ -161,7 +161,7 @@ def test_bf16_oracle_preserves_production_flex_default() -> None:
 
 
 def test_production_compiled_flex_default_stays_flash() -> None:
-    from art.megatron import compiled_flex_attention
+    from art.megatron.flex_attn import compiled as compiled_flex_attention
 
     assert compiled_flex_attention._FORCED_FLEX_BACKEND == "FLASH"
     assert compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS == {"BACKEND": "FLASH"}

@@ -69,7 +69,7 @@ def _art_flex_core_attention(config: object) -> object:
         )
 
         return ArtContextParallelCoreAttention
-    from art.megatron.flex_attention import FlexDotProductAttention
+    from art.megatron.flex_attn.attention import FlexDotProductAttention
 
     return FlexDotProductAttention
 

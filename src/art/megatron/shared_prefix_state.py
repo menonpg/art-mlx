@@ -9,11 +9,11 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import create_block_mask
 
-from art.megatron.compiled_flex_attention import flash_sparse_block_size_for_head_dim
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-from art.megatron.flex_attention import (
+from art.megatron.flex_attn.attention import (
     SharedPrefixAttentionState as FlexSharedPrefixAttentionState,
 )
+from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.gdn.gdn_shared_prefix import (
     GdnPackedExecutionSpec,
     GdnRankExecutionPlan,

@@ -11,7 +11,7 @@ from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron import provider_common
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
-from art.megatron.flex_attention import FlexDotProductAttention
+from art.megatron.flex_attn.attention import FlexDotProductAttention
 from art.megatron.model_support.registry import UnsupportedModelArchitectureError
 import art.megatron.provider as provider_module
 

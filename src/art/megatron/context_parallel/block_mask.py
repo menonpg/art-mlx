@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from art.megatron.compiled_flex_attention import normalize_sparse_block_size
+from art.megatron.flex_attn.compiled import normalize_sparse_block_size
 
 from .types import AttnMaskKind, FlexMaskSpec
 

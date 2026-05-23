@@ -748,7 +748,7 @@ def _run_logits(
 ) -> Any:
     import torch
 
-    from art.megatron.flex_attention import create_shared_prefix_attention_state
+    from art.megatron.flex_attn.attention import create_shared_prefix_attention_state
 
     device = next(runtime.model[0].parameters()).device
     input_ids = packed_tensors["tokens"].to(device=device)

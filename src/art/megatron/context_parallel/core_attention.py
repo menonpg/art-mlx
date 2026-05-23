@@ -12,7 +12,10 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
-from art.megatron.flex_attention import FlexAttentionWrapper, SharedPrefixAttentionState
+from art.megatron.flex_attn.attention import (
+    FlexAttentionWrapper,
+    SharedPrefixAttentionState,
+)
 
 from .executor import run_context_parallel
 from .types import ArtContextParallelState
