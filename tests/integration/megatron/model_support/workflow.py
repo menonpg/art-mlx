@@ -63,12 +63,9 @@ def build_validation_stage_names(
     *,
     include_native_vllm_lora: bool = False,
     native_vllm_lora_status: NativeVllmLoraStatus | None = None,
-    exclude_native_vllm_lora: bool = False,
 ) -> list[str]:
     stages = list(MANDATORY_VALIDATION_STAGES)
-    if not exclude_native_vllm_lora and (
-        include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}
-    ):
+    if include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}:
         stages.append(NATIVE_VLLM_LORA_STAGE)
     return stages
 
@@ -87,7 +84,6 @@ def initialize_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
-    exclude_native_vllm_lora: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
     spec = get_model_support_spec(
@@ -104,7 +100,6 @@ def initialize_validation_report(
             for stage_name in build_validation_stage_names(
                 include_native_vllm_lora=include_native_vllm_lora,
                 native_vllm_lora_status=handler.native_vllm_lora_status,
-                exclude_native_vllm_lora=exclude_native_vllm_lora,
             )
         ],
     )
@@ -669,7 +664,6 @@ def build_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
-    exclude_native_vllm_lora: bool = False,
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
@@ -679,7 +673,6 @@ def build_validation_report(
     report = initialize_validation_report(
         base_model=base_model,
         include_native_vllm_lora=include_native_vllm_lora,
-        exclude_native_vllm_lora=exclude_native_vllm_lora,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     stage_runners = {
@@ -781,7 +774,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--allow-unsupported-arch", action="store_true")
-    parser.add_argument("--exclude-native-vllm-lora", action="store_true")
     parser.add_argument("--include-sensitivity", action="store_true")
     parser.add_argument("--skip-stage", action="append", default=[])
     parser.add_argument("--stop-on-failure", action="store_true")
@@ -792,7 +784,6 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     report = build_validation_report(
         base_model=args.base_model,
-        exclude_native_vllm_lora=args.exclude_native_vllm_lora,
         include_sensitivity=args.include_sensitivity,
         output_json=args.output_json,
         skip_stages=set(args.skip_stage),
