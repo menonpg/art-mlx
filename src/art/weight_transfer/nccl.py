@@ -5,7 +5,6 @@
 import ctypes
 from datetime import timedelta
 import importlib.util
-import os
 from pathlib import Path
 import pickle
 import socket
@@ -306,8 +305,6 @@ class TrainerNcclCommunicator:
 
 
 def _find_nccl_library() -> str:
-    if override := os.environ.get("VLLM_NCCL_SO_PATH"):
-        return override
     if torch.version.cuda is not None:
         spec = importlib.util.find_spec("nvidia.nccl")
         if spec is None or spec.submodule_search_locations is None:
