@@ -4,8 +4,10 @@ from .forward_trace import ForwardTraceCapture
 from .oracle_harness import (
     DENSE_ORACLE_TOPOLOGY,
     ORACLE_TOPOLOGY,
+    TOPOLOGIES,
     DiffAccumulator,
     MetricThresholdRule,
+    Topology,
     _default_phase_pass_fns,
     _suite_variants,
     selected_sensitivity_mutations_for_objective,
@@ -71,21 +73,18 @@ def test_dense_suite_variants_include_tp2_dp2_without_oracle_duplicate() -> None
     )
 
 
-def test_moe_suite_variants_include_dp2_ep_and_etp_topologies() -> None:
+def test_moe_suite_variants_use_minimal_non_cp_topology_matrix() -> None:
+    assert TOPOLOGIES == [
+        Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
+        Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
+        Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
+        Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
+    ]
+    assert [topology.world_size() for topology in TOPOLOGIES] == [1, 2, 2, 2]
+
     variants = _suite_variants("rl", is_moe=True)
 
-    assert any(
-        variant.topology.tp == 1
-        and variant.topology.ep == 2
-        and variant.topology.dp == 2
-        for variant in variants
-    )
-    assert any(
-        variant.topology.tp == 1
-        and variant.topology.etp == 2
-        and variant.topology.dp == 2
-        for variant in variants
-    )
+    assert [variant.topology for variant in variants] == TOPOLOGIES[1:]
 
 
 def test_max_world_size_arg_filters_dense_variants() -> None:

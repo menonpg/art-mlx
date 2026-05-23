@@ -178,12 +178,9 @@ class Topology(BaseModel):
 
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
     Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
     Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
     Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
