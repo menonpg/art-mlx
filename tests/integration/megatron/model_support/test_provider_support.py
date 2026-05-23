@@ -11,7 +11,11 @@ from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
 from art.megatron.flex_attn.attention import FlexDotProductAttention
-from art.megatron.model_support.registry import UnsupportedModelArchitectureError
+from art.megatron.model_support.registry import (
+    UnsupportedModelArchitectureError,
+    get_model_support_handler,
+    get_model_support_spec,
+)
 import art.megatron.provider as provider_module
 
 
@@ -85,6 +89,15 @@ class _FakeBridge:
 
     def to_megatron_provider(self) -> _FakeProvider:
         return self._provider
+
+
+def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
+    spec = get_model_support_spec("OpenPipe/Qwen3-14B-Instruct")
+    handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
+
+    assert spec.key == "qwen3_dense"
+    assert spec.native_vllm_lora_status == "validated"
+    assert handler.key == "qwen3_dense"
 
 
 def test_get_provider_accepts_registry_supported_models(

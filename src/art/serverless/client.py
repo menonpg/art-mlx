@@ -316,6 +316,9 @@ class Client(AsyncAPIClient):
         api_key = self.api_key
         return {"Authorization": f"Bearer {api_key}"}
 
+    def _auth_headers(self, security: Any | None = None) -> dict[str, str]:  # noqa: ARG002
+        return self.auth_headers
+
     @property
     @override
     def default_headers(self) -> dict[str, str | Omit]:

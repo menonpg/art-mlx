@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.5.17"
+version = "0.5.18"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,7 +45,7 @@ backend = [
 megatron = [
     "numpy<2",
     "torch>=2.11.0",
-    "flash-attn-4 @ https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl",
+    "flash-attn-4==4.0.0b5",
     "ninja>=1.11.1",
     "quack-kernels==0.3.7",
     "apex",
@@ -54,8 +54,10 @@ megatron = [
     "transformer-engine-torch==2.11.0",
     "megatron-core==0.16.0rc0",
     "pybind11>=2.13.6",
-    "megatron-bridge",
-    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@v1.2.1 ; sys_platform == 'linux'",
+    "megatron-bridge==0.4.0rc0",
+    "deep-ep==1.2.1 ; sys_platform == 'linux'",
+    "causal-conv1d==1.6.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
+    "mamba-ssm==2.3.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "nvidia-ml-py==13.580.82",
     "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
@@ -267,10 +269,12 @@ dev = [
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
-panza = { git = "https://github.com/corbt/panza.git" }
-apex = { git = "https://github.com/NVIDIA/apex.git", branch = "25.09" }
+apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
+deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
+flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
-transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.11", subdirectory = "transformer_engine/pytorch" }
+panza = { git = "https://github.com/corbt/panza.git" }
+transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

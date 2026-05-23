@@ -23,7 +23,7 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .trajectories import Trajectory, TrajectoryGroup
-from .types import TrainConfig, TrainSFTConfig
+from .types import TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
 
 if TYPE_CHECKING:
@@ -38,12 +38,41 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
 
 
+def _merge_extra_body_defaults(
+    defaults: dict[str, Any],
+    provided: Any,
+) -> Any:
+    if provided is None:
+        return {**defaults}
+    if not isinstance(provided, dict):
+        return provided
+
+    merged = {**defaults}
+    for key, value in provided.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
 class _OpenAIChatCompletionsProxy:
-    def __init__(self, completions: Any, record_costs: Any) -> None:
+    def __init__(
+        self,
+        completions: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+    ) -> None:
         self._completions = completions
         self._record_costs = record_costs
+        self._default_extra_body = default_extra_body
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
+        if self._default_extra_body is not None:
+            kwargs["extra_body"] = _merge_extra_body_defaults(
+                self._default_extra_body,
+                kwargs.get("extra_body"),
+            )
         response = await self._completions.create(*args, **kwargs)
         self._record_costs(response)
         return response
@@ -53,24 +82,40 @@ class _OpenAIChatCompletionsProxy:
 
 
 class _OpenAIChatProxy:
-    def __init__(self, chat: Any, record_costs: Any) -> None:
+    def __init__(
+        self,
+        chat: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+    ) -> None:
         self._chat = chat
-        self.completions = _OpenAIChatCompletionsProxy(chat.completions, record_costs)
+        self.completions = _OpenAIChatCompletionsProxy(
+            chat.completions,
+            record_costs,
+            default_extra_body,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._chat, name)
 
 
 class _OpenAIClientProxy:
-    def __init__(self, client: Any, record_costs: Any) -> None:
+    def __init__(
+        self,
+        client: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+    ) -> None:
         self._client = client
         self._record_costs = record_costs
-        self.chat = _OpenAIChatProxy(client.chat, record_costs)
+        self._default_extra_body = default_extra_body
+        self.chat = _OpenAIChatProxy(client.chat, record_costs, default_extra_body)
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
         return _OpenAIClientProxy(
             self._client.with_options(*args, **kwargs),
             self._record_costs,
+            self._default_extra_body,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -179,7 +224,8 @@ class Model(
         report_metrics: list[str] | None = None,
         **kwargs: Never,
     ) -> None:
-        super().__init__(
+        BaseModel.__init__(
+            self,
             name=name,
             project=project,
             entity=entity,
@@ -191,6 +237,9 @@ class Model(
             report_metrics=report_metrics,
             **kwargs,
         )
+        self._init_runtime_state()
+
+    def _init_runtime_state(self) -> None:
         object.__setattr__(self, "_wandb_defined_metrics", set())
         object.__setattr__(self, "_wandb_config", {})
         object.__setattr__(self, "_run_start_time", time.time())
@@ -238,10 +287,10 @@ class Model(
 
     def __new__(  # pyright: ignore[reportInconsistentOverload]
         cls,
-        *args,
-        **kwargs,
-    ) -> "Model[ModelConfig, StateType]":
-        return super().__new__(cls)
+        *args: Any,
+        **kwargs: Any,
+    ) -> "Model[Any, Any]":
+        return BaseModel.__new__(cls)
 
     def safe_model_dump(self, *args, **kwargs) -> dict:
         """
@@ -307,9 +356,22 @@ class Model(
         # manually.
         self._openai_client = cast(
             AsyncOpenAI,
-            _OpenAIClientProxy(raw_client, self._record_openai_completion_costs),
+            _OpenAIClientProxy(
+                raw_client,
+                self._record_openai_completion_costs,
+                self._default_chat_completion_extra_body(),
+            ),
         )
         return self._openai_client
+
+    def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
+        internal_config = getattr(self, "_internal_config", None)
+        if internal_config is None:
+            return None
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        if chat_template_kwargs is None:
+            return None
+        return {"chat_template_kwargs": dict(chat_template_kwargs)}
 
     def litellm_completion_params(self, step: int | None = None) -> dict:
         """Return the parameters that should be sent to litellm.completion.
@@ -401,7 +463,7 @@ class Model(
         )
         self.overwrite_state(state)
 
-    def merge_state(self, state: StateType) -> StateType:
+    def merge_state(self, state: dict[str, Any]) -> StateType:
         """Deep-merge state into the existing state and persist it.
 
         Args:
@@ -688,7 +750,7 @@ class Model(
         )
         if callable(gpu_cost_getter) and "costs/gpu" not in provided_metric_keys:
             gpu_cost_per_hour_usd = gpu_cost_getter(self)
-            if gpu_cost_per_hour_usd is not None:
+            if isinstance(gpu_cost_per_hour_usd, int | float):
                 automatic_metrics["costs/gpu"] = (
                     step_wall_s * float(gpu_cost_per_hour_usd) / 3600.0
                 )
@@ -969,7 +1031,8 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         _internal_config: dev.InternalModelConfig | None = None,
         **kwargs: Never,
     ) -> None:
-        super().__init__(
+        BaseModel.__init__(
+            self,
             name=name,
             project=project,
             entity=entity,
@@ -980,6 +1043,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             report_metrics=report_metrics,
             **kwargs,
         )
+        self._init_runtime_state()
         object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
         if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
@@ -1064,10 +1128,10 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
     def __new__(  # pyright: ignore[reportInconsistentOverload]
         cls,
-        *args,
-        **kwargs,
-    ) -> "TrainableModel[ModelConfig, StateType]":
-        return super().__new__(cls)
+        *args: Any,
+        **kwargs: Any,
+    ) -> "TrainableModel[Any, Any]":
+        return BaseModel.__new__(cls)
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
@@ -1135,65 +1199,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         # Backend only does file deletion
         await self.backend()._delete_checkpoint_files(self, steps_to_keep)
-
-    async def train(
-        self,
-        trajectory_groups: Iterable[TrajectoryGroup],
-        config: TrainConfig = TrainConfig(),
-        _config: dev.TrainConfig | None = None,
-        verbose: bool = False,
-    ) -> None:
-        """
-        Reinforce fine-tune the model with a batch of trajectory groups.
-
-        .. deprecated::
-            Use ``backend.train(model, trajectory_groups, ...)`` instead.
-            This method will be removed in a future version.
-
-        Args:
-            trajectory_groups: A batch of trajectory groups.
-            config: Fine-tuning specific configuration
-            _config: Additional configuration that is subject to change and
-                not yet part of the public API. Use at your own risk.
-        """
-        warnings.warn(
-            "model.train() is deprecated. Use backend.train(model, ...) instead.\n\n"
-            "Migration guide:\n"
-            "  # Before (deprecated):\n"
-            "  await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))\n\n"
-            "  # After (recommended):\n"
-            "  result = await backend.train(model, trajectory_groups, learning_rate=5e-6)\n"
-            "  await model.log(trajectory_groups, metrics=result.metrics, step=result.step, split='train')\n\n"
-            "Key differences:\n"
-            "  - backend.train() does NOT automatically log trajectories or metrics\n"
-            "  - backend.train() returns a TrainResult with step, metrics, and checkpoint info\n"
-            "  - Each backend has its own type-checked parameters (no more generic config objects)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        groups_list = list(trajectory_groups)
-        _config = _config or {}  # ty:ignore[invalid-assignment]
-
-        # 1. Train (backend no longer logs internally)
-        training_metrics: list[dict[str, float]] = []
-        trainer_started = time.monotonic()
-        async for metrics in self.backend()._train_model(
-            self,
-            groups_list,
-            config,
-            _config,  # ty:ignore[invalid-argument-type]
-            verbose,
-        ):
-            training_metrics.append(metrics)
-        trainer_elapsed = time.monotonic() - trainer_started
-
-        # 2. Calculate aggregated training metrics
-        avg_metrics = average_metric_samples(training_metrics)
-        avg_metrics.setdefault("time/step_trainer_s", trainer_elapsed)
-
-        # 3. Log trajectories and training metrics together (single wandb log call)
-        step = await self.get_step()
-        await self.log(groups_list, split="train", metrics=avg_metrics, step=step)
 
     async def train_sft(
         self,

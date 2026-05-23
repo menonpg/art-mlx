@@ -99,7 +99,9 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             else:
                 table_source = table
             batch_size, sequence_length = position_ids.shape
-            gathered = table_source.view(table_source.shape[0], embedding_dim).index_select(
+            gathered = table_source.view(
+                table_source.shape[0], embedding_dim
+            ).index_select(
                 0,
                 position_ids.reshape(-1),
             )

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import json
 import os
+from pathlib import Path
 import signal
 import time
 from typing import Any, AsyncIterator, Generic, Iterable, TypeVar, cast
@@ -11,6 +16,14 @@ T = TypeVar("T")
 import art
 from art import TrajectoryGroup
 
+from .checkpoint_retention import (
+    CHECKPOINT_CREATED_AT_METRIC,
+    CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CHECKPOINT_SAVED_METRIC,
+    CheckpointInfo,
+    CheckpointRetentionContext,
+    CheckpointRetentionStrategy,
+)
 from .state import PipelineState
 from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
@@ -23,7 +36,7 @@ _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
-        return iterable
+        return cast(AsyncIterator[T], iterable)
 
     async def _iter():
         for item in iterable:
@@ -91,6 +104,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         eval_every_n_steps: int = 20,
         eval_at_start: bool = True,
         save_checkpoint: bool = True,
+        checkpoint_retention_strategy: CheckpointRetentionStrategy | None = None,
+        checkpoint_retention_interval: int = 1,
         # Resumption
         resume: bool = True,
     ) -> None:
@@ -114,6 +129,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if checkpoint_retention_interval <= 0:
+            raise ValueError("checkpoint_retention_interval must be > 0")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -138,11 +155,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.eval_every_n_steps = eval_every_n_steps
         self.eval_at_start = eval_at_start
         self.save_checkpoint = save_checkpoint
+        self.checkpoint_retention_strategy = checkpoint_retention_strategy
+        self.checkpoint_retention_interval = checkpoint_retention_interval
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
         self._discard_queue: list[TrajectoryGroup] = []
         self._discard_queue_limit = discard_queue_multiplier * min_batch_size
         self._collapse_triggered = False
+        self._checkpoint_lease_counts: Counter[int] = Counter()
+        self._scheduled_eval_steps: set[int] = set()
 
         self.state = PipelineState()
         self._scenario_lock = asyncio.Lock()
@@ -181,6 +202,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             pipeline_state.get("total_scenarios_consumed", scenario_offset) or 0
         )
         self.state.last_eval_step = last_eval_step
+        self.state.completed_eval_steps = {
+            int(step) for step in pipeline_state.get("completed_eval_steps", []) or []
+        }
 
         if scenario_offset > 0 and self._scenario_iter is not None:
             skipped = await self._skip_scenarios(self._scenario_iter, scenario_offset)
@@ -196,6 +220,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._eval_queue = asyncio.Queue()
 
         if self.eval_fn is not None and self.eval_at_start:
+            self._scheduled_eval_steps.add(start_step)
             await self._eval_queue.put(start_step)
             self.state.last_eval_step = start_step
             self._persist_state(start_step)
@@ -308,11 +333,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "PipelineTrainer + LocalBackend(dedicated) requires "
                 "loss_fn_config=None."
             )
-        if not self.normalize_advantages:
-            raise ValueError(
-                "PipelineTrainer + LocalBackend(dedicated) requires "
-                "normalize_advantages=True."
-            )
         if self.adam_params is not None:
             raise ValueError(
                 "PipelineTrainer + LocalBackend(dedicated) requires adam_params=None."
@@ -356,6 +376,45 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             ):
                 await self.state.policy_updated.wait()
 
+    @asynccontextmanager
+    async def _adapter_lease(self, step: int) -> AsyncIterator[None]:
+        self._checkpoint_lease_counts[step] += 1
+        if not hasattr(type(self.backend), "adapter_lease"):
+            try:
+                yield
+            finally:
+                self._release_checkpoint_lease(step)
+            return
+        try:
+            lease = getattr(self.backend, "adapter_lease", None)
+            if lease is None:
+                yield
+                return
+            async with lease(self.model, step):
+                yield
+        finally:
+            self._release_checkpoint_lease(step)
+
+    def _release_checkpoint_lease(self, step: int) -> None:
+        self._checkpoint_lease_counts[step] -= 1
+        if self._checkpoint_lease_counts[step] <= 0:
+            del self._checkpoint_lease_counts[step]
+
+    def _retained_adapter_steps(self, current_step: int) -> set[int]:
+        min_step = max(0, current_step - self.max_steps_off_policy)
+        return set(range(min_step, current_step + 1))
+
+    async def _prune_model_adapters(self, current_step: int) -> None:
+        if not hasattr(type(self.backend), "prune_model_adapters"):
+            return
+        prune = getattr(self.backend, "prune_model_adapters", None)
+        if prune is None:
+            return
+        await prune(
+            self.model,
+            retain_steps=self._retained_adapter_steps(current_step),
+        )
+
     async def _rollout_worker(self, worker_id: int) -> None:
         assert self._output_queue is not None
         while not self.state.done:
@@ -376,7 +435,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 token = self.model.activate_metrics_context("train")
                 rollout_started = time.monotonic()
                 try:
-                    group = await self.rollout_fn(self.model, scenario, self.config)
+                    async with self._adapter_lease(initial_version):
+                        group = await self.rollout_fn(self.model, scenario, self.config)
                 finally:
                     token.var.reset(token)
                 rollout_wall_s = time.monotonic() - rollout_started
@@ -398,7 +458,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 raise
             except Exception as exc:
                 errored = True
-                print(f"Worker {worker_id}: rollout failed: {exc}")
+                exc_type = f"{type(exc).__module__}.{type(exc).__name__}"
+                print(
+                    f"Worker {worker_id}: rollout failed ({exc_type}): {exc!r}"
+                    f"{self._scenario_error_context(scenario)}"
+                )
             finally:
                 self._status.note_rollout_finished(errored=errored)
 
@@ -488,6 +552,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 current_step = result.step
                 self.state.policy_version = current_step
                 self.state.next_training_step = current_step
+                await self._log_checkpoint_saved(result)
+                await self._prune_model_adapters(current_step)
+                await self._run_checkpoint_retention(current_step)
 
                 step_seconds = time.monotonic() - step_start
                 self._status.note_training_batch(
@@ -517,6 +584,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self._log_zero_variance_groups(current_step)
 
                 if self.eval_fn is not None and should_eval_step:
+                    self._scheduled_eval_steps.add(current_step)
                     if self._eval_queue is not None:
                         await self._eval_queue.put(current_step)
                     self.state.last_eval_step = current_step
@@ -629,11 +697,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._status.note_val_started(step)
         reward: float | None = None
         eval_elapsed = 0.0
+        eval_completed = False
         try:
             token = self.model.activate_metrics_context("eval")
             eval_started = time.monotonic()
             try:
-                result = await self.eval_fn(self.model, step, self.config)
+                async with self._adapter_lease(step):
+                    result = await self.eval_fn(self.model, step, self.config)
             finally:
                 token.var.reset(token)
                 eval_elapsed = time.monotonic() - eval_started
@@ -671,11 +741,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     step=step,
                     metrics={"time/step_eval_s": eval_elapsed},
                 )
+            await self._log_checkpoint_eval_completed(step)
+            eval_completed = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"Eval failed at step {step}: {exc}")
         finally:
+            self._scheduled_eval_steps.discard(step)
+            if eval_completed:
+                self.state.completed_eval_steps.add(step)
+                self._persist_state(self.state.next_training_step)
             self._status.note_val_finished(step, reward)
 
     @staticmethod
@@ -727,6 +803,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 group.metadata["scenario_id"] = value
                 continue
             group.metadata[f"scenario_{key}"] = value
+
+    @staticmethod
+    def _scenario_error_context(scenario: ScenarioT) -> str:
+        metadata = scenario.get("metadata") if isinstance(scenario, dict) else None
+        if metadata is None or not isinstance(metadata, dict):
+            return ""
+        fields = (
+            f"{key}={metadata[key]!r}"
+            for key in ("scenario_id", "epoch", "scenario_index")
+            if key in metadata
+        )
+        context = " ".join(fields)
+        return f" [{context}]" if context else ""
 
     def _is_group_stale(self, group: TrajectoryGroup, min_version: int) -> bool:
         group_version = self._group_initial_version(group)
@@ -823,8 +912,153 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "total_scenarios_consumed": self.state.total_scenarios_consumed,
             "training_step": training_step,
             "last_eval_step": self.state.last_eval_step,
+            "completed_eval_steps": sorted(self.state.completed_eval_steps),
         }
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
+
+    def _log_checkpoint_history(self, step: int, metrics: dict[str, float]) -> None:
+        row = {
+            (key if key.startswith("checkpoint/") else f"checkpoint/{key}"): value
+            for key, value in metrics.items()
+            if value == value
+        }
+        if not row:
+            return
+        row["training_step"] = step
+        row["time/wall_clock_sec"] = time.time() - self.model._run_start_time
+        row["step"] = step
+        row["recorded_at"] = datetime.now().isoformat()
+
+        output_dir = self.model._get_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        with open(Path(output_dir) / "history.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+
+    async def _log_checkpoint_saved(self, result: Any) -> None:
+        step = int(result.step)
+        checkpoint_path = getattr(result, "checkpoint_path", None)
+        path = (
+            Path(checkpoint_path)
+            if isinstance(checkpoint_path, str) and checkpoint_path
+            else Path(self.model._get_output_dir()) / "checkpoints" / f"{step:04d}"
+        )
+        if not path.exists():
+            return
+        self._log_checkpoint_history(
+            step,
+            {
+                CHECKPOINT_SAVED_METRIC: 1.0,
+                CHECKPOINT_CREATED_AT_METRIC: path.stat().st_ctime,
+            },
+        )
+
+    async def _log_checkpoint_eval_completed(self, step: int) -> None:
+        self._log_checkpoint_history(
+            step,
+            {CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0},
+        )
+
+    def _checkpoint_metrics_by_step(self) -> dict[int, dict[str, float]]:
+        history_path = Path(self.model._get_output_dir()) / "history.jsonl"
+        if not history_path.exists():
+            return {}
+        sums: dict[int, dict[str, float]] = {}
+        counts: dict[int, dict[str, int]] = {}
+        with history_path.open("r", encoding="utf-8") as history_file:
+            for line in history_file:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                step = row.get("step")
+                if not isinstance(step, int):
+                    continue
+                for key, value in row.items():
+                    if key in {"step", "recorded_at"}:
+                        continue
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    step_sums = sums.setdefault(step, {})
+                    step_counts = counts.setdefault(step, {})
+                    step_sums[key] = step_sums.get(key, 0.0) + float(value)
+                    step_counts[key] = step_counts.get(key, 0) + 1
+        return {
+            step: {
+                key: value / counts[step][key]
+                for key, value in step_sums.items()
+                if counts[step][key] > 0
+            }
+            for step, step_sums in sums.items()
+        }
+
+    def _checkpoint_infos(self) -> list[CheckpointInfo]:
+        checkpoint_dir = Path(self.model._get_output_dir()) / "checkpoints"
+        if not checkpoint_dir.exists():
+            return []
+        metrics_by_step = self._checkpoint_metrics_by_step()
+        checkpoints: list[CheckpointInfo] = []
+        for path in checkpoint_dir.iterdir():
+            if not path.is_dir() or not path.name.isdigit():
+                continue
+            step = int(path.name)
+            stat = path.stat()
+            metrics = metrics_by_step.get(step, {})
+            created_at_unix = metrics.get(CHECKPOINT_CREATED_AT_METRIC)
+            created_at = (
+                datetime.fromtimestamp(created_at_unix, timezone.utc)
+                if created_at_unix is not None
+                else datetime.fromtimestamp(stat.st_ctime, timezone.utc)
+            )
+            checkpoints.append(
+                CheckpointInfo(
+                    step=step,
+                    path=str(path),
+                    created_at=created_at,
+                    is_eval_step=(
+                        step in self.state.completed_eval_steps
+                        or metrics.get(CHECKPOINT_EVAL_COMPLETED_METRIC, 0.0) > 0.0
+                        or any(key.startswith(("val/", "test/")) for key in metrics)
+                    ),
+                    metrics=metrics,
+                )
+            )
+        return sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
+
+    def _protected_checkpoint_steps(self, current_step: int) -> set[int]:
+        return (
+            {current_step}
+            | set(self._checkpoint_lease_counts)
+            | set(self._scheduled_eval_steps)
+        )
+
+    async def _run_checkpoint_retention(self, current_step: int) -> None:
+        strategy = self.checkpoint_retention_strategy
+        if strategy is None:
+            return
+        if current_step % self.checkpoint_retention_interval != 0:
+            return
+        all_checkpoints = self._checkpoint_infos()
+        if not all_checkpoints:
+            return
+        protected_steps = self._protected_checkpoint_steps(current_step)
+        eligible = [
+            checkpoint
+            for checkpoint in all_checkpoints
+            if checkpoint.step not in protected_steps
+        ]
+        if not eligible:
+            return
+        context = CheckpointRetentionContext(
+            current_step=current_step,
+            checkpoints=eligible,
+        )
+        eligible_steps = {checkpoint.step for checkpoint in eligible}
+        keep_eligible_steps = set(strategy(context)) & eligible_steps
+        delete_steps = eligible_steps - keep_eligible_steps
+        if not delete_steps:
+            return
+        keep_steps = {checkpoint.step for checkpoint in all_checkpoints} - delete_steps
+        await self.backend._delete_checkpoint_files(self.model, sorted(keep_steps))
 
     @staticmethod
     def _is_scalar_metadata(value: object) -> bool:

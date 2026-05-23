@@ -355,7 +355,7 @@ wheels = [
 [[package]]
 name = "apex"
 version = "0.1"
-source = { git = "https://github.com/NVIDIA/apex.git?branch=25.09#4bdecd06b3c4b2c0a8fb6603829a8f9f05a42b49" }
+source = { git = "https://github.com/NVIDIA/apex.git?rev=25.09#4bdecd06b3c4b2c0a8fb6603829a8f9f05a42b49" }
 dependencies = [
     { name = "packaging" },
 ]
@@ -5390,7 +5390,7 @@ aiohttp = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.5.17"
+version = "0.5.18"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
@@ -5435,8 +5435,10 @@ langgraph = [
 ]
 megatron = [
     { name = "apex" },
+    { name = "causal-conv1d", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "deep-ep", marker = "sys_platform == 'linux'" },
     { name = "flash-attn-4" },
+    { name = "mamba-ssm", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
     { name = "ml-dtypes", marker = "python_full_version < '3.13'" },
@@ -5494,9 +5496,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'backend'", specifier = "==1.7.0" },
-    { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?branch=25.09" },
+    { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?rev=25.09" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
+    { name = "causal-conv1d", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==1.6.1" },
     { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
     { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=v1.2.1" },
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },
@@ -5509,6 +5512,7 @@ requires-dist = [
     { name = "langchain-openai", marker = "extra == 'langgraph'", specifier = ">=0.3.27" },
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=0.6.2" },
     { name = "litellm", specifier = ">=1.71.1,<=1.82.0" },
+    { name = "mamba-ssm", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==2.3.1" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
     { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" },
     { name = "megatron-core", marker = "extra == 'megatron'", specifier = "==0.16.0rc0" },
@@ -5548,7 +5552,7 @@ requires-dist = [
     { name = "torchao", marker = "extra == 'backend'", specifier = "==0.16.0" },
     { name = "transformer-engine", marker = "extra == 'megatron'", specifier = "==2.11.0" },
     { name = "transformer-engine-cu12", marker = "extra == 'megatron'", specifier = "==2.11.0" },
-    { name = "transformer-engine-torch", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/TransformerEngine.git?subdirectory=transformer_engine%2Fpytorch&tag=v2.11" },
+    { name = "transformer-engine-torch", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/TransformerEngine.git?subdirectory=transformer_engine%2Fpytorch&rev=v2.11" },
     { name = "transformers", marker = "extra == 'backend'", specifier = "==5.2.0" },
     { name = "transformers", marker = "extra == 'tinker'", specifier = "==5.2.0" },
     { name = "trl", marker = "extra == 'backend'", specifier = "==0.20.0" },
@@ -9042,7 +9046,7 @@ wheels = [
 [[package]]
 name = "transformer-engine-torch"
 version = "2.11.0"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?subdirectory=transformer_engine%2Fpytorch&tag=v2.11#c188b533cc3721ca9c6bbfd26148f5cf60108c25" }
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?subdirectory=transformer_engine%2Fpytorch&rev=v2.11#c188b533cc3721ca9c6bbfd26148f5cf60108c25" }
 dependencies = [
     { name = "einops" },
     { name = "onnx" },

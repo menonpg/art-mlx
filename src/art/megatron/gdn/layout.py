@@ -754,7 +754,9 @@ def _shard_indexed_transfer_for_sequence_parallel(
     source_rows_per_tp = _ceil_div(
         _source_count_for_rank(plan, transfer.source_rank), tp_size
     )
-    dest_rows_per_tp = _ceil_div(_dest_count_for_rank(plan, transfer.dest_rank), tp_size)
+    dest_rows_per_tp = _ceil_div(
+        _dest_count_for_rank(plan, transfer.dest_rank), tp_size
+    )
     if source_rows_per_tp <= 0 or dest_rows_per_tp <= 0:
         return ()
     source_tp = torch.div(source_positions, source_rows_per_tp, rounding_mode="floor")
@@ -774,7 +776,9 @@ def _shard_indexed_transfer_for_sequence_parallel(
         return ()
     source_rank = source_rank[keep]
     dest_rank = dest_rank[keep]
-    source_local_positions = source_positions[keep] - source_tp[keep] * source_rows_per_tp
+    source_local_positions = (
+        source_positions[keep] - source_tp[keep] * source_rows_per_tp
+    )
     dest_local_positions = dest_positions[keep] - dest_tp[keep] * dest_rows_per_tp
     world_size = plan.cp_size * tp_size
     keys = source_rank * world_size + dest_rank
@@ -927,7 +931,9 @@ def shard_cp_exchange_plan_for_sequence_parallel(
         cp_size=world_size,
         source_token_counts_by_rank=source_counts,
         dest_token_counts_by_rank=dest_counts,
-        transfers=tuple(sorted(transfers, key=lambda item: (item.source_rank, item.dest_rank))),
+        transfers=tuple(
+            sorted(transfers, key=lambda item: (item.source_rank, item.dest_rank))
+        ),
         cross_rank_token_count_override=1,
     )
     return GdnSpExchangePlan.model_construct(plan=sp_plan, rank=composite_rank)

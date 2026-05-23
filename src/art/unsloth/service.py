@@ -30,6 +30,7 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     VllmRuntimeLaunchConfig,
     build_vllm_runtime_server_cmd,
+    get_vllm_runtime_nccl_so_path,
     get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
@@ -134,6 +135,7 @@ class UnslothService:
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
     _vllm_api_key: str | None = None
+    _vllm_nccl_so_path: str | None = None
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
@@ -141,6 +143,11 @@ class UnslothService:
         repr=False,
     )
     _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
+    _loaded_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
@@ -237,6 +244,11 @@ class UnslothService:
         server_args = self._runtime_server_args(config)
         api_key = server_args.get("api_key")
         self._vllm_api_key = api_key if isinstance(api_key, str) else None
+        self._vllm_nccl_so_path = (
+            str(get_vllm_runtime_nccl_so_path())
+            if self.rollout_weights_mode == "merged"
+            else None
+        )
         cmd = build_vllm_runtime_server_cmd(
             VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
@@ -360,6 +372,8 @@ class UnslothService:
                     "/get_world_size endpoint"
                 ) from exc
             inference_world_size = int(world_size_response.json()["world_size"])
+            if self._vllm_nccl_so_path is None:
+                raise RuntimeError("vLLM runtime NCCL path is not initialized")
 
             master_port = _find_free_tcp_port()
             init_info = {
@@ -383,6 +397,7 @@ class UnslothService:
                     "master_address": init_info["master_address"],
                     "master_port": init_info["master_port"],
                     "world_size": init_info["world_size"],
+                    "nccl_so_path": self._vllm_nccl_so_path,
                 },
             )
             remote_init_response = await remote_init_task
@@ -542,7 +557,7 @@ class UnslothService:
         )
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"http://{self._vllm_host}:{self._vllm_port}/v1/load_lora_adapter",
+                f"{self._vllm_base_url}/v1/load_lora_adapter",
                 json={
                     "lora_name": lora_name,
                     "lora_path": checkpoint_path,
@@ -556,6 +571,33 @@ class UnslothService:
             f"[DEDICATED] _reload_adapter DONE: lora_name={lora_name} "
             f"status={response.status_code}"
         )
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _unload_adapter(self, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/v1/unload_lora_adapter",
+                json={"lora_name": f"{self.model_name}@{step}"},
+                **self._runtime_request_kwargs(),
+                timeout=30.0,
+            )
+            if response.status_code == 404:
+                self._loaded_adapter_steps.discard(step)
+                return
+            response.raise_for_status()
+        self._loaded_adapter_steps.discard(step)
+
+    async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
+        if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+            return
+        for step in sorted(self._loaded_adapter_steps - retain_steps):
+            if step == self._latest_step:
+                continue
+            await self._unload_adapter(step)
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
@@ -571,6 +613,8 @@ class UnslothService:
                 self._vllm_log_file.close()
                 self._vllm_log_file = None
             self._vllm_log_path = None
+            self._vllm_nccl_so_path = None
+            self._loaded_adapter_steps.clear()
         finally:
             self._lifecycle.restore_parent_cleanup()
 
@@ -606,6 +650,8 @@ class UnslothService:
             port,
             config=config,
         )
+        if self.rollout_weights_mode == "lora":
+            self._loaded_adapter_steps.add(self._latest_step)
         try:
             if self.rollout_weights_mode == "merged":
                 _ = self._state
