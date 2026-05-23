@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from art.megatron.model_support.spec import (
     ArchitectureReport,
     LayerFamilyInstance,
+    ValidationReport,
     ValidationStageResult,
 )
 
@@ -34,6 +35,10 @@ def test_build_validation_stage_names_has_fixed_order() -> None:
         *MANDATORY_VALIDATION_STAGES,
         NATIVE_VLLM_LORA_STAGE,
     ]
+    assert build_validation_stage_names(
+        native_vllm_lora_status="validated",
+        exclude_native_vllm_lora=True,
+    ) == list(MANDATORY_VALIDATION_STAGES)
 
 
 def test_build_validation_report_populates_architecture_stage(
@@ -331,6 +336,110 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
     assert lora_coverage_stage.passed is False
     assert lora_coverage_stage.metrics == {
         "error": "RuntimeError: missing wrapped targets"
+    }
+
+
+def test_build_validation_report_can_exclude_native_vllm_lora(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[],
+            recommended_min_layers=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
+        lambda: {},
+    )
+
+    def _run_stage_in_subprocess(
+        *,
+        stage_name,
+        base_model,
+        architecture,
+        allow_unvalidated_arch=False,
+    ):
+        calls.append(stage_name)
+        return ValidationStageResult(name=stage_name, passed=True, metrics={})
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+
+    report = build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        exclude_native_vllm_lora=True,
+    )
+
+    assert NATIVE_VLLM_LORA_STAGE not in [stage.name for stage in report.stages]
+    assert NATIVE_VLLM_LORA_STAGE not in calls
+
+
+def test_build_validation_report_writes_incremental_output_and_stops(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[],
+            recommended_min_layers=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
+        lambda: {},
+    )
+
+    def _run_stage_in_subprocess(
+        *,
+        stage_name,
+        base_model,
+        architecture,
+        allow_unvalidated_arch=False,
+    ):
+        calls.append(stage_name)
+        return ValidationStageResult(
+            name=stage_name,
+            passed=stage_name != "lora_coverage",
+            metrics={"stage": stage_name},
+        )
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+    output_json = tmp_path / "workflow_report.json"
+
+    report = build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        output_json=output_json,
+        stop_on_failure=True,
+    )
+
+    assert calls == ["hf_parity", "lora_coverage"]
+    assert output_json.exists()
+    saved = ValidationReport.model_validate_json(output_json.read_text())
+    assert saved == report
+    failed_stage = next(
+        stage for stage in saved.stages if stage.name == "lora_coverage"
+    )
+    skipped_stage = next(
+        stage for stage in saved.stages if stage.name == "train_inf_mismatch"
+    )
+    assert failed_stage.passed is False
+    assert skipped_stage.metrics == {
+        "skipped": True,
+        "reason": "stopped after lora_coverage failed",
     }
 
 

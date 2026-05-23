@@ -1,4 +1,5 @@
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import argparse
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import importlib
 import importlib.metadata
 import os
@@ -62,9 +63,12 @@ def build_validation_stage_names(
     *,
     include_native_vllm_lora: bool = False,
     native_vllm_lora_status: NativeVllmLoraStatus | None = None,
+    exclude_native_vllm_lora: bool = False,
 ) -> list[str]:
     stages = list(MANDATORY_VALIDATION_STAGES)
-    if include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}:
+    if not exclude_native_vllm_lora and (
+        include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}
+    ):
         stages.append(NATIVE_VLLM_LORA_STAGE)
     return stages
 
@@ -83,6 +87,7 @@ def initialize_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
+    exclude_native_vllm_lora: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
     spec = get_model_support_spec(
@@ -99,6 +104,7 @@ def initialize_validation_report(
             for stage_name in build_validation_stage_names(
                 include_native_vllm_lora=include_native_vllm_lora,
                 native_vllm_lora_status=handler.native_vllm_lora_status,
+                exclude_native_vllm_lora=exclude_native_vllm_lora,
             )
         ],
     )
@@ -147,6 +153,33 @@ def _temporary_env(**updates: str):
                 os.environ.pop(key, None)
                 continue
             os.environ[key] = value
+
+
+def _write_validation_report(
+    report: ValidationReport,
+    output_json: str | Path | None,
+) -> None:
+    if output_json is None:
+        return
+    path = Path(output_json)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _mark_remaining_stages_skipped(
+    report: ValidationReport,
+    *,
+    after_stage_name: str,
+) -> None:
+    past_failure = False
+    for stage in report.stages:
+        if past_failure:
+            stage.metrics = {
+                "skipped": True,
+                "reason": f"stopped after {after_stage_name} failed",
+            }
+            continue
+        past_failure = stage.name == after_stage_name
 
 
 def _run_stage_in_subprocess(
@@ -636,17 +669,18 @@ def build_validation_report(
     *,
     base_model: str,
     include_native_vllm_lora: bool = False,
+    exclude_native_vllm_lora: bool = False,
+    include_sensitivity: bool | None = None,
+    output_json: str | Path | None = None,
+    skip_stages: set[str] | None = None,
+    stop_on_failure: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
     report = initialize_validation_report(
         base_model=base_model,
         include_native_vllm_lora=include_native_vllm_lora,
+        exclude_native_vllm_lora=exclude_native_vllm_lora,
         allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    architecture = (
-        inspect_architecture(base_model, allow_unvalidated_arch=True)
-        if allow_unvalidated_arch
-        else inspect_architecture(base_model)
     )
     stage_runners = {
         "hf_parity": run_hf_parity_stage,
@@ -659,49 +693,121 @@ def build_validation_report(
         "yes_no_trainability": run_yes_no_trainability_stage,
         NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
-    stage_results: dict[str, ValidationStageResult] = {}
-    for stage_name, stage_runner in stage_runners.items():
-        if stage_name in SUBPROCESS_VALIDATION_STAGES:
-            stage_results[stage_name] = _run_stage_in_subprocess(
-                stage_name=stage_name,
-                base_model=base_model,
-                architecture=architecture,
-                allow_unvalidated_arch=allow_unvalidated_arch,
-            )
-            continue
-        try:
-            stage_results[stage_name] = stage_runner(
-                base_model=base_model,
-                architecture=architecture,
-                allow_unvalidated_arch=allow_unvalidated_arch,
-            )
-        except Exception as exc:
-            stage_results[stage_name] = ValidationStageResult(
-                name=stage_name,
-                passed=False,
-                metrics=_stage_error_metrics(exc),
-            )
-    for stage in report.stages:
-        if stage.name == "dependency_resolution":
-            stage.passed = True
-            stage.metrics = dict(report.dependency_versions)
-            continue
-        if stage.name != "architecture_discovery":
-            stage_result = stage_results.get(stage.name)
-            if stage_result is not None:
-                stage.passed = stage_result.passed
-                stage.metrics = dict(stage_result.metrics)
-                stage.artifact_dir = stage_result.artifact_dir
-            continue
-        stage.passed = not architecture.unresolved_risks
-        stage.metrics = {
-            "recommended_min_layers": architecture.recommended_min_layers,
-            "layer_families": [
-                family.model_dump() for family in architecture.layer_families
-            ],
-            "unresolved_risks": list(architecture.unresolved_risks),
-        }
+    env = (
+        {SKIP_SENSITIVITY_ENV: "0" if include_sensitivity else "1"}
+        if include_sensitivity is not None
+        else {}
+    )
+    skip_stages = skip_stages or set()
+    architecture: ArchitectureReport | None = None
+    context = _temporary_env(**env) if env else nullcontext()
+    with context:
+        for stage in report.stages:
+            if stage.name in skip_stages:
+                stage.passed = True
+                stage.metrics = {"skipped": True, "reason": "--skip-stage"}
+                _write_validation_report(report, output_json)
+                continue
+            if stage.name == "dependency_resolution":
+                stage.passed = True
+                stage.metrics = dict(report.dependency_versions)
+                _write_validation_report(report, output_json)
+                continue
+            if stage.name == "architecture_discovery":
+                try:
+                    architecture = (
+                        inspect_architecture(base_model, allow_unvalidated_arch=True)
+                        if allow_unvalidated_arch
+                        else inspect_architecture(base_model)
+                    )
+                    stage.passed = not architecture.unresolved_risks
+                    stage.metrics = {
+                        "recommended_min_layers": architecture.recommended_min_layers,
+                        "layer_families": [
+                            family.model_dump()
+                            for family in architecture.layer_families
+                        ],
+                        "unresolved_risks": list(architecture.unresolved_risks),
+                    }
+                except Exception as exc:
+                    stage.passed = False
+                    stage.metrics = _stage_error_metrics(exc)
+                _write_validation_report(report, output_json)
+                if stop_on_failure and not stage.passed:
+                    _mark_remaining_stages_skipped(report, after_stage_name=stage.name)
+                    _write_validation_report(report, output_json)
+                    break
+                continue
+            if architecture is None:
+                raise RuntimeError(
+                    "architecture_discovery must run before subprocess stages"
+                )
+            stage_runner = stage_runners[stage.name]
+            if stage.name in SUBPROCESS_VALIDATION_STAGES:
+                stage_result = _run_stage_in_subprocess(
+                    stage_name=stage.name,
+                    base_model=base_model,
+                    architecture=architecture,
+                    allow_unvalidated_arch=allow_unvalidated_arch,
+                )
+            else:
+                try:
+                    stage_result = stage_runner(
+                        base_model=base_model,
+                        architecture=architecture,
+                        allow_unvalidated_arch=allow_unvalidated_arch,
+                    )
+                except Exception as exc:
+                    stage_result = ValidationStageResult(
+                        name=stage.name,
+                        passed=False,
+                        metrics=_stage_error_metrics(exc),
+                    )
+            stage.passed = stage_result.passed
+            stage.metrics = dict(stage_result.metrics)
+            stage.artifact_dir = stage_result.artifact_dir
+            _write_validation_report(report, output_json)
+            if stop_on_failure and not stage.passed:
+                _mark_remaining_stages_skipped(report, after_stage_name=stage.name)
+                _write_validation_report(report, output_json)
+                break
     return report
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run ART Megatron model support workflow"
+    )
+    parser.add_argument("--base-model", required=True)
+    parser.add_argument("--output-json", required=True)
+    parser.add_argument("--allow-unsupported-arch", action="store_true")
+    parser.add_argument("--exclude-native-vllm-lora", action="store_true")
+    parser.add_argument("--include-sensitivity", action="store_true")
+    parser.add_argument("--skip-stage", action="append", default=[])
+    parser.add_argument("--stop-on-failure", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    report = build_validation_report(
+        base_model=args.base_model,
+        exclude_native_vllm_lora=args.exclude_native_vllm_lora,
+        include_sensitivity=args.include_sensitivity,
+        output_json=args.output_json,
+        skip_stages=set(args.skip_stage),
+        stop_on_failure=args.stop_on_failure,
+        allow_unvalidated_arch=args.allow_unsupported_arch,
+    )
+    for stage in report.stages:
+        status = "PASS" if stage.passed else "FAIL"
+        print(f"{stage.name}: {status}", flush=True)
+        if stage.artifact_dir:
+            print(f"  artifact_dir={stage.artifact_dir}", flush=True)
+        if not stage.passed:
+            print(f"  metrics={stage.metrics}", flush=True)
+    print(f"report_json={args.output_json}", flush=True)
+    return 0 if all(stage.passed for stage in report.stages) else 1
 
 
 def assess_minimal_layer_coverage(
@@ -730,3 +836,7 @@ def assess_minimal_layer_coverage(
         missing_layer_families=missing_layer_families,
         unresolved_risks=list(architecture_report.unresolved_risks),
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
