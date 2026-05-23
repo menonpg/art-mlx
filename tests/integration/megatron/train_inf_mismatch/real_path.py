@@ -168,7 +168,7 @@ async def _rollout(
             model=model.get_inference_name(),
             messages=messages,
             max_tokens=max_completion_tokens,
-            temperature=0.3,
+            temperature=0.8,
             logprobs=True,
             top_logprobs=TOP_K,
             **request_kwargs,
