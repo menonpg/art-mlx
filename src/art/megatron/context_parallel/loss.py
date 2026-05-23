@@ -10,6 +10,21 @@ from art.loss import Loss, compute_probs_corr
 from .types import DispatchedPackedTensors
 
 
+def validate_context_parallel_loss_config(
+    experimental_config: dev.TrainConfig,
+) -> None:
+    if experimental_config.get("importance_sampling_level", "token") != "token":
+        raise NotImplementedError(
+            "CP dispatched loss currently supports token-level importance sampling "
+            "only. Add group-id dispatch before enabling sequence-level variants."
+        )
+    if experimental_config.get("truncated_importance_sampling", None) is not None:
+        raise NotImplementedError(
+            "CP dispatched loss currently does not dispatch original_logprobs, so "
+            "truncated_importance_sampling is disabled for CP training."
+        )
+
+
 def loss_fn_dispatched(
     inputs: DispatchedPackedTensors,
     *,

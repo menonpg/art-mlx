@@ -30,7 +30,6 @@ from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
@@ -38,8 +37,10 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 from art import dev, types
 from art.loss import Loss, shift_tensor
 from art.loss import loss_fn as base_loss_fn
-from art.megatron.compile_workarounds import install_torch_compile_workarounds
-from art.megatron.context_parallel.loss import loss_fn_dispatched
+from art.megatron.context_parallel.loss import (
+    loss_fn_dispatched,
+    validate_context_parallel_loss_config,
+)
 from art.megatron.context_parallel.runtime import prepare_cp_micro
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
@@ -51,8 +52,6 @@ from art.megatron.lora import apply_lora_adapters
 from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
 from art.megatron.provider_common import ProviderBundle
 from art.megatron.routing_replay import (
-    TRACE_ROW_TOKEN_UIDS_ATTR,
-    TRACE_UID_SPAN_ATTR,
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
 )
@@ -69,13 +68,27 @@ from art.megatron.runtime.jobs import (
     load_megatron_job,
 )
 from art.megatron.shared_prefix_state import create_shared_prefix_state
-from art.megatron.training.finalize_grads import finalize_model_grads_extended
+from art.megatron.training.compile import (
+    configure_training_compile,
+    install_fast_frozen_output_backward,
+)
+from art.megatron.training.finalize_grads import (
+    finalize_model_grads_extended,
+    flush_param_grads_to_main_grads,
+)
 from art.megatron.training.model_chunks import (
     ModelChunks,
     as_megatron_api_chunks,
     validate_model_chunks,
 )
 from art.megatron.training.sft_batches import load_sft_batch_from_disk
+from art.megatron.training.trace import (
+    attach_trace_token_uids,
+    context_parallel_debug_token_uids_enabled,
+    packed_sequence_token_uids,
+    set_replay_local_input_token_uids,
+    sft_sequence_token_uids,
+)
 from art.megatron.training.weight_offload import WeightOffloadManager
 from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
 from art.megatron.weights.merged_weight_export import (
@@ -226,40 +239,6 @@ def _register_trainable_parameter_mode(
     )
 
 
-def _frozen_linear_grad_input(
-    grad_output: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    if grad_output.dim() <= 2 or weight.dim() != 2:
-        return grad_output.matmul(weight)
-    grad_output_2d = grad_output.reshape(-1, int(grad_output.shape[-1]))
-    grad_input_2d = grad_output_2d.matmul(weight)
-    return grad_input_2d.reshape(*grad_output.shape[:-1], int(weight.shape[-1]))
-
-
-def _install_fast_frozen_output_backward() -> None:
-    from megatron.core.tensor_parallel.layers import LinearWithFrozenWeight
-
-    if getattr(LinearWithFrozenWeight.backward, "__art_fast_output_backward__", False):
-        return
-
-    def _fast_backward(
-        ctx: Any,
-        grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None]:
-        (weight,) = ctx.saved_tensors
-        grad_input = _frozen_linear_grad_input(grad_output, weight)
-        if ctx.allreduce_dgrad:
-            torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-                grad_input,
-                group=ctx.tp_group,
-            )
-        return grad_input, None, None, None, None
-
-    setattr(_fast_backward, "__art_fast_output_backward__", True)
-    LinearWithFrozenWeight.backward = staticmethod(_fast_backward)
-
-
 def _eager_initialize_optimizer_state(optimizer: Any) -> None:
     chained_optimizers = getattr(optimizer, "chained_optimizers", None)
     if chained_optimizers is not None:
@@ -270,14 +249,6 @@ def _eager_initialize_optimizer_state(optimizer: Any) -> None:
     inner_optimizer = getattr(optimizer, "optimizer", None)
     if callable(init_state_fn) and inner_optimizer is not None:
         init_state_fn(inner_optimizer, getattr(optimizer, "config", None))
-
-
-def _compile_enabled() -> bool:
-    return os.environ.get("ART_DISABLE_MEGATRON_COMPILE", "0") in {
-        "0",
-        "false",
-        "False",
-    }
 
 
 def _default_optimizer_config() -> OptimizerConfig:
@@ -382,7 +353,7 @@ def build_training_runtime(
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-    _install_fast_frozen_output_backward()
+    install_fast_frozen_output_backward()
     provider_bundle = prepare_provider_bundle(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
@@ -431,25 +402,11 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     provider_bundle.handler.install_preprocess_patch(model)
-    compile_workaround_config = provider_bundle.handler.compile_workaround_config(
-        provider
+    transformer_layers_compiled = configure_training_compile(
+        model=model,
+        provider=provider,
+        provider_bundle=provider_bundle,
     )
-    compile_enabled = _compile_enabled()
-    flags = (
-        compile_workaround_config.flags
-        if compile_enabled and not compile_workaround_config.disable_compile
-        else compile_workaround_config.unconditional_flags
-    )
-    if flags:
-        install_torch_compile_workarounds(
-            compile_workaround_config.model_copy(update={"flags": flags})
-        )
-    transformer_layers_compiled = (
-        compile_enabled and not compile_workaround_config.disable_compile
-    )
-    if transformer_layers_compiled:
-        for chunk in model:
-            _compile_transformer_layers(chunk)
 
     optimizer_config = optimizer_config or _default_optimizer_config()
     optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
@@ -640,28 +597,6 @@ def run_megatron_rl_job(
         if job_completed:
             gc.collect()
             torch.cuda.empty_cache()
-
-
-def _flush_param_grads_to_main_grads(model_chunks: ModelChunks) -> None:
-    """Fallback for direct SFT jobs when DDP post-hooks leave grads in param.grad.
-
-    Megatron's distributed optimizer reads gradients from `main_grad`, which is
-    normally populated by DDP backward post-hooks. Some direct ART runtimes can
-    reach finalize/step with gradients still in `param.grad`, so copy them over
-    using the same guard Megatron uses in its hook implementation.
-    """
-    for chunk in model_chunks:
-        for param in chunk.parameters():
-            if not param.requires_grad or param.grad is None:
-                continue
-            if not hasattr(param, "main_grad"):
-                continue
-            main_grad = cast(torch.Tensor, param.main_grad)
-            if not getattr(param, "grad_added_to_main_grad", False) or getattr(
-                param, "zero_out_wgrad", False
-            ):
-                main_grad.add_(param.grad.to(dtype=main_grad.dtype))
-            param.grad = None
 
 
 def run_megatron_sft_job(
@@ -961,30 +896,6 @@ def _causal_attention_state(
     )
 
 
-def _set_child_module(
-    parent: torch.nn.Module,
-    name: str,
-    child: torch.nn.Module,
-) -> None:
-    if isinstance(parent, torch.nn.ModuleList | torch.nn.Sequential):
-        parent[int(name)] = child
-        return
-    setattr(parent, name, child)
-
-
-def _compile_transformer_layers(module: torch.nn.Module) -> None:
-    for name, child in list(module.named_children()):
-        if isinstance(child, TransformerLayer):
-            physical_forward = getattr(child, "_art_gdn_island_physical_forward", None)
-            if callable(physical_forward):
-                child._art_gdn_island_physical_forward = torch.compile(physical_forward)
-                continue
-            compiled_child = cast(torch.nn.Module, torch.compile(child))
-            _set_child_module(parent=module, name=name, child=compiled_child)
-            continue
-        _compile_transformer_layers(child)
-
-
 def iter_modules(model_chunks: ModelChunks) -> Any:
     for chunk in model_chunks:
         for module in chunk.modules():
@@ -1281,15 +1192,6 @@ def _infer_parallel_topology(model_chunks: ModelChunks) -> ParallelTopology:
     )
 
 
-def _cp_debug_token_uids_enabled(
-    topology: ParallelTopology,
-    moe_routing_replay_controller: MoeRoutingReplayController | None,
-) -> bool:
-    return int(topology.cp) > 1 and (
-        moe_routing_replay_controller is not None or moe_debug_token_uids_enabled()
-    )
-
-
 def _next_micro_lookahead(
     micro_inputs: list[Any],
     micro_order: int,
@@ -1299,71 +1201,6 @@ def _next_micro_lookahead(
     if next_micro_order < len(micro_inputs):
         return micro_inputs[next_micro_order]
     return trailing_micro
-
-
-def _packed_sequence_token_uids(
-    micro: PackedTensors,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    return torch.arange(
-        int(micro["tokens"].shape[1]),
-        device=device,
-        dtype=torch.int64,
-    ).unsqueeze(0)
-
-
-def _flatten_local_token_uids(
-    token_uids: torch.Tensor | None,
-) -> torch.Tensor | None:
-    if token_uids is None:
-        return None
-    return (
-        token_uids.transpose(0, 1)
-        .contiguous()
-        .reshape(-1)
-        .to(dtype=torch.int64)
-        .contiguous()
-    )
-
-
-def _set_root_output_trace_token_uids(
-    root_module: torch.nn.Module,
-    token_uids: torch.Tensor | None,
-) -> None:
-    if token_uids is None:
-        if hasattr(root_module, "_art_root_output_token_uids"):
-            delattr(root_module, "_art_root_output_token_uids")
-        return
-    setattr(
-        root_module,
-        "_art_root_output_token_uids",
-        token_uids.detach().to(device="cpu", dtype=torch.int64).contiguous(),
-    )
-
-
-def _set_module_trace_token_uids(
-    model_chunks: ModelChunks,
-    token_uids: torch.Tensor | None,
-) -> None:
-    row_token_uids = _flatten_local_token_uids(token_uids)
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            if row_token_uids is None:
-                if hasattr(module, TRACE_ROW_TOKEN_UIDS_ATTR):
-                    delattr(module, TRACE_ROW_TOKEN_UIDS_ATTR)
-                if hasattr(module, TRACE_UID_SPAN_ATTR):
-                    delattr(module, TRACE_UID_SPAN_ATTR)
-                continue
-            setattr(
-                module,
-                TRACE_ROW_TOKEN_UIDS_ATTR,
-                row_token_uids.detach()
-                .to(device="cpu", dtype=torch.int64)
-                .contiguous(),
-            )
-            if hasattr(module, TRACE_UID_SPAN_ATTR):
-                delattr(module, TRACE_UID_SPAN_ATTR)
 
 
 def _prepare_dense_rl_micro(
@@ -1397,7 +1234,7 @@ def _prepare_dense_rl_micro(
         ),
         loss_inputs=micro,
         ref_logprobs=ref_logprobs,
-        local_token_uids=_packed_sequence_token_uids(micro, device=device),
+        local_token_uids=packed_sequence_token_uids(micro, device=device),
     )
 
 
@@ -1421,11 +1258,6 @@ def _prepare_rl_cp_micro_full(
         ),
         debug_token_uids=debug_token_uids,
     )
-
-
-def moe_debug_token_uids_enabled() -> bool:
-    raw = os.environ.get("ART_MEGATRON_ATTACH_TOKEN_UIDS", "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _prepared_rl_micro_from_cp_batch(
@@ -1540,22 +1372,7 @@ def _validate_context_parallel_training_supported(
     del model_chunks, model_support_handler
     if int(topology.cp) <= 1:
         return
-    _validate_context_parallel_loss_config(experimental_config)
-
-
-def _validate_context_parallel_loss_config(
-    experimental_config: dev.TrainConfig,
-) -> None:
-    if experimental_config.get("importance_sampling_level", "token") != "token":
-        raise NotImplementedError(
-            "CP dispatched loss currently supports token-level importance sampling "
-            "only. Add group-id dispatch before enabling sequence-level variants."
-        )
-    if experimental_config.get("truncated_importance_sampling", None) is not None:
-        raise NotImplementedError(
-            "CP dispatched loss currently does not dispatch original_logprobs, so "
-            "truncated_importance_sampling is disabled for CP training."
-        )
+    validate_context_parallel_loss_config(experimental_config)
 
 
 def _count_sft_trainable_tokens(
@@ -1594,28 +1411,6 @@ def _prepare_sft_micro_inputs(
     return input_ids, position_ids, shifted_labels, mask, actual_len
 
 
-def _sft_sequence_token_uids(
-    inputs: dict[str, torch.Tensor],
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    attention_mask = inputs["attention_mask"].reshape(-1)
-    actual_len = max(int(attention_mask.sum().item()), 1)
-    total_tokens = int(inputs["input_ids"].numel())
-    token_uids = torch.full(
-        (1, total_tokens),
-        -1,
-        device=device,
-        dtype=torch.int64,
-    )
-    token_uids[:, :actual_len] = torch.arange(
-        actual_len,
-        device=device,
-        dtype=torch.int64,
-    ).unsqueeze(0)
-    return token_uids
-
-
 def _prepare_dense_sft_micro(
     micro: dict[str, torch.Tensor],
     *,
@@ -1641,7 +1436,7 @@ def _prepare_dense_sft_micro(
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),
-        local_token_uids=_sft_sequence_token_uids(micro, device=device)[
+        local_token_uids=sft_sequence_token_uids(micro, device=device)[
             :, : int(input_ids.shape[1])
         ],
     )
@@ -1822,7 +1617,7 @@ def run_megatron_sft_step(
     )
 
     device = next(model_chunks[0].parameters()).device
-    debug_token_uids = _cp_debug_token_uids_enabled(
+    debug_token_uids = context_parallel_debug_token_uids_enabled(
         topology,
         moe_routing_replay_controller,
     )
@@ -1849,20 +1644,11 @@ def run_megatron_sft_step(
             debug_token_uids=debug_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
-        if moe_routing_replay_controller is not None and hasattr(
+        set_replay_local_input_token_uids(
             moe_routing_replay_controller,
-            "set_local_input_token_uids",
-        ):
-            moe_routing_replay_controller.set_local_input_token_uids(
-                _flatten_local_token_uids(prepared_micro.local_token_uids)
-            )
-        attach_trace_token_uids = moe_debug_token_uids_enabled()
-        _set_root_output_trace_token_uids(
-            model_chunks[0], prepared_micro.local_token_uids
+            prepared_micro.local_token_uids,
         )
-        if attach_trace_token_uids:
-            _set_module_trace_token_uids(model_chunks, prepared_micro.local_token_uids)
-        try:
+        with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
             per_token_loss: torch.Tensor = model_chunks[0](
                 input_ids=prepared_micro.input_ids,
                 position_ids=prepared_micro.position_ids,
@@ -1874,10 +1660,6 @@ def run_megatron_sft_step(
                     attention_bias=prepared_micro.attention_state,
                 ),
             )
-        finally:
-            _set_root_output_trace_token_uids(model_chunks[0], None)
-            if attach_trace_token_uids:
-                _set_module_trace_token_uids(model_chunks, None)
         masked_loss = (
             per_token_loss[prepared_micro.loss_mask].sum() + per_token_loss.sum() * 0.0
         )
@@ -1903,7 +1685,7 @@ def run_megatron_sft_step(
         loss_inputs_for_count,
         device=device,
     )
-    _flush_param_grads_to_main_grads(model_chunks)
+    flush_param_grads_to_main_grads(model_chunks)
     finalize_model_grads_extended(
         as_megatron_api_chunks(model_chunks), num_tokens=num_tokens
     )
@@ -1977,7 +1759,7 @@ def run_training_step(
 
     device = next(model_chunks[0].parameters()).device
     topology = _infer_parallel_topology(model_chunks)
-    debug_token_uids = _cp_debug_token_uids_enabled(
+    debug_token_uids = context_parallel_debug_token_uids_enabled(
         topology,
         moe_routing_replay_controller,
     )
@@ -2039,13 +1821,10 @@ def run_training_step(
         cp_gdn_rank_plan_cache_hits += int(
             prepared_micro.context_parallel_gdn_rank_plan_cache_hit
         )
-        if moe_routing_replay_controller is not None and hasattr(
+        set_replay_local_input_token_uids(
             moe_routing_replay_controller,
-            "set_local_input_token_uids",
-        ):
-            moe_routing_replay_controller.set_local_input_token_uids(
-                _flatten_local_token_uids(prepared_micro.local_token_uids)
-            )
+            prepared_micro.local_token_uids,
+        )
 
         model_forward_kwargs = dict(
             input_ids=prepared_micro.model_tokens,
@@ -2057,13 +1836,7 @@ def run_training_step(
                 attention_bias=prepared_micro.attention_state,
             ),
         )
-        attach_trace_token_uids = moe_debug_token_uids_enabled()
-        _set_root_output_trace_token_uids(
-            model_chunks[0], prepared_micro.local_token_uids
-        )
-        if attach_trace_token_uids:
-            _set_module_trace_token_uids(model_chunks, prepared_micro.local_token_uids)
-        try:
+        with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
             if int(prepared_micro.model_tokens.numel()) == 0:
                 logits = model_chunks[0](**model_forward_kwargs, labels=None)
                 new_logprobs = _empty_new_logprobs_from_logits(
@@ -2074,10 +1847,6 @@ def run_training_step(
                     **model_forward_kwargs,
                     labels=prepared_micro.model_labels,
                 )
-        finally:
-            _set_root_output_trace_token_uids(model_chunks[0], None)
-            if attach_trace_token_uids:
-                _set_module_trace_token_uids(model_chunks, None)
 
         loss_info = loss_fn(
             prepared_micro.loss_inputs,

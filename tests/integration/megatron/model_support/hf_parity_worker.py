@@ -717,7 +717,7 @@ def _run_megatron_sft_step(
         micro_inputs,
         device=device,
     )
-    megatron_train._flush_param_grads_to_main_grads(runtime.model)
+    megatron_train.flush_param_grads_to_main_grads(runtime.model)
     megatron_train.finalize_model_grads_extended(
         megatron_train.as_megatron_api_chunks(runtime.model),
         num_tokens=num_tokens,
