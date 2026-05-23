@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 import torch
 
@@ -183,13 +185,15 @@ def test_forward_trace_reads_row_uids_from_output_tensor() -> None:
 
 
 def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
-    ids, scores = _extract_router_topk(
+    topk = _extract_router_topk(
         (
             torch.empty((0, 8), dtype=torch.float32),
             torch.empty((0, 8), dtype=torch.bool),
         ),
         topk_hint=2,
     )
+    assert topk is not None
+    ids, scores = topk
 
     assert ids.shape == (0, 2)
     assert scores.shape == (0, 2)
@@ -262,7 +266,7 @@ def test_forward_trace_splits_expert_rows_with_input_uid_span() -> None:
 
 
 def test_forward_trace_canonicalizes_row_outputs_by_token_uid() -> None:
-    trace = {
+    trace: dict[str, list[dict[str, Any]]] = {
         "chunk0.module.decoder.layers.0": [
             {
                 "primary_output": torch.tensor([[30.0], [10.0], [20.0]]),

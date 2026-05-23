@@ -154,7 +154,7 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     if prev_is_gdn:
         original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
         if original_shape is not None:
-            attention_bias.gdn_attention_original_shape = original_shape
+            setattr(attention_bias, "gdn_attention_original_shape", original_shape)
         _mark_gdn_layout_active(attention_bias, hidden_states, gdn=self.self_attention)
     else:
         hidden_states = _enter_gdn_island_layout(
@@ -166,14 +166,14 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         args, kwargs = _replace_layer_hidden_states(args, kwargs, hidden_states)
     previous_input_layout = getattr(attention_bias, "gdn_input_layout", None)
     previous_output_layout = getattr(attention_bias, "gdn_output_layout", None)
-    attention_bias.gdn_input_layout = "gdn"
-    attention_bias.gdn_output_layout = "gdn"
+    setattr(attention_bias, "gdn_input_layout", "gdn")
+    setattr(attention_bias, "gdn_output_layout", "gdn")
 
     try:
         output = original_forward(*args, **kwargs)
     finally:
-        attention_bias.gdn_input_layout = previous_input_layout
-        attention_bias.gdn_output_layout = previous_output_layout
+        setattr(attention_bias, "gdn_input_layout", previous_input_layout)
+        setattr(attention_bias, "gdn_output_layout", previous_output_layout)
     if next_is_gdn:
         hidden_out = _attach_gdn_attention_original_shape(
             _layer_output_hidden_states(output),
@@ -1119,6 +1119,8 @@ def gdn_cp_gdn_to_attention_layout(
     group: Any,
     gdn: Any | None = None,
 ) -> Tensor:
+    if original_shape is None:
+        raise RuntimeError("GDN CP output layout conversion requires original_shape")
     return _cp_output_to_attention(gdn_hidden, plan, original_shape, group, gdn=gdn)
 
 
@@ -1552,7 +1554,7 @@ def _gdn_attention_original_shape_from_tensor(
         return None
     if not isinstance(original_shape, tuple) or len(original_shape) != 3:
         return None
-    return tuple(int(dim) for dim in original_shape)
+    return (int(original_shape[0]), int(original_shape[1]), int(original_shape[2]))
 
 
 def _set_active_routing_replay_token_uids(token_uids: Tensor | None) -> Tensor | None:

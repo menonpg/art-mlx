@@ -8,7 +8,7 @@ public autograd-compatible tile override for CUTE flex attention.
 from __future__ import annotations
 
 import inspect
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -36,7 +36,8 @@ def _apply_flash_flex_block_sparse_tile_patch() -> None:
         _TILE_PATCH_APPLIED = True
         return
 
-    original_tile_size_fwd_sm90 = cute_interface._tile_size_fwd_sm90
+    cute_interface_any = cast(Any, cute_interface)
+    original_tile_size_fwd_sm90 = cute_interface_any._tile_size_fwd_sm90
 
     def tile_size_fwd_sm90_art(
         head_dim,
@@ -59,7 +60,7 @@ def _apply_flash_flex_block_sparse_tile_patch() -> None:
             use_block_sparsity,
         )
 
-    cute_interface._tile_size_fwd_sm90 = tile_size_fwd_sm90_art
+    cute_interface_any._tile_size_fwd_sm90 = tile_size_fwd_sm90_art
     _TILE_PATCH_APPLIED = True
 
 
@@ -487,7 +488,9 @@ def apply_flash_flex_dlse_patch() -> None:
             full_q_indices=full_q_indices if needs_block_mask else None,
         )
 
-    flex_flash_mod.create_flex_flash_attention_backward_kernel_with_dlse = (
+    cast(
+        Any, flex_flash_mod
+    ).create_flex_flash_attention_backward_kernel_with_dlse = (
         create_flex_flash_attention_backward_kernel_with_dlse
     )
     flex_attention_mod.flex_attention_backward = flex_attention_backward_with_flash_dlse

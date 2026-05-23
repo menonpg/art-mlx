@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 import socket
+from typing import Any, cast
 
 import pytest
 import torch
@@ -139,21 +140,19 @@ def test_gdn_varlen_causal_conv_gelu_matches_qwen_planner_bucket() -> None:
             params_dtype=torch.float32, linear_policy="noop"
         )
         ref_gdn.eval()
+        ref_gdn_any = cast(Any, ref_gdn)
+        conv1d = cast(Any, ref_gdn.conv1d)
         qkv, conv_initial, _, _, out_grad, final_grad = _inputs(
             batch=int(bucket.segment_count),
-            channels=int(ref_gdn.conv_dim_local_tp),
+            channels=int(ref_gdn_any.conv_dim_local_tp),
             max_len=int(bucket.length),
-            kernel_width=int(ref_gdn.conv_kernel_dim),
+            kernel_width=int(ref_gdn_any.conv_kernel_dim),
             has_bias=True,
             seed=123,
         )
         qkv = qkv.masked_fill(~bucket.real_mask.transpose(0, 1).unsqueeze(1), 0)
-        weight = ref_gdn.conv1d.weight.detach().squeeze(1).contiguous()
-        bias = (
-            None
-            if ref_gdn.conv1d.bias is None
-            else ref_gdn.conv1d.bias.detach().contiguous()
-        )
+        weight = conv1d.weight.detach().squeeze(1).contiguous()
+        bias = None if conv1d.bias is None else conv1d.bias.detach().contiguous()
         ref = _run_reference(
             qkv, conv_initial, weight, bias, bucket.lengths, out_grad, final_grad
         )
@@ -444,13 +443,14 @@ def _run_fused_gdn(
     )
     assert final is not None
     ((out * out_grad).sum() + (final * final_grad).sum()).backward()
+    conv1d = cast(Any, gdn.conv1d)
     return {
         "out": out.detach(),
         "final": final.detach(),
-        "qkv_grad": qkv.grad.detach(),
-        "conv_initial_grad": conv_initial.grad.detach(),
-        "weight_grad": gdn.conv1d.weight.grad.detach().squeeze(1),
-        "bias_grad": None if gdn.conv1d.bias is None else gdn.conv1d.bias.grad.detach(),
+        "qkv_grad": _required_grad(qkv.grad),
+        "conv_initial_grad": _required_grad(conv_initial.grad),
+        "weight_grad": _required_grad(conv1d.weight.grad).squeeze(1),
+        "bias_grad": None if conv1d.bias is None else _required_grad(conv1d.bias.grad),
     }
 
 
@@ -513,10 +513,10 @@ def _result(
     return {
         "out": out.detach(),
         "final": final.detach(),
-        "qkv_grad": qkv.grad.detach(),
-        "conv_initial_grad": conv_initial.grad.detach(),
-        "weight_grad": weight.grad.detach(),
-        "bias_grad": None if bias is None else bias.grad.detach(),
+        "qkv_grad": _required_grad(qkv.grad),
+        "conv_initial_grad": _required_grad(conv_initial.grad),
+        "weight_grad": _required_grad(weight.grad),
+        "bias_grad": None if bias is None else _required_grad(bias.grad),
     }
 
 
@@ -531,11 +531,17 @@ def _packed_result(
     return {
         "out": out.detach(),
         "final": final.detach(),
-        "conv_in_grad": conv_in.grad.detach(),
-        "conv_initial_grad": conv_initial.grad.detach(),
-        "weight_grad": weight.grad.detach(),
-        "bias_grad": None if bias is None else bias.grad.detach(),
+        "conv_in_grad": _required_grad(conv_in.grad),
+        "conv_initial_grad": _required_grad(conv_initial.grad),
+        "weight_grad": _required_grad(weight.grad),
+        "bias_grad": None if bias is None else _required_grad(bias.grad),
     }
+
+
+def _required_grad(grad: Tensor | None) -> Tensor:
+    if grad is None:
+        raise AssertionError("missing gradient")
+    return grad.detach()
 
 
 def _assert_results_close(

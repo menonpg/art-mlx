@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
@@ -67,7 +67,9 @@ def make_qwen35_gdn_pair(
     model_parallel_cuda_manual_seed(1234)
     ref_gdn = first_gdn(make_qwen35_language_model(resolved, params_dtype=params_dtype))
     model_parallel_cuda_manual_seed(5678)
-    test_gdn = first_gdn(make_qwen35_language_model(resolved, params_dtype=params_dtype))
+    test_gdn = first_gdn(
+        make_qwen35_language_model(resolved, params_dtype=params_dtype)
+    )
     test_gdn.load_state_dict(ref_gdn.state_dict())
     apply_gdn_linear_policy(ref_gdn, linear_policy)
     apply_gdn_linear_policy(test_gdn, linear_policy)
@@ -138,13 +140,13 @@ def first_gdn(model: torch.nn.Module) -> torch.nn.Module:
 
 def apply_gdn_linear_policy(gdn: torch.nn.Module, policy: str) -> None:
     if policy == "real":
-        gdn._art_benchmark_linear_policy = "real"
+        setattr(gdn, "_art_benchmark_linear_policy", "real")
         return
     if policy != "noop":
         raise ValueError(f"unknown GDN benchmark linear policy {policy!r}")
     gdn.in_proj = _NoopGdnInProj(gdn)  # type: ignore[assignment]
-    gdn.out_proj = _NoopGdnOutProj(int(gdn.hidden_size))  # type: ignore[assignment]
-    gdn._art_benchmark_linear_policy = "noop"
+    gdn.out_proj = _NoopGdnOutProj(int(cast(Any, gdn).hidden_size))  # type: ignore[assignment]
+    setattr(gdn, "_art_benchmark_linear_policy", "noop")
     if hasattr(gdn, "_art_reentrant_te_linear_transpose_cache_disabled"):
         delattr(gdn, "_art_reentrant_te_linear_transpose_cache_disabled")
 
@@ -152,7 +154,8 @@ def apply_gdn_linear_policy(gdn: torch.nn.Module, policy: str) -> None:
 class _NoopGdnInProj(torch.nn.Module):
     def __init__(self, gdn: torch.nn.Module) -> None:
         super().__init__()
-        self.out_features = int(gdn.in_proj_dim) // int(gdn.tp_size)
+        gdn_any = cast(Any, gdn)
+        self.out_features = int(gdn_any.in_proj_dim) // int(gdn_any.tp_size)
         self.register_buffer("_template", torch.empty(0), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -180,12 +183,18 @@ class _NoopGdnOutProj(torch.nn.Module):
         if in_features == self.hidden_size:
             return norm_out, None
         if in_features > self.hidden_size and in_features % self.hidden_size == 0:
-            shape = (*norm_out.shape[:-1], in_features // self.hidden_size, self.hidden_size)
+            shape = (
+                *norm_out.shape[:-1],
+                in_features // self.hidden_size,
+                self.hidden_size,
+            )
             return norm_out.reshape(shape).sum(dim=-2), None
         if in_features > self.hidden_size:
             return norm_out[..., : self.hidden_size], None
         repeats = (self.hidden_size + in_features - 1) // in_features
-        return norm_out.repeat_interleave(repeats, dim=-1)[..., : self.hidden_size], None
+        return norm_out.repeat_interleave(repeats, dim=-1)[
+            ..., : self.hidden_size
+        ], None
 
 
 def benchmark_linear_policy(model: Any) -> str:

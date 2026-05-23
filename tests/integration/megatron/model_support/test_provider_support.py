@@ -24,7 +24,13 @@ class _FakeProvider:
         self.transformer_layer_spec = self._base_layer_spec
         self.finalized = False
         self.overlap_moe_expert_parallel_comm = False
+        self.moe_shared_expert_overlap = False
         self.num_moe_experts = 0
+        self.recompute_granularity: str | None = None
+        self.recompute_method: str | None = None
+        self.recompute_num_layers: int | None = None
+        self.expert_model_parallel_size = 1
+        self.expert_tensor_parallel_size = 1
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None

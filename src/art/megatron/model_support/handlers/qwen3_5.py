@@ -961,9 +961,9 @@ class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
             ep_size=int(self.ep_size),
         )
         normalized_param = self._normalize_expert_param_name(self.megatron_param)
-        _, target_param = get_module_and_param_from_name(
+        target_param = get_module_and_param_from_name(
             megatron_module, normalized_param
-        )
+        )[1]
         full_target_shape = (
             target_param.shape[0] * self.tp_size,
             target_param.shape[1],
@@ -1025,9 +1025,9 @@ class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
             ep_size=int(self.ep_size),
         )
         normalized_param = self._normalize_expert_param_name(self.megatron_param)
-        _, target_param = get_module_and_param_from_name(
+        target_param = get_module_and_param_from_name(
             megatron_module, normalized_param
-        )
+        )[1]
         if self._mapping is None:
             self._detected_type = self._detect_parallelism_type(megatron_module)
             self._mapping = self._get_or_create_mapping(self._detected_type)

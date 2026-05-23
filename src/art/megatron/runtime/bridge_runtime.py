@@ -444,7 +444,7 @@ def _optimized_load_weights_hf_to_megatron(
         if task is None or task.megatron_module is None:
             continue
         hf_weights = self.maybe_modify_loaded_hf_weight(
-            task.mapping.hf_param, cached_state
+            task.mapping.hf_param, cast(Mapping[str, torch.Tensor], cached_state)
         )
         converted_weights = task.mapping.hf_to_megatron(
             hf_weights, task.megatron_module

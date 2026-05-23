@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import sys
 import time
+from typing import Any, cast
 
 from ..model_support import oracle_worker
 from ..model_support.oracle_harness import (
@@ -25,17 +26,18 @@ def _apply_attention_only_mlp_noop():
     """Disables decoder-layer MLP for the attention-only oracle worker."""
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    original_forward_mlp = TransformerLayer._forward_mlp
+    transformer_layer = cast(Any, TransformerLayer)
+    original_forward_mlp = transformer_layer._forward_mlp
 
     def _noop_forward_mlp(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return hidden_states
 
-    TransformerLayer._forward_mlp = _noop_forward_mlp  # ty: ignore[method-assign]
+    transformer_layer._forward_mlp = _noop_forward_mlp
     try:
         yield
     finally:
-        TransformerLayer._forward_mlp = original_forward_mlp  # ty: ignore[method-assign]
+        transformer_layer._forward_mlp = original_forward_mlp
 
 
 def run_worker_subprocess(
@@ -112,7 +114,8 @@ def run_worker_subprocess(
             if not events and run.poll() is not None:
                 break
             for key, _ in events:
-                chunk = os.read(key.fileobj.fileno(), 8192)
+                fileobj = cast(Any, key.fileobj)
+                chunk = os.read(fileobj.fileno(), 8192)
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue

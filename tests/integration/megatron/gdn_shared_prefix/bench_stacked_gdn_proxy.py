@@ -12,7 +12,7 @@ import socket
 import statistics
 import sys
 import time
-from typing import Any
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
@@ -345,6 +345,16 @@ class StackedGdnProxyResult(BaseModel):
     all_sequences_median: StackedRollup
     tail_sequences_median: StackedRollup
     sequences: tuple[SequenceSummary, ...]
+
+
+class _BucketStats(TypedDict):
+    bucket_count: int
+    real_tokens: int
+    padded_tokens: int
+    padding_ratio: float
+    max_length: int
+    max_segments: int
+    max_padding_ratio: float
 
 
 def _resolve_layer_schedule(args: argparse.Namespace) -> LayerSchedule:
@@ -1589,7 +1599,7 @@ def _all_execution_buckets(plan: Any) -> tuple[Any, ...]:
     )
 
 
-def _bucket_stats(buckets: tuple[Any, ...]) -> dict[str, int | float]:
+def _bucket_stats(buckets: tuple[Any, ...]) -> _BucketStats:
     padded_tokens = 0
     real_tokens = 0
     max_length = 0

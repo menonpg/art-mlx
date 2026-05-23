@@ -17,6 +17,7 @@ from art.megatron import train as megatron_train  # noqa: E402
 from art.megatron.context_parallel.runtime import prepare_cp_micro  # noqa: E402
 from art.megatron.context_parallel.types import (  # noqa: E402
     ArtContextParallelState,
+    ContextParallelConfig,
     ParallelTopology,
 )
 from art.preprocessing.pack import PackedTensors  # noqa: E402
@@ -71,7 +72,7 @@ def _worker(rank: int, cp_size: int, port: int, output_dir: str) -> None:
         prepared = prepare_cp_micro(
             micro=micro,
             topology=ParallelTopology(cp=cp_size),
-            config=megatron_train.ContextParallelConfig(),
+            config=ContextParallelConfig(),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
             build_gdn_execution_spec=True,

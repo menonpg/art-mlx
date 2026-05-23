@@ -35,7 +35,11 @@ def _compile_transformer_layers(module: torch.nn.Module) -> None:
         if isinstance(child, TransformerLayer):
             physical_forward = getattr(child, "_art_gdn_island_physical_forward", None)
             if callable(physical_forward):
-                child._art_gdn_island_physical_forward = torch.compile(physical_forward)
+                setattr(
+                    child,
+                    "_art_gdn_island_physical_forward",
+                    torch.compile(physical_forward),
+                )
                 continue
             compiled_child = cast(torch.nn.Module, torch.compile(child))
             _set_child_module(parent=module, name=name, child=compiled_child)

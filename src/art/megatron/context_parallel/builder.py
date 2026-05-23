@@ -71,7 +71,11 @@ def _scan_runs(
             group_changes[: mismatch_index - 1],
             as_tuple=False,
         ).flatten()
-        start = 0 if int(prior_boundaries.numel()) == 0 else int(prior_boundaries[-1].item()) + 1
+        start = (
+            0
+            if int(prior_boundaries.numel()) == 0
+            else int(prior_boundaries[-1].item()) + 1
+        )
         group_id = int(group_row[start].item())
         raise RuntimeError(
             "Found one group run with inconsistent parent ids: "

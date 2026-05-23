@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import importlib
 import os
@@ -257,7 +258,7 @@ class MegatronService:
 
     @staticmethod
     def _resolve_megatron_topology(
-        raw_topology: dict[str, int | None] | MegatronTopologyConfig | None,
+        raw_topology: Mapping[str, int | None] | MegatronTopologyConfig | None,
     ) -> MegatronTopologyConfig | None:
         if raw_topology is None:
             return None
@@ -864,7 +865,12 @@ class MegatronService:
                     "MegatronService subprocess jobs must use moe_routing_replay_path."
                 )
             megatron_topology = self._resolve_megatron_topology(
-                _config.get("megatron_topology", self.config.get("megatron_topology"))
+                cast(
+                    Mapping[str, int | None] | MegatronTopologyConfig | None,
+                    _config.get(
+                        "megatron_topology", self.config.get("megatron_topology")
+                    ),
+                )
             )
             if self.is_dedicated:
                 await self._ensure_megatron_running(megatron_topology=megatron_topology)

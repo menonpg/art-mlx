@@ -506,12 +506,10 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
     compiled_flex_attention._FORCED_FLEX_BACKEND = patched_backend  # type: ignore[invalid-assignment]
     compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS = patched_kernel_options
     compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
-        compiled_flex_attention._forced_flex_attention_dense,
-        options=compiled_flex_attention._COMPILE_OPTIONS,
+        compiled_flex_attention._forced_flex_attention_dense
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        compiled_flex_attention._forced_flex_attention_sparse,
-        options=compiled_flex_attention._COMPILE_OPTIONS,
+        compiled_flex_attention._forced_flex_attention_sparse
     )
     try:
         yield
@@ -563,12 +561,10 @@ def _apply_test_flex_inner_fp32_patch(flex_backend: str | None):
         return attn_out.to(dtype=q.dtype), aux
 
     compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
-        _fp32_inner_call,
-        options=compiled_flex_attention._COMPILE_OPTIONS,
+        _fp32_inner_call
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        _fp32_inner_call,
-        options=compiled_flex_attention._COMPILE_OPTIONS,
+        _fp32_inner_call
     )
     try:
         yield
@@ -649,24 +645,22 @@ def _apply_test_attention_full_fp32_patch(flex_backend: str | None):
         return output, bias
 
     compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
-        _fp32_inner_call,
-        options=compiled_flex_attention._COMPILE_OPTIONS,
+        _fp32_inner_call
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        _fp32_inner_call,
-        options=compiled_flex_attention._COMPILE_OPTIONS,
+        _fp32_inner_call
     )
-    ColumnParallelLinear._forward_impl = _column_forward_impl_fp32  # type: ignore[invalid-assignment]
-    RowParallelLinear._forward_impl = _row_forward_impl_fp32  # type: ignore[invalid-assignment]
-    Attention.forward = _attention_forward_fp32  # type: ignore[method-assign]
+    setattr(ColumnParallelLinear, "_forward_impl", _column_forward_impl_fp32)
+    setattr(RowParallelLinear, "_forward_impl", _row_forward_impl_fp32)
+    setattr(Attention, "forward", _attention_forward_fp32)
     try:
         yield
     finally:
         compiled_flex_attention.dense_compiled_flex_attention = original_dense
         compiled_flex_attention.sparse_compiled_flex_attention = original_sparse
-        ColumnParallelLinear._forward_impl = original_column_forward_impl
-        RowParallelLinear._forward_impl = original_row_forward_impl
-        Attention.forward = original_attention_forward  # type: ignore[method-assign]
+        setattr(ColumnParallelLinear, "_forward_impl", original_column_forward_impl)
+        setattr(RowParallelLinear, "_forward_impl", original_row_forward_impl)
+        setattr(Attention, "forward", original_attention_forward)
 
 
 def _assert_runtime_configuration(

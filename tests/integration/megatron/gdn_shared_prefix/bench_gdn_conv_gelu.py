@@ -26,7 +26,6 @@ from art.megatron.gdn.gdn_shared_prefix import (
 from art.megatron.gdn.operator import (
     _causal_conv1d_fn,
     _causal_conv1d_with_state,
-    _conv_final_from_varlen_qkv,
 )
 from tests.integration.megatron.gdn_shared_prefix.benchmark_gdn import (
     make_qwen35_gdn_pair,
@@ -304,19 +303,28 @@ def _run_correctness(
         for path in paths[1:]:
             candidate = _run_once(gdn, path.fn, inputs)
             metrics = CorrectnessMetrics(
-                output_pct=mean_abs_pct(reference["out"], candidate["out"]),
-                final_pct=mean_abs_pct(reference["final"], candidate["final"]),
-                qkv_grad_pct=mean_abs_pct(reference["qkv_grad"], candidate["qkv_grad"]),
+                output_pct=mean_abs_pct(
+                    _tensor(reference, "out"), _tensor(candidate, "out")
+                ),
+                final_pct=mean_abs_pct(
+                    _tensor(reference, "final"), _tensor(candidate, "final")
+                ),
+                qkv_grad_pct=mean_abs_pct(
+                    _tensor(reference, "qkv_grad"), _tensor(candidate, "qkv_grad")
+                ),
                 conv_initial_grad_pct=mean_abs_pct(
-                    reference["conv_initial_grad"], candidate["conv_initial_grad"]
+                    _tensor(reference, "conv_initial_grad"),
+                    _tensor(candidate, "conv_initial_grad"),
                 ),
                 weight_grad_pct=mean_abs_pct(
-                    reference["weight_grad"], candidate["weight_grad"]
+                    _tensor(reference, "weight_grad"), _tensor(candidate, "weight_grad")
                 ),
                 bias_grad_pct=(
                     None
                     if reference["bias_grad"] is None
-                    else mean_abs_pct(reference["bias_grad"], candidate["bias_grad"])
+                    else mean_abs_pct(
+                        _tensor(reference, "bias_grad"), _tensor(candidate, "bias_grad")
+                    )
                 ),
             )
             if metrics.worst_pct > 0.5:
@@ -538,6 +546,26 @@ def _fused_path(
     )
     assert final is not None
     return out, final
+
+
+def _conv_final_from_varlen_qkv(
+    qkv: Tensor, conv_initial: Tensor, lengths: Tensor
+) -> Tensor:
+    tail_width = int(conv_initial.shape[-1])
+    if tail_width == 0:
+        return conv_initial
+    extended = torch.cat([conv_initial, qkv], dim=-1)
+    starts = lengths.to(device=qkv.device, dtype=torch.long).view(-1, 1, 1)
+    offsets = torch.arange(tail_width, device=qkv.device).view(1, 1, -1)
+    gather_index = (starts + offsets).expand(-1, int(qkv.shape[1]), -1)
+    return extended.gather(dim=-1, index=gather_index)
+
+
+def _tensor(result: dict[str, Tensor | None], key: str) -> Tensor:
+    tensor = result[key]
+    if tensor is None:
+        raise AssertionError(f"missing tensor {key}")
+    return tensor
 
 
 def _time_many(fn: Callable[[], None], warmups: int, iters: int) -> list[float]:

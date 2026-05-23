@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
-from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed import barrier, destroy_process_group, init_process_group
 import torch.multiprocessing as mp
 
 from art.megatron.context_parallel import (
@@ -259,9 +259,9 @@ def _worker(
                 planner_config=_planner_config_from_args(args),
                 attention_token_layout_index=attention_token_layout_index,
             )
-        torch.distributed.barrier()
+        barrier()
         for _ in range(args.iters):
-            torch.distributed.barrier()
+            barrier()
             start = time.perf_counter()
             plan = _build_rank_execution_plan_from_spec(
                 spec,
@@ -272,7 +272,7 @@ def _worker(
                 attention_token_layout_index=attention_token_layout_index,
             )
             plan_times.append((time.perf_counter() - start) * 1000.0)
-            torch.distributed.barrier()
+            barrier()
         if plan is None:
             raise RuntimeError("distributed CP GDN plan was not built")
         plan = move_gdn_rank_execution_plan_to_device(
