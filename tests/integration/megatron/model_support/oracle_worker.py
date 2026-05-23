@@ -21,6 +21,8 @@ from art.megatron.routing_replay import (
 )
 from art.preprocessing.pack import PackedTensors
 
+from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
+from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
 from .oracle_harness import (
     SUPPORTED_SENSITIVITY_MUTATIONS,
@@ -34,8 +36,6 @@ from .oracle_harness import (
     _require_not_none,
     _write_json,
 )
-from .routing_replay_bundle import build_bundle_from_forward_trace_dir
-from .routing_replay_trace import install_moe_routing_trace_hooks
 from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 _TOPOLOGY_ENV_VARS = {

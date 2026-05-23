@@ -3,15 +3,21 @@ from __future__ import annotations
 from collections import defaultdict
 import json
 import logging
+import math
+import os
 from pathlib import Path
+import random
 import re
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from safetensors.torch import load_file, save_file
 import torch
 
 from art.megatron.weights.param_name_canonicalization import canonical_art_param_name
+
+if TYPE_CHECKING:
+    from art.preprocessing.pack import PackedTensors
 
 ROUTER_NAME_TOKEN = ".mlp.router"
 ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v2"
@@ -336,6 +342,148 @@ class MoeRoutingReplayBundle(BaseModel):
         }
         with (base_dir / "manifest.json").open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
+
+
+def build_moe_routing_replay_bundle_from_packed_tensors(
+    *,
+    packed_tensors: PackedTensors,
+    global_grad_accumulation_sequences: int,
+    topology: ParallelTopology | None = None,
+) -> MoeRoutingReplayBundle:
+    routing_replay = packed_tensors.get("moe_routing_replay")
+    if routing_replay is None:
+        raise RuntimeError("Packed tensors do not contain MoE routing replay data")
+    if global_grad_accumulation_sequences <= 0:
+        raise RuntimeError(
+            "global_grad_accumulation_sequences must be positive when building "
+            f"MoE routing replay bundles, got {global_grad_accumulation_sequences}"
+        )
+    expert_indices = routing_replay.expert_indices
+    token_mask = routing_replay.token_mask
+    num_sequences = int(expert_indices.shape[0])
+    sequence_length = int(expert_indices.shape[1])
+    num_layers = int(expert_indices.shape[2])
+    topk = int(expert_indices.shape[3])
+    num_experts = int(routing_replay.num_experts)
+
+    group_ids = packed_tensors["group_ids"]
+    parent_ids = packed_tensors["parent_ids"]
+    non_padding = group_ids != -1
+    next_group_ids = torch.nn.functional.pad(group_ids[:, 1:], (0, 1), value=-1)
+    terminal_completion = (
+        non_padding & (group_ids != parent_ids) & (group_ids != next_group_ids)
+    )
+    unexpected_missing = non_padding & ~token_mask & ~terminal_completion
+    if bool(unexpected_missing.any().item()):
+        raise RuntimeError(
+            "Packed tensors are missing MoE routes outside terminal completion "
+            f"tokens: missing_rows={int(unexpected_missing.sum().item())}"
+        )
+
+    router_keys = [
+        f"chunk_00.layer_{layer_index:04d}.mlp.router"
+        for layer_index in range(num_layers)
+    ]
+    steps: dict[int, StepRoutes] = {}
+    num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    for step_index in range(num_steps):
+        start = step_index * global_grad_accumulation_sequences
+        end = start + global_grad_accumulation_sequences
+        routers: dict[str, StepRouterRoutes] = {}
+        for layer_index, router_key in enumerate(router_keys):
+            calls: dict[int, RouterCallRoute] = {}
+            for offset, sample_index in enumerate(range(start, end)):
+                if sample_index < num_sequences:
+                    route_indices = expert_indices[
+                        sample_index, :, layer_index, :
+                    ].clone()
+                    missing_rows = ~token_mask[sample_index]
+                    if bool(missing_rows.any().item()):
+                        # Megatron Core RouterReplay replays only top-k ids and does
+                        # not consume an expert mask. Rows without vLLM routes are
+                        # allowed only for padding or terminal completion query
+                        # positions, whose next-token logits are not scored.
+                        missing_positions = torch.nonzero(
+                            missing_rows, as_tuple=False
+                        ).flatten()
+                        route_indices[missing_rows] = _synthetic_replay_rows(
+                            row_positions=missing_positions,
+                            num_experts=num_experts,
+                            topk=topk,
+                            dtype=expert_indices.dtype,
+                            seed=(sample_index + 1) * 1_000_003
+                            + (layer_index + 1) * 97_003,
+                        )
+                    calls[offset] = RouterCallRoute(
+                        expert_indices=route_indices,
+                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
+                        num_experts=num_experts,
+                        sample_index=sample_index,
+                    )
+                else:
+                    route_indices = _synthetic_replay_rows(
+                        row_positions=torch.arange(sequence_length),
+                        num_experts=num_experts,
+                        topk=topk,
+                        dtype=expert_indices.dtype,
+                        seed=(step_index + 1) * 1_000_003
+                        + (layer_index + 1) * 97_003
+                        + (offset + 1) * 9_176,
+                    )
+                    calls[offset] = RouterCallRoute(
+                        expert_indices=route_indices,
+                        expert_mask=torch.ones_like(route_indices, dtype=torch.bool),
+                        num_experts=num_experts,
+                        micro_slot=offset,
+                    )
+            routers[router_key] = StepRouterRoutes(calls=calls)
+        steps[step_index] = StepRoutes(
+            routers=routers,
+            global_token_uids=torch.arange(sequence_length, dtype=torch.int64),
+        )
+    return MoeRoutingReplayBundle(
+        topology=topology or parallel_topology_from_env(),
+        num_steps=num_steps,
+        max_topk=topk,
+        router_keys=router_keys,
+        steps=steps,
+    )
+
+
+def parallel_topology_from_env() -> ParallelTopology:
+    tp = _env_int("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", 1)
+    ep = _env_int("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", 1)
+    etp = _env_int(
+        "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
+        _env_int("ART_MEGATRON_EXPERT_TENSOR_MODEL_PARALLEL_SIZE", 1),
+    )
+    cp = _env_int("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", 1)
+    pp = _env_int("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", 1)
+    return ParallelTopology(tp=tp, ep=ep, etp=etp, dp=1, sp=tp > 1, cp=cp, pp=pp)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return default if raw is None or raw == "" else int(raw)
+
+
+def _synthetic_replay_rows(
+    *,
+    row_positions: torch.Tensor,
+    num_experts: int,
+    topk: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    return torch.tensor(
+        [
+            random.Random(seed + (int(position) + 1) * 1_299_709).sample(
+                range(num_experts), topk
+            )
+            for position in row_positions.tolist()
+        ],
+        dtype=dtype,
+    )
 
 
 class LocalTokenIndexer(Protocol):

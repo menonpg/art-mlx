@@ -9,6 +9,7 @@ from typing_extensions import NotRequired, TypedDict, Unpack
 from ..types import Verbosity
 from .moe_routing import (
     MoeRoutingPackStats,
+    PackedMoeRoutingReplay,
     TokenRoute,
     count_route_slot_conflicts,
 )
@@ -26,12 +27,7 @@ class PackedTensors(TypedDict):
     weights: torch.Tensor
     pixel_values: list[torch.Tensor | None]
     image_grid_thw: list[torch.Tensor | None]
-    moe_routing_expert_indices: NotRequired[torch.Tensor]
-    moe_routing_token_mask: NotRequired[torch.Tensor]
-    moe_routing_num_layers: NotRequired[int]
-    moe_routing_topk: NotRequired[int]
-    moe_routing_num_experts: NotRequired[int]
-    moe_routing_pack_stats: NotRequired[MoeRoutingPackStats]
+    moe_routing_replay: NotRequired[PackedMoeRoutingReplay]
 
 
 class DiskPackedTensors(TypedDict):
@@ -216,12 +212,14 @@ def packed_tensors_from_tokenized_results(
             num_experts,
         ) = _tensorize_moe_routes(moe_routes, seq_len)
         moe_routing_pack_stats.packed_tokens = int(route_mask.sum().item())
-        packed_tensors["moe_routing_expert_indices"] = route_tensor
-        packed_tensors["moe_routing_token_mask"] = route_mask
-        packed_tensors["moe_routing_num_layers"] = num_layers
-        packed_tensors["moe_routing_topk"] = topk
-        packed_tensors["moe_routing_num_experts"] = num_experts
-        packed_tensors["moe_routing_pack_stats"] = moe_routing_pack_stats
+        packed_tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
+            expert_indices=route_tensor,
+            token_mask=route_mask,
+            num_layers=num_layers,
+            topk=topk,
+            num_experts=num_experts,
+            pack_stats=moe_routing_pack_stats,
+        )
     return packed_tensors
 
 

@@ -977,7 +977,7 @@ class LocalBackend(Backend):
                     "enable_expert_replay requires explicit "
                     "TrainConfig.grad_accumulation_sequences"
                 )
-            from ..megatron.routing_replay_pack import (
+            from ..megatron.routing_replay import (
                 build_moe_routing_replay_bundle_from_packed_tensors,
             )
 
@@ -991,8 +991,9 @@ class LocalBackend(Backend):
             ).to_dir(routing_replay_dir)
             service_dev_config["moe_routing_replay_path"] = routing_replay_dir
             service_dev_config["moe_routing_replay_strict"] = True
-            stats = packed_tensors.get("moe_routing_pack_stats")
-            if stats is not None:
+            routing_replay = packed_tensors.get("moe_routing_replay")
+            if routing_replay is not None:
+                stats = routing_replay.pack_stats
                 base_metrics.update(
                     {
                         "data/moe_routing_packed_tokens": float(stats.packed_tokens),

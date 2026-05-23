@@ -6,7 +6,7 @@ from typing import Any, cast
 from openai.types.chat.chat_completion import Choice
 import pytest
 
-from art.megatron.routing_replay_pack import (
+from art.megatron.routing_replay import (
     build_moe_routing_replay_bundle_from_packed_tensors,
 )
 from art.preprocessing.moe_routing import (
@@ -162,7 +162,8 @@ def test_pack_carries_routes_through_shared_prefix_splicing() -> None:
     )
 
     assert packed["tokens"].tolist()[0][:6] == [10, 11, 20, 21, 22, 23]
-    assert packed["moe_routing_expert_indices"].tolist()[0][:6] == [
+    routing_replay = packed["moe_routing_replay"]
+    assert routing_replay.expert_indices.tolist()[0][:6] == [
         _route(0),
         _route(10),
         _route(20),
@@ -170,7 +171,7 @@ def test_pack_carries_routes_through_shared_prefix_splicing() -> None:
         _route(40),
         _route(50),
     ]
-    stats = packed["moe_routing_pack_stats"]
+    stats = routing_replay.pack_stats
     assert stats.shared_prefix_rows == 2
     assert stats.shared_prefix_conflict_rows == 1
     assert stats.shared_prefix_conflict_slots == 4
@@ -198,4 +199,5 @@ def test_build_replay_bundle_uses_packed_sequence_sample_calls() -> None:
 
     route = bundle.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
     assert route.sample_index == 0
-    assert route.expert_indices.tolist() == [[0, 1], [10, 11], [20, 21], [0, 0]]
+    assert route.expert_indices.tolist()[:3] == [[0, 1], [10, 11], [20, 21]]
+    assert len(set(route.expert_indices.tolist()[3])) == 2

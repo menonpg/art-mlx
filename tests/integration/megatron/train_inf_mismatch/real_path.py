@@ -591,7 +591,7 @@ async def run_real_path_train_inf_mismatch(
     artifact_dir: Path,
 ) -> RealPathTrainInfReport:
     import art
-    from art.megatron.routing_replay_pack import (
+    from art.megatron.routing_replay import (
         build_moe_routing_replay_bundle_from_packed_tensors,
     )
     from art.megatron.runtime.backend import MegatronBackend
@@ -669,7 +669,8 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir / "real_path_disk_packed_tensors.json",
             cast(dict[str, Any], disk_packed_tensors),
         )
-        stats = packed_tensors["moe_routing_pack_stats"]
+        routing_replay = packed_tensors["moe_routing_replay"]
+        stats = routing_replay.pack_stats
 
         vllm_lora = _vllm_scores_from_real_choices(
             trajectory_groups=trajectory_groups,

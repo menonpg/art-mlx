@@ -247,6 +247,7 @@ class TrainerNcclCommunicator:
         rank: int,
         world_size: int,
         device: int | torch.device,
+        nccl_so_path: str | None = None,
     ) -> None:
         bootstrap_group = _BootstrapGroup(
             host=host,
@@ -260,7 +261,7 @@ class TrainerNcclCommunicator:
         self.device = (
             torch.device(f"cuda:{device}") if isinstance(device, int) else device
         )
-        self._nccl = _NcclLibrary()
+        self._nccl = _NcclLibrary(nccl_so_path)
         unique_id_bytes = (
             _nccl_unique_id_to_bytes(self._nccl.get_unique_id()) if rank == 0 else None
         )
@@ -331,6 +332,7 @@ def trainer_init(init_info: dict[str, object]) -> TrainerNcclCommunicator:
         rank=0,
         world_size=int(cast(Any, init_info["world_size"])),
         device=torch.cuda.current_device(),
+        nccl_so_path=cast(str | None, init_info.get("nccl_so_path")),
     )
 
 

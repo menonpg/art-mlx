@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from openai.types.chat.chat_completion import Choice
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, model_validator
 
 ART_MOE_ROUTING_METADATA_KEY = "art_moe_routing"
 
@@ -45,6 +45,50 @@ class MoeRoutingPackStats(BaseModel):
         self.shared_prefix_conflict_rows += stats.overlap_conflict_rows
         self.shared_prefix_conflict_slots += stats.overlap_conflict_slots
         self.shared_prefix_compared_slots += stats.overlap_compared_slots
+
+
+class PackedMoeRoutingReplay(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    expert_indices: Any
+    token_mask: Any
+    num_layers: int
+    topk: int
+    num_experts: int
+    pack_stats: MoeRoutingPackStats
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PackedMoeRoutingReplay":
+        if self.expert_indices.ndim != 4:
+            raise RuntimeError(
+                "expert_indices must have shape "
+                "[num_sequences, sequence_length, num_layers, topk], got "
+                f"{tuple(self.expert_indices.shape)}"
+            )
+        if self.token_mask.shape != self.expert_indices.shape[:2]:
+            raise RuntimeError(
+                "token_mask shape must match packed route tokens, got "
+                f"{tuple(self.token_mask.shape)} vs "
+                f"{tuple(self.expert_indices.shape[:2])}"
+            )
+        if self.num_layers != int(self.expert_indices.shape[2]):
+            raise RuntimeError(
+                f"num_layers={self.num_layers} does not match "
+                f"expert_indices.shape[2]={self.expert_indices.shape[2]}"
+            )
+        if self.topk != int(self.expert_indices.shape[3]):
+            raise RuntimeError(
+                f"topk={self.topk} does not match "
+                f"expert_indices.shape[3]={self.expert_indices.shape[3]}"
+            )
+        if self.num_experts <= 0:
+            raise RuntimeError(f"num_experts must be >0, got {self.num_experts}")
+        if self.topk > self.num_experts:
+            raise RuntimeError(
+                f"MoE routing topk cannot exceed num_experts: topk={self.topk}, "
+                f"num_experts={self.num_experts}"
+            )
+        return self
 
 
 def attach_moe_routing_metadata_to_choice(
