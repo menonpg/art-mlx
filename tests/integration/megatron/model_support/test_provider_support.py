@@ -453,3 +453,40 @@ def test_get_provider_bundle_honors_expert_parallel_env_overrides(
     assert resolved.expert_model_parallel_size == 1
     assert resolved.expert_tensor_parallel_size == 2
     assert resolved.sequence_parallel is True
+
+
+def test_ep_overlap_recompute_contract_disables_full_recompute() -> None:
+    provider = _FakeProvider()
+    provider.overlap_moe_expert_parallel_comm = True
+    provider.moe_shared_expert_overlap = True
+    provider.recompute_granularity = "full"
+    provider.recompute_method = "uniform"
+    provider.recompute_num_layers = 1
+
+    provider_module._enforce_ep_overlap_recompute_contract(cast(Any, provider))
+
+    assert provider.moe_shared_expert_overlap is False
+    assert provider.recompute_granularity is None
+    assert provider.recompute_method is None
+    assert provider.recompute_num_layers is None
+
+
+def test_finalize_provider_bundle_can_disable_flex_dispatcher_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.expert_model_parallel_size = 2
+    provider.expert_tensor_parallel_size = 1
+    dispatcher_calls: list[str] = []
+    monkeypatch.setenv("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "disabled")
+    monkeypatch.setattr(
+        provider_module,
+        "apply_flex_dispatcher_backend",
+        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
+            cast(str, moe_flex_dispatcher_backend)
+        ),
+    )
+
+    provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
+
+    assert dispatcher_calls == []
