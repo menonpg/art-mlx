@@ -203,7 +203,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
             patch_standard_attention_specs,
             transformer_block_spec_factory,
         ) = _require_qwen35_provider_symbols()
-        from art.megatron.provider_common import patch_art_flex_attention
+        from art.megatron.provider import patch_art_flex_attention
 
         matched_provider_type = next(
             provider_type

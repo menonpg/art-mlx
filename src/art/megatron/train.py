@@ -47,8 +47,11 @@ from art.megatron.context_parallel.types import (
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
-from art.megatron.provider import finalize_provider_bundle, prepare_provider_bundle
-from art.megatron.provider_common import ProviderBundle
+from art.megatron.provider import (
+    ProviderBundle,
+    finalize_provider_bundle,
+    prepare_provider_bundle,
+)
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,

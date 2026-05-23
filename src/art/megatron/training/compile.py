@@ -7,7 +7,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
 from art.megatron.compile_workarounds import install_torch_compile_workarounds
-from art.megatron.provider_common import ProviderBundle
+from art.megatron.provider import ProviderBundle
 from art.megatron.training.model_chunks import ModelChunks
 
 

@@ -1,9 +1,9 @@
 from mp_actors import move_to_child_process
 
-from ...local.backend import LocalBackend
-from ...local.service import ModelService
-from ...model import TrainableModel
-from ...utils.output_dirs import get_model_dir
+from ..local.backend import LocalBackend
+from ..local.service import ModelService
+from ..model import TrainableModel
+from ..utils.output_dirs import get_model_dir
 
 
 class MegatronBackend(LocalBackend):
@@ -19,8 +19,8 @@ class MegatronBackend(LocalBackend):
         self._supports_result_packing = True
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
-        from ...dev.get_model_config import get_model_config
-        from ..service import MegatronService
+        from ..dev.get_model_config import get_model_config
+        from .service import MegatronService
 
         if model.name not in self._services:
             config = get_model_config(

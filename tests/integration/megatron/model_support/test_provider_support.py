@@ -9,7 +9,6 @@ pytest.importorskip("megatron.bridge")
 
 from megatron.core.transformer.enums import AttnBackend
 
-from art.megatron import provider_common
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
 from art.megatron.flex_attn.attention import FlexDotProductAttention
 from art.megatron.model_support.registry import UnsupportedModelArchitectureError
@@ -392,9 +391,9 @@ def test_art_flex_patch_uses_runtime_context_parallel_state(
 ) -> None:
     layer_spec = _FakeProvider()._base_layer_spec(SimpleNamespace())
     config = SimpleNamespace(context_parallel_size=1)
-    monkeypatch.setattr(provider_common, "_runtime_context_parallel_size", lambda: 2)
+    monkeypatch.setattr(provider_module, "_runtime_context_parallel_size", lambda: 2)
 
-    provider_common.patch_art_flex_attention(layer_spec, config)
+    provider_module.patch_art_flex_attention(layer_spec, config)
 
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention

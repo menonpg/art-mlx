@@ -17,12 +17,12 @@ import torch
 import art
 from art import dev
 from art.local import LocalBackend
+from art.megatron.backend import MegatronBackend
 from art.megatron.model_support.registry import (
     get_model_support_spec,
     model_uses_expert_parallel,
 )
 from art.megatron.model_support.spec import RolloutWeightsMode
-from art.megatron.runtime.backend import MegatronBackend
 
 from ..model_support.oracle_harness import Topology, oracle_topology
 from ..model_support.oracle_worker import provider_topology_env

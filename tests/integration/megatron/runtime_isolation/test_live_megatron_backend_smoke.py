@@ -11,7 +11,7 @@ import pytest
 
 import art
 from art import dev
-from art.megatron.runtime.backend import MegatronBackend
+from art.megatron.backend import MegatronBackend
 from art.megatron.service import MegatronService
 
 from ..model_support.oracle_harness import ORACLE_TOPOLOGY, Topology
