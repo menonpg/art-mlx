@@ -1372,7 +1372,8 @@ class ForwardTraceCapture:
         merged_call: dict[str, Any] = {}
         keys = sorted(set().union(*(entry.keys() for entry in rank_call_entries)))
         for key in keys:
-            values = [entry[key] for entry in rank_call_entries if key in entry]
+            value_entries = [entry for entry in rank_call_entries if key in entry]
+            values = [entry[key] for entry in value_entries]
             if key == "rank_meta":
                 merged_call[key] = values
                 continue
@@ -1380,7 +1381,7 @@ class ForwardTraceCapture:
                 primary_hint = next(
                     (
                         cls._primary_output_merge_hint(entry)
-                        for entry in rank_call_entries
+                        for entry in value_entries
                         if cls._primary_output_merge_hint(entry) is not None
                     ),
                     None,
@@ -1397,7 +1398,7 @@ class ForwardTraceCapture:
                 expert_merged = cls._merge_expert_tensor_parallel_values(
                     module_name=module_name,
                     key=key,
-                    rank_call_entries=rank_call_entries,
+                    rank_call_entries=value_entries,
                     preferred_cat_dim=preferred_cat_dim,
                     preferred_reduce=preferred_reduce,
                 )
@@ -1406,7 +1407,7 @@ class ForwardTraceCapture:
                     if expert_merged is not None
                     else cls._merge_row_token_uids(
                         values_by_rank=values,
-                        rank_call_entries=rank_call_entries,
+                        rank_call_entries=value_entries,
                     )
                 )
                 continue
@@ -1415,7 +1416,7 @@ class ForwardTraceCapture:
             if values and key not in {"merge_hints", "call_index", "module_type"}:
                 hint_values = [
                     cast(dict[str, Any], entry["merge_hints"]).get(key)
-                    for entry in rank_call_entries
+                    for entry in value_entries
                     if isinstance(entry.get("merge_hints"), dict)
                 ]
                 op_hints = [
@@ -1443,7 +1444,7 @@ class ForwardTraceCapture:
             expert_merged = cls._merge_expert_tensor_parallel_values(
                 module_name=module_name,
                 key=key,
-                rank_call_entries=rank_call_entries,
+                rank_call_entries=value_entries,
                 preferred_cat_dim=preferred_cat_dim,
                 preferred_reduce=preferred_reduce,
             )
@@ -1452,7 +1453,7 @@ class ForwardTraceCapture:
                 if expert_merged is not None
                 else cls._merge_rank_values_with_cp_groups(
                     values_by_rank=values,
-                    rank_call_entries=rank_call_entries,
+                    rank_call_entries=value_entries,
                     preferred_cat_dim=preferred_cat_dim,
                     preferred_reduce=preferred_reduce,
                 )

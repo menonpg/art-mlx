@@ -1755,12 +1755,16 @@ def _project_empty_gdn_inputs(
         seq_len *= int(getattr(gdn, "sp_size", 1))
     value_heads = _local_value_heads(gdn)
     qkv_width = (gdn.qk_dim * 2 + gdn.v_dim) // gdn.tp_size
-    qkv = hidden_states.new_zeros((batch_size, seq_len, qkv_width))
-    gate = hidden_states.new_zeros(
-        (batch_size, seq_len, value_heads, gdn.value_head_dim)
+    dependency = hidden_states.sum() * 0
+    qkv = hidden_states.new_zeros((batch_size, seq_len, qkv_width)) + dependency
+    gate = (
+        hidden_states.new_zeros((batch_size, seq_len, value_heads, gdn.value_head_dim))
+        + dependency
     )
-    beta = hidden_states.new_zeros((batch_size, seq_len, value_heads))
-    recurrent_g = hidden_states.new_zeros((batch_size, seq_len, value_heads))
+    beta = hidden_states.new_zeros((batch_size, seq_len, value_heads)) + dependency
+    recurrent_g = (
+        hidden_states.new_zeros((batch_size, seq_len, value_heads)) + dependency
+    )
     return (
         qkv.contiguous(),
         gate.contiguous(),
