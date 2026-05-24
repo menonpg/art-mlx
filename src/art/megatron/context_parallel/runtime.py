@@ -74,12 +74,29 @@ def _cache_put(cache: dict[Any, Any], key: Any, value: Any) -> None:
 
 
 def _metadata_tensor_digest(tensor: torch.Tensor) -> str:
+    """Digest planning metadata without touching CUDA in the normal path.
+
+    CP lookahead depends on this function receiving CPU metadata. CUDA input is
+    still accepted for compatibility, but the device-to-host copy below will
+    synchronize and break host-ahead overlap with the previous microbatch's GPU
+    work.
+    """
     cpu_tensor = tensor.detach().to(device="cpu").contiguous()
     digest = hashlib.sha1()
     digest.update(str(tuple(cpu_tensor.shape)).encode("utf-8"))
     digest.update(str(cpu_tensor.dtype).encode("utf-8"))
     digest.update(cpu_tensor.numpy().tobytes())
     return digest.hexdigest()
+
+
+def _planning_metadata_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Return metadata on CPU for the no-sync CP planning boundary.
+
+    Production lookahead callers should pass CPU tensors, making this a cheap
+    detach/contiguous operation. CUDA input is a compatibility fallback and
+    necessarily synchronizes.
+    """
+    return tensor.detach().to(device="cpu").contiguous()
 
 
 def _planning_bundle_cache_key(
@@ -2125,7 +2142,16 @@ def prepare_cp_micro(
     build_gdn_execution_spec: bool = False,
     debug_token_uids: bool = False,
     prepare_execution_state: bool = True,
+    target_device: torch.device | None = None,
 ) -> PreparedMegatronBatch:
+    """Prepare one CP microbatch with a CPU-only planning phase.
+
+    The intended overlap contract is: build the shared-prefix/runtime plan from
+    CPU metadata, then materialize local tensors and BlockMasks on
+    `target_device`. Passing CUDA `group_ids` or `parent_ids` still works for
+    older direct callers, but it reintroduces D2H syncs and invalidates the
+    host-ahead/device-behind lookahead assumption.
+    """
     total_start = time.perf_counter()
     state, rank_plan, spec, pad_multiple = prepare_megatron_context_parallel_state(
         micro=micro,
@@ -2134,6 +2160,7 @@ def prepare_cp_micro(
         cp_group=cp_group,
         cp_rank=cp_rank,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        target_device=target_device,
     )
     dispatch_start = time.perf_counter()
     tensors = dispatch_megatron_context_parallel_training_tensors(
@@ -2142,6 +2169,7 @@ def prepare_cp_micro(
         spec=spec,
         pad_multiple=pad_multiple,
         debug_token_uids=debug_token_uids,
+        target_device=target_device,
     )
     dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
     if tensors.token_uids is not None:
@@ -2179,7 +2207,15 @@ def prepare_megatron_context_parallel_state(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    target_device: torch.device | None = None,
 ) -> tuple[ArtContextParallelState, RankRuntimePlan, PackedBatchAttentionSpec, int]:
+    """Build CP runtime state from CPU metadata.
+
+    This is the portion of CP prepare that must stay free of CUDA reads so the
+    training loop can run it after enqueueing backward for the previous
+    microbatch. If device metadata reaches this function, scalar reads,
+    cache-key hashing, and shared-prefix parsing can block the host on GPU work.
+    """
     plan_start = time.perf_counter()
     if int(topology.cp) <= 1:
         raise RuntimeError(
@@ -2195,10 +2231,12 @@ def prepare_megatron_context_parallel_state(
             "ART context parallel currently supports exactly one packed sequence at a time, "
             f"got batch={int(micro['group_ids'].shape[0])}."
         )
+    group_ids_cpu = _planning_metadata_cpu(micro["group_ids"])
+    parent_ids_cpu = _planning_metadata_cpu(micro["parent_ids"])
     runtime_config = _config_for_runtime_cp(topology=topology, config=config)
     planning_key = _planning_bundle_cache_key(
-        group_ids=micro["group_ids"],
-        parent_ids=micro["parent_ids"],
+        group_ids=group_ids_cpu,
+        parent_ids=parent_ids_cpu,
         topology=topology,
         config=runtime_config,
         original_seq_len=int(micro["tokens"].shape[1]),
@@ -2208,8 +2246,8 @@ def prepare_megatron_context_parallel_state(
     plan_cache_hit = bundle is not None
     if bundle is None:
         spec = build_shared_prefix_attention_spec(
-            group_ids=micro["group_ids"],
-            parent_ids=micro["parent_ids"],
+            group_ids=group_ids_cpu,
+            parent_ids=parent_ids_cpu,
         )
         runtime_key = make_runtime_key(spec, topology=topology, config=runtime_config)
         runtime_plan = get_or_build_runtime_plan(
@@ -2226,8 +2264,8 @@ def prepare_megatron_context_parallel_state(
             )
 
             gdn_execution_spec = parse_gdn_shared_prefix_segments(
-                micro["group_ids"],
-                micro["parent_ids"],
+                group_ids_cpu,
+                parent_ids_cpu,
                 min_completions_per_family=0,
             )
         bundle = _PlanningBundle(
@@ -2243,9 +2281,12 @@ def prepare_megatron_context_parallel_state(
     if build_gdn_execution_spec:
         if bundle.gdn_execution_spec is None:
             raise RuntimeError("GDN CP planning requires a parsed execution spec")
+        gdn_plan_device = (
+            target_device if target_device is not None else micro["tokens"].device
+        )
         rank_gdn_key = _rank_plan_cache_key(
             planning_key=planning_key,
-            device=micro["tokens"].device,
+            device=gdn_plan_device,
             cp_rank=int(cp_rank),
         )
         gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
@@ -2257,7 +2298,7 @@ def prepare_megatron_context_parallel_state(
 
             gdn_execution_plan = build_gdn_rank_execution_plan(
                 bundle.gdn_execution_spec,
-                device=micro["tokens"].device,
+                device=gdn_plan_device,
                 cp_rank=int(cp_rank),
                 cp_size=int(topology.cp),
                 attention_token_layout_index=rank_plan.token_layout_index,
@@ -2275,8 +2316,8 @@ def prepare_megatron_context_parallel_state(
         rank_plan=rank_plan,
         cp_group=cp_group,
         config=runtime_config,
-        group_ids=micro["group_ids"][0].contiguous(),
-        parent_ids=micro["parent_ids"][0].contiguous(),
+        group_ids=group_ids_cpu[0].contiguous(),
+        parent_ids=parent_ids_cpu[0].contiguous(),
         gdn_execution_spec=bundle.gdn_execution_spec,
         gdn_execution_plan=gdn_execution_plan,
         planner_provenance=planner_provenance,
@@ -2295,7 +2336,14 @@ def dispatch_megatron_context_parallel_training_tensors(
     spec: PackedBatchAttentionSpec,
     pad_multiple: int,
     debug_token_uids: bool = False,
+    target_device: torch.device | None = None,
 ) -> DispatchedPackedTensors:
+    """Gather this rank's training tensors and optionally move them to device.
+
+    Dispatch may enqueue H2D copies when `target_device` is CUDA, but it must
+    not read CUDA metadata back to host. Padding control flow is therefore
+    derived from rank-plan shape metadata, not from scalar CUDA tensor reads.
+    """
     dispatch_meta_cache: dict[
         tuple[tuple[tuple[int, int], ...], int, str, int | None],
         tuple[torch.Tensor, torch.Tensor],
@@ -2375,15 +2423,17 @@ def dispatch_megatron_context_parallel_training_tensors(
         )
     )
     return DispatchedPackedTensors(
-        tokens=local_tokens,
-        labels=local_labels,
-        input_pos=local_input_pos,
-        assistant_mask=local_assistant_mask,
-        old_logprobs=local_old_logprobs,
-        advantages=local_advantages,
-        weights=local_weights,
+        tokens=_to_target_device(local_tokens, target_device),
+        labels=_to_target_device(local_labels, target_device),
+        input_pos=_to_target_device(local_input_pos, target_device),
+        assistant_mask=_to_target_device(local_assistant_mask, target_device),
+        old_logprobs=_to_target_device(local_old_logprobs, target_device),
+        advantages=_to_target_device(local_advantages, target_device),
+        weights=_to_target_device(local_weights, target_device),
         valid_lengths=rank_plan.local_valid_lengths,
-        token_uids=local_token_uids,
+        token_uids=None
+        if local_token_uids is None
+        else _to_target_device(local_token_uids, target_device),
     )
 
 
@@ -2800,6 +2850,16 @@ def _build_token_uids(
     return tensor
 
 
+def _to_target_device(
+    tensor: torch.Tensor,
+    target_device: torch.device | None,
+) -> torch.Tensor:
+    """Move dispatched local tensors without adding host-side device reads."""
+    if target_device is None or tensor.device == target_device:
+        return tensor
+    return tensor.to(device=target_device, non_blocking=True)
+
+
 def _dispatch_tensor(
     tensor: torch.Tensor,
     *,
@@ -2812,6 +2872,12 @@ def _dispatch_tensor(
     ]
     | None = None,
 ) -> torch.Tensor:
+    """Gather local rows without branching on CUDA tensor values.
+
+    The old `bool(valid_mask.all())` branch synchronized whenever dispatch ran
+    on CUDA. Use the rank plan's Python length metadata to decide whether a pad
+    mask is needed.
+    """
     if tensor.ndim != 2:
         raise RuntimeError(
             f"_dispatch_tensor expected a rank-2 tensor, got shape {tuple(tensor.shape)}"
@@ -2838,7 +2904,7 @@ def _dispatch_tensor(
         dispatch_meta_cache=dispatch_meta_cache,
     )
     output = torch.gather(tensor, dim=1, index=gather_index)
-    if not bool(valid_mask.all()):
+    if int(rank_plan.local_valid_lengths[0]) < max_local_len:
         output = output.masked_fill(~valid_mask, pad_value)
     return output
 

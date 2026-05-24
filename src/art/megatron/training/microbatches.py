@@ -312,7 +312,12 @@ def _prepare_rl_cp_micro_full(
     model_support_handler: Any,
     debug_token_uids: bool,
 ) -> PreparedMegatronBatch:
-    _move_inputs_to_device(micro, device)
+    """Prepare RL CP inputs without moving planning metadata to CUDA first.
+
+    CP lookahead relies on the CPU running this after backward has enqueued GPU
+    work. Moving the full packed micro to CUDA before planning forces later D2H
+    metadata reads and collapses that overlap.
+    """
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
@@ -323,6 +328,7 @@ def _prepare_rl_cp_micro_full(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
         debug_token_uids=debug_token_uids,
+        target_device=device,
     )
 
 
@@ -530,7 +536,16 @@ def _prepare_sft_cp_micro_full(
     model_support_handler: Any,
     debug_token_uids: bool,
 ) -> PreparedMegatronBatch:
-    sparse_micro = _sft_inputs_to_sparse_packed_tensors(micro, device=device)
+    """Prepare SFT CP inputs through the same CPU-planning boundary as RL CP.
+
+    The synthetic sparse-packed metadata is constructed on CPU and only the
+    rank-local dispatched tensors are moved to `device`. Constructing it on CUDA
+    would make shared-prefix planning read metadata back from the GPU.
+    """
+    sparse_micro = _sft_inputs_to_sparse_packed_tensors(
+        micro,
+        device=torch.device("cpu"),
+    )
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
@@ -541,6 +556,7 @@ def _prepare_sft_cp_micro_full(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
         debug_token_uids=debug_token_uids,
+        target_device=device,
     )
 
 
