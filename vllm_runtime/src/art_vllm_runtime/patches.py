@@ -242,6 +242,10 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
         original_host_init(self, *args, **kwargs)
         self._art_req_filled_masks: dict[str, np.ndarray] = {}
         self._art_prefix_route_blocks: dict[tuple[Any, ...], np.ndarray] = {}
+        self._art_prefix_route_waiters: dict[
+            tuple[Any, ...], list[tuple[str, int, int]]
+        ] = {}
+        self._art_prefix_route_needs_by_req: dict[str, set[tuple[Any, ...]]] = {}
         self._art_prefix_route_hydrated_tokens = 0
         self._art_prefix_route_cache_misses = 0
         self._art_prefix_route_cache_conflicts = 0
@@ -260,6 +264,15 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     def free_request(self: Any, req_id: str) -> None:
         original_free_request(self, req_id)
         self._art_req_filled_masks.pop(req_id, None)
+        for key in self._art_prefix_route_needs_by_req.pop(req_id, set()):
+            waiters = self._art_prefix_route_waiters.get(key)
+            if waiters is None:
+                continue
+            waiters = [waiter for waiter in waiters if waiter[0] != req_id]
+            if waiters:
+                self._art_prefix_route_waiters[key] = waiters
+            else:
+                self._art_prefix_route_waiters.pop(key, None)
 
     def mark_filled(self: Any, req_id: str, positions: np.ndarray) -> None:
         if positions.size == 0:
@@ -277,6 +290,58 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
             raise RuntimeError(
                 "Routed expert capture is incomplete for request "
                 f"{req_id}: seqlen={seqlen}, first_missing_positions={missing}"
+            )
+
+    def fill_prefix_block(
+        self: Any,
+        req_id: str,
+        start: int,
+        end: int,
+        value: np.ndarray,
+        key: tuple[Any, ...] | None = None,
+    ) -> bool:
+        buf = self.get_or_grow_buffer(req_id, end - 1)
+        mask = self._art_req_filled_masks[req_id]
+        if bool(mask[start:end].all()):
+            if key is not None:
+                needs = self._art_prefix_route_needs_by_req.get(req_id)
+                if needs is not None:
+                    needs.discard(key)
+                    if not needs:
+                        self._art_prefix_route_needs_by_req.pop(req_id, None)
+            return False
+        buf[start:end] = value
+        mask[start:end] = True
+        self.update_filled_len(req_id, end - 1)
+        if key is not None:
+            needs = self._art_prefix_route_needs_by_req.get(req_id)
+            if needs is not None:
+                needs.discard(key)
+                if not needs:
+                    self._art_prefix_route_needs_by_req.pop(req_id, None)
+        return True
+
+    def store_prefix_block(
+        self: Any,
+        key: tuple[Any, ...],
+        value: np.ndarray,
+    ) -> None:
+        existing = self._art_prefix_route_blocks.get(key)
+        if existing is None:
+            existing = value.copy()
+            self._art_prefix_route_blocks[key] = existing
+        elif not np.array_equal(existing, value):
+            self._art_prefix_route_cache_conflicts += 1
+        hydrated = 0
+        for req_id, start, end in self._art_prefix_route_waiters.pop(key, []):
+            if self._art_fill_prefix_block(req_id, start, end, existing, key):
+                hydrated += end - start
+        if hydrated:
+            self._art_prefix_route_hydrated_tokens += hydrated
+            logger.info(
+                "Hydrated %s routed-expert prefix-cache tokens from materialized "
+                "route block",
+                hydrated,
             )
 
     def store_prefix_blocks(
@@ -303,13 +368,9 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
                 continue
             key = _route_block_key(token_ids, end, lora_key)
             value = buf[start:end].copy()
-            existing = self._art_prefix_route_blocks.get(key)
-            if existing is None:
-                self._art_prefix_route_blocks[key] = value
-            elif not np.array_equal(existing, value):
-                self._art_prefix_route_cache_conflicts += 1
+            self._art_store_prefix_block(key, value)
 
-    def hydrate_cached_prefix(
+    def need_cached_prefix(
         self: Any,
         req_id: str,
         token_ids: list[int],
@@ -326,25 +387,40 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
         hydrated = 0
         for end in range(block_size, upper + 1, block_size):
             start = end - block_size
+            mask = self._art_req_filled_masks.get(req_id)
+            if (
+                mask is not None
+                and end <= mask.shape[0]
+                and bool(mask[start:end].all())
+            ):
+                continue
             key = _route_block_key(token_ids, end, lora_key)
             value = self._art_prefix_route_blocks.get(key)
             if value is None:
-                self._art_prefix_route_cache_misses += block_size
+                needs = self._art_prefix_route_needs_by_req.setdefault(req_id, set())
+                if key not in needs:
+                    self._art_prefix_route_waiters.setdefault(key, []).append(
+                        (req_id, start, end)
+                    )
+                    needs.add(key)
+                    self._art_prefix_route_cache_misses += block_size
                 continue
-            buf = self.get_or_grow_buffer(req_id, end - 1)
-            mask = self._art_req_filled_masks[req_id]
-            if bool(mask[start:end].all()):
-                continue
-            buf[start:end] = value
-            mask[start:end] = True
-            self.update_filled_len(req_id, end - 1)
-            hydrated += block_size
+            if self._art_fill_prefix_block(req_id, start, end, value, key):
+                hydrated += block_size
         if hydrated:
             self._art_prefix_route_hydrated_tokens += hydrated
             logger.info(
                 "Hydrated %s routed-expert prefix-cache tokens for request %s",
                 hydrated,
                 req_id,
+            )
+
+    def require_no_unmet_prefix_route_needs(self: Any, req_id: str) -> None:
+        needs = self._art_prefix_route_needs_by_req.get(req_id)
+        if needs:
+            raise RuntimeError(
+                "Routed expert capture is missing materialized prefix-cache "
+                f"route blocks for request {req_id}: unmet_blocks={len(needs)}"
             )
 
     def scatter_to_host(self: Any) -> None:
@@ -371,6 +447,7 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
                     int(pos.max()) + 1,
                 )
             offset += n_tokens
+        self._art_pending_route_metadata = None
 
     def get_routed_experts(
         self: Any,
@@ -382,6 +459,7 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
             filled = self.host_cache.get_filled_len(req_id)
             effective_len = min(filled, seqlen) if seqlen is not None else filled
             if effective_len > 0:
+                self.host_cache._art_require_no_unmet_prefix_route_needs(req_id)
                 self.host_cache._art_require_filled(req_id, effective_len)
         return original_get_routed_experts(self, req_id, seqlen, free_slot)
 
@@ -405,7 +483,7 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
             block_size = _runner_block_size(runner)
             snapshots = _request_snapshots(runner, ordered)
             for req_id, snapshot in snapshots.items():
-                host_cache._art_hydrate_cached_prefix(
+                host_cache._art_need_cached_prefix(
                     req_id,
                     snapshot["token_ids"],
                     snapshot["lora_key"],
@@ -427,8 +505,13 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     host_cls.free_request = free_request  # type: ignore[method-assign]
     host_cls._art_mark_filled = mark_filled  # type: ignore[attr-defined]
     host_cls._art_require_filled = require_filled  # type: ignore[attr-defined]
+    host_cls._art_fill_prefix_block = fill_prefix_block  # type: ignore[attr-defined]
+    host_cls._art_store_prefix_block = store_prefix_block  # type: ignore[attr-defined]
     host_cls._art_store_prefix_blocks = store_prefix_blocks  # type: ignore[attr-defined]
-    host_cls._art_hydrate_cached_prefix = hydrate_cached_prefix  # type: ignore[attr-defined]
+    host_cls._art_need_cached_prefix = need_cached_prefix  # type: ignore[attr-defined]
+    host_cls._art_require_no_unmet_prefix_route_needs = (  # type: ignore[attr-defined]
+        require_no_unmet_prefix_route_needs
+    )
     capturer_cls._scatter_to_host = scatter_to_host  # type: ignore[method-assign]
     capturer_cls.get_routed_experts = get_routed_experts  # type: ignore[method-assign]
     routed_experts_capturer.issue_routing_d2h_copy = issue_routing_d2h_copy
