@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD
 from ..model_support.oracle_harness import (
     FlexBackend,
     LoraConfig,
@@ -26,6 +25,8 @@ from .megatron_attention_oracle_worker import (
 
 ATTN_SENSITIVITY_MUTATION_ENV = "ART_ATTN_SENSITIVITY_MUTATIONS"
 ATTN_TOPOLOGY_INDICES_ENV = "ART_ATTN_TOPOLOGY_INDICES"
+ATTN_BF16_FWD_MEAN_ABS_PCT_THRESHOLD = 3.0
+ATTN_BF16_GRAD_MEAN_ABS_PCT_THRESHOLD = 5.0
 
 ATTN_SENSITIVITY_MUTATIONS = (
     "attn_kv_fetch_pack_on_comm_stream",
@@ -136,15 +137,18 @@ def _selected_attention_topologies() -> list[tuple[int, Topology]]:
 
 
 def _attention_phase_pass_fns() -> dict[str, PhasePassFn]:
-    metric_rule = MetricThresholdRule(
-        limits={"mean_abs_pct": DEFAULT_MEAN_ABS_PCT_THRESHOLD}
+    fwd_rule = MetricThresholdRule(
+        limits={"mean_abs_pct": ATTN_BF16_FWD_MEAN_ABS_PCT_THRESHOLD}
+    )
+    grad_rule = MetricThresholdRule(
+        limits={"mean_abs_pct": ATTN_BF16_GRAD_MEAN_ABS_PCT_THRESHOLD}
     )
     return {
-        "forward": metric_rule,
-        "outputs": metric_rule,
-        "losses": metric_rule,
-        "grads": metric_rule,
-        "deltas": metric_rule,
+        "forward": fwd_rule,
+        "outputs": fwd_rule,
+        "losses": fwd_rule,
+        "grads": grad_rule,
+        "deltas": grad_rule,
     }
 
 
