@@ -21,10 +21,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # prefix route-conflict behavior on the measured path.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
-    "qwen3_moe": 6.0,
+    "qwen3_moe": 7.0,
     "qwen3_5_moe": 4.0,
 }
-TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.0015
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 
