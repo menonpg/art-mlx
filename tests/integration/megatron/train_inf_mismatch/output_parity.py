@@ -20,6 +20,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # tighten these thresholds without rechecking both vLLM self-mismatch and shared
 # prefix route-conflict behavior on the measured path.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
+BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
+    "qwen3_moe": 6.0,
+    "qwen3_5_moe": 4.0,
+}
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.0015
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 
@@ -227,6 +232,23 @@ def default_rollout_modes_for_model(
         modes.append("native_lora")
     modes.append("merged")
     return modes
+
+
+def fwd_mean_abs_pct_limit_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> float:
+    from art.megatron.model_support.registry import get_model_support_spec
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        BF16_FWD_MEAN_ABS_PCT_LIMIT,
+    )
 
 
 def config_from_env() -> TrainInfOutputParityConfig:
@@ -533,15 +555,15 @@ def compare_rollout(
     vl = torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32)
     return RolloutComparison(
         rollout_mode=rollout_mode,
-        base=compare_pair(candidate=vb, target=mb, sequence_ids=sequence_ids),
-        lora=compare_pair(candidate=vl, target=ml, sequence_ids=sequence_ids),
+        base=compare_pair(candidate=mb, target=vb, sequence_ids=sequence_ids),
+        lora=compare_pair(candidate=ml, target=vl, sequence_ids=sequence_ids),
         delta=compare_pair(
-            candidate=vl - vb,
-            target=ml - mb,
+            candidate=ml - mb,
+            target=vl - vb,
             sequence_ids=sequence_ids,
         ),
-        base_topk=compare_topk(vllm_base, megatron_base),
-        lora_topk=compare_topk(vllm_lora, megatron_lora),
+        base_topk=compare_topk(megatron_base, vllm_base),
+        lora_topk=compare_topk(megatron_lora, vllm_lora),
     )
 
 

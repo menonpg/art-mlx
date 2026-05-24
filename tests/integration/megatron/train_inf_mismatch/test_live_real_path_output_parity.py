@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from .real_path import (
-    BF16_FWD_MEAN_ABS_PCT_LIMIT,
     config_from_env,
     run_real_path_train_inf_mismatch,
 )
@@ -42,4 +41,8 @@ async def test_real_path_train_inf_mismatch_live(artifact_dir: Path) -> None:
     assert report.logical_token_count > 0
     assert report.moe_routing_packed_tokens > 0
     assert report.passed, report.model_dump_json(indent=2)
-    assert report.lora.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
+    assert report.lora.mean_abs_pct <= report.mean_abs_pct_limit
+    assert (
+        report.lora_topk.top20_intersection_kl_candidate_to_target
+        <= report.top20_kl_candidate_to_target_limit
+    )

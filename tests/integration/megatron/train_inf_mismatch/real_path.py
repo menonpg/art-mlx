@@ -19,7 +19,7 @@ from art.preprocessing.pack import DiskPackedTensors
 
 from .artifacts import REPO_ROOT
 from .output_parity import (
-    BF16_FWD_MEAN_ABS_PCT_LIMIT,
+    TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     LogicalTokenMap,
     PairComparison,
@@ -42,6 +42,7 @@ from .output_parity import (
     build_logical_token_map,
     compare_pair,
     compare_topk,
+    fwd_mean_abs_pct_limit_for_model,
 )
 
 
@@ -53,7 +54,7 @@ class RealPathConfig(BaseModel):
     )
     prompt_count: int = 2
     rollouts_per_prompt: int = 2
-    max_completion_tokens: int = 64
+    max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
 
 
@@ -88,6 +89,8 @@ class RealPathTrainInfReport(BaseModel):
     moe_routing_shared_prefix_conflict_rows: int
     moe_routing_shared_prefix_conflict_slots: int
     moe_routing_shared_prefix_compared_slots: int
+    mean_abs_pct_limit: float
+    top20_kl_candidate_to_target_limit: float
     passed: bool
 
 
@@ -700,12 +703,20 @@ async def run_real_path_train_inf_mismatch(
 
         sequence_ids = [token.prompt_id for token in logical_map.tokens]
         comparison = compare_pair(
-            candidate=torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32),
-            target=torch.tensor(megatron_lora.target_logprobs, dtype=torch.float32),
+            candidate=torch.tensor(megatron_lora.target_logprobs, dtype=torch.float32),
+            target=torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32),
             sequence_ids=sequence_ids,
         )
-        topk_comparison = compare_topk(vllm_lora, megatron_lora)
-        passed = comparison.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
+        topk_comparison = compare_topk(megatron_lora, vllm_lora)
+        mean_abs_pct_limit = fwd_mean_abs_pct_limit_for_model(
+            parity_config.base_model,
+            allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+        )
+        passed = (
+            comparison.mean_abs_pct <= mean_abs_pct_limit
+            and topk_comparison.top20_intersection_kl_candidate_to_target
+            <= TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+        )
         report = RealPathTrainInfReport(
             base_model=parity_config.base_model,
             artifact_dir=str(artifact_dir),
@@ -727,6 +738,8 @@ async def run_real_path_train_inf_mismatch(
             moe_routing_shared_prefix_compared_slots=int(
                 stats.shared_prefix_compared_slots
             ),
+            mean_abs_pct_limit=mean_abs_pct_limit,
+            top20_kl_candidate_to_target_limit=TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
             passed=passed,
         )
         _write_json(

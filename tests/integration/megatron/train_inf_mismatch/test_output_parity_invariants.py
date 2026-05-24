@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from . import workflow_stage
 from .output_parity import (
+    TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     EngineSide,
     ScoreBundle,
@@ -19,7 +20,9 @@ from .output_parity import (
     compare_rollout,
     compare_topk,
     config_from_env,
+    fwd_mean_abs_pct_limit_for_model,
 )
+from .real_path import RealPathConfig
 
 
 def test_logical_map_flattens_shared_prefix_branches() -> None:
@@ -119,6 +122,16 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
     assert report.delta.mean_abs_pct > 0
 
 
+def test_real_path_default_generates_16_tokens_per_rollout() -> None:
+    assert RealPathConfig().max_completion_tokens == 16
+
+
+def test_architecture_specific_real_path_limits() -> None:
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 6.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 4.0
+    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.0015
+
+
 def test_compare_topk_reports_restricted_intersection_kl() -> None:
     target = ScoreBundle(
         side="megatron",
@@ -215,3 +228,4 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
 
     assert report.passed is True
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
+    assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
