@@ -266,6 +266,9 @@ class ArtContextParallelState(BaseModel):
     gdn_input_layout: str | None = None
     gdn_output_layout: str | None = None
     gdn_attention_original_shape: tuple[int, int, int] | None = None
+    gdn_attention_original_shapes: dict[int, tuple[int, int, int]] = Field(
+        default_factory=dict
+    )
     gdn_attention_token_uids: torch.Tensor | None = None
     gdn_active_module: Any | None = None
     planner_provenance: PlannerProvenance

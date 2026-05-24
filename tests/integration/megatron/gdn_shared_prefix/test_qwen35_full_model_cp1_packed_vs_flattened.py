@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import socket
 from typing import Any
 
@@ -24,6 +24,12 @@ from art.loss import shift_tensor
 from art.megatron.model_support.handlers.qwen3_5 import QWEN3_5_MOE_HANDLER
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 
+from ..model_support.oracle_harness import TEST_DEFAULT_FLEX_BACKEND
+from ..model_support.oracle_worker import (
+    _apply_requested_flex_backend_patch,
+    _apply_test_attention_full_fp32_patch,
+    _apply_test_flex_inner_fp32_patch,
+)
 from .cases import default_phase0_cases
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
@@ -38,6 +44,21 @@ from .real_gdn_oracle import (
     attach_main_grads,
     zero_parameter_grads,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fp32_test_flex_backend() -> Iterator[None]:
+    with ExitStack() as stack:
+        stack.enter_context(
+            _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        stack.enter_context(
+            _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        stack.enter_context(
+            _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        yield
 
 
 @pytest.mark.skipif(

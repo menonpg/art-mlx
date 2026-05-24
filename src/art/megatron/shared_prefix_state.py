@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 from typing import Any
 
+from pydantic import Field
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import create_block_mask
@@ -34,7 +35,11 @@ class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
     gdn_input_layout: str | None = None
     gdn_output_layout: str | None = None
     gdn_attention_original_shape: tuple[int, int, int] | None = None
+    gdn_attention_original_shapes: dict[int, tuple[int, int, int]] = Field(
+        default_factory=dict
+    )
     gdn_attention_token_uids: Tensor | None = None
+    gdn_active_module: Any | None = None
 
 
 _compiled_create_block_mask = torch.compile(create_block_mask, backend="aot_eager")

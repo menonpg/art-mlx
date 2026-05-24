@@ -280,7 +280,14 @@ def _native_gdn_cp_prepared_varlen_worker(
             device=hidden.device,
             dtype=torch.long,
         )
-        local_bucket = _varlen_bucket(local_lengths, device=hidden.device)
+        local_bucket = _varlen_bucket(
+            local_lengths,
+            device=hidden.device,
+            lengths_by_rank_cpu=_varlen_lengths_by_rank_cpu(
+                lengths,
+                cp_size=cp_size,
+            ),
+        )
         local_qkv = _cat_time_slices(qkv_full, local_offsets).requires_grad_(True)
         local_beta = _cat_time_slices(beta_full, local_offsets).requires_grad_(True)
         local_g = _cat_time_slices(recurrent_g_full, local_offsets).requires_grad_(True)
@@ -468,7 +475,10 @@ def _varlen_hidden_and_lengths(cp_size: int) -> tuple[torch.Tensor, torch.Tensor
 
 
 def _varlen_bucket(
-    lengths: torch.Tensor, *, device: torch.device
+    lengths: torch.Tensor,
+    *,
+    device: torch.device,
+    lengths_by_rank_cpu: torch.Tensor | None = None,
 ) -> GdnSegmentBucketPlan:
     max_len = int(lengths.max().item())
     lengths_cpu = lengths.detach().cpu()
@@ -481,7 +491,7 @@ def _varlen_bucket(
         length=max_len,
         lengths=lengths,
         lengths_cpu=lengths_cpu,
-        lengths_by_rank_cpu=None,
+        lengths_by_rank_cpu=lengths_by_rank_cpu,
         real_mask=real_mask,
         cu_seqlens=cu_seqlens_cpu.to(device=device),
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -508,6 +518,23 @@ def _rank_varlen_offsets(
             raise ValueError("test varlen chain unexpectedly produced an empty shard")
         offsets.append((start, end))
     return tuple(offsets)
+
+
+def _varlen_lengths_by_rank_cpu(lengths: torch.Tensor, *, cp_size: int) -> torch.Tensor:
+    return torch.tensor(
+        [
+            [
+                end - start
+                for start, end in _rank_varlen_offsets(
+                    lengths,
+                    rank=rank,
+                    cp_size=cp_size,
+                )
+            ]
+            for rank in range(cp_size)
+        ],
+        dtype=torch.long,
+    )
 
 
 def _cat_time_slices(

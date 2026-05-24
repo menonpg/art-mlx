@@ -152,9 +152,16 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     prev_is_gdn = bool(getattr(self, "_art_gdn_island_prev_is_gdn", False))
     next_is_gdn = bool(getattr(self, "_art_gdn_island_next_is_gdn", False))
     if prev_is_gdn:
-        original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
+        original_shape = _gdn_attention_original_shape_from_tensor(
+            hidden_states
+        ) or _gdn_attention_original_shape_from_state(
+            attention_bias,
+            gdn=getattr(attention_bias, "gdn_active_module", None),
+        )
         if original_shape is not None:
-            setattr(attention_bias, "gdn_attention_original_shape", original_shape)
+            _store_gdn_attention_original_shape(
+                attention_bias, original_shape, gdn=self.self_attention
+            )
         _mark_gdn_layout_active(attention_bias, hidden_states, gdn=self.self_attention)
     else:
         hidden_states = _enter_gdn_island_layout(
@@ -175,9 +182,12 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         setattr(attention_bias, "gdn_input_layout", previous_input_layout)
         setattr(attention_bias, "gdn_output_layout", previous_output_layout)
     if next_is_gdn:
+        original_shape = _gdn_attention_original_shape_from_state(
+            attention_bias, gdn=self.self_attention
+        )
         hidden_out = _attach_gdn_attention_original_shape(
             _layer_output_hidden_states(output),
-            getattr(attention_bias, "gdn_attention_original_shape", None),
+            original_shape,
         )
         _mark_gdn_layout_active(attention_bias, hidden_out, gdn=self.self_attention)
         return _replace_layer_output_hidden_states(output, hidden_out)
@@ -1149,7 +1159,7 @@ def _enter_gdn_island_layout(
         gdn=gdn,
     )
     attention_bias.gdn_hidden_layout = "gdn"
-    attention_bias.gdn_attention_original_shape = original_shape
+    _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
     if gdn is not None:
         attention_bias.gdn_active_module = gdn
     token_uids = _local_layout_token_uids(
@@ -1213,7 +1223,7 @@ def _mark_gdn_layout_active(
         return
     original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
     if original_shape is not None:
-        attention_bias.gdn_attention_original_shape = original_shape
+        _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
     gdn_token_uids = _local_layout_token_uids(
         plan, "gdn", hidden_states=hidden_states, gdn=gdn
     )
@@ -1230,9 +1240,11 @@ def _leave_gdn_island_layout(
 ) -> Tensor:
     plan = _require_gdn_cp_plan(attention_bias)
     gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
-    original_shape = getattr(attention_bias, "gdn_attention_original_shape", None)
+    original_shape = _gdn_attention_original_shape_from_state(attention_bias, gdn=gdn)
     if original_shape is None:
         original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
+        if original_shape is not None:
+            _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
     attention_hidden = gdn_cp_gdn_to_attention_layout(
         gdn_hidden,
         plan,
@@ -1546,15 +1558,88 @@ def _attach_gdn_attention_original_shape(
     return tensor
 
 
+def _store_gdn_attention_original_shape(
+    attention_bias: Any,
+    original_shape: tuple[int, int, int],
+    *,
+    gdn: Any | None,
+) -> tuple[int, int, int]:
+    normalized = (
+        int(original_shape[0]),
+        int(original_shape[1]),
+        int(original_shape[2]),
+    )
+    attention_bias.gdn_attention_original_shape = normalized
+    _gdn_attention_original_shape_cache(attention_bias)[
+        _gdn_attention_original_shape_cache_key(gdn)
+    ] = normalized
+    return normalized
+
+
+def _gdn_attention_original_shape_from_state(
+    attention_bias: Any,
+    *,
+    gdn: Any | None,
+) -> tuple[int, int, int] | None:
+    cache = getattr(attention_bias, "gdn_attention_original_shapes", None)
+    if isinstance(cache, dict):
+        if gdn is not None:
+            original_shape = _normalize_gdn_attention_original_shape(
+                cache.get(_gdn_attention_original_shape_cache_key(gdn))
+            )
+            if original_shape is not None:
+                return original_shape
+        active_gdn = getattr(attention_bias, "gdn_active_module", None)
+        if active_gdn is not None:
+            original_shape = _normalize_gdn_attention_original_shape(
+                cache.get(_gdn_attention_original_shape_cache_key(active_gdn))
+            )
+            if original_shape is not None:
+                return original_shape
+        if gdn is None:
+            original_shape = _normalize_gdn_attention_original_shape(
+                cache.get(_gdn_attention_original_shape_cache_key(None))
+            )
+            if original_shape is not None:
+                return original_shape
+    original_shape = _normalize_gdn_attention_original_shape(
+        getattr(attention_bias, "gdn_attention_original_shape", None)
+    )
+    active_gdn = getattr(attention_bias, "gdn_active_module", None)
+    if original_shape is None or (
+        gdn is not None and active_gdn is not None and active_gdn is not gdn
+    ):
+        return None
+    return original_shape
+
+
+def _gdn_attention_original_shape_cache(
+    attention_bias: Any,
+) -> dict[int, tuple[int, int, int]]:
+    cache = getattr(attention_bias, "gdn_attention_original_shapes", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(attention_bias, "gdn_attention_original_shapes", cache)
+    return cast(dict[int, tuple[int, int, int]], cache)
+
+
+def _gdn_attention_original_shape_cache_key(gdn: Any | None) -> int:
+    return 0 if gdn is None else id(gdn)
+
+
+def _normalize_gdn_attention_original_shape(
+    original_shape: Any,
+) -> tuple[int, int, int] | None:
+    if not isinstance(original_shape, tuple) or len(original_shape) != 3:
+        return None
+    return (int(original_shape[0]), int(original_shape[1]), int(original_shape[2]))
+
+
 def _gdn_attention_original_shape_from_tensor(
     tensor: Tensor,
 ) -> tuple[int, int, int] | None:
     original_shape = getattr(tensor, _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR, None)
-    if original_shape is None:
-        return None
-    if not isinstance(original_shape, tuple) or len(original_shape) != 3:
-        return None
-    return (int(original_shape[0]), int(original_shape[1]), int(original_shape[2]))
+    return _normalize_gdn_attention_original_shape(original_shape)
 
 
 def _set_active_routing_replay_token_uids(token_uids: Tensor | None) -> Tensor | None:
