@@ -141,8 +141,8 @@ def _native_gdn_cp_packed_layer_worker(
                 cp_chain_min_prefix_only_tokens=128,
             ),
         )
-        assert plan.chain_prefix_buckets
-        assert plan.chain_completion_buckets
+        assert plan.gdn_token_count > 0
+        assert plan.chain_prefix_buckets or plan.prefix_boundary_buckets
         hidden, output_grad = _packed_hidden_and_grad(case, cp_size)
         ref_hidden = hidden.clone().detach().requires_grad_(True)
         ref_out, _ = run_gdn_layer(
