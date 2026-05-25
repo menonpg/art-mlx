@@ -9,7 +9,7 @@ import shutil
 import socket
 import time
 from types import TracebackType
-from typing import AsyncIterator, Iterable, Literal, cast
+from typing import Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 logger = logging.getLogger(__name__)
@@ -961,12 +961,11 @@ class LocalBackend(Backend):
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         service_dev_config = cast(dev.TrainConfig, {**dev_config})
+        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
+            service,
+            config,
+        )
         if include_moe_routing:
-            if config.grad_accumulation_sequences is None:
-                raise RuntimeError(
-                    "enable_expert_replay requires explicit "
-                    "TrainConfig.grad_accumulation_sequences"
-                )
             from ..megatron.routing_replay import (
                 build_moe_routing_replay_bundle_from_packed_tensors,
             )
@@ -977,14 +976,11 @@ class LocalBackend(Backend):
             )
             build_moe_routing_replay_bundle_from_packed_tensors(
                 packed_tensors=packed_tensors,
-                global_grad_accumulation_sequences=config.grad_accumulation_sequences,
+                global_grad_accumulation_sequences=grad_accumulation_sequences,
             ).to_dir(routing_replay_dir)
             service_dev_config["moe_routing_replay_path"] = routing_replay_dir
             service_dev_config["moe_routing_replay_strict"] = True
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        grad_accumulation_sequences = max(
-            1, int(config.grad_accumulation_sequences or 1)
-        )
         fallback_gradient_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
         )
@@ -1018,6 +1014,20 @@ class LocalBackend(Backend):
         # Note: Metrics logging is now handled by the frontend (Model.train())
         if verbose:
             print("_train_model complete")
+
+    async def _resolve_grad_accumulation_sequences(
+        self,
+        service: ModelService,
+        config: TrainConfig,
+    ) -> int:
+        resolver = getattr(
+            cast(Any, service),
+            "resolve_global_grad_accumulation_sequences",
+            None,
+        )
+        if callable(resolver):
+            return max(1, int(await resolver(config)))
+        return max(1, int(config.grad_accumulation_sequences or 1))
 
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)

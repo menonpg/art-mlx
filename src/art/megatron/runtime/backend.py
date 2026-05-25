@@ -39,6 +39,7 @@ class MegatronBackend(LocalBackend):
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
+                enable_expert_replay=self._enable_expert_replay,
             )
             if not self._in_process:
                 self._services[model.name] = move_to_child_process(

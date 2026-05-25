@@ -128,6 +128,25 @@ def _subprocess_log_tail(log_path: Path, *, max_lines: int = 40) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _inspect_architecture_for_workflow(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool,
+) -> ArchitectureReport:
+    # Discovery only inspects layer families, so use a minimal topology instead
+    # of inheriting visible GPU count and tripping model-specific TP limits.
+    with _temporary_env(
+        ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE="1",
+        ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE="1",
+        ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE="1",
+    ):
+        return (
+            inspect_architecture(base_model, allow_unvalidated_arch=True)
+            if allow_unvalidated_arch
+            else inspect_architecture(base_model)
+        )
+
+
 @contextmanager
 def _redirect_output(log_path: Path):
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -708,10 +727,9 @@ def build_validation_report(
                 continue
             if stage.name == "architecture_discovery":
                 try:
-                    architecture = (
-                        inspect_architecture(base_model, allow_unvalidated_arch=True)
-                        if allow_unvalidated_arch
-                        else inspect_architecture(base_model)
+                    architecture = _inspect_architecture_for_workflow(
+                        base_model,
+                        allow_unvalidated_arch=allow_unvalidated_arch,
                     )
                     stage.passed = not architecture.unresolved_risks
                     stage.metrics = {
@@ -809,9 +827,10 @@ def assess_minimal_layer_coverage(
     allow_unvalidated_arch: bool = False,
 ) -> MinimalLayerCoverageReport:
     architecture_report = architecture or (
-        inspect_architecture(base_model, allow_unvalidated_arch=True)
-        if allow_unvalidated_arch
-        else inspect_architecture(base_model)
+        _inspect_architecture_for_workflow(
+            base_model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
     )
     missing_layer_families = [
         family.key
