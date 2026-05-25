@@ -31,6 +31,10 @@ _ROUTING_EXPERT_KEYS = {
 TokenRoute = list[list[int]]
 
 
+def _has_routing_experts(metadata: dict[str, Any]) -> bool:
+    return any(metadata.get(key) is not None for key in _ROUTING_EXPERT_KEYS)
+
+
 class MoeRoutingAlignmentStats(BaseModel):
     choices_with_routing: int = 0
     routed_tokens: int = 0
@@ -118,7 +122,7 @@ def attach_moe_routing_metadata_to_choice(
                     if key in raw_choice
                 }
             )
-    if not metadata or _ROUTING_EXPERT_KEYS.isdisjoint(metadata):
+    if not metadata or not _has_routing_experts(metadata):
         return
     extra = choice.model_extra
     if extra is None:
@@ -130,11 +134,11 @@ def choice_moe_routing_metadata(choice: Choice) -> dict[str, Any] | None:
     extra = choice.model_extra or {}
     nested = extra.get(ART_MOE_ROUTING_METADATA_KEY)
     if isinstance(nested, dict):
-        if _ROUTING_EXPERT_KEYS.isdisjoint(nested):
+        if not _has_routing_experts(nested):
             return None
         return nested
     top_level = {key: extra[key] for key in _ROUTING_RESPONSE_KEYS if key in extra}
-    if _ROUTING_EXPERT_KEYS.isdisjoint(top_level):
+    if not _has_routing_experts(top_level):
         return None
     return top_level or None
 
