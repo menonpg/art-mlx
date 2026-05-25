@@ -22,6 +22,11 @@ _ROUTING_RESPONSE_KEYS = {
     COMPLETION_ROUTED_EXPERTS_KEY,
     ROUTED_EXPERTS_KEY,
 }
+_ROUTING_EXPERT_KEYS = {
+    PROMPT_ROUTED_EXPERTS_KEY,
+    COMPLETION_ROUTED_EXPERTS_KEY,
+    ROUTED_EXPERTS_KEY,
+}
 
 TokenRoute = list[list[int]]
 
@@ -113,7 +118,7 @@ def attach_moe_routing_metadata_to_choice(
                     if key in raw_choice
                 }
             )
-    if not metadata:
+    if not metadata or _ROUTING_EXPERT_KEYS.isdisjoint(metadata):
         return
     extra = choice.model_extra
     if extra is None:
@@ -125,8 +130,12 @@ def choice_moe_routing_metadata(choice: Choice) -> dict[str, Any] | None:
     extra = choice.model_extra or {}
     nested = extra.get(ART_MOE_ROUTING_METADATA_KEY)
     if isinstance(nested, dict):
+        if _ROUTING_EXPERT_KEYS.isdisjoint(nested):
+            return None
         return nested
     top_level = {key: extra[key] for key in _ROUTING_RESPONSE_KEYS if key in extra}
+    if _ROUTING_EXPERT_KEYS.isdisjoint(top_level):
+        return None
     return top_level or None
 
 
