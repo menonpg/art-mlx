@@ -563,6 +563,7 @@ def run_megatron_rl_job(
             optimizer_state_path=job.optimizer_state_path,
         )
     finally:
+        configure_moe_routing_replay(runtime)
         if packed_tensors is not None:
             del packed_tensors
         if adapter_model is not None:
@@ -861,15 +862,8 @@ def finalize_megatron_job(
 
     if job_path is not None and os.path.exists(job_path):
         os.remove(job_path)
-    cleanup_error: str | None = None
     if cleanup_path is not None and os.path.exists(cleanup_path):
-        try:
-            shutil.rmtree(cleanup_path)
-        except OSError as exc:
-            cleanup_error = f"{type(exc).__name__}: {exc}"
-            shutil.rmtree(cleanup_path, ignore_errors=True)
-    if cleanup_error is not None:
-        print0(runtime.rank, "Cleanup warning:", cleanup_error)
+        shutil.rmtree(cleanup_path)
     with open(log_path, "a+", encoding="utf-8") as log_file:
         log_file.write("all done\n")
 
