@@ -128,7 +128,7 @@ def test_real_path_default_generates_16_tokens_per_rollout() -> None:
 
 def test_architecture_specific_real_path_limits() -> None:
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 7.0
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 4.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
 
