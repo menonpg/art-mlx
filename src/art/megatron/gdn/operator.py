@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import os
 from types import MethodType
 from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
@@ -1391,6 +1392,11 @@ def _layout_token_uids(
     return torch.tensor(indices, dtype=torch.int64)
 
 
+def _trace_token_uids_enabled() -> bool:
+    raw = os.environ.get("ART_MEGATRON_ATTACH_TOKEN_UIDS", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _local_layout_token_uids(
     plan: GdnRankExecutionPlan,
     layout: Literal["attention", "gdn"],
@@ -1412,6 +1418,24 @@ def _local_layout_token_uids(
     if start >= int(token_uids.numel()):
         return local_uids
     real_uids = token_uids[start:end]
+    local_uids[: int(real_uids.numel())] = real_uids
+    return local_uids
+
+
+def _replicated_layout_token_uids(
+    plan: GdnRankExecutionPlan,
+    layout: Literal["attention", "gdn"],
+    *,
+    hidden_states: Tensor,
+) -> Tensor:
+    token_uids = _layout_token_uids(plan, layout)
+    token_count = _hidden_token_count(hidden_states)
+    if token_count == int(token_uids.numel()):
+        return token_uids
+    if token_count <= 0:
+        return token_uids.new_empty((0,))
+    local_uids = token_uids.new_full((token_count,), -1)
+    real_uids = token_uids[: min(token_count, int(token_uids.numel()))]
     local_uids[: int(real_uids.numel())] = real_uids
     return local_uids
 
@@ -1544,6 +1568,74 @@ def _set_out_proj_lora_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None
         getattr(getattr(gdn, "out_proj", None), "lora", None),
         token_uids,
     )
+
+
+def _set_out_norm_trace_token_uids(gdn: Any, token_uids: Tensor | None) -> None:
+    if token_uids is None:
+        return
+    _set_module_trace_token_uids(
+        getattr(gdn, "out_norm", None),
+        token_uids.repeat_interleave(_local_value_heads(gdn)),
+    )
+
+
+def _set_out_proj_trace_token_uids(
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    sequence_parallel_output: bool,
+) -> None:
+    token_uids = _trace_token_uids_from_tensor(hidden_states)
+    if token_uids is None:
+        return
+    projection = _gdn_output_projection(gdn)
+    output_uids = _row_parallel_output_token_uids(
+        token_uids,
+        hidden_states,
+        projection,
+        sequence_parallel_output=sequence_parallel_output,
+    )
+    _set_module_trace_token_uids(getattr(gdn, "out_proj", None), output_uids)
+    _set_module_trace_token_uids(projection, output_uids)
+
+
+def _row_parallel_output_token_uids(
+    token_uids: Tensor,
+    hidden_states: Tensor,
+    projection: Any | None,
+    *,
+    sequence_parallel_output: bool,
+) -> Tensor:
+    token_uids = token_uids.to(dtype=torch.int64).reshape(-1)
+    if (
+        projection is None
+        or not _uses_sequence_parallel(projection)
+        or not sequence_parallel_output
+    ):
+        return token_uids
+    token_count = _hidden_token_count(hidden_states)
+    if token_count <= 0:
+        return token_uids.new_empty((0,))
+    if int(token_uids.numel()) != token_count:
+        return token_uids
+    tp_size = _tp_world_size(projection)
+    tp_rank = _tp_rank(projection)
+    rows_per_rank, remainder = divmod(token_count, tp_size)
+    if remainder != 0:
+        return token_uids
+    start = tp_rank * rows_per_rank
+    return token_uids[start : start + rows_per_rank].contiguous()
+
+
+def _pad_trace_token_uids_for_stream(token_uids: Tensor, stream: Tensor) -> Tensor:
+    token_count = _hidden_token_count(stream)
+    if token_count == int(token_uids.numel()):
+        return token_uids
+    padded = token_uids.new_full((token_count,), -1)
+    copied = min(token_count, int(token_uids.numel()))
+    if copied:
+        padded[:copied] = token_uids[:copied]
+    return padded
 
 
 def _attach_gdn_attention_original_shape(
@@ -1898,14 +1990,21 @@ def _project_gdn_output(
     reduce_tensor_parallel_output: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     batch_size, seq_len, _, _ = recurrent_output.shape
+    token_uids = (
+        _replicated_layout_token_uids(plan, "gdn", hidden_states=recurrent_output)
+        if _trace_token_uids_enabled()
+        else None
+    )
     with _nvtx_range("art_gdn_output_norm_gate", recurrent_output):
+        _set_out_norm_trace_token_uids(gdn, token_uids)
         norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
         norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
         norm_out = norm_out.transpose(0, 1).contiguous()
-        _attach_trace_token_uids(
-            norm_out,
-            _local_layout_token_uids(plan, "gdn", hidden_states=norm_out, gdn=gdn),
-        )
+        if token_uids is not None:
+            token_uids = _replicated_layout_token_uids(
+                plan, "gdn", hidden_states=norm_out
+            )
+        _attach_trace_token_uids(norm_out, token_uids)
     with _nvtx_range("art_gdn_out_proj", norm_out):
         out, out_bias = _out_proj(
             gdn,
@@ -1955,10 +2054,21 @@ def _project_cp_gdn_output(
     output_layout: Literal["attention", "gdn"],
 ) -> tuple[Tensor, Tensor | None]:
     batch_size, seq_len, _, _ = recurrent_output.shape
+    token_uids = (
+        _replicated_layout_token_uids(plan, "gdn", hidden_states=recurrent_output)
+        if _trace_token_uids_enabled()
+        else None
+    )
     with _nvtx_range("art_gdn_output_norm_gate", recurrent_output):
+        _set_out_norm_trace_token_uids(gdn, token_uids)
         norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
         norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
         norm_out = norm_out.transpose(0, 1).contiguous()
+        if token_uids is not None:
+            token_uids = _replicated_layout_token_uids(
+                plan, "gdn", hidden_states=norm_out
+            )
+        _attach_trace_token_uids(norm_out, token_uids)
     if output_layout == "attention":
         norm_out = _exchange_cp_sequence_stream(
             norm_out,
@@ -1967,7 +2077,15 @@ def _project_cp_gdn_output(
             source_layout="gdn",
             dest_layout="attention",
         )
+        if token_uids is not None:
+            token_uids = _replicated_layout_token_uids(
+                plan, "attention", hidden_states=norm_out
+            )
+        _attach_trace_token_uids(norm_out, token_uids)
     norm_out = _pad_sequence_parallel_output_stream(gdn, norm_out)
+    if token_uids is not None:
+        token_uids = _pad_trace_token_uids_for_stream(token_uids, norm_out)
+    _attach_trace_token_uids(norm_out, token_uids)
     with _nvtx_range("art_gdn_out_proj", norm_out):
         return _out_proj(gdn, norm_out)
 
@@ -2077,6 +2195,11 @@ def _out_proj(
     reduce_tensor_parallel_output: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     projection = gdn.out_proj
+    _set_out_proj_trace_token_uids(
+        gdn,
+        hidden_states,
+        sequence_parallel_output=sequence_parallel_output,
+    )
     if (
         int(hidden_states.numel()) != 0
         and not force_explicit

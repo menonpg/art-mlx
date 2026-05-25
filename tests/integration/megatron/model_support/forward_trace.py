@@ -922,6 +922,118 @@ class ForwardTraceCapture:
                 "rank_blocked_token_heads expects a 2D [rows, head_dim] tensor, "
                 f"got shape={tuple(tensor.shape)}"
             )
+        tensor = cls._canonicalize_rank_blocked_rows(
+            tensor,
+            local_heads=local_heads,
+            rank_world_size=rank_world_size,
+            call=call,
+        )
+        row_token_uids = call.get("row_token_uids")
+        if (
+            isinstance(row_token_uids, torch.Tensor)
+            and row_token_uids.ndim == 1
+            and int(row_token_uids.numel()) == int(tensor.shape[0])
+        ):
+            call["row_token_uids"] = cls._canonicalize_rank_blocked_rows(
+                row_token_uids,
+                local_heads=local_heads,
+                rank_world_size=rank_world_size,
+                call=call,
+            )
+        return tensor
+
+    @classmethod
+    def _canonicalize_rank_blocked_rows(
+        cls,
+        tensor: torch.Tensor,
+        *,
+        local_heads: int,
+        rank_world_size: int,
+        call: dict[str, Any],
+    ) -> torch.Tensor:
+        rank_meta = call.get("rank_meta")
+        row_splits = call.get("primary_output__row_splits")
+        if (
+            isinstance(rank_meta, list)
+            and isinstance(row_splits, list)
+            and len(rank_meta) == len(row_splits)
+            and sum(int(split) for split in row_splits) == int(tensor.shape[0])
+        ):
+            chunks = list(torch.split(tensor, [int(split) for split in row_splits], 0))
+            grouped_indices: dict[int, list[int]] = {}
+            for index, meta in enumerate(rank_meta):
+                if not isinstance(meta, dict):
+                    return cls._canonicalize_rank_blocked_rows_without_splits(
+                        tensor,
+                        local_heads=local_heads,
+                        rank_world_size=rank_world_size,
+                    )
+                cp_rank = _safe_int(meta.get("cp_rank"), 0)
+                grouped_indices.setdefault(cp_rank, []).append(index)
+            ordered_groups: list[torch.Tensor] = []
+            for cp_rank in sorted(grouped_indices):
+                group_indices = sorted(
+                    grouped_indices[cp_rank],
+                    key=lambda index: _safe_int(
+                        cast(dict[str, Any], rank_meta[index]).get("tp_rank"),
+                        index,
+                    ),
+                )
+                group_chunks = [chunks[index] for index in group_indices]
+                canonical_group = cls._canonicalize_rank_blocked_group_rows(
+                    group_chunks,
+                    local_heads=local_heads,
+                    rank_world_size=rank_world_size,
+                )
+                ordered_groups.append(canonical_group)
+            return torch.cat(ordered_groups, dim=0).contiguous()
+        return cls._canonicalize_rank_blocked_rows_without_splits(
+            tensor,
+            local_heads=local_heads,
+            rank_world_size=rank_world_size,
+        )
+
+    @staticmethod
+    def _canonicalize_rank_blocked_group_rows(
+        chunks: list[torch.Tensor],
+        *,
+        local_heads: int,
+        rank_world_size: int,
+    ) -> torch.Tensor:
+        if len(chunks) != rank_world_size:
+            raise RuntimeError(
+                "rank_blocked_token_heads expected one chunk per tensor-parallel "
+                f"rank, got {len(chunks)} for world_size={rank_world_size}"
+            )
+        rows_per_rank = int(chunks[0].shape[0])
+        if any(int(chunk.shape[0]) != rows_per_rank for chunk in chunks[1:]):
+            raise RuntimeError(
+                "rank_blocked_token_heads CP group rank chunks must have equal rows"
+            )
+        token_count, head_remainder = divmod(rows_per_rank, local_heads)
+        if head_remainder != 0:
+            raise RuntimeError(
+                "rank_blocked_token_heads rows per rank must divide local_heads, got "
+                f"rows_per_rank={rows_per_rank} local_heads={local_heads}"
+            )
+        if rows_per_rank == 0:
+            return torch.cat(chunks, dim=0).contiguous()
+        grouped = torch.cat(chunks, dim=0)
+        tail_shape = tuple(grouped.shape[1:])
+        return (
+            grouped.reshape(rank_world_size, token_count, local_heads, *tail_shape)
+            .permute(1, 0, 2, *range(3, 3 + len(tail_shape)))
+            .reshape(rows_per_rank * rank_world_size, *tail_shape)
+            .contiguous()
+        )
+
+    @staticmethod
+    def _canonicalize_rank_blocked_rows_without_splits(
+        tensor: torch.Tensor,
+        *,
+        local_heads: int,
+        rank_world_size: int,
+    ) -> torch.Tensor:
         rows_per_rank, remainder = divmod(int(tensor.shape[0]), rank_world_size)
         if remainder != 0:
             raise RuntimeError(
@@ -934,9 +1046,10 @@ class ForwardTraceCapture:
                 "rank_blocked_token_heads rows per rank must divide local_heads, got "
                 f"rows_per_rank={rows_per_rank} local_heads={local_heads}"
             )
+        tail_shape = tuple(tensor.shape[1:])
         return (
-            tensor.reshape(rank_world_size, token_count, local_heads, tensor.shape[-1])
-            .permute(1, 0, 2, 3)
+            tensor.reshape(rank_world_size, token_count, local_heads, *tail_shape)
+            .permute(1, 0, 2, *range(3, 3 + len(tail_shape)))
             .reshape(tensor.shape)
             .contiguous()
         )
@@ -1204,8 +1317,15 @@ class ForwardTraceCapture:
                 token_uids = token_uids_by_key.get(key)
                 if token_uids is None:
                     continue
+                existing_uids = call.get("row_token_uids")
+                if (
+                    isinstance(existing_uids, torch.Tensor)
+                    and existing_uids.ndim == 1
+                    and int(existing_uids.numel()) == int(tensor.shape[0])
+                ):
+                    continue
                 if int(token_uids.numel()) == int(tensor.shape[0]):
-                    call.setdefault("row_token_uids", token_uids)
+                    call["row_token_uids"] = token_uids
                     continue
                 head_count = cls._rank_blocked_token_head_count(call)
                 if head_count is not None and int(
@@ -1443,6 +1563,14 @@ class ForwardTraceCapture:
                         primary_hint.get("dim"), int
                     ):
                         preferred_cat_dim = int(primary_hint["dim"])
+                    if primary_hint.get("layout") == "rank_blocked_token_heads":
+                        merged_call[key] = cls._merge_rank_values_with_cp_groups(
+                            values_by_rank=values,
+                            rank_call_entries=value_entries,
+                            preferred_cat_dim=preferred_cat_dim,
+                            preferred_reduce=preferred_reduce,
+                        )
+                        continue
                 expert_merged = cls._merge_expert_tensor_parallel_values(
                     module_name=module_name,
                     key=key,

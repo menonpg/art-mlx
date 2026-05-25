@@ -23,7 +23,6 @@ from .oracle_harness import (
     Topology,
     VariantRunner,
     _default_phase_pass_fns,
-    _is_cp_gdn_layout_local_forward_trace,
     _resolve_test_flex_backend,
     _suite_variants,
     case_config,
@@ -512,6 +511,78 @@ def test_gate_up_rank_interleaved_trace_layout_canonicalizes_dense_tp() -> None:
     assert torch.equal(actual, canonical)
 
 
+def test_forward_trace_canonicalizes_cp_tp_rank_blocked_heads_with_row_uids() -> None:
+    module_name = "chunk0.module.decoder.layers.0.self_attention.out_norm"
+    rank_traces = []
+    rank_specs = [
+        (0, 0, [10, 10, 20, 20], [[100.0], [101.0], [200.0], [201.0]]),
+        (0, 1, [10, 10, 20, 20], [[110.0], [111.0], [210.0], [211.0]]),
+        (1, 0, [5, 5], [[50.0], [51.0]]),
+        (1, 1, [5, 5], [[60.0], [61.0]]),
+    ]
+    for global_rank, (cp_rank, tp_rank, uids, values) in enumerate(rank_specs):
+        rank_traces.append(
+            {
+                module_name: [
+                    {
+                        "micro_call_index": 0,
+                        "micro_order": 0,
+                        "micro_sample_index": 0,
+                        "module_type": "RMSNorm",
+                        "primary_output": torch.tensor(values),
+                        "row_token_uids": torch.tensor(uids),
+                        "merge_hints": {
+                            "primary_output": {
+                                "op": "concat",
+                                "dim": 0,
+                                "layout": "rank_blocked_token_heads",
+                                "local_heads": 2,
+                                "world_size_key": "tp_world_size",
+                            }
+                        },
+                        "rank_meta": {
+                            "global_rank": global_rank,
+                            "world_size": 4,
+                            "tp_rank": tp_rank,
+                            "tp_world_size": 2,
+                            "cp_rank": cp_rank,
+                            "cp_world_size": 2,
+                        },
+                    }
+                ]
+            }
+        )
+
+    merged = ForwardTraceCapture.canonicalize_trace(
+        ForwardTraceCapture._merge_rank_traces(rank_traces)
+    )
+    call = merged[module_name][0]
+
+    assert torch.equal(
+        call["row_token_uids"],
+        torch.tensor([5, 5, 5, 5, 10, 10, 10, 10, 20, 20, 20, 20]),
+    )
+    assert torch.equal(
+        call["primary_output"].flatten(),
+        torch.tensor(
+            [
+                50.0,
+                51.0,
+                60.0,
+                61.0,
+                100.0,
+                101.0,
+                110.0,
+                111.0,
+                200.0,
+                201.0,
+                210.0,
+                211.0,
+            ]
+        ),
+    )
+
+
 def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas() -> (
     None
 ):
@@ -662,21 +733,6 @@ def test_forward_expert_lora_noise_pass_rejects_broad_escape_hatches() -> None:
         [router_not_exact, *_gates(router_exact=False)]
     )
     assert not router_not_exact.pass_signal
-
-
-def test_cp_gdn_layout_local_forward_trace_filter_is_narrow() -> None:
-    assert _is_cp_gdn_layout_local_forward_trace(
-        "chunk0.module.decoder.layers.__layer_avg__.self_attention.out_proj.call_0"
-    )
-    assert _is_cp_gdn_layout_local_forward_trace(
-        "chunk0.module.decoder.layers.__layer_avg__.self_attention.out_norm.call_0"
-    )
-    assert not _is_cp_gdn_layout_local_forward_trace(
-        "chunk0.module.decoder.layers.__layer_avg__.self_attention.in_proj.call_0"
-    )
-    assert not _is_cp_gdn_layout_local_forward_trace(
-        "chunk0.module.decoder.layers.__layer_avg__.self_attention.linear_proj.call_0"
-    )
 
 
 def test_suite_variants_skip_duplicate_oracle_replay_variant() -> None:
