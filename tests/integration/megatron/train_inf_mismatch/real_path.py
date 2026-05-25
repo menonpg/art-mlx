@@ -43,6 +43,7 @@ from .output_parity import (
     compare_pair,
     compare_topk,
     fwd_mean_abs_pct_limit_for_model,
+    model_support_is_moe,
 )
 
 
@@ -240,7 +241,11 @@ def _parse_token_id(raw: str | None) -> int:
     )
 
 
-def _choice_score_index(trajectory_groups: list[Any]) -> dict[tuple[int, ...], Choice]:
+def _choice_score_index(
+    trajectory_groups: list[Any],
+    *,
+    require_routing_metadata: bool,
+) -> dict[tuple[int, ...], Choice]:
     indexed: dict[tuple[int, ...], Choice] = {}
     for group in trajectory_groups:
         for trajectory in group:
@@ -249,7 +254,21 @@ def _choice_score_index(trajectory_groups: list[Any]) -> dict[tuple[int, ...], C
                     continue
                 metadata = choice_moe_routing_metadata(item)
                 if metadata is None:
-                    raise RuntimeError("Real-path trajectory choice is missing routes")
+                    if require_routing_metadata:
+                        raise RuntimeError(
+                            "Real-path trajectory choice is missing routes"
+                        )
+                    token_logprobs = (
+                        item.logprobs.content
+                        if item.logprobs is not None
+                        and item.logprobs.content is not None
+                        else []
+                    )
+                    indexed.setdefault(
+                        tuple(_parse_token_id(entry.token) for entry in token_logprobs),
+                        item,
+                    )
+                    continue
                 prompt_ids = [int(value) for value in metadata["prompt_token_ids"]]
                 completion_ids = [
                     int(value)
@@ -279,12 +298,30 @@ def _vllm_scores_from_real_choices(
     *,
     trajectory_groups: list[Any],
     logical_map: LogicalTokenMap,
+    require_routing_metadata: bool,
 ) -> ScoreBundle:
-    choices_by_tokens = _choice_score_index(trajectory_groups)
+    choices_by_tokens = _choice_score_index(
+        trajectory_groups,
+        require_routing_metadata=require_routing_metadata,
+    )
     prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
+    tokens_by_prompt_id: dict[int, list[Any]] = {}
+    for token in logical_map.tokens:
+        tokens_by_prompt_id.setdefault(token.prompt_id, []).append(token)
     choice_by_prompt_id: dict[int, Choice] = {}
     for prompt in logical_map.prompts:
-        choice = choices_by_tokens.get(tuple(prompt.token_ids))
+        prompt_tokens = tokens_by_prompt_id.get(prompt.prompt_id, [])
+        prompt_len = (
+            min(token.vllm_prompt_token_index for token in prompt_tokens) - 1
+            if prompt_tokens
+            else len(prompt.token_ids)
+        )
+        key = (
+            tuple(prompt.token_ids)
+            if require_routing_metadata
+            else tuple(prompt.token_ids[prompt_len:])
+        )
+        choice = choices_by_tokens.get(key)
         if choice is None:
             raise RuntimeError(
                 "Could not find captured vLLM choice for logical prompt "
@@ -297,8 +334,14 @@ def _vllm_scores_from_real_choices(
         prompt = prompt_by_id[token.prompt_id]
         choice = choice_by_prompt_id[token.prompt_id]
         metadata = choice_moe_routing_metadata(choice)
-        assert metadata is not None
-        prompt_len = len(metadata["prompt_token_ids"])
+        if metadata is None:
+            prompt_tokens = tokens_by_prompt_id.get(prompt.prompt_id, [])
+            prompt_len = (
+                min(candidate.vllm_prompt_token_index for candidate in prompt_tokens)
+                - 1
+            )
+        else:
+            prompt_len = len(metadata["prompt_token_ids"])
         token_logprobs = (
             choice.logprobs.content
             if choice.logprobs is not None and choice.logprobs.content is not None
@@ -601,6 +644,10 @@ async def run_real_path_train_inf_mismatch(
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
+    is_moe = model_support_is_moe(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    )
     _write_json(artifact_dir / "real_path_config.json", config.model_dump(mode="json"))
     adapter_path = _make_nonzero_adapter(
         config=parity_config, artifact_dir=artifact_dir
@@ -610,7 +657,7 @@ async def run_real_path_train_inf_mismatch(
 
     backend = MegatronBackend(
         path=str(artifact_dir / "art_path"),
-        enable_expert_replay=True,
+        enable_expert_replay=is_moe,
     )
     model = art.TrainableModel(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
@@ -623,7 +670,8 @@ async def run_real_path_train_inf_mismatch(
             "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
             "engine_args": {
                 "tensor_parallel_size": len(parity_config.inference_gpu_ids),
-                "enable_expert_parallel": len(parity_config.inference_gpu_ids) > 1,
+                "enable_expert_parallel": is_moe
+                and len(parity_config.inference_gpu_ids) > 1,
                 "max_model_len": parity_config.packed.sequence_length + 8,
                 "max_logprobs": TOP_K,
                 **parity_config.engine_args,
@@ -650,7 +698,7 @@ async def run_real_path_train_inf_mismatch(
             plot_tensors=False,
             packed_sequence_length=parity_config.packed.sequence_length,
             logprob_calculation_chunk_size=1024,
-            include_moe_routing=True,
+            include_moe_routing=is_moe,
         )
         if packed_tensors is None:
             raise RuntimeError("Real ART path produced no packed tensors")
@@ -660,10 +708,13 @@ async def run_real_path_train_inf_mismatch(
 
         routing_replay_dir = artifact_dir / "real_path_moe_routing_replay"
         global_grad_accumulation_sequences = int(packed_tensors["tokens"].shape[0])
-        build_moe_routing_replay_bundle_from_packed_tensors(
-            packed_tensors=packed_tensors,
-            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
-        ).to_dir(routing_replay_dir)
+        routing_replay_path: str | None = None
+        if is_moe:
+            build_moe_routing_replay_bundle_from_packed_tensors(
+                packed_tensors=packed_tensors,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            ).to_dir(routing_replay_dir)
+            routing_replay_path = str(routing_replay_dir)
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors,
             str(artifact_dir / "real_path_packed_tensors"),
@@ -672,12 +723,18 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir / "real_path_disk_packed_tensors.json",
             cast(dict[str, Any], disk_packed_tensors),
         )
-        routing_replay = packed_tensors["moe_routing_replay"]
-        stats = routing_replay.pack_stats
+        if is_moe:
+            routing_replay = packed_tensors["moe_routing_replay"]
+            stats = routing_replay.pack_stats
+        else:
+            from art.preprocessing.moe_routing import MoeRoutingPackStats
+
+            stats = MoeRoutingPackStats()
 
         vllm_lora = _vllm_scores_from_real_choices(
             trajectory_groups=trajectory_groups,
             logical_map=logical_map,
+            require_routing_metadata=is_moe,
         )
         _write_json(
             artifact_dir / "real_path_vllm_lora_scores.json",
@@ -692,7 +749,7 @@ async def run_real_path_train_inf_mismatch(
                 logical_map_path=str(logical_map_path),
                 weight_state="lora",
                 adapter_path=adapter_path,
-                moe_routing_replay_path=str(routing_replay_dir),
+                moe_routing_replay_path=routing_replay_path,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
         )

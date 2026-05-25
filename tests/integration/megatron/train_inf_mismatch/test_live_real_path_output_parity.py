@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from .output_parity import model_support_is_moe
 from .real_path import (
     config_from_env,
     run_real_path_train_inf_mismatch,
@@ -39,7 +40,11 @@ async def test_real_path_train_inf_mismatch_live(artifact_dir: Path) -> None:
 
     assert report.logical_prompt_count > 0
     assert report.logical_token_count > 0
-    assert report.moe_routing_packed_tokens > 0
+    if model_support_is_moe(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    ):
+        assert report.moe_routing_packed_tokens > 0
     assert report.passed, report.model_dump_json(indent=2)
     assert report.lora.mean_abs_pct <= report.mean_abs_pct_limit
     assert (
