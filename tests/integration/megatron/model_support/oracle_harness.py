@@ -88,6 +88,11 @@ NON_FINITE_METRIC_VALUE = 1e30
 ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = DEFAULT_MEAN_ABS_PCT_THRESHOLD
 FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT = 3e-4
 FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
+CP_GDN_LAYOUT_LOCAL_FORWARD_TRACE_TOKENS = (
+    ".self_attention.out_norm.call_",
+    ".self_attention.out_proj.call_",
+    ".self_attention.out_proj.lora.call_",
+)
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
@@ -1118,6 +1123,11 @@ def _is_forward_expert_lora_trace(param: str) -> bool:
     )
 
 
+def _is_cp_gdn_layout_local_forward_trace(param: str) -> bool:
+    """Returns whether a forward trace key names a GDN CP layout-local internal."""
+    return any(token in param for token in CP_GDN_LAYOUT_LOCAL_FORWARD_TRACE_TOKENS)
+
+
 def _stacked_layers(
     pairs: list[tuple[str, Any, Any]],
 ) -> list[tuple[str, Any, Any]]:
@@ -1642,6 +1652,17 @@ class VariantRunner:
         router_ids: bool = False,
     ) -> list[MetricRow]:
         """Builds rows from two keyed tensor maps through a unified compare path."""
+        if phase == "forward" and int(variant.topology.cp) > 1:
+            reference = {
+                key: value
+                for key, value in reference.items()
+                if not _is_cp_gdn_layout_local_forward_trace(key)
+            }
+            candidate = {
+                key: value
+                for key, value in candidate.items()
+                if not _is_cp_gdn_layout_local_forward_trace(key)
+            }
         matching, rows = self._check_matching_keys(
             reference, candidate, variant, step_index, phase
         )

@@ -23,6 +23,7 @@ from .oracle_harness import (
     Topology,
     VariantRunner,
     _default_phase_pass_fns,
+    _is_cp_gdn_layout_local_forward_trace,
     _resolve_test_flex_backend,
     _suite_variants,
     case_config,
@@ -184,6 +185,21 @@ def test_forward_trace_reads_row_uids_from_output_tensor() -> None:
     assert torch.equal(row_uids, torch.tensor([4, 7]))
 
 
+def test_forward_trace_prefers_local_tensor_uids_over_module_fallback() -> None:
+    module = type("ModuleWithGenericTraceUids", (), {})()
+    inputs = torch.zeros((2, 1), dtype=torch.float32)
+    setattr(module, "_art_trace_row_token_uids", torch.tensor([10, 11]))
+    setattr(inputs, "_art_trace_row_token_uids", torch.tensor([4, 7]))
+
+    row_uids, _uid_span = ForwardTraceCapture._row_token_uids_for_trace(
+        inputs=(inputs,),
+        module=module,
+    )
+
+    assert row_uids is not None
+    assert torch.equal(row_uids, torch.tensor([4, 7]))
+
+
 def test_forward_trace_extracts_empty_router_topk_with_config_hint() -> None:
     topk = _extract_router_topk(
         (
@@ -295,6 +311,54 @@ def test_forward_trace_canonicalizes_row_outputs_by_token_uid() -> None:
     assert torch.equal(
         call["output"]["routing_map"],
         torch.tensor([[False], [True], [True]]),
+    )
+
+
+def test_forward_trace_expands_attention_output_uids_for_out_norm_heads() -> None:
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.self_attention": [
+            {
+                "micro_order": 0,
+                "micro_sample_index": 0,
+                "primary_output": torch.zeros((3, 1, 8)),
+                "row_token_uids": torch.tensor([0, -1, 2]),
+            }
+        ],
+        "chunk0.module.decoder.layers.0.self_attention.out_norm": [
+            {
+                "micro_order": 0,
+                "micro_sample_index": 0,
+                "primary_output": torch.arange(24, dtype=torch.float32).reshape(6, 4),
+                "merge_hints": {
+                    "primary_output": {
+                        "op": "concat",
+                        "dim": 0,
+                        "layout": "rank_blocked_token_heads",
+                        "local_heads": 2,
+                        "world_size_key": "tp_world_size",
+                    }
+                },
+                "rank_meta": {"tp_world_size": 1},
+            }
+        ],
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.self_attention.out_norm"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([-1, -1, 0, 0, 2, 2]))
+    assert torch.equal(
+        call["primary_output"],
+        torch.tensor(
+            [
+                [8.0, 9.0, 10.0, 11.0],
+                [12.0, 13.0, 14.0, 15.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [16.0, 17.0, 18.0, 19.0],
+                [20.0, 21.0, 22.0, 23.0],
+            ]
+        ),
     )
 
 
@@ -598,6 +662,21 @@ def test_forward_expert_lora_noise_pass_rejects_broad_escape_hatches() -> None:
         [router_not_exact, *_gates(router_exact=False)]
     )
     assert not router_not_exact.pass_signal
+
+
+def test_cp_gdn_layout_local_forward_trace_filter_is_narrow() -> None:
+    assert _is_cp_gdn_layout_local_forward_trace(
+        "chunk0.module.decoder.layers.__layer_avg__.self_attention.out_proj.call_0"
+    )
+    assert _is_cp_gdn_layout_local_forward_trace(
+        "chunk0.module.decoder.layers.__layer_avg__.self_attention.out_norm.call_0"
+    )
+    assert not _is_cp_gdn_layout_local_forward_trace(
+        "chunk0.module.decoder.layers.__layer_avg__.self_attention.in_proj.call_0"
+    )
+    assert not _is_cp_gdn_layout_local_forward_trace(
+        "chunk0.module.decoder.layers.__layer_avg__.self_attention.linear_proj.call_0"
+    )
 
 
 def test_suite_variants_skip_duplicate_oracle_replay_variant() -> None:

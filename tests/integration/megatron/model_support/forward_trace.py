@@ -6,6 +6,12 @@ from typing import Any, Callable, cast
 
 import torch
 
+from .trace_uids import (
+    expand_token_uids_for_heads,
+    extract_tensor_attr,
+    row_token_uids_from_trace_sources,
+)
+
 CAPTURE_NAME_TOKENS = (
     ".self_attention",
     ".self_attention.in_proj",
@@ -189,22 +195,6 @@ def _materialize_tensor(tensor: torch.Tensor) -> torch.Tensor:
             if isinstance(local_tensor, torch.Tensor):
                 tensor = local_tensor
     return tensor.detach().cpu()
-
-
-def _extract_tensor_attr(value: Any, attr_name: str) -> Any:
-    if isinstance(value, torch.Tensor):
-        return getattr(value, attr_name, None)
-    if isinstance(value, dict):
-        for item in value.values():
-            attr_value = _extract_tensor_attr(item, attr_name)
-            if attr_value is not None:
-                return attr_value
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            attr_value = _extract_tensor_attr(item, attr_name)
-            if attr_value is not None:
-                return attr_value
-    return None
 
 
 def _extract_router_topk(
@@ -654,53 +644,12 @@ class ForwardTraceCapture:
         row_count: int | None = None,
         prefer_uid_span: bool = False,
     ) -> tuple[torch.Tensor | None, int | None]:
-        candidates = (
-            (
-                _extract_tensor_attr(output, "_art_trace_row_token_uids"),
-                _extract_tensor_attr(output, "_art_trace_uid_span"),
-            ),
-            (
-                getattr(module, "_art_trace_row_token_uids", None),
-                getattr(module, "_art_trace_uid_span", None),
-            ),
-            (
-                _extract_tensor_attr(inputs, "_art_trace_row_token_uids"),
-                _extract_tensor_attr(inputs, "_art_trace_uid_span"),
-            ),
-        )
-        row_count_matches: list[tuple[torch.Tensor, Any]] = []
-        tensor_candidates: list[tuple[torch.Tensor, Any]] = []
-        for row_token_uids, uid_span in candidates:
-            if not isinstance(row_token_uids, torch.Tensor):
-                continue
-            tensor_candidates.append((row_token_uids, uid_span))
-            if row_count is None or int(row_token_uids.numel()) == int(row_count):
-                row_count_matches.append((row_token_uids, uid_span))
-        if not tensor_candidates:
-            return None, None
-
-        def _select_candidate(
-            options: list[tuple[torch.Tensor, Any]],
-        ) -> tuple[torch.Tensor, Any] | None:
-            if prefer_uid_span:
-                for row_token_uids, uid_span in options:
-                    if isinstance(uid_span, int) and uid_span > 0:
-                        return row_token_uids, uid_span
-            if options:
-                return options[0]
-            return None
-
-        selected = _select_candidate(row_count_matches) or _select_candidate(
-            tensor_candidates
-        )
-        if selected is None:
-            return None, None
-        selected_uids, selected_span = selected
-        uid_span = selected_span
-        uid_span_int = uid_span if isinstance(uid_span, int) and uid_span > 0 else None
-        return (
-            selected_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
-            uid_span_int,
+        return row_token_uids_from_trace_sources(
+            inputs=inputs,
+            output=output,
+            module=module,
+            row_count=row_count,
+            prefer_uid_span=prefer_uid_span,
         )
 
     @classmethod
@@ -1144,6 +1093,50 @@ class ForwardTraceCapture:
             int(tensor.shape[0]),
         )
 
+    @staticmethod
+    def _decoder_micro_trace_key(
+        module_name: str,
+        call: dict[str, Any],
+    ) -> tuple[str, int, int] | None:
+        module_name = _normalize_trace_module_name(module_name)
+        if ".decoder.layers." not in module_name:
+            return None
+        return (
+            module_name.split(".self_attention", 1)[0].split(".mlp", 1)[0],
+            _safe_int(call.get("micro_sample_index"), -1),
+            _safe_int(call.get("micro_order"), -1),
+        )
+
+    @staticmethod
+    def _is_attention_output_trace(module_name: str) -> bool:
+        module_name = _normalize_trace_module_name(module_name)
+        return module_name.endswith(".self_attention")
+
+    @staticmethod
+    def _rank_blocked_token_head_count(call: dict[str, Any]) -> int | None:
+        primary_hint = ForwardTraceCapture._primary_output_merge_hint(call)
+        if not isinstance(primary_hint, dict):
+            return None
+        if primary_hint.get("layout") != "rank_blocked_token_heads":
+            return None
+        local_heads = primary_hint.get("local_heads")
+        world_size_key = primary_hint.get("world_size_key")
+        if not isinstance(local_heads, int) or local_heads <= 0:
+            return None
+        if not isinstance(world_size_key, str):
+            return None
+        rank_meta = call.get("rank_meta")
+        rank_world_size = None
+        if isinstance(rank_meta, list) and rank_meta:
+            first_meta = rank_meta[0]
+            if isinstance(first_meta, dict):
+                rank_world_size = first_meta.get(world_size_key)
+        elif isinstance(rank_meta, dict):
+            rank_world_size = rank_meta.get(world_size_key)
+        if not isinstance(rank_world_size, int) or rank_world_size <= 0:
+            return None
+        return int(local_heads) * int(rank_world_size)
+
     @classmethod
     def _propagate_decoder_row_token_uids(
         cls,
@@ -1172,27 +1165,82 @@ class ForwardTraceCapture:
                 call["row_token_uids"] = row_token_uids
 
     @classmethod
+    def _propagate_attention_output_row_token_uids(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        token_uids_by_key: dict[tuple[str, int, int], torch.Tensor] = {}
+        for module_name in sorted(trace.keys()):
+            if not cls._is_attention_output_trace(module_name):
+                continue
+            for call in trace[module_name]:
+                tensor = call.get("primary_output")
+                row_token_uids = call.get("row_token_uids")
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.ndim == 0
+                    or not isinstance(row_token_uids, torch.Tensor)
+                    or row_token_uids.ndim != 1
+                    or int(row_token_uids.numel()) != int(tensor.shape[0])
+                ):
+                    continue
+                key = cls._decoder_micro_trace_key(module_name, call)
+                if key is not None and key not in token_uids_by_key:
+                    token_uids_by_key[key] = row_token_uids
+
+        if not token_uids_by_key:
+            return
+
+        for module_name in sorted(trace.keys()):
+            if cls._is_attention_output_trace(module_name):
+                continue
+            for call in trace[module_name]:
+                tensor = call.get("primary_output")
+                if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                    continue
+                key = cls._decoder_micro_trace_key(module_name, call)
+                if key is None:
+                    continue
+                token_uids = token_uids_by_key.get(key)
+                if token_uids is None:
+                    continue
+                if int(token_uids.numel()) == int(tensor.shape[0]):
+                    call.setdefault("row_token_uids", token_uids)
+                    continue
+                head_count = cls._rank_blocked_token_head_count(call)
+                if head_count is not None and int(
+                    token_uids.numel()
+                ) * head_count == int(tensor.shape[0]):
+                    call["row_token_uids"] = expand_token_uids_for_heads(
+                        token_uids,
+                        head_count=head_count,
+                    )
+
+    @classmethod
     def canonicalize_trace(
         cls,
         trace: dict[str, list[dict[str, Any]]],
     ) -> dict[str, list[dict[str, Any]]]:
         """Canonicalizes topology-dependent trace outputs in place."""
-        cls._propagate_decoder_row_token_uids(trace)
         for module_name in sorted(trace.keys()):
             calls = trace[module_name]
             for call_offset, call in enumerate(calls):
-                if bool(call.get(PRIMARY_OUTPUT_CANONICAL_KEY)):
-                    continue
                 call_index = int(call.get("call_index", call_offset))
                 tensor = call.get("primary_output")
-                if isinstance(tensor, torch.Tensor):
+                if isinstance(tensor, torch.Tensor) and not bool(
+                    call.get(PRIMARY_OUTPUT_CANONICAL_KEY)
+                ):
                     call["primary_output"] = cls._canonicalize_primary_output_tensor(
                         module_name=module_name,
                         tensor=tensor,
                         call=call,
                     )
-                cls._canonicalize_call_row_token_order(call)
                 call[PRIMARY_OUTPUT_CANONICAL_KEY] = True
+        cls._propagate_decoder_row_token_uids(trace)
+        cls._propagate_attention_output_row_token_uids(trace)
+        for calls in trace.values():
+            for call in calls:
+                cls._canonicalize_call_row_token_order(call)
         return trace
 
     @classmethod
