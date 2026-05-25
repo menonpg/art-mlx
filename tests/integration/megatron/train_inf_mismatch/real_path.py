@@ -311,11 +311,14 @@ def _vllm_scores_from_real_choices(
     choice_by_prompt_id: dict[int, Choice] = {}
     for prompt in logical_map.prompts:
         prompt_tokens = tokens_by_prompt_id.get(prompt.prompt_id, [])
-        prompt_len = (
-            min(token.vllm_prompt_token_index for token in prompt_tokens) - 1
-            if prompt_tokens
-            else len(prompt.token_ids)
-        )
+        prompt_len = len(prompt.token_ids)
+        if prompt_tokens:
+            first_vllm_index = min(
+                token.vllm_prompt_token_index for token in prompt_tokens
+            )
+            prompt_len = (
+                first_vllm_index - 1 if require_routing_metadata else first_vllm_index
+            )
         key = (
             tuple(prompt.token_ids)
             if require_routing_metadata
@@ -336,9 +339,8 @@ def _vllm_scores_from_real_choices(
         metadata = choice_moe_routing_metadata(choice)
         if metadata is None:
             prompt_tokens = tokens_by_prompt_id.get(prompt.prompt_id, [])
-            prompt_len = (
-                min(candidate.vllm_prompt_token_index for candidate in prompt_tokens)
-                - 1
+            prompt_len = min(
+                candidate.vllm_prompt_token_index for candidate in prompt_tokens
             )
         else:
             prompt_len = len(metadata["prompt_token_ids"])
