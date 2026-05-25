@@ -126,8 +126,11 @@ def _covered_exported_target_modules(
         if base_name.endswith(".self_attention.out_proj.weight"):
             covered.add("out_proj")
             continue
-        if ".mlp.experts.linear_fc" in base_name:
-            covered.add("experts")
+        if ".mlp.experts.linear_fc1" in base_name:
+            covered.update({"experts", "gate_proj", "up_proj"})
+            continue
+        if ".mlp.experts.linear_fc2" in base_name:
+            covered.update({"experts", "down_proj"})
             continue
         if ".linear_fc1.weight" in base_name:
             covered.update({"gate_proj", "up_proj"})
