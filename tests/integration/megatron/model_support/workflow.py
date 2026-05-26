@@ -9,8 +9,11 @@ import sys
 import tempfile
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.model_support.registry import (
+    VALIDATED_MODEL_SUPPORT_SPECS,
     get_model_support_handler_for_spec,
     get_model_support_spec,
 )
@@ -44,6 +47,12 @@ MANDATORY_VALIDATION_STAGES = (
     "yes_no_trainability",
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
+ARCHITECTURE_REPRESENTATIVE_MODELS = {
+    "qwen3_moe": "Qwen/Qwen3-30B-A3B",
+    "qwen3_dense": "Qwen/Qwen3-32B",
+    "qwen3_5_moe": "Qwen/Qwen3.5-35B-A3B",
+    "qwen3_5_dense": "Qwen/Qwen3.5-27B",
+}
 SUBPROCESS_VALIDATION_STAGES = frozenset(
     {
         "hf_parity",
@@ -57,6 +66,11 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         NATIVE_VLLM_LORA_STAGE,
     }
 )
+
+
+class AllArchitecturesValidationReport(BaseModel):
+    passed: bool = False
+    reports: list[ValidationReport] = Field(default_factory=list)
 
 
 def build_validation_stage_names(
@@ -178,6 +192,48 @@ def _write_validation_report(
     path = Path(output_json)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _write_all_architectures_report(
+    report: AllArchitecturesValidationReport,
+    output_json: str | Path | None,
+) -> None:
+    if output_json is None:
+        return
+    path = Path(output_json)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _per_architecture_output_json(output_json: str | Path, model_key: str) -> Path:
+    path = Path(output_json)
+    suffix = path.suffix or ".json"
+    return path.with_name(f"{path.stem}.{model_key}{suffix}")
+
+
+def validated_architecture_representative_models() -> list[str]:
+    missing_keys = {
+        spec.key
+        for spec in VALIDATED_MODEL_SUPPORT_SPECS
+        if spec.key not in ARCHITECTURE_REPRESENTATIVE_MODELS
+    }
+    unknown_keys = set(ARCHITECTURE_REPRESENTATIVE_MODELS) - {
+        spec.key for spec in VALIDATED_MODEL_SUPPORT_SPECS
+    }
+    if missing_keys or unknown_keys:
+        raise RuntimeError(
+            "Architecture representative mapping does not match validated specs: "
+            f"missing={sorted(missing_keys)}, unknown={sorted(unknown_keys)}"
+        )
+    representatives: list[str] = []
+    for spec in VALIDATED_MODEL_SUPPORT_SPECS:
+        base_model = ARCHITECTURE_REPRESENTATIVE_MODELS[spec.key]
+        if base_model not in spec.model_names:
+            raise RuntimeError(
+                f"{base_model!r} is not registered under model support spec {spec.key!r}"
+            )
+        representatives.append(base_model)
+    return representatives
 
 
 def _mark_remaining_stages_skipped(
@@ -785,11 +841,51 @@ def build_validation_report(
     return report
 
 
+def build_all_architectures_validation_report(
+    *,
+    include_sensitivity: bool | None = None,
+    output_json: str | Path | None = None,
+    skip_stages: set[str] | None = None,
+    stop_on_failure: bool = False,
+    allow_unvalidated_arch: bool = False,
+) -> AllArchitecturesValidationReport:
+    aggregate = AllArchitecturesValidationReport()
+    _write_all_architectures_report(aggregate, output_json)
+    for base_model in validated_architecture_representative_models():
+        model_key = get_model_support_spec(
+            base_model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        ).key
+        report = build_validation_report(
+            base_model=base_model,
+            include_sensitivity=include_sensitivity,
+            output_json=(
+                _per_architecture_output_json(output_json, model_key)
+                if output_json is not None
+                else None
+            ),
+            skip_stages=skip_stages,
+            stop_on_failure=stop_on_failure,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+        aggregate.reports.append(report)
+        aggregate.passed = all(
+            all(stage.passed for stage in model_report.stages)
+            for model_report in aggregate.reports
+        )
+        _write_all_architectures_report(aggregate, output_json)
+        if stop_on_failure and not all(stage.passed for stage in report.stages):
+            break
+    return aggregate
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run ART Megatron model support workflow"
     )
-    parser.add_argument("--base-model", required=True)
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument("--base-model")
+    model_group.add_argument("--all-architectures", action="store_true")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--allow-unsupported-arch", action="store_true")
     parser.add_argument("--include-sensitivity", action="store_true")
@@ -800,6 +896,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.all_architectures:
+        all_report = build_all_architectures_validation_report(
+            include_sensitivity=args.include_sensitivity,
+            output_json=args.output_json,
+            skip_stages=set(args.skip_stage),
+            stop_on_failure=args.stop_on_failure,
+            allow_unvalidated_arch=args.allow_unsupported_arch,
+        )
+        for report in all_report.reports:
+            print(f"base_model={report.base_model}", flush=True)
+            for stage in report.stages:
+                status = "PASS" if stage.passed else "FAIL"
+                print(f"  {stage.name}: {status}", flush=True)
+                if stage.artifact_dir:
+                    print(f"    artifact_dir={stage.artifact_dir}", flush=True)
+                if not stage.passed:
+                    print(f"    metrics={stage.metrics}", flush=True)
+        print(f"report_json={args.output_json}", flush=True)
+        return 0 if all_report.passed else 1
     report = build_validation_report(
         base_model=args.base_model,
         include_sensitivity=args.include_sensitivity,

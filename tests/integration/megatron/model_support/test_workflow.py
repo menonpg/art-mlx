@@ -12,6 +12,7 @@ from .workflow import (
     NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
     assess_minimal_layer_coverage,
+    build_all_architectures_validation_report,
     build_validation_report,
     build_validation_stage_names,
     run_chat_template_rollout_stage,
@@ -22,6 +23,7 @@ from .workflow import (
     run_packed_position_ids_stage,
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
+    validated_architecture_representative_models,
 )
 
 
@@ -35,6 +37,62 @@ def test_build_validation_stage_names_has_fixed_order() -> None:
         *MANDATORY_VALIDATION_STAGES,
         NATIVE_VLLM_LORA_STAGE,
     ]
+
+
+def test_validated_architecture_representative_models_are_fixed() -> None:
+    assert validated_architecture_representative_models() == [
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-27B",
+    ]
+
+
+def test_build_all_architectures_validation_report_stops_on_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+
+    def _build_validation_report(
+        *,
+        base_model,
+        include_sensitivity=None,
+        output_json=None,
+        skip_stages=None,
+        stop_on_failure=False,
+        allow_unvalidated_arch=False,
+    ):
+        del include_sensitivity
+        del output_json
+        del skip_stages
+        del stop_on_failure
+        del allow_unvalidated_arch
+        calls.append(base_model)
+        return ValidationReport(
+            base_model=base_model,
+            model_key="qwen3_dense",
+            stages=[
+                ValidationStageResult(
+                    name="train_inf_mismatch",
+                    passed=base_model != "Qwen/Qwen3-32B",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.build_validation_report",
+        _build_validation_report,
+    )
+
+    report = build_all_architectures_validation_report(
+        output_json=tmp_path / "all_architectures.json",
+        stop_on_failure=True,
+    )
+
+    assert calls == ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-32B"]
+    assert report.passed is False
+    assert [item.base_model for item in report.reports] == calls
 
 
 def test_build_validation_report_populates_architecture_stage(
