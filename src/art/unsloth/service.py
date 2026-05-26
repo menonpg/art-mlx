@@ -549,11 +549,18 @@ class UnslothService:
         """Terminate vLLM subprocess if running."""
         if not self._lifecycle.begin_close():
             return
+        weight_transfer_group = self._weight_transfer_group
         self._weight_transfer_group = None
         try:
-            self._child_processes.close()
-            self._vllm_runtime.close()
-            self._loaded_adapter_steps.clear()
+            try:
+                if weight_transfer_group is not None:
+                    close = getattr(weight_transfer_group, "close", None)
+                    if close is not None:
+                        close()
+            finally:
+                self._child_processes.close()
+                self._vllm_runtime.close()
+                self._loaded_adapter_steps.clear()
         finally:
             self._lifecycle.restore_parent_cleanup()
 

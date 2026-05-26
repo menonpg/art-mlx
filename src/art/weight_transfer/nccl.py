@@ -91,6 +91,8 @@ class _NcclLibrary:
             _nccl_result_t,
             [ctypes.POINTER(_nccl_comm_t), ctypes.c_int, _NcclUniqueId, ctypes.c_int],
         )
+        self._configure("ncclCommDestroy", _nccl_result_t, [_nccl_comm_t])
+        self._configure("ncclCommAbort", _nccl_result_t, [_nccl_comm_t])
         self._configure(
             "ncclAllReduce",
             _nccl_result_t,
@@ -139,6 +141,12 @@ class _NcclLibrary:
             self._lib.ncclCommInitRank(ctypes.byref(comm), world_size, unique_id, rank)
         )
         return comm
+
+    def destroy_comm(self, comm: Any) -> None:
+        self._check(self._lib.ncclCommDestroy(comm))
+
+    def abort_comm(self, comm: Any) -> None:
+        self._check(self._lib.ncclCommAbort(comm))
 
     def all_reduce(
         self,
@@ -237,6 +245,20 @@ class _BootstrapGroup:
         self._broadcast_recv_counter[src] += 1
         return received
 
+    def close(self) -> None:
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+
+def _canonical_cuda_device(device: int | torch.device) -> torch.device:
+    cuda_device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
+    if cuda_device.type != "cuda":
+        raise RuntimeError(f"NCCL weight transfer requires a CUDA device, got {device}")
+    if cuda_device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return cuda_device
+
 
 class TrainerNcclCommunicator:
     def __init__(
@@ -249,6 +271,7 @@ class TrainerNcclCommunicator:
         device: int | torch.device,
         nccl_so_path: str | None = None,
     ) -> None:
+        self.device = _canonical_cuda_device(device)
         bootstrap_group = _BootstrapGroup(
             host=host,
             port=port,
@@ -258,9 +281,6 @@ class TrainerNcclCommunicator:
         self._bootstrap_group = bootstrap_group
         self.rank = rank
         self.world_size = world_size
-        self.device = (
-            torch.device(f"cuda:{device}") if isinstance(device, int) else device
-        )
         self._nccl = _NcclLibrary(nccl_so_path)
         unique_id_bytes = (
             _nccl_unique_id_to_bytes(self._nccl.get_unique_id()) if rank == 0 else None
@@ -275,16 +295,54 @@ class TrainerNcclCommunicator:
             self.all_reduce(warmup, stream=stream)
             stream.synchronize()
 
+    def _require_comm(self) -> Any:
+        if self._comm is None:
+            raise RuntimeError("NCCL weight transfer communicator is closed")
+        return self._comm
+
+    def _validate_collective_tensor(self, tensor: torch.Tensor) -> None:
+        if not tensor.is_cuda:
+            raise RuntimeError(
+                f"NCCL weight transfer requires a CUDA tensor, got {tensor.device}"
+            )
+        if tensor.device != self.device:
+            raise RuntimeError(
+                "NCCL weight transfer tensor device mismatch: "
+                f"expected {self.device}, got {tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            raise RuntimeError("NCCL weight transfer requires contiguous tensors")
+
+    def close(self) -> None:
+        comm = self._comm
+        if comm is None:
+            return
+        self._comm = None
+        try:
+            self._nccl.destroy_comm(comm)
+        finally:
+            self._bootstrap_group.close()
+
+    def abort(self) -> None:
+        comm = self._comm
+        if comm is None:
+            return
+        self._comm = None
+        try:
+            self._nccl.abort_comm(comm)
+        finally:
+            self._bootstrap_group.close()
+
     def all_reduce(
         self,
         tensor: torch.Tensor,
         *,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        assert tensor.device == self.device
+        self._validate_collective_tensor(tensor)
         self._nccl.all_reduce(
             tensor,
-            self._comm,
+            self._require_comm(),
             stream=stream or torch.cuda.current_stream(self.device),
         )
 
@@ -295,10 +353,10 @@ class TrainerNcclCommunicator:
         src: int,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        assert tensor.device == self.device
+        self._validate_collective_tensor(tensor)
         self._nccl.broadcast(
             tensor,
-            self._comm,
+            self._require_comm(),
             rank=self.rank,
             src=src,
             stream=stream or torch.cuda.current_stream(self.device),

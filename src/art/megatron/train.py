@@ -1406,6 +1406,17 @@ def _sync_merged_weights_to_vllm(
     )
 
 
+def _close_merged_weight_transfer_group(runtime: TrainingRuntime) -> None:
+    weight_transfer_group = runtime.merged_weight_transfer_group
+    runtime.merged_weight_transfer_group = None
+    runtime.merged_weight_transfer_init_info = None
+    if weight_transfer_group is None:
+        return
+    close = getattr(weight_transfer_group, "close", None)
+    if close is not None:
+        close()
+
+
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     weight_offload = WeightOffloadManager.from_env(
         model=runtime.model,
@@ -1428,14 +1439,17 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         runtime.optimizer = None
         weight_offload.after_job()
 
-    after_job()
-    run_megatron_worker_loop(
-        runtime,
-        supports_sft=True,
-        wait_until_ready=wait_until_ready,
-        before_job=before_job,
-        after_job=after_job,
-    )
+    try:
+        after_job()
+        run_megatron_worker_loop(
+            runtime,
+            supports_sft=True,
+            wait_until_ready=wait_until_ready,
+            before_job=before_job,
+            after_job=after_job,
+        )
+    finally:
+        _close_merged_weight_transfer_group(runtime)
 
 
 def main() -> None:
