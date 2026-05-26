@@ -31,7 +31,6 @@ from .kernels.cute_grouped_lora_quack import (
 
 MOE_LORA_RANK = 1
 DENSE_LORA_RANK = 8
-LORA_RANK = MOE_LORA_RANK
 LORA_ALPHA = 32
 
 ShardDomain = Literal["tp", "expert_tp"]
