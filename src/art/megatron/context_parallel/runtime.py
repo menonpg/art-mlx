@@ -2140,7 +2140,7 @@ def prepare_cp_micro(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
-    debug_token_uids: bool = False,
+    trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
     target_device: torch.device | None = None,
 ) -> PreparedMegatronBatch:
@@ -2168,12 +2168,12 @@ def prepare_cp_micro(
         rank_plan=rank_plan,
         spec=spec,
         pad_multiple=pad_multiple,
-        debug_token_uids=debug_token_uids,
+        trace_token_uids=trace_token_uids,
         target_device=target_device,
     )
     dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
     if tensors.token_uids is not None:
-        state = state.model_copy(update={"debug_token_uids": tensors.token_uids})
+        state = state.model_copy(update={"trace_token_uids": tensors.token_uids})
     execution_state_prepare_ms = 0.0
     if prepare_execution_state:
         from .executor import prepare_context_parallel_execution_state
@@ -2324,7 +2324,7 @@ def prepare_megatron_context_parallel_state(
         plan_build_ms=plan_build_ms,
         plan_cache_hit=plan_cache_hit,
         gdn_rank_plan_cache_hit=gdn_rank_plan_cache_hit,
-        debug_token_uids=None,
+        trace_token_uids=None,
     )
     return state, rank_plan, bundle.spec, pad_multiple
 
@@ -2335,7 +2335,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     rank_plan: RankRuntimePlan,
     spec: PackedBatchAttentionSpec,
     pad_multiple: int,
-    debug_token_uids: bool = False,
+    trace_token_uids: bool = False,
     target_device: torch.device | None = None,
 ) -> DispatchedPackedTensors:
     """Gather this rank's training tensors and optionally move them to device.
@@ -2359,7 +2359,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     weights = shift_tensor(micro["weights"], 0.0)
     token_uids = (
         _build_token_uids(spec, seq_len=int(micro["tokens"].shape[1]))
-        if debug_token_uids
+        if trace_token_uids
         else None
     )
     local_tokens = _dispatch_tensor(

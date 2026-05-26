@@ -19,7 +19,7 @@ def trace_token_uids_enabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def context_parallel_debug_token_uids_enabled(
+def context_parallel_trace_token_uids_enabled(
     topology: ParallelTopology,
     moe_routing_replay_controller: Any | None,
 ) -> bool:

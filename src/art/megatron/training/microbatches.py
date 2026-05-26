@@ -310,7 +310,7 @@ def _prepare_rl_cp_micro_full(
     device: torch.device,
     topology: ParallelTopology,
     model_support_handler: Any,
-    debug_token_uids: bool,
+    trace_token_uids: bool,
 ) -> PreparedMegatronBatch:
     """Prepare RL CP inputs without moving planning metadata to CUDA first.
 
@@ -327,7 +327,7 @@ def _prepare_rl_cp_micro_full(
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
-        debug_token_uids=debug_token_uids,
+        trace_token_uids=trace_token_uids,
         target_device=device,
     )
 
@@ -389,7 +389,7 @@ def _prepare_current_rl_micro(
     provider: Any,
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
-    debug_token_uids: bool,
+    trace_token_uids: bool,
     pending_prepared_micro: PreparedMegatronBatch | None,
 ) -> tuple[PreparedRLMicroInputs, PreparedMegatronBatch | None]:
     if int(topology.cp) <= 1:
@@ -410,7 +410,7 @@ def _prepare_current_rl_micro(
             device=device,
             topology=topology,
             model_support_handler=model_support_handler,
-            debug_token_uids=debug_token_uids,
+            trace_token_uids=trace_token_uids,
         )
     return _prepared_rl_micro_from_cp_batch(prepared, ref_logprobs=ref_logprobs), None
 
@@ -421,7 +421,7 @@ def _prepare_next_rl_cp_micro(
     device: torch.device,
     topology: ParallelTopology,
     model_support_handler: Any,
-    debug_token_uids: bool,
+    trace_token_uids: bool,
 ) -> PreparedMegatronBatch | None:
     if next_micro is None or int(topology.cp) <= 1:
         return None
@@ -430,7 +430,7 @@ def _prepare_next_rl_cp_micro(
         device=device,
         topology=topology,
         model_support_handler=model_support_handler,
-        debug_token_uids=debug_token_uids,
+        trace_token_uids=trace_token_uids,
     )
 
 
@@ -534,7 +534,7 @@ def _prepare_sft_cp_micro_full(
     device: torch.device,
     topology: ParallelTopology,
     model_support_handler: Any,
-    debug_token_uids: bool,
+    trace_token_uids: bool,
 ) -> PreparedMegatronBatch:
     """Prepare SFT CP inputs through the same CPU-planning boundary as RL CP.
 
@@ -555,7 +555,7 @@ def _prepare_sft_cp_micro_full(
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
-        debug_token_uids=debug_token_uids,
+        trace_token_uids=trace_token_uids,
         target_device=device,
     )
 
@@ -582,7 +582,7 @@ def _prepare_current_sft_micro(
     topology: ParallelTopology,
     provider: Any,
     model_support_handler: Any,
-    debug_token_uids: bool,
+    trace_token_uids: bool,
     pending_prepared_micro: PreparedMegatronBatch | None,
 ) -> tuple[PreparedSFTMicroInputs, PreparedMegatronBatch | None]:
     if int(topology.cp) <= 1:
@@ -602,7 +602,7 @@ def _prepare_current_sft_micro(
             device=device,
             topology=topology,
             model_support_handler=model_support_handler,
-            debug_token_uids=debug_token_uids,
+            trace_token_uids=trace_token_uids,
         )
     return _prepared_sft_micro_from_cp_batch(prepared), None
 
@@ -613,7 +613,7 @@ def _prepare_next_sft_cp_micro(
     device: torch.device,
     topology: ParallelTopology,
     model_support_handler: Any,
-    debug_token_uids: bool,
+    trace_token_uids: bool,
 ) -> PreparedMegatronBatch | None:
     if next_micro is None or int(topology.cp) <= 1:
         return None
@@ -622,5 +622,5 @@ def _prepare_next_sft_cp_micro(
         device=device,
         topology=topology,
         model_support_handler=model_support_handler,
-        debug_token_uids=debug_token_uids,
+        trace_token_uids=trace_token_uids,
     )

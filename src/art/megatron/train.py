@@ -109,7 +109,7 @@ from art.megatron.training.model_chunks import (
 from art.megatron.training.sft_batches import load_sft_batch_from_disk
 from art.megatron.training.trace import (
     attach_trace_token_uids,
-    context_parallel_debug_token_uids_enabled,
+    context_parallel_trace_token_uids_enabled,
     set_replay_local_input_token_uids,
 )
 from art.megatron.training.weight_offload import WeightOffloadManager
@@ -1042,7 +1042,7 @@ def run_megatron_sft_step(
     )
 
     device = next(model_chunks[0].parameters()).device
-    debug_token_uids = context_parallel_debug_token_uids_enabled(
+    trace_token_uids = context_parallel_trace_token_uids_enabled(
         topology,
         moe_routing_replay_controller,
     )
@@ -1066,7 +1066,7 @@ def run_megatron_sft_step(
             topology=topology,
             provider=provider,
             model_support_handler=model_support_handler,
-            debug_token_uids=debug_token_uids,
+            trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
         set_replay_local_input_token_uids(
@@ -1094,7 +1094,7 @@ def run_megatron_sft_step(
             device=device,
             topology=topology,
             model_support_handler=model_support_handler,
-            debug_token_uids=debug_token_uids,
+            trace_token_uids=trace_token_uids,
         )
         detached_micro_loss = masked_loss.detach()
         if raw_loss_sum is None:
@@ -1184,7 +1184,7 @@ def run_training_step(
 
     device = next(model_chunks[0].parameters()).device
     topology = _infer_parallel_topology(model_chunks)
-    debug_token_uids = context_parallel_debug_token_uids_enabled(
+    trace_token_uids = context_parallel_trace_token_uids_enabled(
         topology,
         moe_routing_replay_controller,
     )
@@ -1233,7 +1233,7 @@ def run_training_step(
             provider=provider,
             model_support_handler=model_support_handler,
             ref_logprobs=ref_logprobs,
-            debug_token_uids=debug_token_uids,
+            trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
         cp_plan_ms += float(prepared_micro.context_parallel_plan_ms)
@@ -1319,7 +1319,7 @@ def run_training_step(
             device=device,
             topology=topology,
             model_support_handler=model_support_handler,
-            debug_token_uids=debug_token_uids,
+            trace_token_uids=trace_token_uids,
         )
         detached_probs_corr = loss_info.probs_corr.detach()
         if probs_corr_total is None:

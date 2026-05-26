@@ -275,7 +275,7 @@ class ArtContextParallelState(BaseModel):
     plan_build_ms: float = 0.0
     plan_cache_hit: bool = False
     gdn_rank_plan_cache_hit: bool = False
-    debug_token_uids: torch.Tensor | None = None
+    trace_token_uids: torch.Tensor | None = None
     execution_cache: ContextParallelExecutionCache = Field(
         default_factory=ContextParallelExecutionCache
     )
