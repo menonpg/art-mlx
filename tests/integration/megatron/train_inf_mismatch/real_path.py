@@ -60,6 +60,7 @@ class RealPathConfig(BaseModel):
     max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
     diagnose_base: bool = False
+    trace_layers: bool = False
 
 
 class RealPathMegatronWorkerRequest(BaseModel):
@@ -71,6 +72,7 @@ class RealPathMegatronWorkerRequest(BaseModel):
     adapter_path: str | None = None
     moe_routing_replay_path: str | None = None
     global_grad_accumulation_sequences: int
+    forward_trace_dir: str | None = None
 
 
 class RealPathMegatronWorkerResult(BaseModel):
@@ -90,6 +92,8 @@ class RealPathBaseDiagnosticBundle(BaseModel):
     moe_routing_shared_prefix_conflict_rows: int
     moe_routing_shared_prefix_conflict_slots: int
     moe_routing_shared_prefix_compared_slots: int
+    vllm_forward_trace_dir: str | None = None
+    megatron_forward_trace_dir: str | None = None
 
 
 class RealPathTrainInfReport(BaseModel):
@@ -163,6 +167,10 @@ def config_from_env() -> RealPathConfig:
         config.prompt_sentence_count = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_DIAGNOSE_BASE"):
         config.diagnose_base = raw == "1"
+    if raw := os.environ.get("ART_REAL_PATH_TRACE_LAYERS"):
+        config.trace_layers = raw == "1"
+        if config.trace_layers:
+            config.diagnose_base = True
     return config
 
 
@@ -325,6 +333,7 @@ async def _direct_vllm_runtime(
     lora_path: str,
     rollout_weights_mode: str,
     engine_args: dict[str, Any],
+    forward_trace_dir: Path | None = None,
 ) -> AsyncIterator[tuple[str, int]]:
     import art.vllm_runtime as runtime
 
@@ -344,6 +353,14 @@ async def _direct_vllm_runtime(
     log_path = artifact_dir / f"real_path_vllm_{served_model_name}.log"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    if forward_trace_dir is not None:
+        trace_site = Path(__file__).resolve().parent / "vllm_forward_trace_site"
+        env["ART_VLLM_FORWARD_TRACE_DIR"] = str(forward_trace_dir)
+        env["PYTHONPATH"] = (
+            str(trace_site)
+            if not env.get("PYTHONPATH")
+            else f"{trace_site}{os.pathsep}{env['PYTHONPATH']}"
+        )
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,
@@ -486,6 +503,18 @@ async def _score_base_real_generation_path(
     if is_moe:
         engine_args["enable_return_routed_experts"] = True
         engine_args["async_scheduling"] = False
+    vllm_forward_trace_dir = (
+        artifact_dir / "real_path_base_vllm_forward_trace"
+        if config.trace_layers
+        else None
+    )
+    megatron_forward_trace_dir = (
+        artifact_dir / "real_path_base_megatron_forward_trace"
+        if config.trace_layers
+        else None
+    )
+    if config.trace_layers:
+        engine_args["enforce_eager"] = True
 
     async with _direct_vllm_runtime(
         config=parity_config,
@@ -494,6 +523,7 @@ async def _score_base_real_generation_path(
         lora_path=str(placeholder_lora),
         rollout_weights_mode="merged",
         engine_args=engine_args,
+        forward_trace_dir=vllm_forward_trace_dir,
     ) as (host, port):
         model = art.TrainableModel(
             name=f"{served_name}_client",
@@ -574,6 +604,11 @@ async def _score_base_real_generation_path(
             adapter_path=None,
             moe_routing_replay_path=routing_replay_path,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            forward_trace_dir=(
+                str(megatron_forward_trace_dir)
+                if megatron_forward_trace_dir is not None
+                else None
+            ),
         )
     )
     megatron_base = ScoreBundle.model_validate(
@@ -594,6 +629,14 @@ async def _score_base_real_generation_path(
         ),
         moe_routing_shared_prefix_compared_slots=int(
             stats.shared_prefix_compared_slots
+        ),
+        vllm_forward_trace_dir=(
+            str(vllm_forward_trace_dir) if vllm_forward_trace_dir is not None else None
+        ),
+        megatron_forward_trace_dir=(
+            str(megatron_forward_trace_dir)
+            if megatron_forward_trace_dir is not None
+            else None
         ),
     )
 
@@ -630,6 +673,7 @@ def _make_nonzero_adapter(
         adapter_path=None,
         moe_routing_replay_path=None,
         global_grad_accumulation_sequences=1,
+        forward_trace_dir=None,
     )
     return _run_real_path_megatron_worker(request, adapter_only=True).adapter_path or ""
 
@@ -762,11 +806,31 @@ def _real_path_megatron_worker(
     logical_map = LogicalTokenMap.model_validate(
         _read_json(Path(request.logical_map_path))
     )
-    logits = _run_logits_with_replay(
-        runtime=runtime,
-        packed_tensors=cast(dict[str, Any], packed_tensors),
-        global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
-    )
+    forward_trace_capture = None
+    if request.forward_trace_dir is not None:
+        from ..model_support.forward_trace import ForwardTraceCapture
+
+        forward_trace_capture = ForwardTraceCapture(
+            runtime.model,
+            enabled=True,
+            capture_name_tokens=(),
+            strict_output_match=True,
+        )
+        forward_trace_capture.set_step(
+            0,
+            list(range(int(packed_tensors["tokens"].shape[0]))),
+        )
+    try:
+        logits = _run_logits_with_replay(
+            runtime=runtime,
+            packed_tensors=cast(dict[str, Any], packed_tensors),
+            global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
+        )
+        if forward_trace_capture is not None and request.forward_trace_dir is not None:
+            forward_trace_capture.save_current_step(Path(request.forward_trace_dir))
+    finally:
+        if forward_trace_capture is not None:
+            forward_trace_capture.close()
     score = _extract_scores_from_logits(
         logits=logits,
         logical_map=logical_map,
