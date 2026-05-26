@@ -675,19 +675,19 @@ def _real_path_megatron_worker(
     _set_seed(request.config.seed)
     os.environ.update(request.config.topology.env())
 
+    def _configure_worker_bundle(bundle: Any) -> None:
+        if request.config.lora_target_modules is not None:
+            _configure_lora_target_modules(
+                bundle,
+                _lora_target_modules(request.config),
+            )
+        if not adapter_only and request.weight_state == "base":
+            bundle.provider.register_pre_wrap_hook(megatron_train.freeze_model)
+
     runtime = megatron_train.build_training_runtime(
         model_identifier=request.config.base_model,
         provider_torch_dtype=torch.bfloat16,
-        provider_bundle_configure=(
-            lambda bundle: (
-                _configure_lora_target_modules(
-                    bundle,
-                    _lora_target_modules(request.config),
-                )
-                if request.config.lora_target_modules is not None
-                else None
-            )
-        ),
+        provider_bundle_configure=_configure_worker_bundle,
         provider_configure=lambda provider: _configure_provider(
             provider, request.config
         ),
