@@ -10,10 +10,16 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Literal
+from typing import Any, Callable, Literal, TypedDict
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
+
+from .utils.lifecycle import (
+    ChildProcessSupervisor,
+    managed_process_cmd,
+    terminate_popen_process_group,
+)
 
 RUNTIME_SERVER = "art-vllm-runtime-server"
 RUNTIME_PACKAGE = "art-vllm-runtime"
@@ -62,6 +68,139 @@ class VllmRuntimeInstallMarker(BaseModel):
     manifest_hash: str
     runtime_wheel_sha256: str
     cache_root: str
+
+
+class VllmRuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
+
+
+class ExternalVllmRuntime:
+    def __init__(self, *, host: str = "127.0.0.1") -> None:
+        self.host = host
+        self.port = 0
+        self.api_key: str | None = None
+        self.nccl_so_path: str | None = None
+        self.process: subprocess.Popen[Any] | None = None
+        self.log_file: Any = None
+        self.log_path: str | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def request_kwargs(self) -> VllmRuntimeRequestKwargs:
+        if self.api_key is None:
+            return {}
+        return {"headers": {"Authorization": f"Bearer {self.api_key}"}}
+
+    async def start(
+        self,
+        *,
+        launch_config: VllmRuntimeLaunchConfig,
+        output_dir: str,
+        child_processes: ChildProcessSupervisor,
+        install_parent_cleanup: Callable[[], None],
+        cleanup_on_error: Callable[[], None] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, int]:
+        self.host = launch_config.host
+        self.port = launch_config.port
+        api_key = launch_config.server_args.get("api_key")
+        self.api_key = api_key if isinstance(api_key, str) else None
+        self.nccl_so_path = (
+            str(get_vllm_runtime_nccl_so_path())
+            if launch_config.rollout_weights_mode == "merged"
+            else None
+        )
+
+        cmd = build_vllm_runtime_server_cmd(launch_config)
+        install_parent_cleanup()
+        log_dir = os.path.join(output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_path = os.path.join(log_dir, "vllm-runtime.log")
+        self.log_file = open(self.log_path, "w", buffering=1)
+        self.process = subprocess.Popen(
+            managed_process_cmd(cmd),
+            cwd=str(get_vllm_runtime_working_dir()),
+            env=os.environ.copy(),
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+        runtime_timeout = (
+            timeout
+            if timeout is not None
+            else float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
+        )
+        async with httpx.AsyncClient() as client:
+            try:
+                await wait_for_vllm_runtime(
+                    process=self.process,
+                    host=self.host,
+                    port=self.port,
+                    timeout=runtime_timeout,
+                )
+            except TimeoutError as exc:
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise TimeoutError(
+                    "vLLM subprocess did not become ready within "
+                    f"{runtime_timeout}s. Check logs at {log_path}"
+                ) from exc
+            except RuntimeError as exc:
+                returncode = self.process.returncode
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise RuntimeError(
+                    f"vLLM subprocess exited with code {returncode}. "
+                    f"Check logs at {log_path}"
+                ) from exc
+
+            try:
+                response = await client.get(
+                    f"{self.base_url}/v1/models",
+                    **self.request_kwargs(),
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise RuntimeError(
+                    "vLLM passed /health but /v1/models was not reachable. "
+                    f"Check logs at {log_path}"
+                ) from exc
+
+        assert self.process is not None
+        assert self.log_path is not None
+        child_processes.watch_popen(
+            "vLLM runtime",
+            self.process,
+            log_path=self.log_path,
+        )
+        return self.host, self.port
+
+    def close(self) -> None:
+        if self.process is not None:
+            terminate_popen_process_group(self.process)
+            self.process = None
+        if self.log_file is not None:
+            self.log_file.close()
+            self.log_file = None
+        self.log_path = None
+        self.api_key = None
+        self.nccl_so_path = None
+        self.port = 0
+
+    def _cleanup_after_start_error(
+        self, cleanup_on_error: Callable[[], None] | None
+    ) -> None:
+        if cleanup_on_error is None:
+            self.close()
+        else:
+            cleanup_on_error()
 
 
 def get_vllm_runtime_project_root() -> Path:

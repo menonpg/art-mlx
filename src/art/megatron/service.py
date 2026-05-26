@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import shutil
 import socket
-import subprocess
 import sys
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
@@ -28,15 +27,11 @@ from ..utils.lifecycle import (
     ServiceLifecycle,
     managed_process_cmd,
     terminate_asyncio_process_group,
-    terminate_popen_process_group,
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
+    ExternalVllmRuntime,
     VllmRuntimeLaunchConfig,
-    build_vllm_runtime_server_cmd,
-    get_vllm_runtime_nccl_so_path,
-    get_vllm_runtime_working_dir,
-    wait_for_vllm_runtime,
 )
 from .lora import LORA_ALPHA, LORA_RANK
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
@@ -166,13 +161,11 @@ class MegatronService:
     _megatron_process: asyncio.subprocess.Process | None = None
     _megatron_log_file: Any = None
     _megatron_log_path: str | None = None
-    _vllm_process: subprocess.Popen[Any] | None = None
-    _vllm_log_file: Any = None
-    _vllm_log_path: str | None = None
-    _vllm_host: str = "127.0.0.1"
-    _vllm_port: int = 0
-    _vllm_api_key: str | None = None
-    _vllm_nccl_so_path: str | None = None
+    _vllm_runtime: ExternalVllmRuntime = field(
+        default_factory=ExternalVllmRuntime,
+        init=False,
+        repr=False,
+    )
     _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
     _active_megatron_topology: MegatronTopologyConfig | None = None
     _lifecycle: ServiceLifecycle = field(
@@ -209,7 +202,27 @@ class MegatronService:
 
     @property
     def _vllm_base_url(self) -> str:
-        return f"http://{self._vllm_host}:{self._vllm_port}"
+        return self._vllm_runtime.base_url
+
+    @property
+    def _vllm_host(self) -> str:
+        return self._vllm_runtime.host
+
+    @property
+    def _vllm_port(self) -> int:
+        return self._vllm_runtime.port
+
+    @_vllm_port.setter
+    def _vllm_port(self, port: int) -> None:
+        self._vllm_runtime.port = port
+
+    @property
+    def _vllm_api_key(self) -> str | None:
+        return self._vllm_runtime.api_key
+
+    @property
+    def _vllm_nccl_so_path(self) -> str | None:
+        return self._vllm_runtime.nccl_so_path
 
     def _megatron_random_state(self) -> int | None:
         for config_key in ("peft_args", "init_args"):
@@ -467,91 +480,25 @@ class MegatronService:
         port: int,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, int]:
-        import httpx
-
         self._raise_if_child_failed()
         server_args = self._runtime_server_args(config)
-        api_key = server_args.get("api_key")
-        self._vllm_api_key = api_key if isinstance(api_key, str) else None
-        self._vllm_nccl_so_path = (
-            str(get_vllm_runtime_nccl_so_path())
-            if self.rollout_weights_mode == "merged"
-            else None
-        )
-        cmd = build_vllm_runtime_server_cmd(
-            VllmRuntimeLaunchConfig(
+        return await self._vllm_runtime.start(
+            launch_config=VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
                 port=port,
-                host=self._vllm_host,
+                host=self._vllm_runtime.host,
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
                 served_model_name=f"{self.model_name}@{self._latest_step}",
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
-            )
+            ),
+            output_dir=self.output_dir,
+            child_processes=self._child_processes,
+            install_parent_cleanup=self._install_parent_signal_cleanup,
+            cleanup_on_error=self._stop_vllm_subprocess,
         )
-
-        log_dir = os.path.join(self.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_path = os.path.join(log_dir, "vllm-runtime.log")
-        self._vllm_log_file = open(self._vllm_log_path, "w", buffering=1)
-        self._vllm_process = subprocess.Popen(
-            managed_process_cmd(cmd),
-            cwd=str(get_vllm_runtime_working_dir()),
-            env=os.environ.copy(),
-            stdout=self._vllm_log_file,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            start_new_session=True,
-        )
-        self._install_parent_signal_cleanup()
-        self._vllm_port = port
-
-        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
-        async with httpx.AsyncClient() as client:
-            try:
-                await wait_for_vllm_runtime(
-                    process=self._vllm_process,
-                    host=self._vllm_host,
-                    port=self._vllm_port,
-                    timeout=timeout,
-                )
-            except TimeoutError as exc:
-                self._stop_vllm_subprocess()
-                raise TimeoutError(
-                    f"vLLM subprocess did not become ready within {timeout}s. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-            except RuntimeError as exc:
-                returncode = self._vllm_process.returncode
-                self._stop_vllm_subprocess()
-                raise RuntimeError(
-                    f"vLLM subprocess exited with code {returncode}. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-
-            try:
-                response = await client.get(
-                    f"{self._vllm_base_url}/v1/models",
-                    **self._runtime_request_kwargs(),
-                    timeout=5.0,
-                )
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                self._stop_vllm_subprocess()
-                raise RuntimeError(
-                    "vLLM passed /health but /v1/models was not reachable. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-        assert self._vllm_process is not None
-        assert self._vllm_log_path is not None
-        self._child_processes.watch_popen(
-            "vLLM runtime",
-            self._vllm_process,
-            log_path=self._vllm_log_path,
-        )
-        return self._vllm_host, self._vllm_port
 
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         import httpx
@@ -1031,14 +978,7 @@ class MegatronService:
         self.close()
 
     def _stop_vllm_subprocess(self) -> None:
-        if self._vllm_process is not None:
-            terminate_popen_process_group(self._vllm_process)
-            self._vllm_process = None
-        if self._vllm_log_file is not None:
-            self._vllm_log_file.close()
-            self._vllm_log_file = None
-        self._vllm_log_path = None
-        self._vllm_nccl_so_path = None
+        self._vllm_runtime.close()
         self._merged_weight_transfer_init_info = None
         self._loaded_adapter_steps.clear()
 
