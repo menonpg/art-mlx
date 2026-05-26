@@ -811,12 +811,15 @@ def _real_path_megatron_worker(
     )
     forward_trace_capture = None
     if request.forward_trace_dir is not None:
-        from ..model_support.forward_trace import ForwardTraceCapture
+        from ..model_support.forward_trace import (
+            CAPTURE_NAME_TOKENS,
+            ForwardTraceCapture,
+        )
 
         forward_trace_capture = ForwardTraceCapture(
             runtime.model,
             enabled=True,
-            capture_name_tokens=(".decoder.final_layernorm",),
+            capture_name_tokens=(*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm"),
             strict_output_match=True,
         )
         forward_trace_capture.set_step(
