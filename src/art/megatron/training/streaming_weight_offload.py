@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
+import logging
 import os
 import threading
-from typing import Any
+from typing import Any, Literal
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.tensor_parallel.random import is_checkpointing
@@ -13,6 +14,24 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from .model_chunks import ModelChunks
+
+logger = logging.getLogger(__name__)
+
+LayerOffloadStatus = Literal["cpu", "gpu", "loading"]
+LAYER_STATUS_CPU: LayerOffloadStatus = "cpu"
+LAYER_STATUS_GPU: LayerOffloadStatus = "gpu"
+LAYER_STATUS_LOADING: LayerOffloadStatus = "loading"
+STREAMING_INSTALLED_MESSAGE = (
+    "Installed streaming frozen weight offload for %d layers (%d rank-local params)"
+)
+STREAMING_COMPILED_LAYERS_MESSAGE = (
+    "Streaming weight offload managing compiled transformer layers"
+)
+
+
+def _rank0_info(rank: int, message: str, *args: object) -> None:
+    if rank == 0:
+        logger.info(message, *args)
 
 
 class StreamingWeightOffloadConfig(BaseModel):
@@ -76,7 +95,7 @@ class _LayerState:
         self.index = index
         self.layer = layer
         self.groups = groups
-        self.status = "gpu"
+        self.status: LayerOffloadStatus = LAYER_STATUS_GPU
         self.slot: _LoadSlot | None = None
         self.load_event: torch.cuda.Event | None = None
         self.load_ready = False
@@ -142,11 +161,9 @@ class StreamingWeightOffloader:
                 )
             )
         self.offload_all(wait=True)
-        if self.rank == 0:
-            print(
-                "Installed streaming frozen weight offload for "
-                f"{len(self.layers)} layers ({param_count} rank-local params)"
-            )
+        _rank0_info(
+            self.rank, STREAMING_INSTALLED_MESSAGE, len(self.layers), param_count
+        )
 
     def begin_job(self) -> None:
         self._prefetch_window(0, 1, self.config.resident_layers)
@@ -190,7 +207,7 @@ class StreamingWeightOffloader:
 
     def _offload_recomputed_successors(self, index: int) -> None:
         for layer_state in self.layers[index + 1 :]:
-            if layer_state.status in {"gpu", "loading"}:
+            if layer_state.status in {LAYER_STATUS_GPU, LAYER_STATUS_LOADING}:
                 self._ensure_offloaded(layer_state)
 
     def _start_load(self, index: int) -> None:
@@ -198,16 +215,16 @@ class StreamingWeightOffloader:
         if index < 0 or index >= len(self.layers):
             return
         layer_state = self.layers[index]
-        if layer_state.status in {"gpu", "loading"}:
+        if layer_state.status in {LAYER_STATUS_GPU, LAYER_STATUS_LOADING}:
             return
-        if layer_state.status != "cpu":
+        if layer_state.status != LAYER_STATUS_CPU:
             raise RuntimeError(f"Unexpected layer offload state {layer_state.status!r}")
         slot = self._acquire_slot()
         layer_state.slot = slot
         layer_state.load_event = None
         layer_state.load_ready = False
         layer_state.load_error = None
-        layer_state.status = "loading"
+        layer_state.status = LAYER_STATUS_LOADING
         slot.owner = layer_state
         with self._condition:
             self._queue.append((layer_state, slot))
@@ -225,11 +242,11 @@ class StreamingWeightOffloader:
 
     def _finish_load(self, layer_state: _LayerState) -> None:
         self._check_worker_error()
-        if layer_state.status == "gpu":
+        if layer_state.status == LAYER_STATUS_GPU:
             return
-        if layer_state.status == "cpu":
+        if layer_state.status == LAYER_STATUS_CPU:
             self._start_load(layer_state.index)
-        if layer_state.status != "loading":
+        if layer_state.status != LAYER_STATUS_LOADING:
             raise RuntimeError(f"Unexpected layer load state {layer_state.status!r}")
         self._wait_for_load_launch(layer_state)
         if layer_state.load_error is not None:
@@ -244,22 +261,22 @@ class StreamingWeightOffloader:
         layer_state.load_event.synchronize()
         self._install_gpu_views(layer_state)
         layer_state.load_event = None
-        layer_state.status = "gpu"
+        layer_state.status = LAYER_STATUS_GPU
 
     def _ensure_offloaded(self, layer_state: _LayerState) -> None:
-        if layer_state.status == "cpu":
+        if layer_state.status == LAYER_STATUS_CPU:
             return
-        if layer_state.status == "loading":
+        if layer_state.status == LAYER_STATUS_LOADING:
             self._finish_load(layer_state)
-        if layer_state.status == "gpu":
+        if layer_state.status == LAYER_STATUS_GPU:
             self._start_offload(layer_state)
 
     def _start_offload(self, layer_state: _LayerState) -> None:
-        if layer_state.status == "cpu":
+        if layer_state.status == LAYER_STATUS_CPU:
             return
-        if layer_state.status == "loading":
+        if layer_state.status == LAYER_STATUS_LOADING:
             self._finish_load(layer_state)
-        if layer_state.status != "gpu":
+        if layer_state.status != LAYER_STATUS_GPU:
             raise RuntimeError(f"Unexpected layer offload state {layer_state.status!r}")
         current_stream = torch.cuda.current_stream()
         slot = layer_state.slot
@@ -270,7 +287,7 @@ class StreamingWeightOffloader:
             slot.release_stream = current_stream
         self._install_cpu_views(layer_state)
         layer_state.slot = None
-        layer_state.status = "cpu"
+        layer_state.status = LAYER_STATUS_CPU
 
     def _acquire_slot(self) -> _LoadSlot:
         free_slots = [slot for slot in self.slots if slot.owner is None]
@@ -390,8 +407,8 @@ def install_streaming_weight_offload(
     if not layers:
         raise RuntimeError("Streaming weight offload could not find transformer layers")
     _validate_checkpoint_shape(layers[0])
-    if rank == 0 and compile_enabled:
-        print("Streaming weight offload managing compiled transformer layers")
+    if compile_enabled:
+        _rank0_info(rank, STREAMING_COMPILED_LAYERS_MESSAGE)
     offloader = StreamingWeightOffloader(layers=layers, rank=rank, config=config)
     offloader.install()
     return offloader
