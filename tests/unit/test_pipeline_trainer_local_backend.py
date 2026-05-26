@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -289,7 +290,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     )
     trainer.state.completed_eval_steps = {2, 3}
     trainer._checkpoint_lease_counts[3] = 1
-    trainer._scheduled_eval_steps.add(4)
+    trainer._checkpoint_lease_counts[4] = 1
 
     await trainer._run_checkpoint_retention(5)
 
@@ -615,3 +616,72 @@ async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
 
     assert backend._model_inference_name(model) == f"{model.name}@5"
     service.prune_loaded_adapters.assert_awaited_once_with(retain_steps={3, 4, 5})
+
+
+@pytest.mark.asyncio
+async def test_local_backend_adapter_retention_lease_does_not_pin_inference(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="local-backend-adapter-retention-lease",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+        ),
+    )
+    backend = LocalBackend(path=str(tmp_path))
+    service = SimpleNamespace(
+        _latest_step=5,
+        prune_loaded_adapters=AsyncMock(),
+    )
+    backend._services[model.name] = cast(Any, service)
+
+    async with backend.adapter_retention_lease(model, 3):
+        assert backend._model_inference_name(model) == f"{model.name}@5"
+        await backend.prune_model_adapters(model, retain_steps={5})
+
+    service.prune_loaded_adapters.assert_awaited_once_with(retain_steps={3, 5})
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trainer_scheduled_eval_holds_retention_lease(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-scheduled-eval-lease",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+
+    class BackendWithRetentionLease:
+        def __init__(self) -> None:
+            self.active_steps: set[int] = set()
+
+        @asynccontextmanager
+        async def adapter_retention_lease(self, _model: TrainableModel, step: int):
+            self.active_steps.add(step)
+            try:
+                yield
+            finally:
+                self.active_steps.discard(step)
+
+    backend = BackendWithRetentionLease()
+    trainer = _make_trainer(model=model, backend=backend)
+    trainer._eval_queue = asyncio.Queue()
+
+    await trainer._schedule_eval_step(7)
+
+    assert trainer._scheduled_eval_steps == {7}
+    assert backend.active_steps == {7}
+    assert trainer._protected_checkpoint_steps(8) == {7, 8}
+    assert await trainer._eval_queue.get() == 7
+
+    await trainer._release_scheduled_eval_lease(7)
+
+    assert trainer._scheduled_eval_steps == set()
+    assert backend.active_steps == set()
+    assert trainer._protected_checkpoint_steps(8) == {8}

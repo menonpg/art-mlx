@@ -391,6 +391,16 @@ class LocalBackend(Backend):
         async with pin_inference_step(model.name, step), manager.lease(step):
             yield
 
+    @asynccontextmanager
+    async def adapter_retention_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with manager.lease(step):
+            yield
+
     async def prune_model_adapters(
         self,
         model: AnyTrainableModel,
