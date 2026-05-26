@@ -22,7 +22,7 @@ from .output_parity import (
     config_from_env,
     fwd_mean_abs_pct_limit_for_model,
 )
-from .real_path import RealPathConfig
+from .real_path import RealPathConfig, _delete_adapter_safetensors_on_pass
 
 
 def test_logical_map_flattens_shared_prefix_branches() -> None:
@@ -129,6 +129,29 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
 
 def test_real_path_default_generates_16_tokens_per_rollout() -> None:
     assert RealPathConfig().max_completion_tokens == 16
+
+
+def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    active_lora = run_dir / "real_path_active_lora"
+    checkpoint = run_dir / "art_path" / "models" / "m" / "checkpoints" / "0000"
+    active_lora.mkdir(parents=True)
+    checkpoint.mkdir(parents=True)
+    for directory in (active_lora, checkpoint):
+        (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+        (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+    score_path = run_dir / "real_path_vllm_lora_scores.json"
+    score_path.write_text("{}", encoding="utf-8")
+
+    _delete_adapter_safetensors_on_pass(run_dir, passed=False)
+
+    assert len(list(run_dir.rglob("adapter_model.safetensors"))) == 2
+
+    _delete_adapter_safetensors_on_pass(run_dir, passed=True)
+
+    assert list(run_dir.rglob("adapter_model.safetensors")) == []
+    assert len(list(run_dir.rglob("adapter_config.json"))) == 2
+    assert score_path.exists()
 
 
 def test_architecture_specific_real_path_limits() -> None:

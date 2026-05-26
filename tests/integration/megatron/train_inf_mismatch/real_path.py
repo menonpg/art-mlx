@@ -932,6 +932,13 @@ def _run_real_path_megatron_worker(
     )
 
 
+def _delete_adapter_safetensors_on_pass(artifact_dir: Path, *, passed: bool) -> None:
+    if not passed:
+        return
+    for path in artifact_dir.rglob("adapter_model.safetensors"):
+        path.unlink()
+
+
 async def run_real_path_train_inf_mismatch(
     *,
     config: RealPathConfig,
@@ -1167,6 +1174,7 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir / "real_path_comparison_report.json",
             report.model_dump(mode="json"),
         )
+        _delete_adapter_safetensors_on_pass(artifact_dir, passed=report.passed)
         return report
     finally:
         if backend_open:
