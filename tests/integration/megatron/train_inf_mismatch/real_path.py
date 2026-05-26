@@ -61,6 +61,7 @@ class RealPathConfig(BaseModel):
     prompt_sentence_count: int = 28
     diagnose_base: bool = False
     trace_layers: bool = False
+    trace_enforce_eager: bool = False
 
 
 class RealPathMegatronWorkerRequest(BaseModel):
@@ -171,6 +172,8 @@ def config_from_env() -> RealPathConfig:
         config.trace_layers = raw == "1"
         if config.trace_layers:
             config.diagnose_base = True
+    if raw := os.environ.get("ART_REAL_PATH_TRACE_ENFORCE_EAGER"):
+        config.trace_enforce_eager = raw == "1"
     return config
 
 
@@ -513,7 +516,7 @@ async def _score_base_real_generation_path(
         if config.trace_layers
         else None
     )
-    if config.trace_layers:
+    if config.trace_enforce_eager:
         engine_args["enforce_eager"] = True
 
     async with _direct_vllm_runtime(
