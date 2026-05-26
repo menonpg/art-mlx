@@ -104,8 +104,14 @@ def _should_capture(name: str) -> bool:
     return (
         name.endswith(".input_layernorm")
         or name.endswith(".self_attn")
+        or name.endswith(".qkv_proj")
+        or name.endswith(".q_norm")
+        or name.endswith(".k_norm")
+        or name.endswith(".o_proj")
         or name.endswith(".post_attention_layernorm")
         or name.endswith(".mlp")
+        or name.endswith(".gate_up_proj")
+        or name.endswith(".down_proj")
     )
 
 
