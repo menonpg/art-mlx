@@ -84,6 +84,9 @@ def _save_tensor(
 
     if not isinstance(tensor, torch.Tensor):
         return None
+    max_rows = int(os.environ.get("ART_VLLM_FORWARD_TRACE_MAX_ROWS", "768"))
+    if tensor.ndim > 0 and int(tensor.shape[0]) > max_rows:
+        return None
     rel_path = Path("tensors") / f"{call_index:06d}_{field}.pt"
     path = trace_dir / rel_path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,8 +185,10 @@ def _patch_causal_lm_class(module: Any, class_name: str) -> None:
                     primary_input_path=_save_tensor(
                         trace_dir, call_index, "primary_input", hidden_states
                     ),
-                    primary_output_path=_save_tensor(
-                        trace_dir, call_index, "primary_output", output
+                    primary_output_path=(
+                        _save_tensor(trace_dir, call_index, "primary_output", output)
+                        if os.environ.get("ART_VLLM_FORWARD_TRACE_SAVE_LOGITS") == "1"
+                        else None
                     ),
                 )
             return output
