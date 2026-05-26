@@ -10,7 +10,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import time
 from typing import Any, AsyncIterator, cast
 import uuid
 
@@ -79,11 +78,30 @@ class RealPathMegatronWorkerResult(BaseModel):
     adapter_path: str | None = None
 
 
+class RealPathBaseDiagnosticBundle(BaseModel):
+    vllm_scores: ScoreBundle
+    megatron_scores: ScoreBundle
+    megatron_score_path: str
+    vllm_score_path: str
+    logical_prompt_count: int
+    logical_token_count: int
+    moe_routing_packed_tokens: int
+    moe_routing_shared_prefix_rows: int
+    moe_routing_shared_prefix_conflict_rows: int
+    moe_routing_shared_prefix_conflict_slots: int
+    moe_routing_shared_prefix_compared_slots: int
+
+
 class RealPathTrainInfReport(BaseModel):
     base_model: str
     artifact_dir: str
     logical_prompt_count: int
     logical_token_count: int
+    base_logical_prompt_count: int | None = None
+    base_logical_token_count: int | None = None
+    base_moe_routing_packed_tokens: int | None = None
+    base_moe_routing_shared_prefix_conflict_rows: int | None = None
+    base_moe_routing_shared_prefix_conflict_slots: int | None = None
     adapter_path: str
     megatron_base_scores: str | None = None
     vllm_base_scores: str | None = None
@@ -366,163 +384,12 @@ def _topk_from_chat_logprob(entry: Any) -> TokenTopK:
     )
 
 
-async def _request_prompt_logprobs(
-    *,
-    base_url: str,
-    api_key: str,
-    model_name: str,
-    prompt_token_ids: list[int],
-) -> dict[str, Any]:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"{base_url.rstrip('/')}/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model_name,
-                "prompt": prompt_token_ids,
-                "add_special_tokens": False,
-                "max_tokens": 0,
-                "echo": True,
-                "prompt_logprobs": TOP_K,
-                "return_token_ids": True,
-            },
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def _prompt_logprob_entry_value(entry: dict[str, Any], token_id: int) -> float:
-    raw = entry.get(str(token_id))
-    if raw is None:
-        raise RuntimeError(f"Token {token_id} missing from vLLM prompt_logprobs entry")
-    return float(raw["logprob"] if isinstance(raw, dict) else raw.logprob)
-
-
-def _topk_from_prompt_logprob_entry(entry: dict[str, Any]) -> TokenTopK:
-    parsed: list[tuple[int, int, float]] = []
-    for raw_token_id, raw_value in entry.items():
-        token_id = int(raw_token_id)
-        if isinstance(raw_value, dict):
-            rank = int(raw_value.get("rank", TOP_K + 1))
-            logprob = float(raw_value["logprob"])
-        else:
-            rank = int(raw_value.rank)
-            logprob = float(raw_value.logprob)
-        if 1 <= rank <= TOP_K:
-            parsed.append((rank, token_id, logprob))
-    parsed.sort(key=lambda item: item[0])
-    return TokenTopK(
-        token_ids=[token_id for _rank, token_id, _logprob in parsed[:TOP_K]],
-        logprobs=[logprob for _rank, _token_id, logprob in parsed[:TOP_K]],
-    )
-
-
-async def _vllm_prompt_logprob_scores(
-    *,
-    base_url: str,
-    api_key: str,
-    model_name: str,
-    logical_map: LogicalTokenMap,
-    weight_state: WeightState,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    responses_by_prompt: dict[int, dict[str, Any]] = {}
-    prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
-    for prompt in logical_map.prompts:
-        response = await _request_prompt_logprobs(
-            base_url=base_url,
-            api_key=api_key,
-            model_name=model_name,
-            prompt_token_ids=prompt.token_ids,
-        )
-        choice = response["choices"][0]
-        returned_prompt_ids = [int(value) for value in choice["prompt_token_ids"]]
-        if returned_prompt_ids != prompt.token_ids:
-            raise RuntimeError(
-                "vLLM returned prompt_token_ids do not match request for "
-                f"prompt_id={prompt.prompt_id}"
-            )
-        responses_by_prompt[prompt.prompt_id] = response
-    _write_json(
-        artifact_dir / f"real_path_vllm_{weight_state}_prompt_logprob_responses.json",
-        responses_by_prompt,
-    )
-
-    target_logprobs: list[float] = []
-    topk: list[TokenTopK] = []
-    for token in logical_map.tokens:
-        prompt = prompt_by_id[token.prompt_id]
-        choice = responses_by_prompt[token.prompt_id]["choices"][0]
-        returned_token_id = int(prompt.token_ids[token.vllm_prompt_token_index])
-        if returned_token_id != token.token_id:
-            raise RuntimeError(
-                "Logical token alignment mismatch: "
-                f"expected={token.token_id} returned={returned_token_id}"
-            )
-        entry = choice["prompt_logprobs"][token.vllm_prompt_token_index]
-        if entry is None:
-            raise RuntimeError(
-                f"Missing prompt logprob entry for prompt_id={token.prompt_id} "
-                f"index={token.vllm_prompt_token_index}"
-            )
-        target_logprobs.append(_prompt_logprob_entry_value(entry, token.token_id))
-        topk.append(_topk_from_prompt_logprob_entry(entry))
-    return ScoreBundle(
-        side="vllm",
-        weight_state=weight_state,
-        rollout_mode="native_lora",
-        target_logprobs=target_logprobs,
-        topk=topk,
-    )
-
-
-async def _score_vllm_base_prompt_logprobs(
-    *,
-    config: TrainInfOutputParityConfig,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    served_name = f"train_inf_real_base_{int(time.time())}"
-    placeholder_lora = artifact_dir / "unused_lora_placeholder"
-    placeholder_lora.mkdir(exist_ok=True)
-    engine_args = {
-        "tensor_parallel_size": len(config.inference_gpu_ids),
-        "enable_expert_parallel": model_support_is_moe(
-            config.base_model,
-            allow_unvalidated_arch=config.allow_unvalidated_arch,
-        )
-        and len(config.inference_gpu_ids) > 1,
-        "max_model_len": config.packed.sequence_length + 8,
-        "max_logprobs": TOP_K,
-        **config.engine_args,
-    }
-    engine_args["enable_lora"] = True
-    engine_args["lora_target_modules"] = _lora_target_modules(config)
-    async with _direct_vllm_runtime(
-        config=config,
-        artifact_dir=artifact_dir,
-        served_model_name=served_name,
-        lora_path=str(placeholder_lora),
-        rollout_weights_mode="merged",
-        engine_args=engine_args,
-    ) as (host, port):
-        return await _vllm_prompt_logprob_scores(
-            base_url=f"http://{host}:{port}/v1",
-            api_key="EMPTY",
-            model_name=served_name,
-            logical_map=logical_map,
-            weight_state="base",
-            artifact_dir=artifact_dir,
-        )
-
-
 def _vllm_scores_from_real_choices(
     *,
     trajectory_groups: list[Any],
     logical_map: LogicalTokenMap,
     require_routing_metadata: bool,
+    weight_state: WeightState,
 ) -> ScoreBundle:
     choices_by_tokens = _choice_score_index(
         trajectory_groups,
@@ -549,11 +416,14 @@ def _vllm_scores_from_real_choices(
         prompt = prompt_by_id[token.prompt_id]
         choice = choice_by_prompt_id[token.prompt_id]
         metadata = choice_moe_routing_metadata(choice)
-        prompt_len = prompt.scored_token_start_index
-        if metadata is not None and len(metadata["prompt_token_ids"]) != prompt_len:
+        vllm_prompt_len = prompt.scored_token_start_index
+        if (
+            metadata is not None
+            and len(metadata["prompt_token_ids"]) != vllm_prompt_len
+        ):
             raise RuntimeError(
-                "vLLM routed prompt length does not match ART packed boundary: "
-                f"prompt_id={prompt.prompt_id}, art={prompt_len}, "
+                "vLLM routed prompt length does not match ART packed request: "
+                f"prompt_id={prompt.prompt_id}, art={vllm_prompt_len}, "
                 f"vllm={len(metadata['prompt_token_ids'])}"
             )
         token_logprobs = (
@@ -561,7 +431,7 @@ def _vllm_scores_from_real_choices(
             if choice.logprobs is not None and choice.logprobs.content is not None
             else []
         )
-        completion_index = token.vllm_prompt_token_index - prompt_len
+        completion_index = token.vllm_prompt_token_index - vllm_prompt_len
         if completion_index < 0 or completion_index >= len(token_logprobs):
             raise RuntimeError(
                 "Logical token is outside captured vLLM completion logprobs: "
@@ -578,10 +448,153 @@ def _vllm_scores_from_real_choices(
         topk.append(_topk_from_chat_logprob(entry))
     return ScoreBundle(
         side="vllm",
-        weight_state="lora",
+        weight_state=weight_state,
         rollout_mode="native_lora",
         target_logprobs=target_logprobs,
         topk=topk,
+    )
+
+
+async def _score_base_real_generation_path(
+    *,
+    config: RealPathConfig,
+    artifact_dir: Path,
+    is_moe: bool,
+) -> RealPathBaseDiagnosticBundle:
+    import art
+    from art.megatron.routing_replay import (
+        build_moe_routing_replay_bundle_from_packed_tensors,
+    )
+    from art.megatron.runtime.backend import MegatronBackend
+    from art.preprocessing.moe_routing import MoeRoutingPackStats
+    from art.preprocessing.pack import packed_tensors_to_dir
+
+    parity_config = config.output_parity
+    served_name = f"train_inf_real_base_{uuid.uuid4().hex[:8]}"
+    placeholder_lora = artifact_dir / "unused_base_lora_placeholder"
+    placeholder_lora.mkdir(exist_ok=True)
+    engine_args = {
+        "tensor_parallel_size": len(parity_config.inference_gpu_ids),
+        "enable_expert_parallel": is_moe and len(parity_config.inference_gpu_ids) > 1,
+        "max_model_len": parity_config.packed.sequence_length + 8,
+        "max_logprobs": TOP_K,
+        **parity_config.engine_args,
+    }
+    engine_args.pop("enable_lora", None)
+    engine_args.pop("max_loras", None)
+    engine_args.pop("lora_target_modules", None)
+    if is_moe:
+        engine_args["enable_return_routed_experts"] = True
+        engine_args["async_scheduling"] = False
+
+    async with _direct_vllm_runtime(
+        config=parity_config,
+        artifact_dir=artifact_dir,
+        served_model_name=served_name,
+        lora_path=str(placeholder_lora),
+        rollout_weights_mode="merged",
+        engine_args=engine_args,
+    ) as (host, port):
+        model = art.TrainableModel(
+            name=f"{served_name}_client",
+            project="train_inf_mismatch",
+            base_model=parity_config.base_model,
+            _internal_config={
+                "init_args": {
+                    "max_seq_length": parity_config.packed.sequence_length,
+                },
+            },
+        )
+        object.__setattr__(model, "inference_base_url", f"http://{host}:{port}/v1")
+        object.__setattr__(model, "inference_api_key", "EMPTY")
+        object.__setattr__(model, "inference_model_name", served_name)
+        trajectory_groups = await _collect_real_trajectory_groups(
+            model=model,
+            config=config,
+        )
+
+    packing_backend = MegatronBackend(
+        path=str(artifact_dir / "base_art_path"),
+        enable_expert_replay=is_moe,
+    )
+    packed_tensors = packing_backend._get_packed_tensors(
+        model,
+        trajectory_groups,
+        advantage_balance=0.0,
+        allow_training_without_logprobs=False,
+        scale_rewards=True,
+        plot_tensors=False,
+        packed_sequence_length=parity_config.packed.sequence_length,
+        logprob_calculation_chunk_size=1024,
+        include_moe_routing=is_moe,
+    )
+    if packed_tensors is None:
+        raise RuntimeError("Base diagnostic ART path produced no packed tensors")
+    logical_map = build_logical_token_map(cast(dict[str, Any], packed_tensors))
+    logical_map_path = artifact_dir / "real_path_base_logical_token_map.json"
+    _write_json(logical_map_path, logical_map.model_dump(mode="json"))
+
+    vllm_base = _vllm_scores_from_real_choices(
+        trajectory_groups=trajectory_groups,
+        logical_map=logical_map,
+        require_routing_metadata=is_moe,
+        weight_state="base",
+    )
+    vllm_score_path = artifact_dir / "real_path_vllm_base_scores.json"
+    _write_json(vllm_score_path, vllm_base.model_dump(mode="json"))
+
+    routing_replay_path: str | None = None
+    global_grad_accumulation_sequences = int(packed_tensors["tokens"].shape[0])
+    if is_moe:
+        routing_replay_dir = artifact_dir / "real_path_base_moe_routing_replay"
+        build_moe_routing_replay_bundle_from_packed_tensors(
+            packed_tensors=packed_tensors,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        ).to_dir(routing_replay_dir)
+        routing_replay_path = str(routing_replay_dir)
+        stats = packed_tensors["moe_routing_replay"].pack_stats
+    else:
+        stats = MoeRoutingPackStats()
+
+    disk_packed_tensors = packed_tensors_to_dir(
+        packed_tensors,
+        str(artifact_dir / "real_path_base_packed_tensors"),
+    )
+    _write_json(
+        artifact_dir / "real_path_base_disk_packed_tensors.json",
+        cast(dict[str, Any], disk_packed_tensors),
+    )
+    worker_result = _run_real_path_megatron_worker(
+        RealPathMegatronWorkerRequest(
+            config=parity_config,
+            artifact_dir=str(artifact_dir),
+            disk_packed_tensors=disk_packed_tensors,
+            logical_map_path=str(logical_map_path),
+            weight_state="base",
+            adapter_path=None,
+            moe_routing_replay_path=routing_replay_path,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+    )
+    megatron_base = ScoreBundle.model_validate(
+        _read_json(Path(worker_result.score_path))
+    )
+    return RealPathBaseDiagnosticBundle(
+        vllm_scores=vllm_base,
+        megatron_scores=megatron_base,
+        megatron_score_path=worker_result.score_path,
+        vllm_score_path=str(vllm_score_path),
+        logical_prompt_count=len(logical_map.prompts),
+        logical_token_count=len(logical_map.tokens),
+        moe_routing_packed_tokens=int(stats.packed_tokens),
+        moe_routing_shared_prefix_rows=int(stats.shared_prefix_rows),
+        moe_routing_shared_prefix_conflict_rows=int(stats.shared_prefix_conflict_rows),
+        moe_routing_shared_prefix_conflict_slots=int(
+            stats.shared_prefix_conflict_slots
+        ),
+        moe_routing_shared_prefix_compared_slots=int(
+            stats.shared_prefix_compared_slots
+        ),
     )
 
 
@@ -953,6 +966,7 @@ async def run_real_path_train_inf_mismatch(
             trajectory_groups=trajectory_groups,
             logical_map=logical_map,
             require_routing_metadata=is_moe,
+            weight_state="lora",
         )
         _write_json(
             artifact_dir / "real_path_vllm_lora_scores.json",
@@ -961,38 +975,19 @@ async def run_real_path_train_inf_mismatch(
         await backend.close()
         backend_open = False
 
-        base_worker_result: RealPathMegatronWorkerResult | None = None
+        base_diagnostic: RealPathBaseDiagnosticBundle | None = None
         megatron_base: ScoreBundle | None = None
         vllm_base: ScoreBundle | None = None
         base_comparison: PairComparison | None = None
         base_topk_comparison: TopKComparison | None = None
         if config.diagnose_base:
-            vllm_base = await _score_vllm_base_prompt_logprobs(
-                config=parity_config,
-                logical_map=logical_map,
+            base_diagnostic = await _score_base_real_generation_path(
+                config=config,
                 artifact_dir=artifact_dir,
+                is_moe=is_moe,
             )
-            _write_json(
-                artifact_dir / "real_path_vllm_base_scores.json",
-                vllm_base.model_dump(mode="json"),
-            )
-            base_worker_result = _run_real_path_megatron_worker(
-                RealPathMegatronWorkerRequest(
-                    config=parity_config,
-                    artifact_dir=str(artifact_dir),
-                    disk_packed_tensors=disk_packed_tensors,
-                    logical_map_path=str(logical_map_path),
-                    weight_state="base",
-                    adapter_path=None,
-                    moe_routing_replay_path=None,
-                    global_grad_accumulation_sequences=(
-                        global_grad_accumulation_sequences
-                    ),
-                )
-            )
-            megatron_base = ScoreBundle.model_validate(
-                _read_json(Path(base_worker_result.score_path))
-            )
+            megatron_base = base_diagnostic.megatron_scores
+            vllm_base = base_diagnostic.vllm_scores
 
         worker_result = _run_real_path_megatron_worker(
             RealPathMegatronWorkerRequest(
@@ -1041,16 +1036,39 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir=str(artifact_dir),
             logical_prompt_count=len(logical_map.prompts),
             logical_token_count=len(logical_map.tokens),
+            base_logical_prompt_count=(
+                base_diagnostic.logical_prompt_count
+                if base_diagnostic is not None
+                else None
+            ),
+            base_logical_token_count=(
+                base_diagnostic.logical_token_count
+                if base_diagnostic is not None
+                else None
+            ),
+            base_moe_routing_packed_tokens=(
+                base_diagnostic.moe_routing_packed_tokens
+                if base_diagnostic is not None
+                else None
+            ),
+            base_moe_routing_shared_prefix_conflict_rows=(
+                base_diagnostic.moe_routing_shared_prefix_conflict_rows
+                if base_diagnostic is not None
+                else None
+            ),
+            base_moe_routing_shared_prefix_conflict_slots=(
+                base_diagnostic.moe_routing_shared_prefix_conflict_slots
+                if base_diagnostic is not None
+                else None
+            ),
             adapter_path=adapter_path,
             megatron_base_scores=(
-                base_worker_result.score_path
-                if base_worker_result is not None
+                base_diagnostic.megatron_score_path
+                if base_diagnostic is not None
                 else None
             ),
             vllm_base_scores=(
-                str(artifact_dir / "real_path_vllm_base_scores.json")
-                if vllm_base is not None
-                else None
+                base_diagnostic.vllm_score_path if base_diagnostic is not None else None
             ),
             megatron_lora_scores=worker_result.score_path,
             vllm_lora_scores=str(artifact_dir / "real_path_vllm_lora_scores.json"),

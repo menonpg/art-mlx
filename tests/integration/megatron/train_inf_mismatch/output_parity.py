@@ -111,6 +111,9 @@ class LogicalPrompt(BaseModel):
     sample_id: int
     family_id: int
     completion_id: int
+    # Packed prompt rows are the shared prefix segment exactly: prompt_end-start.
+    # ART stores the final context token at the start of each completion segment,
+    # so vLLM's generated-token logprobs start one token after this boundary.
     packed_prompt_length: int
     scored_token_start_index: int
     token_ids: list[int]
