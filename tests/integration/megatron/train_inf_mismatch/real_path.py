@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import random
 import shutil
+import socket
 import subprocess
 import sys
-from typing import Any, cast
+import time
+from typing import Any, AsyncIterator, cast
 import uuid
 
 from openai.types.chat.chat_completion import Choice
@@ -248,6 +251,12 @@ def _parse_token_id(raw: str | None) -> int:
     )
 
 
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _choice_score_index(
     trajectory_groups: list[Any],
     *,
@@ -287,6 +296,62 @@ def _choice_score_index(
                 ]
                 indexed.setdefault(tuple(prompt_ids + completion_ids), item)
     return indexed
+
+
+@asynccontextmanager
+async def _direct_vllm_runtime(
+    *,
+    config: TrainInfOutputParityConfig,
+    artifact_dir: Path,
+    served_model_name: str,
+    lora_path: str,
+    rollout_weights_mode: str,
+    engine_args: dict[str, Any],
+) -> AsyncIterator[tuple[str, int]]:
+    import art.vllm_runtime as runtime
+
+    port = _free_port()
+    launch_config = runtime.VllmRuntimeLaunchConfig(
+        base_model=config.base_model,
+        port=port,
+        host="127.0.0.1",
+        cuda_visible_devices=",".join(str(value) for value in config.inference_gpu_ids),
+        lora_path=lora_path,
+        served_model_name=served_model_name,
+        rollout_weights_mode=cast(Any, rollout_weights_mode),
+        engine_args=engine_args,
+        server_args={"return_tokens_as_token_ids": True, **config.server_args},
+    )
+    command = runtime.build_vllm_runtime_server_cmd(launch_config)
+    log_path = artifact_dir / f"real_path_vllm_{served_model_name}.log"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(runtime.get_vllm_runtime_working_dir()),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    try:
+        await runtime.wait_for_vllm_runtime(
+            process=process,
+            host=launch_config.host,
+            port=launch_config.port,
+            timeout=float(
+                os.environ.get("ART_TRAIN_INF_MISMATCH_VLLM_TIMEOUT", "1200")
+            ),
+        )
+        yield launch_config.host, launch_config.port
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
 
 
 def _topk_from_chat_logprob(entry: Any) -> TokenTopK:
@@ -411,6 +476,46 @@ async def _vllm_prompt_logprob_scores(
         target_logprobs=target_logprobs,
         topk=topk,
     )
+
+
+async def _score_vllm_base_prompt_logprobs(
+    *,
+    config: TrainInfOutputParityConfig,
+    logical_map: LogicalTokenMap,
+    artifact_dir: Path,
+) -> ScoreBundle:
+    served_name = f"train_inf_real_base_{int(time.time())}"
+    placeholder_lora = artifact_dir / "unused_lora_placeholder"
+    placeholder_lora.mkdir(exist_ok=True)
+    engine_args = {
+        "tensor_parallel_size": len(config.inference_gpu_ids),
+        "enable_expert_parallel": model_support_is_moe(
+            config.base_model,
+            allow_unvalidated_arch=config.allow_unvalidated_arch,
+        )
+        and len(config.inference_gpu_ids) > 1,
+        "max_model_len": config.packed.sequence_length + 8,
+        "max_logprobs": TOP_K,
+        **config.engine_args,
+    }
+    engine_args["enable_lora"] = True
+    engine_args["lora_target_modules"] = _lora_target_modules(config)
+    async with _direct_vllm_runtime(
+        config=config,
+        artifact_dir=artifact_dir,
+        served_model_name=served_name,
+        lora_path=str(placeholder_lora),
+        rollout_weights_mode="merged",
+        engine_args=engine_args,
+    ) as (host, port):
+        return await _vllm_prompt_logprob_scores(
+            base_url=f"http://{host}:{port}/v1",
+            api_key="EMPTY",
+            model_name=served_name,
+            logical_map=logical_map,
+            weight_state="base",
+            artifact_dir=artifact_dir,
+        )
 
 
 def _vllm_scores_from_real_choices(
@@ -770,6 +875,7 @@ async def run_real_path_train_inf_mismatch(
         path=str(artifact_dir / "art_path"),
         enable_expert_replay=is_moe,
     )
+    backend_open = False
     model = art.TrainableModel(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
         project="train_inf_mismatch",
@@ -796,6 +902,7 @@ async def run_real_path_train_inf_mismatch(
 
     try:
         await model.register(backend)
+        backend_open = True
         trajectory_groups = await _collect_real_trajectory_groups(
             model=model,
             config=config,
@@ -851,6 +958,8 @@ async def run_real_path_train_inf_mismatch(
             artifact_dir / "real_path_vllm_lora_scores.json",
             vllm_lora.model_dump(mode="json"),
         )
+        await backend.close()
+        backend_open = False
 
         base_worker_result: RealPathMegatronWorkerResult | None = None
         megatron_base: ScoreBundle | None = None
@@ -858,16 +967,9 @@ async def run_real_path_train_inf_mismatch(
         base_comparison: PairComparison | None = None
         base_topk_comparison: TopKComparison | None = None
         if config.diagnose_base:
-            if model.inference_base_url is None or model.inference_api_key is None:
-                raise RuntimeError(
-                    "Registered model is missing inference client config"
-                )
-            vllm_base = await _vllm_prompt_logprob_scores(
-                base_url=model.inference_base_url,
-                api_key=model.inference_api_key,
-                model_name=parity_config.base_model,
+            vllm_base = await _score_vllm_base_prompt_logprobs(
+                config=parity_config,
                 logical_map=logical_map,
-                weight_state="base",
                 artifact_dir=artifact_dir,
             )
             _write_json(
@@ -882,7 +984,7 @@ async def run_real_path_train_inf_mismatch(
                     logical_map_path=str(logical_map_path),
                     weight_state="base",
                     adapter_path=None,
-                    moe_routing_replay_path=routing_replay_path,
+                    moe_routing_replay_path=None,
                     global_grad_accumulation_sequences=(
                         global_grad_accumulation_sequences
                     ),
@@ -977,7 +1079,8 @@ async def run_real_path_train_inf_mismatch(
         )
         return report
     finally:
-        await backend.close()
+        if backend_open:
+            await backend.close()
 
 
 def _worker_cli(request_path: Path, *, adapter_only: bool) -> None:
