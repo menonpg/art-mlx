@@ -36,7 +36,7 @@ from ..vllm_runtime import (
     get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
-from .lora import LORA_ALPHA, LORA_RANK
+from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .runtime.client import (
     create_megatron_job_paths,
@@ -64,7 +64,7 @@ class _RuntimeRequestKwargs(TypedDict, total=False):
 def create_identity_lora(
     base_model: str,
     lora_path: str,
-    rank: int = LORA_RANK,
+    rank: int | None = None,
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
@@ -78,7 +78,7 @@ def create_identity_lora(
     Args:
         base_model: HuggingFace model identifier.
         lora_path: Directory to save the adapter files.
-        rank: LoRA rank (default 1 for Megatron models).
+        rank: LoRA rank. Defaults to rank 1 for MoE models and rank 8 for dense models.
         lora_alpha: LoRA alpha scaling factor.
     """
     from unittest.mock import patch
@@ -96,6 +96,8 @@ def create_identity_lora(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    if rank is None:
+        rank = default_lora_rank_for_handler(handler)
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     model_config = handler.identity_lora_model_config(base_config)
     with init_empty_weights():
@@ -317,9 +319,15 @@ class MegatronService:
         return optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
+        from .model_support import get_model_support_handler
+
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=LORA_RANK,
+            r=default_lora_rank_for_handler(handler),
             lora_alpha=LORA_ALPHA,
             target_modules=default_target_modules(self.base_model),
             bias="none",

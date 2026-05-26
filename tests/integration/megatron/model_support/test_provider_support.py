@@ -10,6 +10,7 @@ pytest.importorskip("megatron.bridge")
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.flex_attention import FlexDotProductAttention
+from art.megatron.lora import default_lora_rank_for_handler
 from art.megatron.model_support.registry import (
     UnsupportedModelArchitectureError,
     get_model_support_handler,
@@ -78,6 +79,14 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     assert spec.key == "qwen3_dense"
     assert spec.native_vllm_lora_status == "validated"
     assert handler.key == "qwen3_dense"
+
+
+def test_megatron_lora_rank_defaults_by_architecture() -> None:
+    dense_handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
+    moe_handler = get_model_support_handler("Qwen/Qwen3-30B-A3B-Instruct-2507")
+
+    assert default_lora_rank_for_handler(dense_handler) == 8
+    assert default_lora_rank_for_handler(moe_handler) == 1
 
 
 def test_get_provider_accepts_registry_supported_models(
