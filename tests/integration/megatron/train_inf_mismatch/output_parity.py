@@ -111,6 +111,8 @@ class LogicalPrompt(BaseModel):
     sample_id: int
     family_id: int
     completion_id: int
+    packed_prompt_length: int
+    scored_token_start_index: int
     token_ids: list[int]
 
 
@@ -390,6 +392,8 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                             sample_id=sample_id,
                             family_id=family_id,
                             completion_id=completion_id,
+                            packed_prompt_length=prompt_len,
+                            scored_token_start_index=prompt_len + 1,
                             token_ids=flat,
                         )
                     )

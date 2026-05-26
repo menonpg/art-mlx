@@ -38,6 +38,11 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
         [10, 11, 12, 13, 14],
         [10, 11, 12, 15, 16],
     ]
+    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [2, 2]
+    assert [prompt.scored_token_start_index for prompt in logical_map.prompts] == [
+        3,
+        3,
+    ]
     assert [token.token_id for token in logical_map.tokens] == [13, 14, 15, 16]
     assert [token.art_logit_index for token in logical_map.tokens] == [2, 3, 5, 6]
     assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [

@@ -57,6 +57,7 @@ class RealPathConfig(BaseModel):
     rollouts_per_prompt: int = 2
     max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
+    diagnose_base: bool = False
 
 
 class RealPathMegatronWorkerRequest(BaseModel):
@@ -81,8 +82,12 @@ class RealPathTrainInfReport(BaseModel):
     logical_prompt_count: int
     logical_token_count: int
     adapter_path: str
+    megatron_base_scores: str | None = None
+    vllm_base_scores: str | None = None
     megatron_lora_scores: str
     vllm_lora_scores: str
+    base: PairComparison | None = None
+    base_topk: TopKComparison | None = None
     lora: PairComparison
     lora_topk: TopKComparison
     moe_routing_packed_tokens: int
@@ -135,6 +140,8 @@ def config_from_env() -> RealPathConfig:
         config.max_completion_tokens = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_PROMPT_SENTENCE_COUNT"):
         config.prompt_sentence_count = int(raw)
+    if raw := os.environ.get("ART_REAL_PATH_DIAGNOSE_BASE"):
+        config.diagnose_base = raw == "1"
     return config
 
 
@@ -294,6 +301,118 @@ def _topk_from_chat_logprob(entry: Any) -> TokenTopK:
     )
 
 
+async def _request_prompt_logprobs(
+    *,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    prompt_token_ids: list[int],
+) -> dict[str, Any]:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        response = await client.post(
+            f"{base_url.rstrip('/')}/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model_name,
+                "prompt": prompt_token_ids,
+                "add_special_tokens": False,
+                "max_tokens": 0,
+                "echo": True,
+                "prompt_logprobs": TOP_K,
+                "return_token_ids": True,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _prompt_logprob_entry_value(entry: dict[str, Any], token_id: int) -> float:
+    raw = entry.get(str(token_id))
+    if raw is None:
+        raise RuntimeError(f"Token {token_id} missing from vLLM prompt_logprobs entry")
+    return float(raw["logprob"] if isinstance(raw, dict) else raw.logprob)
+
+
+def _topk_from_prompt_logprob_entry(entry: dict[str, Any]) -> TokenTopK:
+    parsed: list[tuple[int, int, float]] = []
+    for raw_token_id, raw_value in entry.items():
+        token_id = int(raw_token_id)
+        if isinstance(raw_value, dict):
+            rank = int(raw_value.get("rank", TOP_K + 1))
+            logprob = float(raw_value["logprob"])
+        else:
+            rank = int(raw_value.rank)
+            logprob = float(raw_value.logprob)
+        if 1 <= rank <= TOP_K:
+            parsed.append((rank, token_id, logprob))
+    parsed.sort(key=lambda item: item[0])
+    return TokenTopK(
+        token_ids=[token_id for _rank, token_id, _logprob in parsed[:TOP_K]],
+        logprobs=[logprob for _rank, _token_id, logprob in parsed[:TOP_K]],
+    )
+
+
+async def _vllm_prompt_logprob_scores(
+    *,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    logical_map: LogicalTokenMap,
+    weight_state: WeightState,
+    artifact_dir: Path,
+) -> ScoreBundle:
+    responses_by_prompt: dict[int, dict[str, Any]] = {}
+    prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
+    for prompt in logical_map.prompts:
+        response = await _request_prompt_logprobs(
+            base_url=base_url,
+            api_key=api_key,
+            model_name=model_name,
+            prompt_token_ids=prompt.token_ids,
+        )
+        choice = response["choices"][0]
+        returned_prompt_ids = [int(value) for value in choice["prompt_token_ids"]]
+        if returned_prompt_ids != prompt.token_ids:
+            raise RuntimeError(
+                "vLLM returned prompt_token_ids do not match request for "
+                f"prompt_id={prompt.prompt_id}"
+            )
+        responses_by_prompt[prompt.prompt_id] = response
+    _write_json(
+        artifact_dir / f"real_path_vllm_{weight_state}_prompt_logprob_responses.json",
+        responses_by_prompt,
+    )
+
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    for token in logical_map.tokens:
+        prompt = prompt_by_id[token.prompt_id]
+        choice = responses_by_prompt[token.prompt_id]["choices"][0]
+        returned_token_id = int(prompt.token_ids[token.vllm_prompt_token_index])
+        if returned_token_id != token.token_id:
+            raise RuntimeError(
+                "Logical token alignment mismatch: "
+                f"expected={token.token_id} returned={returned_token_id}"
+            )
+        entry = choice["prompt_logprobs"][token.vllm_prompt_token_index]
+        if entry is None:
+            raise RuntimeError(
+                f"Missing prompt logprob entry for prompt_id={token.prompt_id} "
+                f"index={token.vllm_prompt_token_index}"
+            )
+        target_logprobs.append(_prompt_logprob_entry_value(entry, token.token_id))
+        topk.append(_topk_from_prompt_logprob_entry(entry))
+    return ScoreBundle(
+        side="vllm",
+        weight_state=weight_state,
+        rollout_mode="native_lora",
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
+
+
 def _vllm_scores_from_real_choices(
     *,
     trajectory_groups: list[Any],
@@ -305,24 +424,12 @@ def _vllm_scores_from_real_choices(
         require_routing_metadata=require_routing_metadata,
     )
     prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
-    tokens_by_prompt_id: dict[int, list[Any]] = {}
-    for token in logical_map.tokens:
-        tokens_by_prompt_id.setdefault(token.prompt_id, []).append(token)
     choice_by_prompt_id: dict[int, Choice] = {}
     for prompt in logical_map.prompts:
-        prompt_tokens = tokens_by_prompt_id.get(prompt.prompt_id, [])
-        prompt_len = len(prompt.token_ids)
-        if prompt_tokens:
-            first_vllm_index = min(
-                token.vllm_prompt_token_index for token in prompt_tokens
-            )
-            prompt_len = (
-                first_vllm_index - 1 if require_routing_metadata else first_vllm_index
-            )
         key = (
             tuple(prompt.token_ids)
             if require_routing_metadata
-            else tuple(prompt.token_ids[prompt_len:])
+            else tuple(prompt.token_ids[prompt.scored_token_start_index :])
         )
         choice = choices_by_tokens.get(key)
         if choice is None:
@@ -337,13 +444,13 @@ def _vllm_scores_from_real_choices(
         prompt = prompt_by_id[token.prompt_id]
         choice = choice_by_prompt_id[token.prompt_id]
         metadata = choice_moe_routing_metadata(choice)
-        if metadata is None:
-            prompt_tokens = tokens_by_prompt_id.get(prompt.prompt_id, [])
-            prompt_len = min(
-                candidate.vllm_prompt_token_index for candidate in prompt_tokens
+        prompt_len = prompt.scored_token_start_index
+        if metadata is not None and len(metadata["prompt_token_ids"]) != prompt_len:
+            raise RuntimeError(
+                "vLLM routed prompt length does not match ART packed boundary: "
+                f"prompt_id={prompt.prompt_id}, art={prompt_len}, "
+                f"vllm={len(metadata['prompt_token_ids'])}"
             )
-        else:
-            prompt_len = len(metadata["prompt_token_ids"])
         token_logprobs = (
             choice.logprobs.content
             if choice.logprobs is not None and choice.logprobs.content is not None
@@ -483,7 +590,9 @@ def _real_path_megatron_worker(
         moe_routing_replay_strict=True,
         print_env=False,
         build_optimizer=False,
-        trainable_parameter_mode="lora",
+        trainable_parameter_mode=(
+            "lora" if adapter_only or request.weight_state == "lora" else "base_model"
+        ),
         allow_unvalidated_arch=request.config.allow_unvalidated_arch,
     )
     for chunk in runtime.model:
@@ -743,6 +852,46 @@ async def run_real_path_train_inf_mismatch(
             vllm_lora.model_dump(mode="json"),
         )
 
+        base_worker_result: RealPathMegatronWorkerResult | None = None
+        megatron_base: ScoreBundle | None = None
+        vllm_base: ScoreBundle | None = None
+        base_comparison: PairComparison | None = None
+        base_topk_comparison: TopKComparison | None = None
+        if config.diagnose_base:
+            if model.inference_base_url is None or model.inference_api_key is None:
+                raise RuntimeError(
+                    "Registered model is missing inference client config"
+                )
+            vllm_base = await _vllm_prompt_logprob_scores(
+                base_url=model.inference_base_url,
+                api_key=model.inference_api_key,
+                model_name=parity_config.base_model,
+                logical_map=logical_map,
+                weight_state="base",
+                artifact_dir=artifact_dir,
+            )
+            _write_json(
+                artifact_dir / "real_path_vllm_base_scores.json",
+                vllm_base.model_dump(mode="json"),
+            )
+            base_worker_result = _run_real_path_megatron_worker(
+                RealPathMegatronWorkerRequest(
+                    config=parity_config,
+                    artifact_dir=str(artifact_dir),
+                    disk_packed_tensors=disk_packed_tensors,
+                    logical_map_path=str(logical_map_path),
+                    weight_state="base",
+                    adapter_path=None,
+                    moe_routing_replay_path=routing_replay_path,
+                    global_grad_accumulation_sequences=(
+                        global_grad_accumulation_sequences
+                    ),
+                )
+            )
+            megatron_base = ScoreBundle.model_validate(
+                _read_json(Path(base_worker_result.score_path))
+            )
+
         worker_result = _run_real_path_megatron_worker(
             RealPathMegatronWorkerRequest(
                 config=parity_config,
@@ -761,6 +910,15 @@ async def run_real_path_train_inf_mismatch(
         import torch
 
         sequence_ids = [token.prompt_id for token in logical_map.tokens]
+        if megatron_base is not None and vllm_base is not None:
+            base_comparison = compare_pair(
+                candidate=torch.tensor(
+                    megatron_base.target_logprobs, dtype=torch.float32
+                ),
+                target=torch.tensor(vllm_base.target_logprobs, dtype=torch.float32),
+                sequence_ids=sequence_ids,
+            )
+            base_topk_comparison = compare_topk(megatron_base, vllm_base)
         comparison = compare_pair(
             candidate=torch.tensor(megatron_lora.target_logprobs, dtype=torch.float32),
             target=torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32),
@@ -782,8 +940,20 @@ async def run_real_path_train_inf_mismatch(
             logical_prompt_count=len(logical_map.prompts),
             logical_token_count=len(logical_map.tokens),
             adapter_path=adapter_path,
+            megatron_base_scores=(
+                base_worker_result.score_path
+                if base_worker_result is not None
+                else None
+            ),
+            vllm_base_scores=(
+                str(artifact_dir / "real_path_vllm_base_scores.json")
+                if vllm_base is not None
+                else None
+            ),
             megatron_lora_scores=worker_result.score_path,
             vllm_lora_scores=str(artifact_dir / "real_path_vllm_lora_scores.json"),
+            base=base_comparison,
+            base_topk=base_topk_comparison,
             lora=comparison,
             lora_topk=topk_comparison,
             moe_routing_packed_tokens=int(stats.packed_tokens),
