@@ -816,7 +816,7 @@ def _real_path_megatron_worker(
         forward_trace_capture = ForwardTraceCapture(
             runtime.model,
             enabled=True,
-            capture_name_tokens=(),
+            capture_name_tokens=(".decoder.final_layernorm",),
             strict_output_match=True,
         )
         forward_trace_capture.set_step(
