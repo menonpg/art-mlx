@@ -830,7 +830,9 @@ def _real_path_megatron_worker(
             global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
         )
         if forward_trace_capture is not None and request.forward_trace_dir is not None:
-            forward_trace_capture.save_current_step(Path(request.forward_trace_dir))
+            trace_dir = Path(request.forward_trace_dir)
+            forward_trace_capture.save_current_step(trace_dir)
+            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
     finally:
         if forward_trace_capture is not None:
             forward_trace_capture.close()
