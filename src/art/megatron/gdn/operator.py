@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-import os
 from types import MethodType
 from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
@@ -32,10 +31,16 @@ from .segment_layout import (
 )
 
 _NVTX_ENABLED: ContextVar[bool] = ContextVar("art_gdn_nvtx_enabled", default=False)
-_TRACE_ROW_TOKEN_UIDS_ATTR = "_art_trace_row_token_uids"
-_TRACE_UID_SPAN_ATTR = "_art_trace_uid_span"
 _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR = "_art_gdn_attention_original_shape"
 _GDN_CP_LAYOUT_ATTR = "_art_gdn_cp_layout"
+_GDN_TRACE_TOKEN_UID_HOOKS: Any | None = None
+
+
+def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
+    global _GDN_TRACE_TOKEN_UID_HOOKS
+    previous = _GDN_TRACE_TOKEN_UID_HOOKS
+    _GDN_TRACE_TOKEN_UID_HOOKS = hooks
+    return previous
 
 
 def install_shared_prefix_gdn_hooks(model_chunks: Sequence[Any]) -> None:
@@ -1163,8 +1168,10 @@ def _enter_gdn_island_layout(
     _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
     if gdn is not None:
         attention_bias.gdn_active_module = gdn
-    token_uids = _local_layout_token_uids(
-        plan, "gdn", hidden_states=gdn_hidden, gdn=gdn
+    token_uids = (
+        _local_layout_token_uids(plan, "gdn", hidden_states=gdn_hidden, gdn=gdn)
+        if _layout_token_uids_enabled()
+        else None
     )
     _set_active_routing_replay_token_uids(token_uids)
     return _attach_cp_layout(
@@ -1202,8 +1209,12 @@ def _mark_attention_layout_active(
     if hidden_states is None:
         return
     plan = _require_gdn_cp_plan(attention_bias)
-    token_uids = _local_layout_token_uids(
-        plan, "attention", hidden_states=hidden_states, gdn=gdn
+    token_uids = (
+        _local_layout_token_uids(
+            plan, "attention", hidden_states=hidden_states, gdn=gdn
+        )
+        if _layout_token_uids_enabled()
+        else None
     )
     _set_active_routing_replay_token_uids(token_uids)
     _attach_trace_token_uids(hidden_states, token_uids)
@@ -1225,8 +1236,10 @@ def _mark_gdn_layout_active(
     original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
     if original_shape is not None:
         _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
-    gdn_token_uids = _local_layout_token_uids(
-        plan, "gdn", hidden_states=hidden_states, gdn=gdn
+    gdn_token_uids = (
+        _local_layout_token_uids(plan, "gdn", hidden_states=hidden_states, gdn=gdn)
+        if _layout_token_uids_enabled()
+        else None
     )
     _set_active_routing_replay_token_uids(gdn_token_uids)
     _attach_trace_token_uids(hidden_states, gdn_token_uids)
@@ -1254,8 +1267,12 @@ def _leave_gdn_island_layout(
         gdn=gdn,
     )
     _mark_attention_layout_active(attention_bias)
-    token_uids = _local_layout_token_uids(
-        plan, "attention", hidden_states=attention_hidden, gdn=gdn
+    token_uids = (
+        _local_layout_token_uids(
+            plan, "attention", hidden_states=attention_hidden, gdn=gdn
+        )
+        if _layout_token_uids_enabled()
+        else None
     )
     _set_active_routing_replay_token_uids(token_uids)
     return _attach_cp_layout(
@@ -1301,12 +1318,6 @@ def _cp_output_to_attention(
             rank=rank,
             group=group,
             backward_plan=backward_plan,
-        )
-    if original_shape is None:
-        original_shape = (
-            int(attention_flat.shape[0]),
-            1,
-            int(attention_flat.shape[-1]),
         )
     return _restore_hidden_from_cp_flat(attention_flat, original_shape)
 
@@ -1393,8 +1404,7 @@ def _layout_token_uids(
 
 
 def _trace_token_uids_enabled() -> bool:
-    raw = os.environ.get("ART_MEGATRON_ATTACH_TOKEN_UIDS", "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return _GDN_TRACE_TOKEN_UID_HOOKS is not None
 
 
 def _local_layout_token_uids(
@@ -1441,15 +1451,11 @@ def _replicated_layout_token_uids(
 
 
 def _attach_trace_token_uids(tensor: Tensor, token_uids: Tensor | None) -> Tensor:
-    if token_uids is None:
+    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
+    if hooks is None or token_uids is None:
         return tensor
-    setattr(
-        tensor,
-        _TRACE_ROW_TOKEN_UIDS_ATTR,
-        token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
-    )
-    setattr(tensor, _TRACE_UID_SPAN_ATTR, None)
-    return tensor
+    attach = getattr(hooks, "attach_token_uids", None)
+    return tensor if attach is None else cast(Tensor, attach(tensor, token_uids))
 
 
 def _attach_cp_layout(tensor: Tensor, layout: Literal["attention", "gdn"]) -> Tensor:
@@ -1494,89 +1500,31 @@ def _infer_cp_hidden_layout(
     return None
 
 
-def _trace_token_uids_from_tensor(tensor: Tensor) -> Tensor | None:
-    token_uids = getattr(tensor, _TRACE_ROW_TOKEN_UIDS_ATTR, None)
-    if not isinstance(token_uids, Tensor):
-        return None
-    return token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
-
-
 def _prepare_in_proj_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
-    token_uids = _trace_token_uids_from_tensor(hidden_states)
-    if token_uids is None:
+    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
+    if hooks is None:
         return
-    projection = _gdn_input_projection(gdn)
-    if projection is None:
-        return
-    output_uids = _column_parallel_input_token_uids(
-        token_uids,
-        hidden_states,
-        projection,
-    )
-    in_proj = getattr(gdn, "in_proj", None)
-    _set_module_trace_token_uids(in_proj, output_uids)
-    _set_module_trace_token_uids(projection, output_uids)
-    _set_module_trace_token_uids(getattr(in_proj, "qkv_lora", None), output_uids)
-    _set_module_trace_token_uids(getattr(in_proj, "z_lora", None), output_uids)
-
-
-@torch.compiler.disable
-def _column_parallel_input_token_uids(
-    token_uids: Tensor, hidden_states: Tensor, projection: Any
-) -> Tensor:
-    if not _uses_sequence_parallel(projection):
-        return token_uids.to(dtype=torch.int64).reshape(-1)
-    seq_len, batch_size, _hidden_size = hidden_states.shape
-    expected = int(seq_len) * int(batch_size)
-    if int(token_uids.numel()) != expected:
-        return token_uids.to(dtype=torch.int64).reshape(-1)
-    uid_tensor = (
-        token_uids.to(device=hidden_states.device, dtype=torch.int64)
-        .reshape(batch_size, seq_len)
-        .transpose(0, 1)
-        .contiguous()
-        .unsqueeze(-1)
-    )
-    gathered = _column_parallel_input(uid_tensor, projection)
-    return (
-        gathered.squeeze(-1)
-        .transpose(0, 1)
-        .contiguous()
-        .reshape(-1)
-        .detach()
-        .to(device="cpu", dtype=torch.int64)
-    )
-
-
-def _set_module_trace_token_uids(module: Any, token_uids: Tensor | None) -> None:
-    if module is None or token_uids is None:
-        return
-    setattr(
-        module,
-        _TRACE_ROW_TOKEN_UIDS_ATTR,
-        token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
-    )
-    if hasattr(module, _TRACE_UID_SPAN_ATTR):
-        delattr(module, _TRACE_UID_SPAN_ATTR)
+    prepare = getattr(hooks, "prepare_in_proj_token_uids", None)
+    if prepare is not None:
+        prepare(gdn, hidden_states)
 
 
 def _set_out_proj_lora_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
-    token_uids = _trace_token_uids_from_tensor(hidden_states)
-    if token_uids is None:
+    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
+    if hooks is None:
         return
-    _set_module_trace_token_uids(
-        getattr(getattr(gdn, "out_proj", None), "lora", None),
-        token_uids,
-    )
+    setter = getattr(hooks, "set_out_proj_lora_token_uids", None)
+    if setter is not None:
+        setter(gdn, hidden_states)
 
 
 def _set_out_norm_trace_token_uids(gdn: Any, token_uids: Tensor | None) -> None:
-    if token_uids is None:
+    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
+    if hooks is None or token_uids is None:
         return
-    _set_module_trace_token_uids(
-        getattr(gdn, "out_norm", None),
-        token_uids.repeat_interleave(_local_value_heads(gdn)),
-    )
+    setter = getattr(hooks, "set_out_norm_token_uids", None)
+    if setter is not None:
+        setter(gdn, token_uids)
 
 
 def _set_out_proj_trace_token_uids(
@@ -1585,57 +1533,24 @@ def _set_out_proj_trace_token_uids(
     *,
     sequence_parallel_output: bool,
 ) -> None:
-    token_uids = _trace_token_uids_from_tensor(hidden_states)
-    if token_uids is None:
+    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
+    if hooks is None:
         return
-    projection = _gdn_output_projection(gdn)
-    output_uids = _row_parallel_output_token_uids(
-        token_uids,
-        hidden_states,
-        projection,
-        sequence_parallel_output=sequence_parallel_output,
-    )
-    _set_module_trace_token_uids(getattr(gdn, "out_proj", None), output_uids)
-    _set_module_trace_token_uids(projection, output_uids)
-
-
-def _row_parallel_output_token_uids(
-    token_uids: Tensor,
-    hidden_states: Tensor,
-    projection: Any | None,
-    *,
-    sequence_parallel_output: bool,
-) -> Tensor:
-    token_uids = token_uids.to(dtype=torch.int64).reshape(-1)
-    if (
-        projection is None
-        or not _uses_sequence_parallel(projection)
-        or not sequence_parallel_output
-    ):
-        return token_uids
-    token_count = _hidden_token_count(hidden_states)
-    if token_count <= 0:
-        return token_uids.new_empty((0,))
-    if int(token_uids.numel()) != token_count:
-        return token_uids
-    tp_size = _tp_world_size(projection)
-    tp_rank = _tp_rank(projection)
-    rows_per_rank, remainder = divmod(token_count, tp_size)
-    if remainder != 0:
-        return token_uids
-    start = tp_rank * rows_per_rank
-    return token_uids[start : start + rows_per_rank].contiguous()
+    setter = getattr(hooks, "set_out_proj_token_uids", None)
+    if setter is not None:
+        setter(
+            gdn,
+            hidden_states,
+            sequence_parallel_output=sequence_parallel_output,
+        )
 
 
 def _pad_trace_token_uids_for_stream(token_uids: Tensor, stream: Tensor) -> Tensor:
-    token_count = _hidden_token_count(stream)
-    if token_count == int(token_uids.numel()):
-        return token_uids
-    padded = token_uids.new_full((token_count,), -1)
-    copied = min(token_count, int(token_uids.numel()))
-    if copied:
-        padded[:copied] = token_uids[:copied]
-    return padded
+    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
+    pad = None if hooks is None else getattr(hooks, "pad_token_uids_for_stream", None)
+    if pad is not None:
+        return cast(Tensor, pad(token_uids, stream))
+    return token_uids
 
 
 def _attach_gdn_attention_original_shape(
@@ -1734,11 +1649,21 @@ def _gdn_attention_original_shape_from_tensor(
     return _normalize_gdn_attention_original_shape(original_shape)
 
 
-def _set_active_routing_replay_token_uids(token_uids: Tensor | None) -> Tensor | None:
+def _active_routing_replay_controller() -> Any | None:
     try:
         from art.megatron.routing_replay import _active_routing_replay_controller
     except ImportError:
         return None
+    return _active_routing_replay_controller()
+
+
+def _layout_token_uids_enabled() -> bool:
+    return (
+        _trace_token_uids_enabled() or _active_routing_replay_controller() is not None
+    )
+
+
+def _set_active_routing_replay_token_uids(token_uids: Tensor | None) -> Tensor | None:
     controller = _active_routing_replay_controller()
     if controller is None or not hasattr(controller, "set_local_input_token_uids"):
         return None

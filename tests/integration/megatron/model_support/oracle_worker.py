@@ -22,6 +22,7 @@ from art.megatron.routing_replay import (
 from art.preprocessing.pack import PackedTensors
 
 from .forward_trace import ForwardTraceCapture
+from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
     SUPPORTED_SENSITIVITY_MUTATIONS,
     OracleCaseConfig,
@@ -1450,6 +1451,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         captured_grads = _collect_lora_grads(model_chunks)
 
     with ExitStack() as training_stack:
+        training_stack.enter_context(install_gdn_trace_token_uid_hooks())
         training_stack.enter_context(
             _mutation_hook(
                 megatron_train,

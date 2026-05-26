@@ -679,6 +679,7 @@ class _PreparePackedRecurrentInputs(torch.autograd.Function):
         )
         ctx.input_shape = tuple(qkv.shape)
         ctx.beta_shape = tuple(beta.shape)
+        ctx.device = qkv.device
         ctx.input_dtype = qkv.dtype
         ctx.beta_dtype = beta.dtype
         ctx.g_dtype = recurrent_g.dtype
