@@ -13,7 +13,7 @@ from megatron.core import parallel_state as ps  # noqa: E402
 from torch.distributed import destroy_process_group, init_process_group  # noqa: E402
 import torch.multiprocessing as mp  # noqa: E402
 
-from art.loss import loss_fn, shift_tensor  # noqa: E402
+from art.loss import LossInputs, loss_fn, shift_tensor  # noqa: E402
 from art.megatron import train as megatron_train  # noqa: E402
 from art.megatron.context_parallel.runtime import prepare_cp_micro  # noqa: E402
 from art.megatron.context_parallel.types import (  # noqa: E402
@@ -190,7 +190,7 @@ def test_main_loss_matches_shifted_dispatched_loss_inputs() -> None:
     dispatched_new_logprobs = dense_new_logprobs.detach().clone().requires_grad_()
 
     dense_loss = loss_fn(
-        packed,
+        LossInputs(inputs=packed),
         new_logprobs=dense_new_logprobs,
         ref_logprobs=ref_logprobs,
         entropies=entropies,

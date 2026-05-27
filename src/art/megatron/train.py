@@ -34,7 +34,7 @@ import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
-from art.loss import Loss, loss_fn, shift_tensor
+from art.loss import Loss, LossInputs, loss_fn, shift_tensor
 from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
@@ -1172,7 +1172,7 @@ def run_training_step(
 
     micro_count = len(micro_inputs)
     raw_loss_sum: torch.Tensor | None = None
-    loss_inputs_for_count: list[PackedTensors | DispatchedPackedTensors] = []
+    loss_inputs_for_count: list[LossInputs | DispatchedPackedTensors] = []
     probs_corr_total: torch.Tensor | None = None
     new_logprobs_gpu: list[torch.Tensor] = []
     cp_plan_ms = 0.0
@@ -1251,16 +1251,12 @@ def run_training_step(
             assistant_tokens = _count_trainable_tokens(prepared_micro.loss_inputs)
             nonzero_weights = int(
                 torch.count_nonzero(
-                    prepared_micro.loss_inputs.weights
-                    if isinstance(prepared_micro.loss_inputs, DispatchedPackedTensors)
-                    else shift_tensor(prepared_micro.loss_inputs["weights"], 0.0)
+                    prepared_micro.loss_inputs.align_inputs().weights
                 ).item()
             )
             nonzero_advantages = int(
                 torch.count_nonzero(
-                    prepared_micro.loss_inputs.advantages
-                    if isinstance(prepared_micro.loss_inputs, DispatchedPackedTensors)
-                    else shift_tensor(prepared_micro.loss_inputs["advantages"], 0.0)
+                    prepared_micro.loss_inputs.align_inputs().advantages
                 ).item()
             )
             raise RuntimeError(

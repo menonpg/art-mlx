@@ -14,7 +14,7 @@ import torch
 import yaml
 
 from .. import dev, types
-from ..loss import loss_fn, shift_tensor
+from ..loss import LossInputs, loss_fn, shift_tensor
 from ..preprocessing.inputs import TrainInputs, create_train_inputs
 from ..preprocessing.pack import (
     DiskPackedTensors,
@@ -100,7 +100,13 @@ class TinkerService:
             )
             for mask, lp in zip(masks, logprobs_list):
                 logprobs[mask] = lp
-            loss = loss_fn(inputs, logprobs.unsqueeze(0), None, None, _config)
+            loss = loss_fn(
+                LossInputs(inputs=inputs),
+                logprobs.unsqueeze(0),
+                None,
+                None,
+                _config,
+            )
             return loss.policy_loss, {"loss/train": loss.policy_loss.item()}
 
         shifted_tokens = shift_tensor(packed_tensors["tokens"], 0)

@@ -11,6 +11,10 @@ if TYPE_CHECKING:
     from art.preprocessing.inputs import TrainInputs
     from art.preprocessing.pack import PackedTensors
 
+    PackedLossInput = PackedTensors | TrainInputs
+else:
+    PackedLossInput = object
+
 
 class Loss(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -22,7 +26,7 @@ class Loss(BaseModel):
     kl_policy_ref: torch.Tensor | None = None
 
 
-class LossInputs(BaseModel):
+class AlignedLossInputs(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     assistant_mask: torch.Tensor
@@ -33,20 +37,8 @@ class LossInputs(BaseModel):
     original_logprobs: torch.Tensor | None = None
     entropies_are_aligned: bool = False
 
-    @classmethod
-    def from_packed(cls, inputs: "PackedTensors | TrainInputs") -> "LossInputs":
-        return cls(
-            assistant_mask=shift_tensor(inputs["assistant_mask"], False),
-            old_logprobs=shift_tensor(inputs["logprobs"], float("nan")),
-            advantages=shift_tensor(inputs["advantages"], 0.0),
-            weights=shift_tensor(inputs["weights"], 0.0),
-            group_ids=shift_tensor(inputs["group_ids"], 0),
-            original_logprobs=(
-                shift_tensor(inputs["original_logprobs"], 0.0)  # ty: ignore[invalid-key]
-                if "original_logprobs" in inputs
-                else None
-            ),
-        )
+    def align_inputs(self) -> "AlignedLossInputs":
+        return self
 
     def group_mean(self, values: torch.Tensor, by: torch.Tensor) -> torch.Tensor:
         return group_aggregate(values, by=by, reduce="mean")
@@ -65,6 +57,27 @@ class LossInputs(BaseModel):
         if self.entropies_are_aligned:
             return entropies
         return shift_tensor(entropies, 0.0)
+
+
+class LossInputs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    inputs: PackedLossInput
+
+    def align_inputs(self) -> AlignedLossInputs:
+        inputs = self.inputs
+        return AlignedLossInputs(
+            assistant_mask=shift_tensor(inputs["assistant_mask"], False),
+            old_logprobs=shift_tensor(inputs["logprobs"], float("nan")),
+            advantages=shift_tensor(inputs["advantages"], 0.0),
+            weights=shift_tensor(inputs["weights"], 0.0),
+            group_ids=shift_tensor(inputs["group_ids"], 0),
+            original_logprobs=(
+                shift_tensor(inputs["original_logprobs"], 0.0)  # ty: ignore[invalid-key]
+                if "original_logprobs" in inputs
+                else None
+            ),
+        )
 
 
 def compute_probs_corr(
@@ -89,16 +102,14 @@ def compute_probs_corr(
 
 
 def loss_fn(
-    inputs: "PackedTensors | TrainInputs | LossInputs",
+    inputs: "LossInputs | AlignedLossInputs",
     new_logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor | None,
     entropies: torch.Tensor | None,
     experimental_config: dev.TrainConfig,
     reduction: Literal["mean", "sum"] = "mean",
 ) -> Loss:
-    aligned_inputs = (
-        inputs if isinstance(inputs, LossInputs) else LossInputs.from_packed(inputs)
-    )
+    aligned_inputs = inputs.align_inputs()
     old_logprobs = aligned_inputs.old_logprobs
     advantages = aligned_inputs.advantages
     assistant_mask = aligned_inputs.assistant_mask.to(new_logprobs.dtype)

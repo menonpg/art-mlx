@@ -7,7 +7,7 @@ from megatron.core import parallel_state as ps
 from pydantic import BaseModel, ConfigDict
 import torch
 
-from art.loss import shift_tensor
+from art.loss import LossInputs, shift_tensor
 from art.megatron.context_parallel.runtime import prepare_cp_micro
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
@@ -37,7 +37,7 @@ class PreparedRLMicroInputs(BaseModel):
     model_labels: torch.Tensor
     attention_state: Any
     packed_seq_params: Any | None = None
-    loss_inputs: PackedTensors | DispatchedPackedTensors
+    loss_inputs: LossInputs | DispatchedPackedTensors
     ref_logprobs: torch.Tensor | None = None
     local_token_uids: torch.Tensor | None = None
     context_parallel_plan_ms: float = 0.0
@@ -223,16 +223,13 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
             inputs[key] = value.to(device)  # type: ignore[index]
 
 
-def _count_trainable_tokens(inputs: PackedTensors | DispatchedPackedTensors) -> float:
-    if isinstance(inputs, DispatchedPackedTensors):
-        assistant_mask = inputs.assistant_mask
-    else:
-        assistant_mask = shift_tensor(inputs["assistant_mask"], False)
+def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:
+    assistant_mask = inputs.align_inputs().assistant_mask
     return float(assistant_mask.sum().item())
 
 
 def _local_trainable_token_count_tensor(
-    micro_inputs: list[PackedTensors | DispatchedPackedTensors],
+    micro_inputs: list[LossInputs | DispatchedPackedTensors],
     device: torch.device,
 ) -> torch.Tensor:
     local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
@@ -298,7 +295,7 @@ def _prepare_dense_rl_micro(
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),
-        loss_inputs=micro,
+        loss_inputs=LossInputs(inputs=micro),
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
     )

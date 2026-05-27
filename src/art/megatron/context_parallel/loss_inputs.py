@@ -2,10 +2,10 @@ from typing import Any, Literal
 
 import torch
 
-from art.loss import LossInputs
+from art.loss import AlignedLossInputs
 
 
-class ContextParallelLossInputs(LossInputs):
+class ContextParallelLossInputs(AlignedLossInputs):
     loss_all_reduce_group: Any | None = None
     entropies_are_aligned: bool = True
 
