@@ -754,20 +754,33 @@ class MegatronService:
         self._clear_pending_jobs()
         return lora_path
 
-    async def _publish_training_checkpoint(
+    def _publish_staged_training_checkpoint(
         self,
         *,
-        lora_path: str,
-    ) -> None:
-        next_step = self._latest_step + 1
-        new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
-        os.makedirs(new_checkpoint_dir, exist_ok=True)
-        shutil.copy(
-            f"{lora_path}/adapter_model.safetensors",
-            f"{new_checkpoint_dir}/adapter_model.safetensors",
-        )
-        self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        self._ensure_lora_adapter_config(staging_lora_path)
+        if not self._adapter_exists_and_loads(staging_lora_path):
+            raise RuntimeError(
+                f"Megatron training did not publish LoRA adapter: {staging_lora_path}"
+            )
+        checkpoint_dir = get_step_checkpoint_dir(self.output_dir, step)
+        if os.path.exists(checkpoint_dir):
+            raise RuntimeError(
+                f"Refusing to publish Megatron checkpoint over existing directory: "
+                f"{checkpoint_dir}"
+            )
+        Path(checkpoint_dir).parent.mkdir(parents=True, exist_ok=True)
+        Path(staging_lora_path).rename(checkpoint_dir)
+        return checkpoint_dir
 
+    async def _wake_and_reload_training_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        step: int,
+    ) -> None:
         _jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         try:
             with open(wake_lock_path, "w") as lock_file:
@@ -777,7 +790,7 @@ class MegatronService:
             if os.path.exists(wake_lock_path):
                 os.remove(wake_lock_path)
 
-        await self._reload_adapter(new_checkpoint_dir, next_step)
+        await self._reload_adapter(checkpoint_dir, step)
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
@@ -839,7 +852,6 @@ class MegatronService:
                 lora_path = self._resolve_active_lora_path()
                 self._clear_pending_jobs()
                 next_step = self._latest_step + 1
-                new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
                 staging_lora_path = self._prepare_training_lora_dir(
                     lora_path,
                     next_step,
@@ -887,33 +899,32 @@ class MegatronService:
                 async for result in stream_megatron_job(
                     job,
                     job_path=job_path,
-                    merge_output_path=new_checkpoint_dir,
                     process=self._megatron_process,
                     process_log_path=self._megatron_log_path,
                 ):
                     yield {key: float(value) for key, value in result.items()}
 
-                self._ensure_lora_adapter_config(
-                    new_checkpoint_dir, source_path=staging_lora_path
+                new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                    staging_lora_path=staging_lora_path,
+                    step=next_step,
                 )
-                if not self._adapter_exists_and_loads(new_checkpoint_dir):
-                    raise RuntimeError(
-                        f"Megatron training did not publish LoRA adapter: "
-                        f"{new_checkpoint_dir}"
-                    )
                 if self.rollout_weights_mode == "merged":
                     self._latest_step = next_step
                 else:
                     await self._reload_adapter(new_checkpoint_dir, next_step)
-                shutil.rmtree(staging_lora_path)
                 return
 
             lora_path = await self._prepare_for_training(
                 megatron_topology=megatron_topology
             )
+            next_step = self._latest_step + 1
+            staging_lora_path = self._prepare_training_lora_dir(
+                lora_path,
+                next_step,
+            )
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
-                lora_path=lora_path,
+                lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),
                 disk_packed_tensors=disk_packed_tensors,
@@ -935,7 +946,14 @@ class MegatronService:
             ):
                 yield {key: float(value) for key, value in result.items()}
 
-            await self._publish_training_checkpoint(lora_path=lora_path)
+            new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=next_step,
+            )
+            await self._wake_and_reload_training_checkpoint(
+                checkpoint_dir=new_checkpoint_dir,
+                step=next_step,
+            )
         except BaseException:
             await self.aclose()
             raise
@@ -955,13 +973,18 @@ class MegatronService:
             lora_path = await self._prepare_for_training(
                 megatron_topology=config.megatron_topology
             )
+            next_step = self._latest_step + 1
+            staging_lora_path = self._prepare_training_lora_dir(
+                lora_path,
+                next_step,
+            )
             serialized_batches = materialize_sft_batches(batches)
             job_path, log_path = self._create_megatron_job_paths()
             grad_accumulation_sequences = (
                 config.batch_size if isinstance(config.batch_size, int) else None
             )
             job = MegatronSFTTrainingJob(
-                lora_path=lora_path,
+                lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("sft"),
                 sft_data_dir=serialized_batches.sft_data_dir,
@@ -984,7 +1007,14 @@ class MegatronService:
                     "loss/grad_norm": float(result["grad_norm"]),
                 }
 
-            await self._publish_training_checkpoint(lora_path=lora_path)
+            new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=next_step,
+            )
+            await self._wake_and_reload_training_checkpoint(
+                checkpoint_dir=new_checkpoint_dir,
+                step=next_step,
+            )
         except BaseException:
             await self.aclose()
             raise

@@ -185,7 +185,7 @@ def provider_topology_env(topology: Topology):
 
 def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
     """Merges rank-sharded LoRA tensors into a full state dict on rank 0."""
-    from art.megatron.weights.merge import merge_sharded_adapter_entries
+    from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
     entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = {}
     for rank_entry in shards_by_rank:

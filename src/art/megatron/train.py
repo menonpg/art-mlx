@@ -12,11 +12,9 @@ install_art_bridge_runtime_patches()
 Public cross-repo API consumed by serverless-training:
 - build_training_runtime
 - run_megatron_worker_loop
-- merge_lora_adapter
 """
 
 import gc
-import importlib
 import json
 import math
 import os
@@ -42,6 +40,10 @@ from art.megatron.context_parallel.types import (
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
+from art.megatron.model_support.lora_disk import (
+    load_adapter_config,
+    load_lora_tensors_for_megatron,
+)
 from art.megatron.provider import (
     ProviderBundle,
     finalize_provider_bundle,
@@ -108,7 +110,7 @@ from art.megatron.training.trace import (
     set_replay_local_input_token_uids,
 )
 from art.megatron.training.weight_offload import WeightOffloadManager
-from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.weights.lora_publish import save_vllm_lora_from_model
 from art.megatron.weights.merged_weight_export import (
     sync_merged_weights_to_vllm,
 )
@@ -117,11 +119,6 @@ from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
 )
-
-safetensors = importlib.import_module("safetensors")
-safetensors_torch = importlib.import_module("safetensors.torch")
-safe_open = safetensors.safe_open
-save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
@@ -134,7 +131,6 @@ __all__ = [
     "run_megatron_rl_job",
     "run_megatron_sft_job",
     "finalize_megatron_job",
-    "merge_lora_adapter",
 ]
 
 
@@ -804,7 +800,7 @@ def _load_adapter_into_model(
     optimizer: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
-    adapter_model = load_lora_adapter_state_dict(lora_path, handler=handler)
+    adapter_model = load_lora_tensors_for_megatron(lora_path, handler=handler)
     load_adapter_into_model(model_chunks, adapter_model, optimizer)
     return adapter_model
 
@@ -817,25 +813,20 @@ def _save_lora_and_optimizer(
     optimizer_state_path: str,
 ) -> None:
     assert runtime.optimizer is not None
-    sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
-        runtime.model,
-        adapter_model,
+    save_vllm_lora_from_model(
+        model=runtime.model,
+        adapter_model=adapter_model,
+        handler=runtime.model_support_handler,
+        adapter_config=load_adapter_config(lora_path),
+        output_dir=lora_path,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
     )
-    shard_path = os.path.join(
-        lora_path,
-        f"adapter_model-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.safetensors",
-    )
-    manifest_path = os.path.join(
-        lora_path,
-        f"adapter_manifest-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.json",
-    )
-    print("Saving adapter shard to", shard_path)
-    os.makedirs(lora_path, exist_ok=True)
-    save_file(sharded_state_dict, shard_path)
-    print("Saving adapter shard manifest to", manifest_path)
-    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-        json.dump(sharded_state_manifest, manifest_file, sort_keys=True)
+    _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
 
+
+def _save_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
+    assert runtime.optimizer is not None
     optimizer_shard_path = os.path.join(
         optimizer_state_path,
         f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
@@ -868,49 +859,20 @@ def _placeholder_attention_mask(device: torch.device) -> torch.Tensor:
     return torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
 
 
-def iter_modules(model_chunks: ModelChunks) -> Any:
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            yield module
-
-
 def load_adapter_into_model(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
 ) -> None:
     with torch.no_grad():
-        for module in iter_modules(model_chunks):
-            if hasattr(module, "load_lora"):
-                module.load_lora(adapter_model)  # type: ignore[attr-defined]
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if hasattr(module, "load_lora"):
+                    module.load_lora(adapter_model)  # type: ignore[attr-defined]
 
     if optimizer is None:
         return
     optimizer.reload_model_params()
-
-
-def collect_sharded_lora_state(
-    model_chunks: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]]]:
-    sharded_state_dict: dict[str, torch.Tensor] = {}
-    sharded_state_manifest: dict[str, dict[str, Any]] = {}
-    for module in iter_modules(model_chunks):
-        if hasattr(module, "sharded_lora_state_dict"):
-            module_sharded_lora_state_dict: dict[str, torch.Tensor] = (
-                module.sharded_lora_state_dict()  # type: ignore[attr-defined]
-            )
-            for key, value in module_sharded_lora_state_dict.items():
-                target_dtype = (
-                    adapter_model[key].dtype if key in adapter_model else value.dtype
-                )
-                sharded_state_dict[key] = value.to(target_dtype).contiguous()
-        if hasattr(module, "sharded_lora_manifest"):
-            module_sharded_lora_manifest: dict[str, dict[str, Any]] = (
-                module.sharded_lora_manifest()  # type: ignore[attr-defined]
-            )
-            sharded_state_manifest.update(module_sharded_lora_manifest)
-    return sharded_state_dict, sharded_state_manifest
 
 
 def _optimizer_step(

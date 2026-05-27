@@ -657,7 +657,7 @@ def _build_deterministic_nonzero_lora(
 
 
 def _merge_sharded_lora(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
-    from art.megatron.weights.merge import merge_sharded_adapter_entries
+    from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
     entries_by_key: dict[str, list[tuple[dict[str, Any], Any]]] = {}
     for rank_entry in shards_by_rank:
@@ -809,7 +809,7 @@ def _megatron_worker(request: MegatronWorkerRequest) -> None:
     import torch
 
     from art.megatron import train as megatron_train
-    from art.megatron.weights.merge import load_lora_adapter_state_dict
+    from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -868,7 +868,7 @@ def _megatron_worker(request: MegatronWorkerRequest) -> None:
             adapter_path = artifact_dir / "active_lora"
         else:
             adapter_path = Path(request.adapter_path)
-        adapter_model = load_lora_adapter_state_dict(
+        adapter_model = load_lora_tensors_for_megatron(
             str(adapter_path),
             handler=runtime.model_support_handler,
             allow_unvalidated_arch=request.config.allow_unvalidated_arch,
