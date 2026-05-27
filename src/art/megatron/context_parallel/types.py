@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from .layout_index import TokenLayoutIndex
+from .loss_inputs import ContextParallelLossInputs
 
 
 class AttnMaskKind(str, Enum):
@@ -200,7 +201,7 @@ class ContextParallelRuntimePlan(BaseModel):
     rank_plans: tuple[RankRuntimePlan, ...]
 
 
-class DispatchedPackedTensors(BaseModel):
+class DispatchedPackedTensors(ContextParallelLossInputs):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     tokens: torch.Tensor
