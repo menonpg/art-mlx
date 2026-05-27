@@ -400,12 +400,15 @@ class Model(
         model_name = self.get_inference_name(step)
         if self.trainable:
             model_name = f"hosted_vllm/{model_name}"
-        return {
+        params = {
             "model": model_name,
             "base_url": self.inference_base_url,
             "api_key": self.inference_api_key,
             "temperature": 1,  # Important for trainable models
         }
+        if extra_body := self._default_chat_completion_extra_body():
+            params["extra_body"] = extra_body
+        return params
 
     # ------------------------------------------------------------------
     # Inference name helpers

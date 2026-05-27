@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
+import gc
 import importlib
 import os
 from pathlib import Path
@@ -18,7 +19,6 @@ from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
-from ..unsloth.train import gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
@@ -36,7 +36,7 @@ from ..vllm_runtime import (
     get_vllm_runtime_working_dir,
     wait_for_vllm_runtime,
 )
-from .lora import LORA_ALPHA, LORA_RANK
+from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
@@ -61,6 +61,13 @@ safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
 
 
+def gc_and_empty_cuda_cache(n: int = 3) -> None:
+    for _ in range(n):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 class _RuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
 
@@ -68,7 +75,7 @@ class _RuntimeRequestKwargs(TypedDict, total=False):
 def create_identity_lora(
     base_model: str,
     lora_path: str,
-    rank: int = LORA_RANK,
+    rank: int | None = None,
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
@@ -82,7 +89,7 @@ def create_identity_lora(
     Args:
         base_model: HuggingFace model identifier.
         lora_path: Directory to save the adapter files.
-        rank: LoRA rank (default 1 for Megatron models).
+        rank: LoRA rank. Defaults to rank 1 for MoE models and rank 8 for dense models.
         lora_alpha: LoRA alpha scaling factor.
     """
     from unittest.mock import patch
@@ -100,6 +107,8 @@ def create_identity_lora(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    if rank is None:
+        rank = default_lora_rank_for_handler(handler)
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     model_config = handler.identity_lora_model_config(base_config)
     with init_empty_weights():
@@ -364,9 +373,15 @@ class MegatronService:
         return optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
+        from .model_support import get_model_support_handler
+
+        handler = get_model_support_handler(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=LORA_RANK,
+            r=default_lora_rank_for_handler(handler),
             lora_alpha=LORA_ALPHA,
             target_modules=default_target_modules(self.base_model),
             bias="none",

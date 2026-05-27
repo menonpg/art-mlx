@@ -29,7 +29,8 @@ from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora_dual,
 )
 
-LORA_RANK = 1
+MOE_LORA_RANK = 1
+DENSE_LORA_RANK = 8
 LORA_ALPHA = 32
 
 ShardDomain = Literal["tp", "expert_tp"]
@@ -131,6 +132,10 @@ def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
     return getattr(linear, "parallel_mode", "") is None or getattr(
         linear, "explicit_expert_comm", False
     )
+
+
+def default_lora_rank_for_handler(handler: Any) -> int:
+    return MOE_LORA_RANK if bool(getattr(handler, "is_moe", False)) else DENSE_LORA_RANK
 
 
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
@@ -1384,11 +1389,12 @@ def apply_lora_adapters(
     handler = provider._art_model_support_handler
     spec = provider._art_model_support_spec
     target_modules = list(spec.default_target_modules)
+    rank = default_lora_rank_for_handler(handler)
     handler.apply_lora_adapters(
         model,
         provider,
         target_modules=target_modules,
-        rank=LORA_RANK,
+        rank=rank,
         alpha=LORA_ALPHA,
     )
     return list(model)

@@ -35,7 +35,7 @@ version = "1.2.1+9af0e0d"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.11.0"
+version = "0.5.18"
 requires-dist = ["einops", "onnx", "onnxscript", "packaging", "pydantic", "torch", "transformer-engine-cu12"]
 
 [[package]]
@@ -4486,7 +4486,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.5.17"
+version = "0.5.18"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
@@ -4589,7 +4589,7 @@ requires-dist = [
     { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?rev=25.09" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
-    { name = "causal-conv1d", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" },
+    { name = "causal-conv1d", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==1.6.1" },
     { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
     { name = "deep-ep", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=v1.2.1" },
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },
@@ -4601,7 +4601,7 @@ requires-dist = [
     { name = "langchain-openai", marker = "extra == 'langgraph'", specifier = ">=0.3.27" },
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=0.6.2" },
     { name = "litellm", specifier = ">=1.71.1,<=1.82.0" },
-    { name = "mamba-ssm", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", url = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.10cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" },
+    { name = "mamba-ssm", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==2.3.1" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
     { name = "megatron-bridge", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" },
     { name = "megatron-core", marker = "extra == 'megatron'", specifier = "==0.17.0" },
@@ -7694,7 +7694,7 @@ wheels = [
 
 [[package]]
 name = "transformer-engine-torch"
-version = "2.11.0"
+version = "0.5.18"
 source = { git = "https://github.com/NVIDIA/TransformerEngine.git?subdirectory=transformer_engine%2Fpytorch&rev=v2.11#c188b533cc3721ca9c6bbfd26148f5cf60108c25" }
 dependencies = [
     { name = "einops" },
