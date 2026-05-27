@@ -163,7 +163,7 @@ def loss_fn(
             0.0,
         )
     if tau := experimental_config.get("kimi_k2_tau", None):
-        advantages -= tau * logprob_diff.detach()
+        advantages = advantages - tau * logprob_diff.detach()
     kl_policy_ref: torch.Tensor | None = None
     kl_penalty_coef = experimental_config.get("kl_penalty_coef", 0.0)
     if kl_penalty_coef > 0 and ref_logprobs is not None:
