@@ -33,7 +33,7 @@ class AlignedLossInputs(BaseModel):
     old_logprobs: torch.Tensor
     advantages: torch.Tensor
     weights: torch.Tensor
-    group_ids: torch.Tensor | None = None
+    group_ids: torch.Tensor
     original_logprobs: torch.Tensor | None = None
     entropies_are_aligned: bool = False
 
@@ -127,10 +127,6 @@ def loss_fn(
     )
     prob_ratio = torch.exp(logprob_diff)
     if importance_sampling_level != "token":
-        if aligned_inputs.group_ids is None:
-            raise ValueError(
-                "group_ids are required for non-token importance sampling."
-            )
         sequence_prob_ratio = torch.exp(
             aligned_inputs.group_mean(
                 logprob_diff,
