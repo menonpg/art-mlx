@@ -62,9 +62,16 @@ class PreparedSFTMicroInputs(BaseModel):
 
 @torch.no_grad()
 def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTensors:
+    def selected_tensor(value: torch.Tensor) -> torch.Tensor:
+        selected = value[index : index + 1]
+        # File-backed slices keep the mmap alive and can make job cleanup fail.
+        if getattr(selected.untyped_storage(), "filename", None):
+            return selected.clone()
+        return selected
+
     return PackedTensors(  # type: ignore[call-arg]
         **{
-            key: value[index : index + 1]
+            key: selected_tensor(value)
             for key, value in packed_tensors.items()
             if isinstance(value, torch.Tensor)
         },

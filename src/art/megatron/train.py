@@ -464,6 +464,9 @@ def run_megatron_rl_job(
     adapter_model = None
     template = None
     zero_template = None
+    cp_lookahead_state = None
+    next_step_first_micro = None
+    step_result = None
 
     job_completed = False
     try:
@@ -575,6 +578,13 @@ def run_megatron_rl_job(
             del zero_template
         if "micro_inputs" in locals():
             del micro_inputs
+        if next_step_first_micro is not None:
+            del next_step_first_micro
+        if step_result is not None:
+            del step_result
+        if cp_lookahead_state is not None:
+            cp_lookahead_state.pending_prepared_micro = None
+            del cp_lookahead_state
         if job_completed:
             gc.collect()
             torch.cuda.empty_cache()
