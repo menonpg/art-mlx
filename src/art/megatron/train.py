@@ -34,12 +34,7 @@ import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
-from art.loss import Loss, shift_tensor
-from art.loss import loss_fn as base_loss_fn
-from art.megatron.context_parallel.loss import (
-    loss_fn_dispatched,
-    validate_context_parallel_loss_config,
-)
+from art.loss import Loss, loss_fn, shift_tensor
 from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
@@ -935,33 +930,6 @@ def _reduce_loss(
     return reduced_loss
 
 
-def loss_fn(
-    inputs: PackedTensors | DispatchedPackedTensors,
-    new_logprobs: torch.Tensor,
-    ref_logprobs: torch.Tensor | None,
-    entropies: torch.Tensor | None,
-    experimental_config: dev.TrainConfig,
-    reduction: Literal["mean", "sum"] = "mean",
-) -> Loss:
-    if isinstance(inputs, DispatchedPackedTensors):
-        return loss_fn_dispatched(
-            inputs,
-            new_logprobs=new_logprobs,
-            ref_logprobs=ref_logprobs,
-            entropies=entropies,
-            experimental_config=experimental_config,
-            reduction=reduction,
-        )
-    return base_loss_fn(
-        cast(Any, inputs),
-        new_logprobs=new_logprobs,
-        ref_logprobs=ref_logprobs,
-        entropies=entropies,
-        experimental_config=experimental_config,
-        reduction=reduction,
-    )
-
-
 def _unwrap_model_config(model_chunks: ModelChunks) -> Any | None:
     module: Any = model_chunks[0]
     while hasattr(module, "module"):
@@ -987,10 +955,7 @@ def _validate_context_parallel_training_supported(
     experimental_config: dev.TrainConfig,
     topology: ParallelTopology,
 ) -> None:
-    del model_chunks, model_support_handler
-    if int(topology.cp) <= 1:
-        return
-    validate_context_parallel_loss_config(experimental_config)
+    del model_chunks, model_support_handler, experimental_config, topology
 
 
 def run_megatron_sft_step(
@@ -1320,6 +1285,7 @@ def run_training_step(
             topology=topology,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
+            ref_logprobs=ref_logprobs,
         )
         detached_probs_corr = loss_info.probs_corr.detach()
         if probs_corr_total is None:

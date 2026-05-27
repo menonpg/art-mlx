@@ -2143,6 +2143,7 @@ def prepare_cp_micro(
     trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
     target_device: torch.device | None = None,
+    ref_logprobs: torch.Tensor | None = None,
 ) -> PreparedMegatronBatch:
     """Prepare one CP microbatch with a CPU-only planning phase.
 
@@ -2170,6 +2171,8 @@ def prepare_cp_micro(
         pad_multiple=pad_multiple,
         trace_token_uids=trace_token_uids,
         target_device=target_device,
+        cp_group=cp_group,
+        ref_logprobs=ref_logprobs,
     )
     dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
     if tensors.token_uids is not None:
@@ -2337,6 +2340,8 @@ def dispatch_megatron_context_parallel_training_tensors(
     pad_multiple: int,
     trace_token_uids: bool = False,
     target_device: torch.device | None = None,
+    cp_group: Any | None = None,
+    ref_logprobs: torch.Tensor | None = None,
 ) -> DispatchedPackedTensors:
     """Gather this rank's training tensors and optionally move them to device.
 
@@ -2357,6 +2362,13 @@ def dispatch_megatron_context_parallel_training_tensors(
     old_logprobs = shift_tensor(micro["logprobs"], float("nan"))
     advantages = shift_tensor(micro["advantages"], 0.0)
     weights = shift_tensor(micro["weights"], 0.0)
+    shifted_group_ids = shift_tensor(micro["group_ids"], 0)
+    original_logprobs_source = cast(Any, micro).get("original_logprobs")
+    original_logprobs = (
+        None
+        if original_logprobs_source is None
+        else shift_tensor(original_logprobs_source, 0.0)
+    )
     token_uids = (
         _build_token_uids(spec, seq_len=int(micro["tokens"].shape[1]))
         if trace_token_uids
@@ -2390,12 +2402,41 @@ def dispatch_megatron_context_parallel_training_tensors(
         pad_multiple=pad_multiple,
         dispatch_meta_cache=dispatch_meta_cache,
     ).to(dtype=torch.bool)
+    local_group_ids = _dispatch_tensor(
+        shifted_group_ids,
+        rank_plan=rank_plan,
+        pad_value=0,
+        pad_multiple=pad_multiple,
+        dispatch_meta_cache=dispatch_meta_cache,
+    )
     local_old_logprobs = _dispatch_tensor(
         old_logprobs,
         rank_plan=rank_plan,
         pad_value=float("nan"),
         pad_multiple=pad_multiple,
         dispatch_meta_cache=dispatch_meta_cache,
+    )
+    local_original_logprobs = (
+        None
+        if original_logprobs is None
+        else _dispatch_tensor(
+            original_logprobs,
+            rank_plan=rank_plan,
+            pad_value=0.0,
+            pad_multiple=pad_multiple,
+            dispatch_meta_cache=dispatch_meta_cache,
+        )
+    )
+    local_ref_logprobs = (
+        None
+        if ref_logprobs is None
+        else _dispatch_tensor(
+            ref_logprobs,
+            rank_plan=rank_plan,
+            pad_value=float("nan"),
+            pad_multiple=pad_multiple,
+            dispatch_meta_cache=dispatch_meta_cache,
+        )
     )
     local_advantages = _dispatch_tensor(
         advantages,
@@ -2427,10 +2468,18 @@ def dispatch_megatron_context_parallel_training_tensors(
         labels=_to_target_device(local_labels, target_device),
         input_pos=_to_target_device(local_input_pos, target_device),
         assistant_mask=_to_target_device(local_assistant_mask, target_device),
+        group_ids=_to_target_device(local_group_ids, target_device),
         old_logprobs=_to_target_device(local_old_logprobs, target_device),
         advantages=_to_target_device(local_advantages, target_device),
         weights=_to_target_device(local_weights, target_device),
         valid_lengths=rank_plan.local_valid_lengths,
+        original_logprobs=None
+        if local_original_logprobs is None
+        else _to_target_device(local_original_logprobs, target_device),
+        ref_logprobs=None
+        if local_ref_logprobs is None
+        else _to_target_device(local_ref_logprobs, target_device),
+        loss_all_reduce_group=cp_group,
         token_uids=None
         if local_token_uids is None
         else _to_target_device(local_token_uids, target_device),

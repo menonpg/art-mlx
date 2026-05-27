@@ -311,6 +311,7 @@ def _prepare_rl_cp_micro_full(
     topology: ParallelTopology,
     model_support_handler: Any,
     trace_token_uids: bool,
+    ref_logprobs: torch.Tensor | None,
 ) -> PreparedMegatronBatch:
     """Prepare RL CP inputs without moving planning metadata to CUDA first.
 
@@ -329,6 +330,7 @@ def _prepare_rl_cp_micro_full(
         ),
         trace_token_uids=trace_token_uids,
         target_device=device,
+        ref_logprobs=ref_logprobs,
     )
 
 
@@ -337,11 +339,6 @@ def _prepared_rl_micro_from_cp_batch(
     *,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
-    if ref_logprobs is not None:
-        raise RuntimeError(
-            "CP ref_logprobs are not supported until the self-attention CP path is "
-            "formally merged with reference-logprob dispatch."
-        )
     return PreparedRLMicroInputs(
         model_tokens=prepared.tensors.tokens,
         model_input_pos=prepared.tensors.input_pos,
@@ -349,7 +346,9 @@ def _prepared_rl_micro_from_cp_batch(
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         loss_inputs=prepared.tensors,
-        ref_logprobs=None,
+        ref_logprobs=prepared.tensors.ref_logprobs
+        if ref_logprobs is not None
+        else None,
         local_token_uids=prepared.tensors.token_uids,
         context_parallel_plan_ms=float(prepared.plan_build_ms),
         context_parallel_dispatch_ms=float(prepared.dispatch_ms),
@@ -411,6 +410,7 @@ def _prepare_current_rl_micro(
             topology=topology,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
+            ref_logprobs=ref_logprobs,
         )
     return _prepared_rl_micro_from_cp_batch(prepared, ref_logprobs=ref_logprobs), None
 
@@ -422,6 +422,7 @@ def _prepare_next_rl_cp_micro(
     topology: ParallelTopology,
     model_support_handler: Any,
     trace_token_uids: bool,
+    ref_logprobs: torch.Tensor | None = None,
 ) -> PreparedMegatronBatch | None:
     if next_micro is None or int(topology.cp) <= 1:
         return None
@@ -431,6 +432,7 @@ def _prepare_next_rl_cp_micro(
         topology=topology,
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
+        ref_logprobs=ref_logprobs,
     )
 
 

@@ -207,10 +207,14 @@ class DispatchedPackedTensors(BaseModel):
     labels: torch.Tensor
     input_pos: torch.Tensor
     assistant_mask: torch.Tensor
+    group_ids: torch.Tensor
     old_logprobs: torch.Tensor
     advantages: torch.Tensor
     weights: torch.Tensor
     valid_lengths: tuple[int, ...]
+    original_logprobs: torch.Tensor | None = None
+    ref_logprobs: torch.Tensor | None = None
+    loss_all_reduce_group: Any | None = None
     token_uids: torch.Tensor | None = None
 
 
