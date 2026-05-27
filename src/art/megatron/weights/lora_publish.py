@@ -81,13 +81,6 @@ def _block_for_key(key: str) -> str:
     return "__global__"
 
 
-def _block_sort_key(block: str) -> tuple[int, int, str]:
-    if block == "__global__":
-        return (0, -1, block)
-    index = block.rsplit(".layers.", 1)[-1]
-    return (1, int(index) if index.isdigit() else -1, block)
-
-
 def collect_local_lora_entries(
     model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
@@ -247,98 +240,147 @@ def _rank_and_device() -> tuple[int, torch.device]:
     return rank, torch.device("cpu")
 
 
-def _exchange_owner_dtype_group(
+def _metadata_by_owner_dtype(
+    metadata: list[LoraShardMeta],
+) -> dict[tuple[int, str], list[LoraShardMeta]]:
+    grouped: dict[tuple[int, str], list[LoraShardMeta]] = {}
+    for meta in metadata:
+        grouped.setdefault((meta.owner_rank, meta.dtype_name), []).append(meta)
+    return {
+        key: sorted(group, key=lambda meta: meta.key)
+        for key, group in sorted(grouped.items())
+    }
+
+
+def _pack_metadata_tensors(
+    metadata: list[LoraShardMeta],
+    tensors: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    return torch.cat(
+        [tensors[meta.key].detach().contiguous().view(-1) for meta in metadata]
+    )
+
+
+def _views_from_flat(
     *,
     owner_rank: int,
-    rank: int,
-    dtype_name: str,
     metadata: list[LoraShardMeta],
+    flat: torch.Tensor,
+) -> dict[tuple[int, str], torch.Tensor]:
+    views: dict[tuple[int, str], torch.Tensor] = {}
+    offset = 0
+    for meta in metadata:
+        views[(owner_rank, meta.key)] = flat.narrow(0, offset, meta.numel).view(
+            meta.shape
+        )
+        offset += meta.numel
+    return views
+
+
+def _exchange_batched_tensors(
+    metadata: list[LoraShardMeta],
+    *,
     local_tensors: dict[str, torch.Tensor],
+    rank: int,
     device: torch.device,
 ) -> dict[tuple[int, str], torch.Tensor]:
     if not _distributed_ready():
-        return {(owner_rank, meta.key): local_tensors[meta.key] for meta in metadata}
+        return {
+            (rank, meta.key): local_tensors[meta.key].contiguous() for meta in metadata
+        }
 
-    dtype = _dtype_from_name(dtype_name)
-    if rank == owner_rank:
-        tensors = [local_tensors[meta.key].contiguous().view(-1) for meta in metadata]
-        if rank == 0:
-            return {
-                (owner_rank, meta.key): local_tensors[meta.key].contiguous()
-                for meta in metadata
-            }
-        flat = tensors[0] if len(tensors) == 1 else torch.cat(tensors)
-        torch.distributed.send(flat, dst=0)  # type: ignore[possibly-missing-attribute]
-        return {}
-
-    if rank == 0:
-        total_numel = sum(meta.numel for meta in metadata)
-        flat = torch.empty(total_numel, dtype=dtype, device=device)
-        torch.distributed.recv(flat, src=owner_rank)  # type: ignore[possibly-missing-attribute]
-        received: dict[tuple[int, str], torch.Tensor] = {}
-        offset = 0
-        for meta in metadata:
-            received[(owner_rank, meta.key)] = flat.narrow(0, offset, meta.numel).view(
-                meta.shape
-            )
-            offset += meta.numel
-        return received
-
-    return {}
-
-
-def _metadata_by_block(
-    metadata: list[LoraShardMeta],
-) -> dict[str, list[LoraShardMeta]]:
-    by_block: dict[str, list[LoraShardMeta]] = {}
-    for meta in metadata:
-        by_block.setdefault(meta.block, []).append(meta)
-    return by_block
-
-
-def _gather_block_tensors(
-    block_metadata: list[LoraShardMeta],
-    *,
-    local_tensors: dict[str, torch.Tensor],
-    rank: int,
-    device: torch.device,
-) -> dict[tuple[int, str], torch.Tensor]:
-    block_tensors: dict[tuple[int, str], torch.Tensor] = {}
-    owner_dtype_pairs = sorted(
-        {(meta.owner_rank, meta.dtype_name) for meta in block_metadata}
-    )
-    for owner_rank, dtype_name in owner_dtype_pairs:
-        group_metadata = sorted(
-            (
-                meta
-                for meta in block_metadata
-                if meta.owner_rank == owner_rank and meta.dtype_name == dtype_name
-            ),
-            key=lambda meta: meta.key,
-        )
-        block_tensors.update(
-            _exchange_owner_dtype_group(
-                owner_rank=owner_rank,
-                rank=rank,
-                dtype_name=dtype_name,
-                metadata=group_metadata,
-                local_tensors=local_tensors,
+    received: dict[tuple[int, str], torch.Tensor] = {}
+    for (owner_rank, dtype_name), group_metadata in _metadata_by_owner_dtype(
+        metadata
+    ).items():
+        if rank == owner_rank:
+            flat = _pack_metadata_tensors(group_metadata, local_tensors)
+            if rank == 0:
+                received.update(
+                    _views_from_flat(
+                        owner_rank=owner_rank,
+                        metadata=group_metadata,
+                        flat=flat,
+                    )
+                )
+            else:
+                torch.distributed.send(flat, dst=0)  # type: ignore[possibly-missing-attribute]
+        elif rank == 0:
+            flat = torch.empty(
+                sum(meta.numel for meta in group_metadata),
+                dtype=_dtype_from_name(dtype_name),
                 device=device,
             )
-        )
-    return block_tensors
+            torch.distributed.recv(flat, src=owner_rank)  # type: ignore[possibly-missing-attribute]
+            received.update(
+                _views_from_flat(
+                    owner_rank=owner_rank,
+                    metadata=group_metadata,
+                    flat=flat,
+                )
+            )
+    return received
 
 
 def _entries_by_key(
-    block_metadata: list[LoraShardMeta],
-    block_tensors: dict[tuple[int, str], torch.Tensor],
+    metadata: list[LoraShardMeta],
+    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
 ) -> dict[str, list[tuple[dict[str, Any], torch.Tensor]]]:
     entries: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = {}
-    for meta in block_metadata:
+    for meta in metadata:
         entries.setdefault(meta.key, []).append(
-            (meta.manifest, block_tensors[(meta.owner_rank, meta.key)])
+            (meta.manifest, tensors_by_owner_key[(meta.owner_rank, meta.key)])
         )
     return entries
+
+
+def _stage_published_tensors(
+    tensors: dict[str, torch.Tensor],
+    stager: _PinnedCpuStager,
+) -> dict[str, torch.Tensor]:
+    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
+    for key, tensor in tensors.items():
+        dtype_name = _dtype_name(tensor.dtype)
+        group_key = (tensor.device.type, tensor.device.index, dtype_name)
+        grouped.setdefault(group_key, []).append((key, tensor))
+
+    staged: dict[str, torch.Tensor] = {}
+    for _group_key, group in sorted(grouped.items()):
+        flat = torch.cat(
+            [tensor.detach().contiguous().view(-1) for _key, tensor in sorted(group)]
+        )
+        staged_flat = stager.stage(flat)
+        offset = 0
+        for key, tensor in sorted(group):
+            numel = tensor.numel()
+            if key in staged:
+                raise RuntimeError(
+                    f"Duplicate vLLM LoRA tensor after conversion: {key}"
+                )
+            staged[key] = staged_flat.narrow(0, offset, numel).view(tensor.shape)
+            offset += numel
+    return staged
+
+
+def _save_rank0_vllm_lora(
+    *,
+    metadata: list[LoraShardMeta],
+    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    output_dir: str,
+) -> None:
+    merged_tensors = merge_sharded_adapter_entries(
+        _entries_by_key(metadata, tensors_by_owner_key)
+    )
+    vllm_tensors, published_config = handler.to_vllm_lora_tensors(
+        merged_tensors,
+        adapter_config=dict(adapter_config),
+    )
+    stager = _PinnedCpuStager()
+    published_tensors = _stage_published_tensors(vllm_tensors, stager)
+    stager.finish()
+    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
 
 
 def save_vllm_lora_from_model(
@@ -372,44 +414,20 @@ def save_vllm_lora_from_model(
         owner_rank=rank,
     )
     all_metadata = _gather_metadata(local_metadata)
-    by_block = _metadata_by_block(all_metadata)
+    exchanged_tensors = _exchange_batched_tensors(
+        all_metadata,
+        local_tensors=local_tensors,
+        rank=rank,
+        device=device,
+    )
 
     if rank != 0:
-        for block in sorted(by_block, key=_block_sort_key):
-            _gather_block_tensors(
-                by_block[block],
-                local_tensors=local_tensors,
-                rank=rank,
-                device=device,
-            )
         return
 
-    stager = _PinnedCpuStager()
-    published_config = dict(adapter_config)
-    published_tensors: dict[str, torch.Tensor] = {}
-    for block in sorted(by_block, key=_block_sort_key):
-        block_metadata = by_block[block]
-        block_tensors = _gather_block_tensors(
-            block_metadata,
-            local_tensors=local_tensors,
-            rank=rank,
-            device=device,
-        )
-        merged_tensors = merge_sharded_adapter_entries(
-            _entries_by_key(block_metadata, block_tensors)
-        )
-        vllm_tensors, converted_config = handler.to_vllm_lora_tensors(
-            merged_tensors,
-            adapter_config=published_config,
-        )
-        if converted_config != published_config:
-            published_config = converted_config
-        for key, tensor in sorted(vllm_tensors.items()):
-            if key in published_tensors:
-                raise RuntimeError(
-                    f"Duplicate vLLM LoRA tensor after conversion: {key}"
-                )
-            published_tensors[key] = stager.stage(tensor)
-        del block_tensors, merged_tensors, vllm_tensors
-    stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
+    _save_rank0_vllm_lora(
+        metadata=all_metadata,
+        tensors_by_owner_key=exchanged_tensors,
+        handler=handler,
+        adapter_config=adapter_config,
+        output_dir=output_dir,
+    )
