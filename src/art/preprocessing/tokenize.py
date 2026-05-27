@@ -15,6 +15,11 @@ from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokeni
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices
+from ..utils.chat_template import (
+    default_chat_template_kwargs_for_tokenizer,
+    merge_chat_template_kwargs,
+)
+from .response_masking import response_only_labels, token_ids_for_template_part
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
@@ -24,14 +29,10 @@ def _chat_template_kwargs(
     tokenizer: PreTrainedTokenizerBase,
     chat_template_kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {}
-    if isinstance(tokenizer.chat_template, str):
-        if "enable_thinking" in tokenizer.chat_template:
-            kwargs["enable_thinking"] = False
-        if "preserve_thinking" in tokenizer.chat_template:
-            kwargs["preserve_thinking"] = True
-    kwargs.update(chat_template_kwargs or {})
-    return kwargs
+    return merge_chat_template_kwargs(
+        default_chat_template_kwargs_for_tokenizer(tokenizer),
+        chat_template_kwargs,
+    )
 
 
 def _normalize_tool_for_vllm_openai(tool: ChatTemplateTool) -> ChatTemplateTool:
@@ -583,17 +584,8 @@ def tokenize_sft_batch(
     """
     _validate_max_seq_length(max_seq_length)
 
-    import unsloth  # noqa: F401 - Must be imported first to set UNSLOTH_IS_PRESENT env var
-    from unsloth_zoo.dataset_utils import train_on_responses_only
-
-    train_on_responses_only_fn = train_on_responses_only(
-        trainer=None,
-        instruction_part=instruction_part,
-        response_part=response_part,
-        force_match=False,
-        tokenizer=tokenizer,
-        return_function=True,
-    )
+    instruction_ids = token_ids_for_template_part(tokenizer, instruction_part)
+    response_ids = token_ids_for_template_part(tokenizer, response_part)
     # Tokenize all trajectories (no padding — each keeps its natural length)
     trajectory_tensors = []
     num_tokens = 0
@@ -625,7 +617,11 @@ def tokenize_sft_batch(
 
         attention_mask = [1] * len(input_ids)
 
-        labels = train_on_responses_only_fn({"input_ids": [input_ids]})["labels"][0]
+        labels = response_only_labels(
+            input_ids,
+            instruction_ids=instruction_ids,
+            response_ids=response_ids,
+        )
 
         trajectory_tensors.append(
             {

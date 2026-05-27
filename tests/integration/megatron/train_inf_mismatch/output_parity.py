@@ -701,11 +701,12 @@ def _collect_full_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
 def _adapter_config(config: TrainInfOutputParityConfig) -> dict[str, Any]:
     from peft.tuners.lora.config import LoraConfig
 
-    from art.megatron.lora import LORA_ALPHA, LORA_RANK
+    from art.megatron.lora import LORA_ALPHA, default_lora_rank_for_handler
+    from art.megatron.model_support import get_model_support_handler
 
     return LoraConfig(
         base_model_name_or_path=config.base_model,
-        r=LORA_RANK,
+        r=default_lora_rank_for_handler(get_model_support_handler(config.base_model)),
         lora_alpha=LORA_ALPHA,
         target_modules=_lora_target_modules(config),
         bias="none",
