@@ -4,6 +4,7 @@ import torch
 
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
     LayerFamilyInstance,
     SharedExpertCompileState,
 )
@@ -102,6 +103,9 @@ class DefaultDenseHandler:
     ) -> dict[str, torch.Tensor]:
         del adapter_config
         return tensors
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return ()
 
     def _shared_expert_compile_state(
         self,

@@ -9,6 +9,7 @@ SharedExpertCompileState = Literal[
     "shared_experts",
     "shared_expert_overlap",
 ]
+ExpertPackedLoraLayout = Literal["expert_rows", "rank_major_expert_cols"]
 
 
 class DependencyFloor(BaseModel):
@@ -41,6 +42,18 @@ class CompileWorkaroundConfig(BaseModel):
     unconditional_flags: tuple[str, ...] = ()
     shared_expert_state: SharedExpertCompileState = "none"
     disable_compile: bool = False
+
+
+class ExpertPackedLoraSlot(BaseModel):
+    source_projection: str
+    source_lora: Literal["lora_A", "lora_B"]
+    output_suffix: str
+    pack_layout: ExpertPackedLoraLayout
+
+
+class ExpertPackedLoraGroup(BaseModel):
+    art_group_suffix: str
+    slots: tuple[ExpertPackedLoraSlot, ...]
 
 
 class ModelSupportSpec(BaseModel):
@@ -98,6 +111,8 @@ class ModelSupportHandler(Protocol):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]: ...
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]: ...
 
     def from_vllm_lora_tensors(
         self,

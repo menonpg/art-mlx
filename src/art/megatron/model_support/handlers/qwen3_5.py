@@ -19,6 +19,8 @@ from art.megatron.model_support.handlers.qwen3_common import (
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
     LayerFamilyInstance,
 )
 from art.megatron.training.model_chunks import ModelChunks
@@ -395,6 +397,39 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     key = "qwen3_5_moe"
     is_moe = True
 
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=(
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_A",
+                        output_suffix="base_layer.lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_B",
+                        output_suffix="base_layer.lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_A",
+                        output_suffix="lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_B",
+                        output_suffix="lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                ),
+            ),
+        )
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -667,14 +702,19 @@ def _to_vllm_lora_tensors(
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
         transformed: dict[str, torch.Tensor] = {}
+        saw_packed_moe = False
         for key, tensor in tensors.items():
+            saw_packed_moe = saw_packed_moe or _VLLM_MOE_KEY_RE.match(key) is not None
             vllm_key, tensor = _to_vllm_lora_tensor(
                 key,
                 tensor,
                 adapter_config=adapter_config,
             )
             transformed[vllm_key] = tensor
-        return transformed, adapter_config
+        return (
+            transformed,
+            _vllm_moe_config(adapter_config) if saw_packed_moe else adapter_config,
+        )
     transformed: dict[str, torch.Tensor] = {}
     used_keys: set[str] = set()
     for prefix, experts in grouped.items():

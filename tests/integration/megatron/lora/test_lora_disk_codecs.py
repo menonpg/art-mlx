@@ -976,6 +976,104 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
     _assert_tensors_equal(roundtrip, full)
 
 
+def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
+
+    rank = 2
+    hidden = 3
+    intermediate = 4
+    group_prefix = "base_model.model.model.layers.0.mlp.experts"
+    full: dict[str, torch.Tensor] = {}
+    gate_up_lora = LoRA(
+        adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
+        in_features=hidden,
+        out_features=2 * intermediate,
+        rank=rank,
+        alpha=rank,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=2,
+    )
+    down_lora = LoRA(
+        adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
+        in_features=intermediate,
+        out_features=hidden,
+        rank=rank,
+        alpha=rank,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=2,
+    )
+    offset = 0
+    for expert in range(2):
+        expert_prefix = f"{group_prefix}.{expert}"
+        tensors = {
+            "gate_up_proj.lora_A.weight": torch.arange(
+                rank * hidden,
+                dtype=torch.float32,
+            ).reshape(rank, hidden)
+            + offset,
+            "gate_up_proj.lora_B.weight": torch.arange(
+                2 * intermediate * rank,
+                dtype=torch.float32,
+            ).reshape(2 * intermediate, rank)
+            + offset
+            + 100,
+            "down_proj.lora_A.weight": torch.arange(
+                rank * intermediate,
+                dtype=torch.float32,
+            ).reshape(rank, intermediate)
+            + offset
+            + 200,
+            "down_proj.lora_B.weight": torch.arange(
+                hidden * rank,
+                dtype=torch.float32,
+            ).reshape(hidden, rank)
+            + offset
+            + 300,
+        }
+        for suffix, tensor in tensors.items():
+            full[f"{expert_prefix}.{suffix}"] = tensor
+        gate_up_lora.A_T.data[expert].copy_(tensors["gate_up_proj.lora_A.weight"].T)
+        gate_up_lora.B_T.data[expert].copy_(tensors["gate_up_proj.lora_B.weight"].T)
+        down_lora.A_T.data[expert].copy_(tensors["down_proj.lora_A.weight"].T)
+        down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
+        offset += 1000
+
+    adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)
+    old_dir = tmp_path / "old"
+    current_dir = tmp_path / "current"
+    old_tensors, old_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        full,
+        adapter_config=dict(adapter_config),
+    )
+    save_vllm_lora_tensors(old_dir, old_tensors, old_config)
+    save_vllm_lora_from_model(
+        model=[torch.nn.Sequential(gate_up_lora, down_lora)],
+        adapter_model=full,
+        handler=QWEN3_5_MOE_HANDLER,
+        adapter_config=dict(adapter_config),
+        output_dir=str(current_dir),
+        rank=0,
+        world_size=1,
+    )
+
+    _assert_tensors_equal(
+        load_file(current_dir / "adapter_model.safetensors"),
+        load_file(old_dir / "adapter_model.safetensors"),
+    )
+    assert (current_dir / "adapter_model.safetensors").read_bytes() == (
+        old_dir / "adapter_model.safetensors"
+    ).read_bytes()
+    assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
+        (old_dir / "adapter_config.json").read_text()
+    )
+
+
 def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(
     tmp_path: Path,
 ):
