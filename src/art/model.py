@@ -618,15 +618,16 @@ class Model(
             # This allows out-of-order logging (e.g., async validation for previous steps).
             run.define_metric("training_step")
             run.define_metric("time/wall_clock_sec")
+            for split in sorted(METRIC_SPLITS):
+                run.define_metric(f"{split}/step", hidden=True)
             run.define_metric("reward/*", step_metric="training_step")
             run.define_metric("loss/*", step_metric="training_step")
             run.define_metric("throughput/*", step_metric="training_step")
             run.define_metric("costs/*", step_metric="training_step")
             run.define_metric("time/*", step_metric="training_step")
             run.define_metric("data/*", step_metric="training_step")
-            run.define_metric("train/*", step_metric="training_step")
-            run.define_metric("val/*", step_metric="training_step")
-            run.define_metric("test/*", step_metric="training_step")
+            for split in sorted(METRIC_SPLITS):
+                run.define_metric(f"{split}/*", step_metric=f"{split}/step")
             run.define_metric("discarded/*", step_metric="training_step")
             self._sync_wandb_config(run)
         return self._wandb_run
@@ -654,6 +655,13 @@ class Model(
             prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
 
         prefixed["training_step"] = step
+        split_prefixes = {
+            key.split("/", 1)[0]
+            for key in prefixed
+            if "/" in key and key.split("/", 1)[0] in METRIC_SPLITS
+        }
+        for split_prefix in split_prefixes:
+            prefixed[f"{split_prefix}/step"] = step
         prefixed["time/wall_clock_sec"] = time.time() - self._run_start_time
 
         output_dir = self._get_output_dir()
@@ -691,11 +699,19 @@ class Model(
             return
 
         for key in keys:
-            if not key.startswith("costs/"):
+            first_component = key.split("/", 1)[0]
+            if key in {"training_step", "time/wall_clock_sec"} or key.endswith("/step"):
+                continue
+            if "/" not in key:
                 continue
             if key in self._wandb_defined_metrics:
                 continue
-            run.define_metric(key, step_metric="training_step")
+            step_metric = (
+                f"{first_component}/step"
+                if first_component in METRIC_SPLITS
+                else "training_step"
+            )
+            run.define_metric(key, step_metric=step_metric, overwrite=True)
             self._wandb_defined_metrics.add(key)
 
     def _route_metrics_and_collect_non_costs(
