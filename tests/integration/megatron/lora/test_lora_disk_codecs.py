@@ -6,6 +6,8 @@ import sys
 from safetensors.torch import load_file, save_file
 import torch
 
+from art.megatron import lora as lora_module
+from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
@@ -707,33 +709,100 @@ def test_lora_publish_keeps_same_key_shards_separate():
     assert torch.equal(merged[key], torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
 
 
-def test_lora_publish_metadata_payload_roundtrip():
-    metadata = [
-        LoraShardMeta(
-            key="base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
-            owner_rank=3,
-            shape=(2, 4),
-            dtype_name="bfloat16",
-            manifest={
-                "sharded": True,
-                "shard_world_size": 4,
-                "shard_rank": 3,
-                "export_shard_dim": 1,
-                "export_shard_strategy": "uniform",
-            },
-            block="unused",
-        )
-    ]
+def test_lora_publish_planner_derives_metadata_from_lora_modules():
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    b_parallel_spec = LoRAParallelSpec(sharded=True, shard_dim=-1)
+    lora = LoRA(
+        adapter_model_prefix=prefix,
+        in_features=4,
+        out_features=6,
+        rank=2,
+        alpha=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        b_parallel_spec=b_parallel_spec,
+    )
+    adapter_model = {
+        f"{prefix}.lora_A.weight": torch.empty(2, 4, dtype=torch.float32),
+        f"{prefix}.lora_B.weight": torch.empty(6, 2, dtype=torch.float32),
+    }
 
-    payload = lora_publish._metadata_payload(metadata)
-    decoded = lora_publish._metadata_from_payload(payload, owner_rank=3)
+    metadata = LoRAPublishPlanner([torch.nn.Sequential(lora)]).global_metadata(
+        adapter_model
+    )
+    by_key = {meta.key: meta for meta in metadata}
 
-    assert decoded[0].key == metadata[0].key
-    assert decoded[0].owner_rank == 3
-    assert decoded[0].shape == metadata[0].shape
-    assert decoded[0].dtype_name == metadata[0].dtype_name
-    assert decoded[0].manifest == metadata[0].manifest
-    assert decoded[0].block == "base_model.model.model.layers.0"
+    a_meta = by_key[f"{prefix}.lora_A.weight"]
+    assert a_meta.shape == (2, 4)
+    assert a_meta.dtype_name == "float32"
+    assert a_meta.owner_rank == 0
+    assert a_meta.manifest == {
+        "sharded": False,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+    }
+    assert a_meta.block == "base_model.model.model.layers.0"
+
+    b_meta = by_key[f"{prefix}.lora_B.weight"]
+    assert b_meta.shape == (6, 2)
+    assert b_meta.dtype_name == "float32"
+    assert b_meta.owner_rank == 0
+    assert b_meta.manifest == {
+        "sharded": True,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+        "export_shard_dim": 0,
+        "export_shard_strategy": "uniform",
+    }
+
+
+def test_lora_publish_planner_maps_expert_owner_ranks(monkeypatch):
+    monkeypatch.setattr(lora_module, "_distributed_initialized", lambda: True)
+    monkeypatch.setattr(
+        lora_module,
+        "_get_shard_world_size",
+        lambda domain: 2 if domain == "expert_tp" else 1,
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_tensor_and_model_parallel_group",
+        lambda check_initialized=False: "joint",
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_model_parallel_group",
+        lambda: "ep",
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_tensor_parallel_group",
+        lambda check_initialized=False: "etp",
+    )
+
+    row_major = {"joint": (0, 1, 2, 3, 4, 5, 6, 7), "ep": (0, 2, 4, 6), "etp": (0, 1)}
+    monkeypatch.setattr(
+        lora_module,
+        "_process_group_ranks",
+        lambda group: row_major[group],
+    )
+    assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
+
+    column_major = {
+        "joint": (0, 1, 2, 3, 4, 5, 6, 7),
+        "ep": (0, 1, 2, 3),
+        "etp": (0, 4),
+    }
+    monkeypatch.setattr(
+        lora_module,
+        "_process_group_ranks",
+        lambda group: column_major[group],
+    )
+    assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
 
 
 def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
@@ -865,19 +934,32 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         ).reshape(2, 1),
     }
 
-    class FakeLoraModule(torch.nn.Module):
-        def sharded_lora_state_dict(self) -> dict[str, torch.Tensor]:
-            return full
-
-        def sharded_lora_manifest(self) -> dict[str, dict[str, int | bool]]:
-            return {
-                key: {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
-                for key in full
-            }
+    gate_up_lora = LoRA(
+        adapter_model_prefix=f"{prefix}.gate_up_proj",
+        in_features=2,
+        out_features=8,
+        rank=1,
+        alpha=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    gate_up_lora.A_T.data.copy_(full[f"{prefix}.gate_up_proj.lora_A.weight"].T)
+    gate_up_lora.B_T.data.copy_(full[f"{prefix}.gate_up_proj.lora_B.weight"].T)
+    down_lora = LoRA(
+        adapter_model_prefix=f"{prefix}.down_proj",
+        in_features=4,
+        out_features=2,
+        rank=1,
+        alpha=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    down_lora.A_T.data.copy_(full[f"{prefix}.down_proj.lora_A.weight"].T)
+    down_lora.B_T.data.copy_(full[f"{prefix}.down_proj.lora_B.weight"].T)
 
     publish_dir = tmp_path / "published_from_model"
     save_vllm_lora_from_model(
-        model=[torch.nn.Sequential(FakeLoraModule())],
+        model=[torch.nn.Sequential(gate_up_lora, down_lora)],
         adapter_model=full,
         handler=QWEN3_5_MOE_HANDLER,
         adapter_config=_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1),

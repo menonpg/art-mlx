@@ -1,30 +1,14 @@
 from collections.abc import Iterable, Sequence
-import pickle
 import re
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 
+from art.megatron.lora import LoRAPublishPlanner, LoraShardMeta
 from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 from art.megatron.training.model_chunks import ModelChunks
 
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
-
-
-class LoraShardMeta(NamedTuple):
-    key: str
-    owner_rank: int
-    shape: tuple[int, ...]
-    dtype_name: str
-    manifest: dict[str, Any]
-    block: str
-
-    @property
-    def numel(self) -> int:
-        total = 1
-        for dim in self.shape:
-            total *= dim
-        return total
 
 
 class _PinnedCpuStager:
@@ -210,119 +194,6 @@ def _distributed_ready() -> bool:
     )
 
 
-def _metadata_payload(local_metadata: list[LoraShardMeta]) -> bytes:
-    rows = [
-        (
-            meta.key,
-            meta.shape,
-            meta.dtype_name,
-            bool(meta.manifest["sharded"]),
-            int(meta.manifest["shard_world_size"]),
-            int(meta.manifest["shard_rank"]),
-            int(meta.manifest.get("export_shard_dim", -1)),
-            meta.manifest.get("export_shard_strategy"),
-            tuple(int(size) for size in meta.manifest.get("component_sizes", ())),
-        )
-        for meta in local_metadata
-    ]
-    return pickle.dumps(rows, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def _manifest_from_metadata_row(
-    *,
-    sharded: bool,
-    shard_world_size: int,
-    shard_rank: int,
-    export_shard_dim: int,
-    export_shard_strategy: str | None,
-    component_sizes: tuple[int, ...],
-) -> dict[str, Any]:
-    manifest: dict[str, Any] = {
-        "sharded": sharded,
-        "shard_world_size": shard_world_size,
-        "shard_rank": shard_rank,
-    }
-    if sharded:
-        manifest["export_shard_dim"] = export_shard_dim
-        manifest["export_shard_strategy"] = export_shard_strategy or "uniform"
-        if component_sizes:
-            manifest["component_sizes"] = list(component_sizes)
-    return manifest
-
-
-def _metadata_from_payload(payload: bytes, *, owner_rank: int) -> list[LoraShardMeta]:
-    rows = pickle.loads(payload)
-    return [
-        LoraShardMeta(
-            key=key,
-            owner_rank=owner_rank,
-            shape=tuple(int(dim) for dim in shape),
-            dtype_name=dtype_name,
-            manifest=_manifest_from_metadata_row(
-                sharded=sharded,
-                shard_world_size=shard_world_size,
-                shard_rank=shard_rank,
-                export_shard_dim=export_shard_dim,
-                export_shard_strategy=export_shard_strategy,
-                component_sizes=component_sizes,
-            ),
-            block=_block_for_key(key),
-        )
-        for (
-            key,
-            shape,
-            dtype_name,
-            sharded,
-            shard_world_size,
-            shard_rank,
-            export_shard_dim,
-            export_shard_strategy,
-            component_sizes,
-        ) in rows
-    ]
-
-
-def _gather_metadata(
-    local_metadata: list[LoraShardMeta],
-    *,
-    rank: int,
-    device: torch.device,
-) -> list[LoraShardMeta]:
-    if not _distributed_ready():
-        return local_metadata
-    world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
-    payload = _metadata_payload(local_metadata)
-    payload_tensor = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(
-        device=device
-    )
-
-    if rank != 0:
-        torch.distributed.send(  # type: ignore[possibly-missing-attribute]
-            torch.tensor([payload_tensor.numel()], dtype=torch.int64, device=device),
-            dst=0,
-        )
-        torch.distributed.send(payload_tensor, dst=0)  # type: ignore[possibly-missing-attribute]
-        return local_metadata
-
-    all_metadata = list(local_metadata)
-    for owner_rank in range(1, world_size):
-        length_tensor = torch.empty(1, dtype=torch.int64, device=device)
-        torch.distributed.recv(length_tensor, src=owner_rank)  # type: ignore[possibly-missing-attribute]
-        remote_payload = torch.empty(
-            int(length_tensor.item()),
-            dtype=torch.uint8,
-            device=device,
-        )
-        torch.distributed.recv(remote_payload, src=owner_rank)  # type: ignore[possibly-missing-attribute]
-        all_metadata.extend(
-            _metadata_from_payload(
-                remote_payload.cpu().numpy().tobytes(),
-                owner_rank=owner_rank,
-            )
-        )
-    return all_metadata
-
-
 def _rank_and_device() -> tuple[int, torch.device]:
     if _distributed_ready():
         rank = torch.distributed.get_rank()  # type: ignore[possibly-missing-attribute]
@@ -501,12 +372,15 @@ def save_vllm_lora_from_model(
                 f"got rank={rank} world_size={world_size}"
             )
         rank = 0
+    planner = LoRAPublishPlanner(model)
     local_tensors, local_metadata = collect_local_lora_entries(
         model,
         adapter_model,
         owner_rank=rank,
     )
-    all_metadata = _gather_metadata(local_metadata, rank=rank, device=device)
+    all_metadata = (
+        planner.global_metadata(adapter_model) if rank == 0 else local_metadata
+    )
     exchanged_tensors = _exchange_batched_tensors(
         all_metadata,
         local_tensors=local_tensors,
