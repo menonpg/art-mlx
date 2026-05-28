@@ -1,6 +1,7 @@
 import asyncio
 import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
+import warnings
 
 from openai._types import NOT_GIVEN
 from tqdm import auto as tqdm
