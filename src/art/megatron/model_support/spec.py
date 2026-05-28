@@ -59,6 +59,7 @@ class ExpertPackedLoraGroup(BaseModel):
 class ModelSupportSpec(BaseModel):
     key: str
     handler_key: str
+    is_moe: bool = False
     model_names: tuple[str, ...] = ()
     default_target_modules: tuple[str, ...]
     default_rollout_weights_mode: RolloutWeightsMode = "lora"

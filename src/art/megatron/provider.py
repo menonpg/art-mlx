@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.megatron.model_support.registry import (
+    ensure_model_support_bridge_registered_for_spec,
     get_model_support_handler_for_spec,
     get_model_support_spec,
 )
@@ -507,6 +508,7 @@ def _build_provider_bundle(
         model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    ensure_model_support_bridge_registered_for_spec(spec)
     handler = get_model_support_handler_for_spec(spec)
     bridge = AutoBridge.from_hf_pretrained(
         model,

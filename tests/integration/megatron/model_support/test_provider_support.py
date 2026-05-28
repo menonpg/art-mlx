@@ -16,6 +16,7 @@ from art.megatron.model_support.registry import (
     UnsupportedModelArchitectureError,
     get_model_support_handler,
     get_model_support_spec,
+    model_uses_expert_parallel,
 )
 import art.megatron.provider as provider_module
 
@@ -103,8 +104,15 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     handler = get_model_support_handler("OpenPipe/Qwen3-14B-Instruct")
 
     assert spec.key == "qwen3_dense"
+    assert spec.is_moe is False
     assert spec.native_vllm_lora_status == "validated"
     assert handler.key == "qwen3_dense"
+
+
+def test_model_support_specs_own_moe_metadata() -> None:
+    assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
+    assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
+    assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
 
 
 def test_megatron_lora_rank_defaults_by_architecture() -> None:

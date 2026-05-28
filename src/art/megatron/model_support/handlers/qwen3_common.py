@@ -1,14 +1,12 @@
+from __future__ import annotations
+
 from typing import Any, Sequence, cast
-
-from megatron.core import parallel_state as ps
-from megatron.core.models.gpt.gpt_model import GPTModel
-import torch
-from torch.distributed import is_initialized
-
-from art.megatron.training.model_chunks import ModelChunks
 
 
 def _context_parallel_world_size(config: Any) -> int:
+    from megatron.core import parallel_state as ps
+    from torch.distributed import is_initialized
+
     if is_initialized() and ps.model_parallel_is_initialized():
         return int(ps.get_context_parallel_world_size())
     return int(getattr(config, "context_parallel_size", 1) or 1)
@@ -18,9 +16,11 @@ def _build_absolute_rotary_pos_emb(
     module: Any,
     *,
     max_position: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
+    dtype: Any,
+    device: Any,
+) -> Any:
+    import torch
+
     rotary_pos_emb = module.rotary_pos_emb
     cache = getattr(module, "_art_absolute_rotary_pos_emb_cache", None)
     if cache is None:
@@ -48,7 +48,10 @@ def _build_absolute_rotary_pos_emb(
 
 
 def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
-    for chunk in cast(ModelChunks, list(model_chunks)):
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    import torch
+
+    for chunk in list(model_chunks):
         module: Any = chunk
         while hasattr(module, "module"):
             module = module.module

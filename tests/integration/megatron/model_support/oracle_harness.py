@@ -337,9 +337,12 @@ class OracleCaseConfig(BaseModel):
 
     @property
     def is_moe(self) -> bool:
-        from art.megatron.model_support import get_model_support_handler
+        from art.megatron.model_support import model_uses_expert_parallel
 
-        return bool(get_model_support_handler(self.base_model).is_moe)
+        return model_uses_expert_parallel(
+            self.base_model,
+            allow_unvalidated_arch=self.allow_unvalidated_arch,
+        )
 
 
 class DiskPackedTensorsSpec(BaseModel):
