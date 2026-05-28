@@ -707,6 +707,35 @@ def test_lora_publish_keeps_same_key_shards_separate():
     assert torch.equal(merged[key], torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
 
 
+def test_lora_publish_metadata_payload_roundtrip():
+    metadata = [
+        LoraShardMeta(
+            key="base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            owner_rank=3,
+            shape=(2, 4),
+            dtype_name="bfloat16",
+            manifest={
+                "sharded": True,
+                "shard_world_size": 4,
+                "shard_rank": 3,
+                "export_shard_dim": 1,
+                "export_shard_strategy": "uniform",
+            },
+            block="unused",
+        )
+    ]
+
+    payload = lora_publish._metadata_payload(metadata)
+    decoded = lora_publish._metadata_from_payload(payload, owner_rank=3)
+
+    assert decoded[0].key == metadata[0].key
+    assert decoded[0].owner_rank == 3
+    assert decoded[0].shape == metadata[0].shape
+    assert decoded[0].dtype_name == metadata[0].dtype_name
+    assert decoded[0].manifest == metadata[0].manifest
+    assert decoded[0].block == "base_model.model.model.layers.0"
+
+
 def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
     uniform_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
     componentwise_key = (
