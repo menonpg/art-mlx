@@ -25,9 +25,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # 0.00238 restricted top20 KL with exact shared-prefix route replay and zero
 # route conflicts; a follow-up workflow rerun with shared-prefix route conflicts
 # measured 0.00359 KL. Qwen3 MoE uses its own bf16-scale gates for this path.
+# A 2026-05-29 Qwen3 dense workflow run measured 4.188% mean_abs_pct and
+# 0.001918 restricted top20 KL, so it uses the same 5% bf16 mean_abs_pct gate.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     "qwen3_moe": 9.0,
+    "qwen3_dense": 5.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
