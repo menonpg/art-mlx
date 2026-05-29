@@ -311,8 +311,8 @@ def run_hf_parity(
     *,
     case_config: OracleCaseConfig,
 ) -> HfParityReport:
-    if case_config.precision != "fp32":
-        raise ValueError("HF parity currently requires fp32 precision")
+    if case_config.precision not in {"fp32", "bf16"}:
+        raise ValueError("HF parity currently requires fp32 or bf16 precision")
     if case_config.num_steps != 1:
         raise ValueError("HF parity currently requires num_steps=1")
 
