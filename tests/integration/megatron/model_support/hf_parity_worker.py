@@ -521,6 +521,83 @@ def _install_hf_qwen35_gdn_fp32_reference(model: Any, *, base_model: str) -> Non
         raise RuntimeError("Qwen3.5 HF parity found no GDN modules to patch")
 
 
+def _torch_chunk_gated_delta_rule_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        torch_chunk_gated_delta_rule,
+    )
+
+    if kwargs:
+        raise TypeError(
+            f"Unsupported Qwen3.5 GDN fp32 reference kwargs: {sorted(kwargs)}"
+        )
+    if cu_seqlens is None:
+        return torch_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    if query.shape[0] != 1:
+        raise RuntimeError(
+            "Qwen3.5 packed GDN fp32 reference expects packed batch size 1, "
+            f"got {query.shape[0]}"
+        )
+    starts = cu_seqlens.detach().cpu().tolist()
+    outputs: list[torch.Tensor] = []
+    finals: list[torch.Tensor] = []
+    for index, (start, end) in enumerate(zip(starts, starts[1:], strict=True)):
+        state = None if initial_state is None else initial_state[index : index + 1]
+        output, final = torch_chunk_gated_delta_rule(
+            query[:, start:end],
+            key[:, start:end],
+            value[:, start:end],
+            g=g[:, start:end],
+            beta=beta[:, start:end],
+            initial_state=state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        outputs.append(output)
+        if final is not None:
+            finals.append(final)
+    return torch.cat(outputs, dim=1), torch.cat(finals, dim=0) if finals else None
+
+
+def _install_megatron_qwen35_gdn_fp32_reference(
+    stack: ExitStack,
+    *,
+    base_model: str,
+) -> None:
+    model_key = base_model.lower()
+    if "qwen3.5" not in model_key and "qwen3_5" not in model_key:
+        return
+    from art.megatron.gdn import operator as gdn_operator
+
+    original = gdn_operator._chunk_gated_delta_rule
+    setattr(
+        gdn_operator,
+        "_chunk_gated_delta_rule",
+        _torch_chunk_gated_delta_rule_reference,
+    )
+    stack.callback(setattr, gdn_operator, "_chunk_gated_delta_rule", original)
+
+
 def _build_megatron_runtime(
     request: HfParityRunRequest,
     *,
@@ -817,6 +894,10 @@ def _worker_run(request: HfParityRunRequest) -> None:
     )
     flex_patch_stack.enter_context(
         _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+    )
+    _install_megatron_qwen35_gdn_fp32_reference(
+        flex_patch_stack,
+        base_model=request.case_config.base_model,
     )
     try:
         _debug("starting HF parity worker")
