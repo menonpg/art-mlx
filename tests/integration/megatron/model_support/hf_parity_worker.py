@@ -561,7 +561,7 @@ def _torch_chunk_gated_delta_rule_reference(
     starts = cu_seqlens.detach().cpu().tolist()
     outputs: list[torch.Tensor] = []
     finals: list[torch.Tensor] = []
-    for index, (start, end) in enumerate(zip(starts, starts[1:], strict=True)):
+    for index, (start, end) in enumerate(zip(starts, starts[1:])):
         state = None if initial_state is None else initial_state[index : index + 1]
         output, final = torch_chunk_gated_delta_rule(
             query[:, start:end],
