@@ -19,6 +19,7 @@ import torch
 from art.megatron.routing_replay import ROUTER_KEY_FORMAT_VERSION
 from art.megatron.training.streaming_weight_offload import StreamingWeightOffloadConfig
 
+from ..artifacts import GitRepoState, pinned_git_state
 from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD, mean_abs_pct_from_sums
 from .forward_trace import ForwardTraceCapture
 
@@ -32,6 +33,7 @@ SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
 ORACLE_BASE_MODEL_ENV = "ART_ORACLE_BASE_MODEL"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
+ORACLE_ARTIFACT_SUITE_NAME = "Megatron oracle artifacts"
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
@@ -368,6 +370,7 @@ class CaseArtifacts(BaseModel):
 class WorkerRunRequest(BaseModel):
     """Defines one distributed worker invocation for generating variant artifacts."""
 
+    git: GitRepoState
     case_id: str
     objective: OracleObjective
     case_config: OracleCaseConfig
@@ -405,6 +408,7 @@ class StepTrace(BaseModel):
 class RunManifest(BaseModel):
     """Records run metadata and per-step trace references for one topology output."""
 
+    git: GitRepoState
     case_id: str
     objective: OracleObjective
     base_model: str
@@ -481,6 +485,7 @@ class VariantSpec(BaseModel):
 class VariantReport(BaseModel):
     """Captures full comparison output for one variant run."""
 
+    git: GitRepoState
     case_id: str
     variant: str
     topology: str
@@ -765,6 +770,24 @@ def _read_json(path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def _current_git_state() -> GitRepoState:
+    return pinned_git_state(ORACLE_ARTIFACT_SUITE_NAME)
+
+
+def _manifest_matches_current_commit(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        payload = _read_json(path)
+    except Exception:
+        return False
+    git_payload = payload.get("git")
+    return (
+        isinstance(git_payload, dict)
+        and git_payload.get("commit") == _current_git_state().commit
+    )
+
+
 def _build_packed_tensors(
     config: PackedTensorConfig,
     seed: int,
@@ -1031,12 +1054,31 @@ def _prune_topology_artifacts(path: Path) -> None:
     if keep_topology_artifacts() or not path.exists():
         return
     for child in path.iterdir():
-        if child.name in {"variant_report.json", "run_request.json", "worker.log"}:
+        if child.name in {
+            "manifest.json",
+            "variant_report.json",
+            "run_request.json",
+            "worker.log",
+        }:
             continue
         if child.is_dir():
             shutil.rmtree(child)
             continue
         child.unlink()
+
+
+def _prune_case_artifacts(case_dir: Path) -> None:
+    """Drops reusable generated inputs after tests have written reports."""
+    if keep_topology_artifacts() or not case_dir.exists():
+        return
+    for name in ("packed_tensors", "packed_tensors.json", "shared_init"):
+        path = case_dir / name
+        if not path.exists():
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def _load_manifest(topology_dir: Path) -> RunManifest:
@@ -1180,6 +1222,7 @@ class VariantRunner:
     ) -> None:
         self.objective = objective
         self.case_config = case_config
+        self.git = _current_git_state()
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
@@ -1372,11 +1415,16 @@ class VariantRunner:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
         manifest_path = topology_dir / "manifest.json"
-        if manifest_path.exists() and not regenerate:
+        if (
+            manifest_path.exists()
+            and not regenerate
+            and _manifest_matches_current_commit(manifest_path)
+        ):
             return topology_dir
         _replace_topology_dir(topology_dir)
         run_case_config = self.case_config
         request = WorkerRunRequest(
+            git=self.git,
             case_id=self.case_id,
             objective=self.objective,
             case_config=run_case_config,
@@ -1413,6 +1461,9 @@ class VariantRunner:
             self.shared_init_path.unlink()
         bundle_manifest = self.oracle_routing_bundle_dir / "manifest.json"
         oracle_manifest = self.oracle_dir / "manifest.json"
+        capture_manifest = (
+            self.case_dir / f"{self.oracle_slug}__oracle_capture" / "manifest.json"
+        )
         bundle_format_current = False
         if bundle_manifest.exists():
             try:
@@ -1427,6 +1478,7 @@ class VariantRunner:
             or not bundle_manifest.exists()
             or not bundle_format_current
             or not self.shared_init_path.exists()
+            or not _manifest_matches_current_commit(capture_manifest)
         )
         run_oracle_topology = partial(
             self._run_topology,
@@ -1447,6 +1499,7 @@ class VariantRunner:
             regenerate
             or not oracle_manifest.exists()
             or not self.shared_init_path.exists()
+            or not _manifest_matches_current_commit(oracle_manifest)
         ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
@@ -1890,6 +1943,7 @@ class VariantRunner:
         fail_count = len(rows) - pass_count
         signal: Literal["pass", "fail"] = "pass" if fail_count == 0 else "fail"
         return VariantReport(
+            git=self.git,
             case_id=self.case_id,
             variant=variant.name,
             topology=topology_slug,
@@ -2018,6 +2072,7 @@ class VariantRunner:
                 )
         finally:
             self._prune_reference_artifacts()
+            _prune_case_artifacts(self.case_dir)
         return reports
 
 

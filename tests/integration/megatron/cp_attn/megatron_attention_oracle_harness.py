@@ -167,12 +167,22 @@ class AttentionVariantRunner(VariantRunner):
         del replay_bundle_dir, capture_bundle_dir
         topology_dir = self.case_dir / output_slug
         manifest_path = topology_dir / "manifest.json"
-        if manifest_path.exists() and not regenerate:
+        from ..model_support.oracle_harness import (
+            REPO_ROOT,
+            _manifest_matches_current_commit,
+            _replace_topology_dir,
+        )
+
+        if (
+            manifest_path.exists()
+            and not regenerate
+            and _manifest_matches_current_commit(manifest_path)
+        ):
             return topology_dir
-        from ..model_support.oracle_harness import REPO_ROOT, _replace_topology_dir
 
         _replace_topology_dir(topology_dir)
         request = WorkerRunRequest(
+            git=self.git,
             case_id=self.case_id,
             objective=self.objective,
             case_config=self.case_config,

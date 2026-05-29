@@ -22,6 +22,7 @@ from art.megatron.model_support.spec import (
     NativeVllmLoraStatus,
 )
 
+from ..artifacts import pinned_git_state
 from .validation_spec import (
     MinimalLayerCoverageReport,
     ValidationReport,
@@ -36,6 +37,7 @@ SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
 LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
 ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
+WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -109,6 +111,7 @@ def initialize_validation_report(
     )
     handler = get_model_support_handler_for_spec(spec)
     return ValidationReport(
+        git=pinned_git_state(WORKFLOW_ARTIFACT_SUITE_NAME).model_dump(mode="json"),
         base_model=base_model,
         model_key=spec.key,
         dependency_versions=detect_dependency_versions(),

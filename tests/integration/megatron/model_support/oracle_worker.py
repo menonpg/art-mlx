@@ -1601,6 +1601,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
         # build and save the run manifest
         manifest = RunManifest(
+            git=request.git,
             case_id=request.case_id,
             objective=request.objective,
             base_model=request.case_config.base_model,

@@ -69,6 +69,7 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         del allow_unvalidated_arch
         calls.append(base_model)
         return ValidationReport(
+            git={},
             base_model=base_model,
             model_key="qwen3_dense",
             stages=[

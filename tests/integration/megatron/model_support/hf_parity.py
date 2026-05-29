@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ..artifacts import GitRepoState, pinned_git_state
 from .oracle_harness import (
     NON_FINITE_METRIC_VALUE,
     ORACLE_TOPOLOGY,
@@ -17,6 +18,7 @@ from .oracle_harness import (
     OracleCaseConfig,
     PackedTensorConfig,
     PhasePassFn,
+    _prune_case_artifacts,
     _read_json,
     _write_json,
     ensure_case_artifacts,
@@ -35,6 +37,7 @@ HF_PARITY_PACKED_TENSORS = PackedTensorConfig(
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+HF_PARITY_ARTIFACT_SUITE_NAME = "Megatron HF parity artifacts"
 
 
 class HfParityMetricRow(BaseModel):
@@ -51,6 +54,7 @@ class HfParityMetricRow(BaseModel):
 
 
 class HfParityRunRequest(BaseModel):
+    git: GitRepoState
     case_id: str
     case_config: OracleCaseConfig
     packed_tensors: DiskPackedTensorsSpec
@@ -59,6 +63,7 @@ class HfParityRunRequest(BaseModel):
 
 
 class HfParityReport(BaseModel):
+    git: GitRepoState
     case_id: str
     base_model: str
     model_key: str
@@ -336,6 +341,7 @@ def run_hf_parity(
             f"risks={coverage.unresolved_risks}"
         )
 
+    git = pinned_git_state(HF_PARITY_ARTIFACT_SUITE_NAME)
     case_artifacts = ensure_case_artifacts(case_config)
     output_dir = Path(case_artifacts.case_dir) / HF_PARITY_OUTPUT_DIRNAME
     report_path = output_dir / HF_PARITY_REPORT_FILENAME
@@ -343,6 +349,7 @@ def run_hf_parity(
     if report_path.exists():
         report_path.unlink()
     request = HfParityRunRequest(
+        git=git,
         case_id=case_artifacts.case_id,
         case_config=case_config,
         packed_tensors=case_artifacts.packed_tensors,
@@ -353,6 +360,7 @@ def run_hf_parity(
         run_hf_parity_subprocess(request, output_dir)
     report = HfParityReport.model_validate(_read_json(report_path))
     assert_hf_parity_pass(report, report_path=report_path)
+    _prune_case_artifacts(Path(case_artifacts.case_dir))
     return report
 
 
@@ -382,6 +390,7 @@ def build_hf_parity_report(
     pass_count = sum(1 for row in rows if row.pass_signal)
     fail_count = len(rows) - pass_count
     return HfParityReport(
+        git=request.git,
         case_id=request.case_id,
         base_model=request.case_config.base_model,
         model_key=request.coverage.model_key,

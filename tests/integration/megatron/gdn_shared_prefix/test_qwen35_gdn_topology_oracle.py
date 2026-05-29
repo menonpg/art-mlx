@@ -12,6 +12,8 @@ from ..model_support.oracle_harness import (
     Topology,
     VariantRunner,
     VariantSpec,
+    _prune_case_artifacts,
+    _prune_topology_artifacts,
     available_gpu_count,
     case_config,
 )
@@ -90,3 +92,5 @@ def test_qwen35_gdn_shared_prefix_cp_topology_oracle(
     assert manifest["num_layers"] == 1
     assert len(manifest["steps"]) == config.num_steps
     assert "finished step_index=0" in (topology_dir / "worker.log").read_text()
+    _prune_topology_artifacts(topology_dir)
+    _prune_case_artifacts(Path(runner.case_artifacts.case_dir))

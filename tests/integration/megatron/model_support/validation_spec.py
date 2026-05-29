@@ -23,6 +23,7 @@ class ValidationStageResult(BaseModel):
 
 
 class ValidationReport(BaseModel):
+    git: dict[str, Any]
     base_model: str
     model_key: str
     dependency_versions: dict[str, str] = Field(default_factory=dict)

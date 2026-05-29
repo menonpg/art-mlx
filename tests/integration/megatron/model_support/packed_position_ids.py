@@ -18,6 +18,7 @@ from art.megatron import train as megatron_train
 from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 
+from ..artifacts import GitRepoState, pinned_git_state
 from .oracle_harness import (
     ORACLE_TOPOLOGY,
     TEST_DEFAULT_FLEX_BACKEND,
@@ -41,6 +42,7 @@ from .oracle_worker import (
 _LOGITS_MEAN_ABS_PCT_LIMIT = 0.2
 _DEBUG_ENV = "ART_PACKED_POSITION_IDS_DEBUG"
 PACKED_POSITION_IDS_REPORT_FILENAME = "report.json"
+PACKED_POSITION_IDS_ARTIFACT_SUITE_NAME = "Megatron packed-position-id artifacts"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -144,6 +146,7 @@ class PackedPositionIdScenario(BaseModel):
 
 
 class PackedPositionIdsReport(BaseModel):
+    git: GitRepoState
     base_model: str
     output_dir: str
     num_layers: int
@@ -151,6 +154,7 @@ class PackedPositionIdsReport(BaseModel):
 
 
 class PackedPositionIdsRunRequest(BaseModel):
+    git: GitRepoState
     base_model: str
     num_layers: int
     output_dir: str
@@ -724,6 +728,7 @@ def _run_packed_position_ids_subprocess(
 
 def _run_packed_position_ids_worker(
     *,
+    git: GitRepoState,
     base_model: str,
     num_layers: int,
     output_dir: Path,
@@ -774,6 +779,7 @@ def _run_packed_position_ids_worker(
         ),
     ]
     report = PackedPositionIdsReport(
+        git=git,
         base_model=base_model,
         output_dir=str(output_dir),
         num_layers=num_layers,
@@ -958,6 +964,7 @@ def run_packed_position_ids(
     if report_path.exists():
         report_path.unlink()
     request = PackedPositionIdsRunRequest(
+        git=pinned_git_state(PACKED_POSITION_IDS_ARTIFACT_SUITE_NAME),
         base_model=base_model,
         num_layers=resolved_num_layers,
         output_dir=str(output_dir),
@@ -971,6 +978,7 @@ def run_packed_position_ids(
 def run_worker_cli(run_request_path: Path) -> None:
     request = PackedPositionIdsRunRequest.model_validate(_read_json(run_request_path))
     _run_packed_position_ids_worker(
+        git=request.git,
         base_model=request.base_model,
         num_layers=request.num_layers,
         output_dir=Path(request.output_dir),
