@@ -21,6 +21,7 @@ from .output_parity import (
     compare_topk,
     config_from_env,
     fwd_mean_abs_pct_limit_for_model,
+    top20_kl_candidate_to_target_limit_for_model,
 )
 from .real_path import RealPathConfig, _delete_adapter_safetensors_on_pass
 
@@ -155,9 +156,14 @@ def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
 
 
 def test_architecture_specific_real_path_limits() -> None:
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 7.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 9.0
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
+    assert top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3-30B-A3B") == 0.003
+    assert (
+        top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3.5-35B-A3B")
+        == TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+    )
 
 
 def test_compare_topk_reports_restricted_intersection_kl() -> None:

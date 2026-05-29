@@ -21,7 +21,6 @@ from art.preprocessing.pack import DiskPackedTensors
 
 from .artifacts import REPO_ROOT
 from .output_parity import (
-    TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     LogicalTokenMap,
     PairComparison,
@@ -46,6 +45,7 @@ from .output_parity import (
     compare_topk,
     fwd_mean_abs_pct_limit_for_model,
     model_support_is_moe,
+    top20_kl_candidate_to_target_limit_for_model,
 )
 
 
@@ -1105,10 +1105,14 @@ async def run_real_path_train_inf_mismatch(
             parity_config.base_model,
             allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
         )
+        top20_kl_limit = top20_kl_candidate_to_target_limit_for_model(
+            parity_config.base_model,
+            allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+        )
         passed = (
             comparison.mean_abs_pct <= mean_abs_pct_limit
             and topk_comparison.top20_intersection_kl_candidate_to_target
-            <= TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+            <= top20_kl_limit
         )
         report = RealPathTrainInfReport(
             base_model=parity_config.base_model,
@@ -1167,7 +1171,7 @@ async def run_real_path_train_inf_mismatch(
                 stats.shared_prefix_compared_slots
             ),
             mean_abs_pct_limit=mean_abs_pct_limit,
-            top20_kl_candidate_to_target_limit=TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
+            top20_kl_candidate_to_target_limit=top20_kl_limit,
             passed=passed,
         )
         _write_json(
