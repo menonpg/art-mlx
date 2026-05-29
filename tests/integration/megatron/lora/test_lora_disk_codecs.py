@@ -188,6 +188,45 @@ def _qwen35_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
     return tensors
 
 
+def _pack_qwen35_vllm_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
+def _qwen35_fused_expert_vllm_tensors(
+    original: dict[str, torch.Tensor],
+    art_prefix: str,
+) -> dict[str, torch.Tensor]:
+    vllm_prefix = art_prefix.replace(
+        "base_model.model.model.layers.",
+        "base_model.model.model.language_model.layers.",
+        1,
+    )
+    expert_prefix = f"{vllm_prefix}.mlp.experts"
+    art_expert_prefix = f"{art_prefix}.mlp.experts"
+    gate_up_a: list[torch.Tensor] = []
+    gate_up_b: list[torch.Tensor] = []
+    down_a: list[torch.Tensor] = []
+    down_b: list[torch.Tensor] = []
+    for expert in range(2):
+        prefix = f"{art_expert_prefix}.{expert}"
+        gate_up_a.append(original[f"{prefix}.gate_up_proj.lora_A.weight"])
+        gate_up_b.append(original[f"{prefix}.gate_up_proj.lora_B.weight"])
+        down_a.append(original[f"{prefix}.down_proj.lora_A.weight"])
+        down_b.append(original[f"{prefix}.down_proj.lora_B.weight"])
+    return {
+        f"{expert_prefix}.base_layer.lora_A.weight": torch.cat(
+            gate_up_a,
+            dim=0,
+        ).contiguous(),
+        f"{expert_prefix}.base_layer.lora_B.weight": _pack_qwen35_vllm_lora_b(
+            gate_up_b
+        ),
+        f"{expert_prefix}.lora_A.weight": torch.cat(down_a, dim=0).contiguous(),
+        f"{expert_prefix}.lora_B.weight": _pack_qwen35_vllm_lora_b(down_b),
+    }
+
+
 def _qwen3_dense_lora_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
     module_dims = {
         "self_attn.q_proj": (rank, 3, 3),
@@ -501,6 +540,7 @@ def test_qwen3_target_parameter_identity_normalizes_to_per_expert_vllm_layout(
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _qwen35_moe_art_tensors(art_prefix)
+    expected_experts = _qwen35_fused_expert_vllm_tensors(original, art_prefix)
     for base_model in ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.6-35B-A3B"):
         vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
             original,
@@ -519,6 +559,9 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
             "experts",
         ]
         assert all("language_model.layers" in key for key in vllm_tensors)
+        assert not any(".mlp.experts.0." in key for key in vllm_tensors)
+        for key, tensor in expected_experts.items():
+            assert torch.equal(vllm_tensors[key], tensor), key
         roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
             vllm_tensors,
             adapter_config=vllm_config,
@@ -528,20 +571,11 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         _save_adapter(adapter_dir, vllm_tensors, vllm_config)
         loaded_modules = _assert_stock_vllm_loads(
             adapter_dir,
-            expected_modules={
-                "q_proj",
-                "experts.0.gate_proj",
-                "experts.0.up_proj",
-                "experts.0.down_proj",
-                "experts.1.gate_proj",
-                "experts.1.up_proj",
-                "experts.1.down_proj",
-            },
+            expected_modules={"q_proj", "experts"},
             mapper="qwen35",
         )
-        assert "language_model.model.layers.0.mlp.experts.0.gate_proj" in loaded_modules
-        assert "language_model.model.layers.0.mlp.experts.0.up_proj" in loaded_modules
-        assert "language_model.model.layers.0.mlp.experts.0.down_proj" in loaded_modules
+        assert "language_model.model.layers.0.mlp.experts" in loaded_modules
+        assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
 
 
 def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
@@ -739,16 +773,11 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
     final_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     loaded_modules = _assert_stock_vllm_loads(
         adapter_dir,
-        expected_modules={
-            "experts.0.gate_proj",
-            "experts.0.up_proj",
-            "experts.0.down_proj",
-        },
+        expected_modules={"experts"},
         mapper="qwen35",
     )
-    assert "language_model.model.layers.0.mlp.experts.0.gate_proj" in loaded_modules
-    assert "language_model.model.layers.0.mlp.experts.0.up_proj" in loaded_modules
-    assert "language_model.model.layers.0.mlp.experts.0.down_proj" in loaded_modules
+    assert "language_model.model.layers.0.mlp.experts" in loaded_modules
+    assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
 
 
 def test_lora_publish_keeps_same_key_shards_separate():

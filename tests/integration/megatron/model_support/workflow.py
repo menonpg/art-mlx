@@ -351,6 +351,7 @@ def run_hf_parity_stage(
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    case_config = hf_parity.hf_parity_case_config(case_config)
     report = hf_parity.run_hf_parity(case_config=case_config)
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     artifact_dir = str(

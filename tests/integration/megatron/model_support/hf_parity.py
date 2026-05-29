@@ -13,9 +13,10 @@ from .oracle_harness import (
     ORACLE_TOPOLOGY,
     DiffAccumulator,
     DiskPackedTensorsSpec,
+    MetricThresholdRule,
     OracleCaseConfig,
+    PackedTensorConfig,
     PhasePassFn,
-    _default_phase_pass_fns,
     _read_json,
     _write_json,
     ensure_case_artifacts,
@@ -27,6 +28,11 @@ from .workflow import assess_minimal_layer_coverage
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
 HF_PARITY_OUTPUT_DIRNAME = "hf_parity_sft"
 HF_PARITY_REPORT_FILENAME = "report.json"
+HF_PARITY_PACKED_TENSORS = PackedTensorConfig(
+    sequence_length=256,
+    prefill_tokens=64,
+    decode_tokens=64,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -65,7 +71,32 @@ class HfParityReport(BaseModel):
 
 
 def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
-    return _default_phase_pass_fns()
+    non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+    fwd_out = MetricThresholdRule(
+        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
+        minimums=non_zero_scales,
+    )
+    loss = MetricThresholdRule(
+        limits={"relative_l2": 2e-2, "mean_abs_pct": 2.0},
+        minimums=non_zero_scales,
+    )
+    grads_deltas = MetricThresholdRule(
+        limits={"mean_abs_pct": 3.0},
+        minimums=non_zero_scales,
+    )
+    return {
+        "forward": fwd_out,
+        "outputs": fwd_out,
+        "losses": loss,
+        "grads": grads_deltas,
+        "deltas": grads_deltas,
+    }
+
+
+def hf_parity_case_config(case_config: OracleCaseConfig) -> OracleCaseConfig:
+    return case_config.model_copy(
+        update={"packed_tensors": HF_PARITY_PACKED_TENSORS.model_copy(deep=True)}
+    )
 
 
 def hf_parity_enabled() -> bool:
@@ -287,6 +318,7 @@ def run_hf_parity(
     *,
     case_config: OracleCaseConfig,
 ) -> HfParityReport:
+    case_config = hf_parity_case_config(case_config)
     if case_config.precision != "fp32":
         raise ValueError("HF parity currently requires fp32 precision")
     if case_config.num_steps != 1:
@@ -365,6 +397,7 @@ def build_hf_parity_report(
 __all__ = [
     "HF_PARITY_ENABLE_ENV",
     "HF_PARITY_OUTPUT_DIRNAME",
+    "HF_PARITY_PACKED_TENSORS",
     "HF_PARITY_REPORT_FILENAME",
     "HfParityMetricRow",
     "HfParityReport",
@@ -373,6 +406,7 @@ __all__ = [
     "build_hf_parity_report",
     "build_parity_sample_indices",
     "build_tensor_map_metric_rows",
+    "hf_parity_case_config",
     "hf_parity_enabled",
     "run_hf_parity",
     "set_hf_config_num_layers",

@@ -8,6 +8,7 @@ from . import hf_parity as hf_parity_module
 from . import hf_parity_worker as hf_parity_worker_module
 from .hf_parity import (
     HF_PARITY_OUTPUT_DIRNAME,
+    HF_PARITY_PACKED_TENSORS,
     HF_PARITY_REPORT_FILENAME,
     HfParityReport,
     HfParityRunRequest,
@@ -33,6 +34,23 @@ def test_build_parity_sample_indices_pads_with_none() -> None:
         num_sequences=2,
         global_grad_accumulation_sequences=4,
     ) == [0, 1, None, None]
+
+
+def test_hf_parity_uses_train_inf_mismatch_settings() -> None:
+    assert HF_PARITY_PACKED_TENSORS.sequence_length == 256
+    assert HF_PARITY_PACKED_TENSORS.prefill_tokens == 64
+    assert HF_PARITY_PACKED_TENSORS.decode_tokens == 64
+
+    phase_pass = hf_parity_module._hf_parity_phase_pass_fns()
+    assert cast(Any, phase_pass["outputs"]).limits == {
+        "relative_l2": 1e-2,
+        "mean_abs_pct": 1.0,
+    }
+    assert cast(Any, phase_pass["losses"]).limits == {
+        "relative_l2": 2e-2,
+        "mean_abs_pct": 2.0,
+    }
+    assert cast(Any, phase_pass["grads"]).limits == {"mean_abs_pct": 3.0}
 
 
 def test_set_hf_config_num_layers_updates_supported_field() -> None:
