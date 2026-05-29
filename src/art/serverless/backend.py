@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
 import warnings
@@ -6,6 +7,7 @@ import warnings
 from openai._types import NOT_GIVEN
 from tqdm import auto as tqdm
 
+from art.adapter_leases import pin_inference_step, pinned_inference_step
 from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
@@ -144,13 +146,25 @@ class ServerlessBackend(Backend):
             model: The model.
             step: If provided, returns name for specific checkpoint using
                   W&B artifact versioning (e.g., :step5). If None, returns
-                  name for latest checkpoint (default, backwards compatible).
+                  name for the pinned checkpoint when running inside an
+                  adapter_lease, otherwise latest checkpoint.
         """
         assert model.entity is not None, "Model entity is required"
+        if step is None:
+            step = pinned_inference_step(model.name)
         base_name = f"wandb-artifact:///{model.entity}/{model.project}/{model.name}"
         if step is not None:
             return f"{base_name}:step{step}"
         return base_name
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with pin_inference_step(model.name, step):
+            yield
 
     async def _get_step(self, model: "Model") -> int:
         if model.trainable:
