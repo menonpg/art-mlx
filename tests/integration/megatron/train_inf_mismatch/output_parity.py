@@ -48,11 +48,11 @@ WeightState = Literal["base", "lora"]
 class Topology(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tp: int = 2
+    tp: int = 1
     ep: int = 2
     etp: int = 1
     dp: int = 1
-    cp: int = 1
+    cp: int = 2
     pp: int = 1
 
     def world_size(self) -> int:

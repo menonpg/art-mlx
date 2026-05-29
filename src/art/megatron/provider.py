@@ -338,8 +338,8 @@ def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
 
 def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     visible_gpu_count = max(torch.cuda.device_count(), 1)
-    provider.tensor_model_parallel_size = visible_gpu_count
-    provider.context_parallel_size = 1
+    provider.tensor_model_parallel_size = 1
+    provider.context_parallel_size = visible_gpu_count
     provider.pipeline_model_parallel_size = 1
     provider.expert_model_parallel_size = (
         visible_gpu_count

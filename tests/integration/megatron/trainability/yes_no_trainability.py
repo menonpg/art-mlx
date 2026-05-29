@@ -33,8 +33,8 @@ _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
-_SHARED_MEGATRON_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
-_DENSE_SHARED_MEGATRON_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
+_SHARED_MEGATRON_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
+_DENSE_SHARED_MEGATRON_TOPOLOGY = Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False)
 _VARIANT_NAME = Literal[
     "megatron_shared",
     "megatron_dedicated",

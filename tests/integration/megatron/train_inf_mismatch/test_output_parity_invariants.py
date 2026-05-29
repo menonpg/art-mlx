@@ -132,6 +132,15 @@ def test_real_path_default_generates_16_tokens_per_rollout() -> None:
     assert RealPathConfig().max_completion_tokens == 16
 
 
+def test_train_inf_default_topology_is_cp_first() -> None:
+    topology = TrainInfOutputParityConfig().topology
+
+    assert topology.tp == 1
+    assert topology.cp == 2
+    assert topology.ep == 2
+    assert topology.world_size() == 2
+
+
 def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
     run_dir = tmp_path / "run"
     active_lora = run_dir / "real_path_active_lora"

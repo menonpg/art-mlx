@@ -147,12 +147,12 @@ def test_get_provider_accepts_registry_supported_models(
     assert resolved.recompute_granularity == "full"
     assert resolved.recompute_method == "uniform"
     assert resolved.recompute_num_layers == 1
-    assert resolved.tensor_model_parallel_size == 2
-    assert resolved.context_parallel_size == 1
+    assert resolved.tensor_model_parallel_size == 1
+    assert resolved.context_parallel_size == 2
     assert resolved.pipeline_model_parallel_size == 1
     assert resolved.expert_model_parallel_size == 2
     assert resolved.expert_tensor_parallel_size == 1
-    assert resolved.sequence_parallel is True
+    assert resolved.sequence_parallel is False
     assert resolved.moe_shared_expert_overlap is False
     assert resolved.moe_router_dtype == "fp32"
     assert resolved.moe_aux_loss_coeff == 0.0
@@ -161,7 +161,7 @@ def test_get_provider_accepts_registry_supported_models(
     layer_spec = cast(Any, resolved.transformer_layer_spec)(resolved, vp_stage=7)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
-        is FlexDotProductAttention
+        is ArtContextParallelCoreAttention
     )
 
 
@@ -291,10 +291,12 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     bundle = provider_module.prepare_provider_bundle("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     assert provider.finalized is False
-    assert getattr(provider, "tensor_model_parallel_size") == 2
+    assert getattr(provider, "tensor_model_parallel_size") == 1
+    assert getattr(provider, "context_parallel_size") == 2
     assert getattr(provider, "expert_model_parallel_size") == 2
 
     bundle.provider.tensor_model_parallel_size = 1
+    bundle.provider.context_parallel_size = 1
     bundle.provider.expert_model_parallel_size = 1
     bundle.provider.sequence_parallel = False
     provider_module.finalize_provider_bundle(bundle)
@@ -319,6 +321,7 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
     monkeypatch.setenv("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
+    monkeypatch.setenv("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "1")
     monkeypatch.setenv("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE", "1")
     monkeypatch.setenv("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE", "1")
 
