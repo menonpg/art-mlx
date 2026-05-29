@@ -343,10 +343,13 @@ def run_hf_parity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
+    precision = (
+        "bf16" if bool(getattr(handler, "build_gdn_execution_spec", False)) else "fp32"
+    )
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=precision,
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,

@@ -29,6 +29,7 @@ from art.preprocessing.pack import packed_tensors_from_dir
 from .hf_parity import (
     HF_PARITY_REPORT_FILENAME,
     HfParityRunRequest,
+    _hf_parity_phase_pass_fns,
     build_hf_parity_report,
     build_parity_sample_indices,
     build_tensor_map_metric_rows,
@@ -273,6 +274,7 @@ def _load_hf_model(
     base_model: str,
     num_layers: int,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> Any:
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -283,7 +285,7 @@ def _load_hf_model(
         base_model,
         config=config,
         trust_remote_code=True,
-        torch_dtype=torch.float32,
+        torch_dtype=dtype,
         low_cpu_mem_usage=True,
     )
     model.train()
@@ -444,6 +446,7 @@ def _run_hf_sft_step(
     sample_indices: list[int | None],
     topology: ReplayParallelTopology,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -451,8 +454,14 @@ def _run_hf_sft_step(
     MoeRoutingReplayBundle | None,
 ]:
     _debug("loading HF model")
-    model = _load_hf_model(base_model=base_model, num_layers=num_layers, device=device)
-    _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
+    model = _load_hf_model(
+        base_model=base_model,
+        num_layers=num_layers,
+        device=device,
+        dtype=dtype,
+    )
+    if dtype == torch.float32:
+        _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
     route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
@@ -482,7 +491,7 @@ def _run_hf_sft_step(
         ).logits
         shifted_labels = megatron_train.shift_tensor(labels, -100)
         per_token_loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
+            logits.float().reshape(-1, logits.shape[-1]),
             shifted_labels.reshape(-1),
             reduction="none",
             ignore_index=-100,
@@ -605,7 +614,7 @@ def _build_megatron_runtime(
 ) -> megatron_train.TrainingRuntime:
     return megatron_train.build_training_runtime(
         model_identifier=request.case_config.base_model,
-        provider_torch_dtype=torch.float32,
+        provider_torch_dtype=_dtype_for_precision(request.case_config.precision),
         provider_bundle_configure=_install_bridge_timing_debug,
         provider_configure=lambda provider: _configure_provider(
             provider, ORACLE_TOPOLOGY, request.case_config
@@ -617,6 +626,14 @@ def _build_megatron_runtime(
         trainable_parameter_mode="base_model",
         allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
     )
+
+
+def _dtype_for_precision(precision: str) -> torch.dtype:
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp32":
+        return torch.float32
+    raise ValueError(f"Unsupported HF parity precision: {precision}")
 
 
 def _megatron_task_tensor(
@@ -889,16 +906,18 @@ def _worker_run(request: HfParityRunRequest) -> None:
     flex_patch_stack.enter_context(
         _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
     )
-    flex_patch_stack.enter_context(
-        _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
-    )
-    flex_patch_stack.enter_context(
-        _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
-    )
-    _install_megatron_qwen35_gdn_fp32_reference(
-        flex_patch_stack,
-        base_model=request.case_config.base_model,
-    )
+    dtype = _dtype_for_precision(request.case_config.precision)
+    if dtype == torch.float32:
+        flex_patch_stack.enter_context(
+            _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        flex_patch_stack.enter_context(
+            _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        _install_megatron_qwen35_gdn_fp32_reference(
+            flex_patch_stack,
+            base_model=request.case_config.base_model,
+        )
     try:
         _debug("starting HF parity worker")
         hf_outputs, hf_loss, hf_grads, moe_routing_replay_bundle = _run_hf_sft_step(
@@ -908,6 +927,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             sample_indices=sample_indices,
             topology=replay_topology,
             device=device,
+            dtype=dtype,
         )
         megatron_outputs, megatron_loss, megatron_grads = _run_megatron_sft_step(
             request=request,
@@ -950,6 +970,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             phase="grads",
             reference=normalized_hf_grads,
             candidate=megatron_grads,
+            phase_pass_fns=_hf_parity_phase_pass_fns(request.case_config),
         )
         report = build_hf_parity_report(
             request=request,

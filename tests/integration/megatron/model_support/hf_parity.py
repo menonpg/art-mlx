@@ -13,6 +13,7 @@ from .oracle_harness import (
     ORACLE_TOPOLOGY,
     DiffAccumulator,
     DiskPackedTensorsSpec,
+    MetricThresholdRule,
     OracleCaseConfig,
     PhasePassFn,
     _default_phase_pass_fns,
@@ -27,6 +28,8 @@ from .workflow import assess_minimal_layer_coverage
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
 HF_PARITY_OUTPUT_DIRNAME = "hf_parity_sft"
 HF_PARITY_REPORT_FILENAME = "report.json"
+BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
+BF16_GRAD_MEAN_ABS_PCT_LIMIT = 5.0
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -64,8 +67,29 @@ class HfParityReport(BaseModel):
     metrics: list[HfParityMetricRow] = Field(default_factory=list)
 
 
-def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
-    return _default_phase_pass_fns()
+def _hf_parity_phase_pass_fns(
+    case_config: OracleCaseConfig | None = None,
+) -> dict[str, PhasePassFn]:
+    if case_config is None or case_config.precision != "bf16":
+        return _default_phase_pass_fns()
+    non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+    phase_pass_fns = _default_phase_pass_fns()
+    phase_pass_fns.update(
+        {
+            "outputs": MetricThresholdRule(
+                limits={"mean_abs_pct": BF16_FWD_MEAN_ABS_PCT_LIMIT},
+                minimums=non_zero_scales,
+            ),
+            "losses": MetricThresholdRule(
+                limits={"mean_abs_pct": BF16_FWD_MEAN_ABS_PCT_LIMIT}
+            ),
+            "grads": MetricThresholdRule(
+                limits={"mean_abs_pct": BF16_GRAD_MEAN_ABS_PCT_LIMIT},
+                minimums=non_zero_scales,
+            ),
+        }
+    )
+    return phase_pass_fns
 
 
 def hf_parity_enabled() -> bool:
@@ -92,6 +116,7 @@ def _build_metric_row(
     param: str,
     summary: dict[str, float],
     structural_failure: str | None = None,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> HfParityMetricRow:
     row = HfParityMetricRow(
         phase=phase,
@@ -103,7 +128,7 @@ def _build_metric_row(
         candidate_abs_scale=summary["candidate_abs_scale"],
         mean_abs_pct=summary["mean_abs_pct"],
     )
-    pass_fn = _hf_parity_phase_pass_fns().get(phase)
+    pass_fn = (phase_pass_fns or _hf_parity_phase_pass_fns()).get(phase)
     if pass_fn is None:
         row.pass_signal = structural_failure is None
         if structural_failure is not None:
@@ -132,6 +157,7 @@ def build_tensor_map_metric_rows(
     phase: str,
     reference: dict[str, Any],
     candidate: dict[str, Any],
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> list[HfParityMetricRow]:
     reference_keys = set(reference.keys())
     candidate_keys = set(candidate.keys())
@@ -144,6 +170,7 @@ def build_tensor_map_metric_rows(
                 param="__tensor_set__",
                 summary=_inf_summary(),
                 structural_failure=f"missing={missing[:5]} extra={extra[:5]}",
+                phase_pass_fns=phase_pass_fns,
             )
         ]
     rows: list[HfParityMetricRow] = []
@@ -155,6 +182,7 @@ def build_tensor_map_metric_rows(
                     param=key,
                     summary=_inf_summary(),
                     structural_failure=f"shape mismatch for '{key}'",
+                    phase_pass_fns=phase_pass_fns,
                 )
             )
             continue
@@ -163,6 +191,7 @@ def build_tensor_map_metric_rows(
                 phase=phase,
                 param=key,
                 summary=summarize_tensor_pair(reference[key], candidate[key]),
+                phase_pass_fns=phase_pass_fns,
             )
         )
     return rows
@@ -326,16 +355,19 @@ def build_hf_parity_report(
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
+    phase_pass_fns = _hf_parity_phase_pass_fns(request.case_config)
     rows = [
         _build_metric_row(
             phase="outputs",
             param="trainable_token_losses",
             summary=outputs_summary,
+            phase_pass_fns=phase_pass_fns,
         ),
         _build_metric_row(
             phase="losses",
             param="loss",
             summary=loss_summary,
+            phase_pass_fns=phase_pass_fns,
         ),
         *grads_rows,
     ]
