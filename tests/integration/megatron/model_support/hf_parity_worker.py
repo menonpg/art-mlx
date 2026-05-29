@@ -970,7 +970,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             phase="grads",
             reference=normalized_hf_grads,
             candidate=megatron_grads,
-            phase_pass_fns=_hf_parity_phase_pass_fns(request.case_config),
+            phase_pass_fns=_hf_parity_phase_pass_fns(),
         )
         report = build_hf_parity_report(
             request=request,

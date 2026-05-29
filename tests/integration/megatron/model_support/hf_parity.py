@@ -13,7 +13,6 @@ from .oracle_harness import (
     ORACLE_TOPOLOGY,
     DiffAccumulator,
     DiskPackedTensorsSpec,
-    MetricThresholdRule,
     OracleCaseConfig,
     PhasePassFn,
     _default_phase_pass_fns,
@@ -28,8 +27,6 @@ from .workflow import assess_minimal_layer_coverage
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
 HF_PARITY_OUTPUT_DIRNAME = "hf_parity_sft"
 HF_PARITY_REPORT_FILENAME = "report.json"
-BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
-BF16_GRAD_MEAN_ABS_PCT_LIMIT = 5.0
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -67,29 +64,8 @@ class HfParityReport(BaseModel):
     metrics: list[HfParityMetricRow] = Field(default_factory=list)
 
 
-def _hf_parity_phase_pass_fns(
-    case_config: OracleCaseConfig | None = None,
-) -> dict[str, PhasePassFn]:
-    if case_config is None or case_config.precision != "bf16":
-        return _default_phase_pass_fns()
-    non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    phase_pass_fns = _default_phase_pass_fns()
-    phase_pass_fns.update(
-        {
-            "outputs": MetricThresholdRule(
-                limits={"mean_abs_pct": BF16_FWD_MEAN_ABS_PCT_LIMIT},
-                minimums=non_zero_scales,
-            ),
-            "losses": MetricThresholdRule(
-                limits={"mean_abs_pct": BF16_FWD_MEAN_ABS_PCT_LIMIT}
-            ),
-            "grads": MetricThresholdRule(
-                limits={"mean_abs_pct": BF16_GRAD_MEAN_ABS_PCT_LIMIT},
-                minimums=non_zero_scales,
-            ),
-        }
-    )
-    return phase_pass_fns
+def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
+    return _default_phase_pass_fns()
 
 
 def hf_parity_enabled() -> bool:
@@ -311,8 +287,8 @@ def run_hf_parity(
     *,
     case_config: OracleCaseConfig,
 ) -> HfParityReport:
-    if case_config.precision not in {"fp32", "bf16"}:
-        raise ValueError("HF parity currently requires fp32 or bf16 precision")
+    if case_config.precision != "fp32":
+        raise ValueError("HF parity currently requires fp32 precision")
     if case_config.num_steps != 1:
         raise ValueError("HF parity currently requires num_steps=1")
 
@@ -355,7 +331,7 @@ def build_hf_parity_report(
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
-    phase_pass_fns = _hf_parity_phase_pass_fns(request.case_config)
+    phase_pass_fns = _hf_parity_phase_pass_fns()
     rows = [
         _build_metric_row(
             phase="outputs",

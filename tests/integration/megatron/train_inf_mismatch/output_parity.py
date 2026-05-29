@@ -21,22 +21,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # prefix route-conflict behavior on the measured path. With the workflow's
 # 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
-# A 2026-05-29 Qwen3 MoE real-path rerun measured 8.31% mean_abs_pct and
-# 0.00238 restricted top20 KL with exact shared-prefix route replay and zero
-# route conflicts; a follow-up workflow rerun with shared-prefix route conflicts
-# measured 0.00359 KL. Qwen3 MoE uses its own bf16-scale gates for this path.
-# A 2026-05-29 Qwen3 dense workflow run measured 4.188% mean_abs_pct and
-# 0.001918 restricted top20 KL, so it uses the same 5% bf16 mean_abs_pct gate.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
-    "qwen3_moe": 9.0,
-    "qwen3_dense": 5.0,
+    "qwen3_moe": 7.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
-TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
-    "qwen3_moe": 0.0045,
-}
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 
@@ -275,14 +265,11 @@ def top20_kl_candidate_to_target_limit_for_model(
 ) -> float:
     from art.megatron.model_support.registry import get_model_support_spec
 
-    spec = get_model_support_spec(
+    get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY.get(
-        spec.key,
-        TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
-    )
+    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
 
 
 def model_support_is_moe(

@@ -38,7 +38,7 @@ def test_qwen35_gdn_shared_prefix_cp_topology_oracle(
     config = case_config(base_model="Qwen/Qwen3.5-35B-A3B").model_copy(
         update={
             "num_layers": 1,
-            "precision": "bf16",
+            "precision": "fp32",
             "grad_accumulation_sequences": 1,
             "lora": LoraConfig(
                 rank=1,
