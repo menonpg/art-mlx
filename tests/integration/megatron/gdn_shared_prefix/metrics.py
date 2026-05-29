@@ -11,12 +11,21 @@ from ..metrics import (
     mean_abs_pct_from_sums,
 )
 
-GDN_CORRECTNESS_DTYPE = torch.float32
+# FLA/TileLang does not compile the real Qwen3.5 GDN kernels for fp32 here.
+# Production Qwen3.5 GDN runs bf16, so real-GDN correctness tests use bf16
+# relative gates instead of scalar absolute tolerances.
+GDN_CORRECTNESS_DTYPE = torch.bfloat16
 MEAN_ABS_PCT_THRESHOLD = DEFAULT_MEAN_ABS_PCT_THRESHOLD
 MEAN_ABS_PCT_MISMATCH_THRESHOLD = 0.1
-REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD = MEAN_ABS_PCT_THRESHOLD
-REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD = MEAN_ABS_PCT_THRESHOLD
-REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD = MEAN_ABS_PCT_THRESHOLD
+REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD = (
+    3.0 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else MEAN_ABS_PCT_THRESHOLD
+)
+REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD = (
+    3.0 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else MEAN_ABS_PCT_THRESHOLD
+)
+REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD = (
+    5.0 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else MEAN_ABS_PCT_THRESHOLD
+)
 
 
 def assert_mean_abs_pct(
