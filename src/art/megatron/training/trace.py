@@ -8,10 +8,11 @@ from typing import Any
 import torch
 
 from art.megatron.context_parallel.types import ParallelTopology
-from art.megatron.routing_replay import TRACE_ROW_TOKEN_UIDS_ATTR, TRACE_UID_SPAN_ATTR
 from art.preprocessing.pack import PackedTensors
 
 ROOT_OUTPUT_TOKEN_UIDS_ATTR = "_art_root_output_token_uids"
+TRACE_ROW_TOKEN_UIDS_ATTR = "_art_trace_row_token_uids"
+TRACE_UID_SPAN_ATTR = "_art_trace_uid_span"
 
 
 def trace_token_uids_enabled() -> bool:

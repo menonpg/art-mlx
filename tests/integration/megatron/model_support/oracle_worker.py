@@ -21,6 +21,8 @@ from art.megatron.routing_replay import (
 )
 from art.preprocessing.pack import PackedTensors
 
+from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
+from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
 from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
@@ -35,7 +37,6 @@ from .oracle_harness import (
     _require_not_none,
     _write_json,
 )
-from .routing_replay_bundle import build_bundle_from_forward_trace_dir
 from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 _TOPOLOGY_ENV_VARS = {
@@ -1345,17 +1346,14 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     provider, request.topology, request.case_config
                 ),
                 optimizer_config=_build_optimizer_config(request.case_config),
+                moe_routing_replay_path=request.moe_routing_replay_path,
+                moe_routing_replay_strict=request.moe_routing_replay_strict,
                 print_env=False,
                 allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
             )
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
     optimizer = runtime.optimizer
-    megatron_train.configure_moe_routing_replay(
-        runtime,
-        replay_bundle_path=request.moe_routing_replay_path,
-        strict=request.moe_routing_replay_strict,
-    )
     _assert_runtime_configuration(model_chunks, request.case_config, request.topology)
     weight_offload = WeightOffloadManager.from_config(
         model=model_chunks,
@@ -1434,17 +1432,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
     experimental_config: dev.TrainConfig = {}
     step_traces: list[StepTrace] = []
     captured_grads: dict[str, Any] | None = None
-    routing_replay_controller = runtime.moe_routing_replay_controller
-    micro_start_callback = (
-        routing_replay_controller.begin_micro
-        if routing_replay_controller is not None
-        else None
-    )
     forward_trace_capture = ForwardTraceCapture(
         model_chunks,
         enabled=True,
-        micro_start_callback=micro_start_callback,
     )
+    install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
 
     def _capture_lora_grads() -> None:
         nonlocal captured_grads

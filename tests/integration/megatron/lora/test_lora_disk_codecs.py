@@ -408,6 +408,75 @@ def test_qwen3_fused_identity_normalizes_to_per_expert_vllm_layout(
     _assert_tensors_equal(converted, expected)
     adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert "experts" in adapter_config["target_modules"]
+
+
+def test_qwen3_target_parameter_identity_normalizes_to_per_expert_vllm_layout(
+    tmp_path: Path,
+) -> None:
+    prefix = "base_model.model.model.layers.0.mlp.experts"
+    rank = 2
+    hidden = 3
+    intermediate = 4
+    num_experts = 2
+    gate_up_a = torch.arange(
+        num_experts * rank * 2 * intermediate,
+        dtype=torch.float32,
+    ).reshape(num_experts * rank, 2 * intermediate)
+    gate_up_b = (
+        torch.arange(hidden * num_experts * rank, dtype=torch.float32).reshape(
+            hidden, num_experts * rank
+        )
+        + 100
+    )
+    down_a = (
+        torch.arange(num_experts * rank * hidden, dtype=torch.float32).reshape(
+            num_experts * rank, hidden
+        )
+        + 200
+    )
+    down_b = (
+        torch.arange(intermediate * num_experts * rank, dtype=torch.float32).reshape(
+            intermediate, num_experts * rank
+        )
+        + 300
+    )
+    _save_adapter(
+        tmp_path,
+        {
+            f"{prefix}.base_layer.lora_A.weight": gate_up_a,
+            f"{prefix}.base_layer.lora_B.weight": gate_up_b,
+            f"{prefix}.lora_A.weight": down_a,
+            f"{prefix}.lora_B.weight": down_b,
+        },
+        _config("Qwen/Qwen3-30B-A3B", rank=rank),
+    )
+
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=QWEN3_MOE_HANDLER,
+        adapter_config=_config("Qwen/Qwen3-30B-A3B", rank=rank),
+    )
+
+    expected: dict[str, torch.Tensor] = {}
+    for expert in range(num_experts):
+        rows = slice(expert * rank, (expert + 1) * rank)
+        gate_a, up_a = gate_up_a[rows].split(intermediate, dim=1)
+        expert_prefix = f"{prefix}.{expert}"
+        expected[f"{expert_prefix}.gate_proj.lora_A.weight"] = gate_up_b[
+            :, rows
+        ].T.contiguous()
+        expected[f"{expert_prefix}.gate_proj.lora_B.weight"] = gate_a.T.contiguous()
+        expected[f"{expert_prefix}.up_proj.lora_A.weight"] = gate_up_b[
+            :, rows
+        ].T.contiguous()
+        expected[f"{expert_prefix}.up_proj.lora_B.weight"] = up_a.T.contiguous()
+        expected[f"{expert_prefix}.down_proj.lora_A.weight"] = down_b[
+            :, rows
+        ].T.contiguous()
+        expected[f"{expert_prefix}.down_proj.lora_B.weight"] = down_a[
+            rows
+        ].T.contiguous()
+    _assert_tensors_equal(load_file(tmp_path / "adapter_model.safetensors"), expected)
     loaded_modules = _assert_stock_vllm_loads(
         tmp_path,
         expected_modules={

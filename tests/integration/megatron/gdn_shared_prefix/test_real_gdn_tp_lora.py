@@ -26,7 +26,7 @@ from art.megatron.model_support import QWEN3_5_MOE_SPEC  # noqa: E402
 from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER  # noqa: E402
 
 from .cases import GdnPhase0Case, default_phase0_cases  # noqa: E402
-from .metrics import GDN_CORRECTNESS_DTYPE, MEAN_ABS_PCT_THRESHOLD  # noqa: E402
+from .metrics import GDN_CORRECTNESS_DTYPE, assert_real_gdn_metrics  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
 from .real_gdn_oracle import (  # noqa: E402
     attach_main_grads,
@@ -59,10 +59,7 @@ def test_real_qwen35_gdn_lora_gradients_match_flattened() -> None:
             parent_ids=tensors["parent_ids"].cuda(),
             assistant_mask=tensors["assistant_mask"].cuda(),
         )
-        assert metrics.loss_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
-        assert metrics.output_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
-        assert metrics.hidden_grad_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
-        assert metrics.param_grad_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
+        assert_real_gdn_metrics(metrics, "lora")
         assert _gdn_lora_grad_names(packed_gdn)
 
 
@@ -112,10 +109,7 @@ def _tp2_worker(rank: int, port: int, output_dir: str) -> None:
             parent_ids=tensors["parent_ids"].cuda(),
             assistant_mask=tensors["assistant_mask"].cuda(),
         )
-        assert metrics.loss_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
-        assert metrics.output_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
-        assert metrics.hidden_grad_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
-        assert metrics.param_grad_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
+        assert_real_gdn_metrics(metrics, "tp2")
         Path(output_dir, f"rank_{rank}.ok").write_text("ok\n")
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():

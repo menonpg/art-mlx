@@ -1,26 +1,32 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
-from contextlib import asynccontextmanager, contextmanager
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
-import shutil
-import socket
-import subprocess
-import sys
-import time
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .artifacts import REPO_ROOT
-
-BF16_FWD_MEAN_ABS_PCT_LIMIT = 3.0
+# These gates are intentionally bf16-scale, not fp32 oracle-scale. A 2026-05-18
+# Qwen/Qwen3.5-35B-A3B diagnostic on the exact same real generated tokens found:
+# vLLM generation vs Megatron: 2.916% mean_abs_pct, 0.0123 MAE, 0.883 top1,
+# 0.976 top20; vLLM prompt_logprobs vs Megatron: 7.896%, 0.0334 MAE, 0.969
+# top1, 0.941 top20; vLLM generation vs vLLM prompt_logprobs: 7.517%, 0.0322
+# MAE, 0.879 top1, 0.941 top20. The real ART path also canonicalizes shared
+# prefix routes when vLLM produced different routes for the same prefix. Do not
+# tighten these thresholds without rechecking both vLLM self-mismatch and shared
+# prefix route-conflict behavior on the measured path. With the workflow's
+# 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
+# 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
+BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
+BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
+    "qwen3_moe": 7.0,
+    "qwen3_5_moe": 5.0,
+}
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 
@@ -40,13 +46,23 @@ class Topology(BaseModel):
     pp: int = 1
 
     def world_size(self) -> int:
-        return self.tp * self.dp * self.cp * self.pp
+        dense_world = self.tp * self.cp * self.pp * self.dp
+        expert_model_size = self.etp * self.ep * self.pp
+        if dense_world % expert_model_size != 0:
+            raise ValueError(
+                "Invalid Megatron MoE topology: "
+                f"tp*cp*pp*dp={dense_world} must be divisible by "
+                f"etp*ep*pp={expert_model_size}"
+            )
+        return dense_world
 
     def env(self) -> dict[str, str]:
         return {
             "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(self.tp),
             "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(self.ep),
             "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE": str(self.etp),
+            "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(self.cp),
+            "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE": str(self.pp),
         }
 
     def slug(self) -> str:
@@ -78,6 +94,7 @@ class TrainInfOutputParityConfig(BaseModel):
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
+    replay_vllm_routing: bool = False
 
     @model_validator(mode="after")
     def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
@@ -94,6 +111,11 @@ class LogicalPrompt(BaseModel):
     sample_id: int
     family_id: int
     completion_id: int
+    # Packed prompt rows are the shared prefix segment exactly: prompt_end-start.
+    # ART stores the final context token at the start of each completion segment,
+    # so vLLM's generated-token logprobs start one token after this boundary.
+    packed_prompt_length: int
+    scored_token_start_index: int
     token_ids: list[int]
 
 
@@ -163,34 +185,6 @@ class RolloutComparison(BaseModel):
     lora_topk: TopKComparison
 
 
-class TrainInfOutputParityReport(BaseModel):
-    base_model: str
-    artifact_dir: str
-    topology: str
-    trainer_gpu_ids: list[int]
-    inference_gpu_ids: list[int]
-    logical_prompt_count: int
-    logical_token_count: int
-    adapter_path: str
-    megatron_base_scores: str
-    megatron_lora_scores: str
-    rollout_comparisons: list[RolloutComparison]
-    passed: bool
-
-
-class MegatronWorkerRequest(BaseModel):
-    config: TrainInfOutputParityConfig
-    artifact_dir: str
-    weight_state: WeightState
-    adapter_path: str | None = None
-
-
-class MegatronWorkerResult(BaseModel):
-    score_path: str
-    logical_map_path: str
-    adapter_path: str | None = None
-
-
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -204,12 +198,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"Expected JSON object in {path}")
     return value
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _parse_gpu_ids(value: str | None, default: list[int]) -> list[int]:
@@ -253,19 +241,38 @@ def default_rollout_modes_for_model(
     return modes
 
 
-@contextmanager
-def _provider_topology_env(topology: Topology) -> Any:
-    names = topology.env()
-    previous = {name: os.environ.get(name) for name in names}
-    os.environ.update(names)
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+def fwd_mean_abs_pct_limit_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> float:
+    from art.megatron.model_support.registry import get_model_support_spec
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        BF16_FWD_MEAN_ABS_PCT_LIMIT,
+    )
+
+
+def model_support_is_moe(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> bool:
+    from art.megatron.model_support.registry import (
+        get_model_support_handler_for_spec,
+        get_model_support_spec,
+    )
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return get_model_support_handler_for_spec(spec).is_moe
 
 
 def config_from_env() -> TrainInfOutputParityConfig:
@@ -295,6 +302,20 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.packed.prefill_tokens = int(raw_prefill)
     if raw_decode := os.environ.get("ART_TRAIN_INF_MISMATCH_DECODE_TOKENS"):
         config.packed.decode_tokens = int(raw_decode)
+    for env_name, attr in (
+        ("ART_TRAIN_INF_MISMATCH_TP", "tp"),
+        ("ART_TRAIN_INF_MISMATCH_EP", "ep"),
+        ("ART_TRAIN_INF_MISMATCH_ETP", "etp"),
+        ("ART_TRAIN_INF_MISMATCH_CP", "cp"),
+        ("ART_TRAIN_INF_MISMATCH_PP", "pp"),
+    ):
+        if raw_value := os.environ.get(env_name):
+            config.topology = config.topology.model_copy(update={attr: int(raw_value)})
+    if not model_support_is_moe(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    ):
+        config.topology = config.topology.model_copy(update={"ep": 1, "etp": 1})
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
     return config
@@ -374,6 +395,8 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                             sample_id=sample_id,
                             family_id=family_id,
                             completion_id=completion_id,
+                            packed_prompt_length=prompt_len,
+                            scored_token_start_index=prompt_len + 1,
                             token_ids=flat,
                         )
                     )
@@ -563,15 +586,15 @@ def compare_rollout(
     vl = torch.tensor(vllm_lora.target_logprobs, dtype=torch.float32)
     return RolloutComparison(
         rollout_mode=rollout_mode,
-        base=compare_pair(candidate=vb, target=mb, sequence_ids=sequence_ids),
-        lora=compare_pair(candidate=vl, target=ml, sequence_ids=sequence_ids),
+        base=compare_pair(candidate=mb, target=vb, sequence_ids=sequence_ids),
+        lora=compare_pair(candidate=ml, target=vl, sequence_ids=sequence_ids),
         delta=compare_pair(
-            candidate=vl - vb,
-            target=ml - mb,
+            candidate=ml - mb,
+            target=vl - vb,
             sequence_ids=sequence_ids,
         ),
-        base_topk=compare_topk(vllm_base, megatron_base),
-        lora_topk=compare_topk(vllm_lora, megatron_lora),
+        base_topk=compare_topk(megatron_base, vllm_base),
+        lora_topk=compare_topk(megatron_lora, vllm_lora),
     )
 
 
@@ -586,36 +609,48 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _packed_tensor_config(config: TrainInfOutputParityConfig) -> Any:
-    from ..model_support.oracle_harness import PackedTensorConfig
-
-    return PackedTensorConfig(
-        num_sequences=config.packed.num_sequences,
-        sequence_length=config.packed.sequence_length,
-        prefill_tokens=config.packed.prefill_tokens,
-        completion_branches_per_prefix=config.packed.completion_branches_per_prefix,
-        decode_tokens=config.packed.decode_tokens,
-        decode_tokens_jitter=config.packed.decode_tokens_jitter,
-        vocab_high=config.packed.vocab_high,
-        packing_mode=config.packed.packing_mode,
-    )
-
-
-def _build_packed_tensors(config: TrainInfOutputParityConfig) -> dict[str, Any]:
-    from ..model_support.packed_position_ids import (
-        _build_art_realistic_packed_tensors,
-    )
-
-    return _build_art_realistic_packed_tensors(
-        _packed_tensor_config(config), config.seed
-    )
-
-
 def _configure_provider(provider: Any, config: TrainInfOutputParityConfig) -> None:
+    provider.tensor_model_parallel_size = config.topology.tp
+    provider.expert_model_parallel_size = config.topology.ep
+    provider.expert_tensor_parallel_size = config.topology.etp
+    provider.context_parallel_size = config.topology.cp
+    provider.pipeline_model_parallel_size = config.topology.pp
     if hasattr(provider, "attention_dropout"):
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
+
+
+def _gather_context_parallel_logits(logits: Any, *, full_sequence_length: int) -> Any:
+    from megatron.core import parallel_state as ps
+    import torch
+    import torch.distributed as dist
+
+    if int(ps.get_context_parallel_world_size()) <= 1:
+        return logits
+    if int(logits.shape[1]) == full_sequence_length:
+        return logits
+    cp_size = int(ps.get_context_parallel_world_size())
+    local_chunks = [torch.empty_like(logits) for _ in range(cp_size)]
+    dist.all_gather(  # ty: ignore[possibly-missing-attribute]
+        local_chunks, logits.contiguous(), group=ps.get_context_parallel_group()
+    )
+    local_sequence_length = int(logits.shape[1])
+    if local_sequence_length % 2 != 0:
+        raise RuntimeError(
+            "Cannot reconstruct context-parallel logits with odd local sequence "
+            f"length {local_sequence_length}"
+        )
+    half = local_sequence_length // 2
+    ordered = [chunk[:, :half] for chunk in local_chunks]
+    ordered.extend(chunk[:, half:] for chunk in reversed(local_chunks))
+    gathered = torch.cat(ordered, dim=1)
+    if int(gathered.shape[1]) != full_sequence_length:
+        raise RuntimeError(
+            "Context-parallel logit gather produced unexpected sequence length: "
+            f"{int(gathered.shape[1])} != {full_sequence_length}"
+        )
+    return gathered
 
 
 def _lora_target_modules(config: TrainInfOutputParityConfig) -> list[str]:
@@ -706,7 +741,12 @@ def _adapter_config(config: TrainInfOutputParityConfig) -> dict[str, Any]:
 
     return LoraConfig(
         base_model_name_or_path=config.base_model,
-        r=default_lora_rank_for_handler(get_model_support_handler(config.base_model)),
+        r=default_lora_rank_for_handler(
+            get_model_support_handler(
+                config.base_model,
+                allow_unvalidated_arch=config.allow_unvalidated_arch,
+            )
+        ),
         lora_alpha=LORA_ALPHA,
         target_modules=_lora_target_modules(config),
         bias="none",
@@ -761,7 +801,7 @@ def _run_logits(
         parent_ids=parent_ids,
     )
     with torch.no_grad():
-        return runtime.model[0](
+        logits = runtime.model[0](
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
@@ -771,6 +811,18 @@ def _run_logits(
                 attention_bias=attention_state,
             ),
         )
+        from megatron.core import parallel_state, tensor_parallel
+
+        if (
+            parallel_state.model_parallel_is_initialized()
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ):
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+        logits = _gather_context_parallel_logits(
+            logits,
+            full_sequence_length=int(input_ids.shape[1]),
+        )
+        return logits
 
 
 def _extract_scores_from_logits(
@@ -803,586 +855,3 @@ def _extract_scores_from_logits(
         target_logprobs=target_logprobs,
         topk=topk,
     )
-
-
-def _megatron_worker(request: MegatronWorkerRequest) -> None:
-    import torch
-
-    from art.megatron import train as megatron_train
-    from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend="nccl")  # type: ignore[possibly-missing-attribute]
-    _set_seed(request.config.seed)
-    os.environ.update(request.config.topology.env())
-
-    runtime = megatron_train.build_training_runtime(
-        model_identifier=request.config.base_model,
-        provider_torch_dtype=torch.bfloat16,
-        provider_bundle_configure=(
-            lambda bundle: (
-                _configure_lora_target_modules(
-                    bundle,
-                    _lora_target_modules(request.config),
-                )
-                if request.config.lora_target_modules is not None
-                else None
-            )
-        ),
-        provider_configure=lambda provider: _configure_provider(
-            provider, request.config
-        ),
-        print_env=False,
-        build_optimizer=False,
-        # This worker only runs forward passes. Use the LoRA trainable path for
-        # both base and LoRA scoring so Megatron freezes base weights before DDP
-        # allocates buffers; base scoring simply does not load a nonzero adapter.
-        trainable_parameter_mode="lora",
-        allow_unvalidated_arch=request.config.allow_unvalidated_arch,
-    )
-    for chunk in runtime.model:
-        chunk.eval()
-
-    artifact_dir = Path(request.artifact_dir)
-    packed_tensors = _build_packed_tensors(request.config)
-    logical_map = build_logical_token_map(packed_tensors)
-
-    adapter_path: Path | None = None
-    if request.weight_state == "lora":
-        if request.adapter_path is None:
-            initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
-            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-                adapter_path = artifact_dir / "active_lora"
-                initialized = _build_deterministic_nonzero_lora(
-                    initial_state or {},
-                    seed=request.config.seed,
-                )
-                _save_vllm_lora_adapter(
-                    lora_path=adapter_path,
-                    state=initialized,
-                    runtime=runtime,
-                    config=request.config,
-                )
-            torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-            adapter_path = artifact_dir / "active_lora"
-        else:
-            adapter_path = Path(request.adapter_path)
-        adapter_model = load_lora_tensors_for_megatron(
-            str(adapter_path),
-            handler=runtime.model_support_handler,
-            allow_unvalidated_arch=request.config.allow_unvalidated_arch,
-        )
-        megatron_train.load_adapter_into_model(runtime.model, adapter_model)
-
-    logits = _run_logits(runtime=runtime, packed_tensors=packed_tensors)
-    score = _extract_scores_from_logits(
-        logits=logits,
-        logical_map=logical_map,
-        side="megatron",
-        weight_state=request.weight_state,
-    )
-
-    if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-        score_path = artifact_dir / f"megatron_{request.weight_state}_scores.json"
-        logical_map_path = artifact_dir / "logical_token_map.json"
-        _write_json(score_path, score.model_dump(mode="json"))
-        _write_json(logical_map_path, logical_map.model_dump(mode="json"))
-        result = MegatronWorkerResult(
-            score_path=str(score_path),
-            logical_map_path=str(logical_map_path),
-            adapter_path=str(adapter_path) if adapter_path is not None else None,
-        )
-        _write_json(
-            artifact_dir / f"megatron_{request.weight_state}_worker_result.json",
-            result.model_dump(mode="json"),
-        )
-    torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-    torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
-
-
-def _run_megatron_worker(request: MegatronWorkerRequest) -> MegatronWorkerResult:
-    artifact_dir = Path(request.artifact_dir)
-    request_path = artifact_dir / f"megatron_{request.weight_state}_request.json"
-    _write_json(request_path, request.model_dump(mode="json"))
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(
-        str(value) for value in request.config.trainer_gpu_ids
-    )
-    env["PYTHONUNBUFFERED"] = "1"
-    tests_dir = str(REPO_ROOT / "tests")
-    env["PYTHONPATH"] = (
-        tests_dir
-        if not env.get("PYTHONPATH")
-        else f"{tests_dir}{os.pathsep}{env['PYTHONPATH']}"
-    )
-    command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node",
-        str(request.config.topology.world_size()),
-        "-m",
-        "integration.megatron.train_inf_mismatch.output_parity",
-        "--worker",
-        "--request",
-        str(request_path),
-    ]
-    log_path = artifact_dir / f"megatron_{request.weight_state}_worker.log"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        run = subprocess.run(
-            command,
-            cwd=str(REPO_ROOT / "tests"),
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    if run.returncode != 0:
-        tail = "\n".join(log_path.read_text(encoding="utf-8").splitlines()[-120:])
-        raise RuntimeError(
-            f"Megatron {request.weight_state} worker failed with exit code "
-            f"{run.returncode}.\n{tail}"
-        )
-    return MegatronWorkerResult.model_validate(
-        _read_json(artifact_dir / f"megatron_{request.weight_state}_worker_result.json")
-    )
-
-
-@asynccontextmanager
-async def _direct_vllm_runtime(
-    *,
-    config: TrainInfOutputParityConfig,
-    artifact_dir: Path,
-    served_model_name: str,
-    lora_path: str,
-    rollout_weights_mode: Literal["lora", "merged"],
-    engine_args: dict[str, Any],
-) -> AsyncIterator[tuple[str, int]]:
-    import art.vllm_runtime as runtime
-
-    port = _free_port()
-    launch_config = runtime.VllmRuntimeLaunchConfig(
-        base_model=config.base_model,
-        port=port,
-        host="127.0.0.1",
-        cuda_visible_devices=",".join(str(value) for value in config.inference_gpu_ids),
-        lora_path=lora_path,
-        served_model_name=served_model_name,
-        rollout_weights_mode=rollout_weights_mode,
-        engine_args=engine_args,
-        server_args={
-            "return_tokens_as_token_ids": True,
-            **config.server_args,
-        },
-    )
-    command = runtime.build_vllm_runtime_server_cmd(launch_config)
-    log_path = artifact_dir / f"vllm_{served_model_name}.log"
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            command,
-            cwd=str(runtime.get_vllm_runtime_working_dir()),
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    try:
-        await runtime.wait_for_vllm_runtime(
-            process=process,
-            host=launch_config.host,
-            port=launch_config.port,
-            timeout=float(
-                os.environ.get("ART_TRAIN_INF_MISMATCH_VLLM_TIMEOUT", "1200")
-            ),
-        )
-        yield launch_config.host, launch_config.port
-    finally:
-        process.terminate()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=30)
-
-
-async def _request_prompt_logprobs(
-    *,
-    base_url: str,
-    model_name: str,
-    prompt_token_ids: list[int],
-) -> dict[str, Any]:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"{base_url}/v1/completions",
-            json={
-                "model": model_name,
-                "prompt": prompt_token_ids,
-                "add_special_tokens": False,
-                "max_tokens": 0,
-                "echo": True,
-                "prompt_logprobs": TOP_K,
-                "return_token_ids": True,
-            },
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def _logprob_entry_value(entry: dict[str, Any], token_id: int) -> float:
-    raw = entry.get(str(token_id))
-    if raw is None:
-        raise RuntimeError(f"Token {token_id} missing from vLLM prompt_logprobs entry")
-    if isinstance(raw, dict):
-        return float(raw["logprob"])
-    return float(raw.logprob)
-
-
-def _topk_from_entry(entry: dict[str, Any]) -> TokenTopK:
-    parsed: list[tuple[int, int, float]] = []
-    for raw_token_id, raw_value in entry.items():
-        token_id = int(raw_token_id)
-        if isinstance(raw_value, dict):
-            rank = int(raw_value.get("rank", TOP_K + 1))
-            logprob = float(raw_value["logprob"])
-        else:
-            rank = int(raw_value.rank)
-            logprob = float(raw_value.logprob)
-        if 1 <= rank <= TOP_K:
-            parsed.append((rank, token_id, logprob))
-    parsed.sort(key=lambda item: item[0])
-    return TokenTopK(
-        token_ids=[token_id for _rank, token_id, _logprob in parsed[:TOP_K]],
-        logprobs=[logprob for _rank, _token_id, logprob in parsed[:TOP_K]],
-    )
-
-
-async def _score_vllm_at_url(
-    *,
-    base_url: str,
-    model_name: str,
-    logical_map: LogicalTokenMap,
-    weight_state: WeightState,
-    rollout_mode: RolloutMode,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    responses_by_prompt: dict[int, dict[str, Any]] = {}
-    prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
-    for prompt in logical_map.prompts:
-        response = await _request_prompt_logprobs(
-            base_url=base_url,
-            model_name=model_name,
-            prompt_token_ids=prompt.token_ids,
-        )
-        choice = response["choices"][0]
-        returned_prompt_ids = [int(value) for value in choice["prompt_token_ids"]]
-        if returned_prompt_ids != prompt.token_ids:
-            raise RuntimeError(
-                "vLLM returned prompt_token_ids do not match request for "
-                f"prompt_id={prompt.prompt_id}"
-            )
-        responses_by_prompt[prompt.prompt_id] = response
-    _write_json(
-        artifact_dir / f"vllm_{rollout_mode}_{weight_state}_responses.json",
-        responses_by_prompt,
-    )
-
-    target_logprobs: list[float] = []
-    topk: list[TokenTopK] = []
-    for token in logical_map.tokens:
-        prompt = prompt_by_id[token.prompt_id]
-        choice = responses_by_prompt[token.prompt_id]["choices"][0]
-        entries = choice["prompt_logprobs"]
-        returned_token_id = int(prompt.token_ids[token.vllm_prompt_token_index])
-        if returned_token_id != token.token_id:
-            raise RuntimeError(
-                "Logical token alignment mismatch: "
-                f"expected={token.token_id} returned={returned_token_id}"
-            )
-        entry = entries[token.vllm_prompt_token_index]
-        if entry is None:
-            raise RuntimeError(
-                f"Missing prompt logprob entry for prompt_id={token.prompt_id} "
-                f"index={token.vllm_prompt_token_index}"
-            )
-        target_logprobs.append(_logprob_entry_value(entry, token.token_id))
-        topk.append(_topk_from_entry(entry))
-    return ScoreBundle(
-        side="vllm",
-        weight_state=weight_state,
-        rollout_mode=rollout_mode,
-        target_logprobs=target_logprobs,
-        topk=topk,
-    )
-
-
-async def _score_vllm_base(
-    *,
-    config: TrainInfOutputParityConfig,
-    rollout_mode: RolloutMode,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    served_name = f"train_inf_base_{rollout_mode}_{int(time.time())}"
-    placeholder_lora = artifact_dir / "unused_lora_placeholder"
-    placeholder_lora.mkdir(exist_ok=True)
-    engine_args = {
-        "tensor_parallel_size": len(config.inference_gpu_ids),
-        "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
-        "max_model_len": config.packed.sequence_length + 8,
-        **config.engine_args,
-    }
-    if rollout_mode == "native_lora":
-        engine_args["enable_lora"] = True
-        engine_args["lora_target_modules"] = _lora_target_modules(config)
-    async with _direct_vllm_runtime(
-        config=config,
-        artifact_dir=artifact_dir,
-        served_model_name=served_name,
-        lora_path=str(placeholder_lora),
-        rollout_weights_mode="merged",
-        engine_args=engine_args,
-    ) as (host, port):
-        return await _score_vllm_at_url(
-            base_url=f"http://{host}:{port}",
-            model_name=served_name,
-            logical_map=logical_map,
-            weight_state="base",
-            rollout_mode=rollout_mode,
-            artifact_dir=artifact_dir,
-        )
-
-
-async def _score_vllm_native_lora(
-    *,
-    config: TrainInfOutputParityConfig,
-    adapter_path: str,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    served_name = f"train_inf_native_lora_{int(time.time())}"
-    engine_args = {
-        "tensor_parallel_size": len(config.inference_gpu_ids),
-        "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
-        "max_model_len": config.packed.sequence_length + 8,
-        **config.engine_args,
-    }
-    engine_args["lora_target_modules"] = _lora_target_modules(config)
-    async with _direct_vllm_runtime(
-        config=config,
-        artifact_dir=artifact_dir,
-        served_model_name=served_name,
-        lora_path=adapter_path,
-        rollout_weights_mode="lora",
-        engine_args=engine_args,
-    ) as (host, port):
-        return await _score_vllm_at_url(
-            base_url=f"http://{host}:{port}",
-            model_name=served_name,
-            logical_map=logical_map,
-            weight_state="lora",
-            rollout_mode="native_lora",
-            artifact_dir=artifact_dir,
-        )
-
-
-async def _score_vllm_merged_lora(
-    *,
-    config: TrainInfOutputParityConfig,
-    adapter_path: str,
-    logical_map: LogicalTokenMap,
-    artifact_dir: Path,
-) -> ScoreBundle:
-    from art import dev
-    from art.megatron.service import MegatronService
-
-    service_name = f"train_inf_merged_lora_{int(time.time())}"
-    output_dir = artifact_dir / "merged_service"
-    from art.utils.output_dirs import get_step_checkpoint_dir
-
-    checkpoint_dir = Path(get_step_checkpoint_dir(str(output_dir), 0))
-    checkpoint_dir.mkdir(parents=True)
-    for filename in ("adapter_model.safetensors", "adapter_config.json"):
-        shutil.copy(Path(adapter_path) / filename, checkpoint_dir / filename)
-    internal_config = dev.InternalModelConfig(
-        trainer_gpu_ids=config.trainer_gpu_ids,
-        inference_gpu_ids=config.inference_gpu_ids,
-        rollout_weights_mode="merged",
-        allow_unvalidated_arch=config.allow_unvalidated_arch,
-        engine_args={
-            "tensor_parallel_size": len(config.inference_gpu_ids),
-            "enable_expert_parallel": len(config.inference_gpu_ids) > 1,
-            "max_model_len": config.packed.sequence_length + 8,
-            **config.engine_args,
-        },
-    )
-    with _provider_topology_env(config.topology):
-        service = MegatronService(
-            model_name=service_name,
-            base_model=config.base_model,
-            config=internal_config,
-            output_dir=str(output_dir),
-        )
-        try:
-            host, port = await service.start_openai_server(
-                {"server_args": {"port": _free_port(), **config.server_args}}
-            )
-            return await _score_vllm_at_url(
-                base_url=f"http://{host}:{port}",
-                model_name=f"{service_name}@0",
-                logical_map=logical_map,
-                weight_state="lora",
-                rollout_mode="merged",
-                artifact_dir=artifact_dir,
-            )
-        finally:
-            await service.aclose()
-
-
-def _assert_lora_active(
-    base: ScoreBundle, lora: ScoreBundle, *, side: EngineSide
-) -> None:
-    import torch
-
-    base_values = torch.tensor(base.target_logprobs, dtype=torch.float32)
-    lora_values = torch.tensor(lora.target_logprobs, dtype=torch.float32)
-    if not bool(torch.isfinite(base_values).all().item()):
-        raise RuntimeError(f"{side} base target logprobs contain non-finite values")
-    if not bool(torch.isfinite(lora_values).all().item()):
-        raise RuntimeError(f"{side} LoRA target logprobs contain non-finite values")
-    if int(torch.count_nonzero((lora_values - base_values).abs() > 0).item()) == 0:
-        raise RuntimeError(f"{side} LoRA is not active: all deltas are zero")
-
-
-async def run_train_inf_output_parity(
-    *,
-    config: TrainInfOutputParityConfig,
-    artifact_dir: Path,
-) -> TrainInfOutputParityReport:
-    _write_json(artifact_dir / "probe_config.json", config.model_dump(mode="json"))
-    lora_result = _run_megatron_worker(
-        MegatronWorkerRequest(
-            config=config,
-            artifact_dir=str(artifact_dir),
-            weight_state="lora",
-            adapter_path=None,
-        )
-    )
-    if lora_result.adapter_path is None:
-        raise RuntimeError("LoRA worker did not produce an adapter")
-    base_result = _run_megatron_worker(
-        MegatronWorkerRequest(
-            config=config,
-            artifact_dir=str(artifact_dir),
-            weight_state="base",
-            adapter_path=None,
-        )
-    )
-    logical_map = LogicalTokenMap.model_validate(
-        _read_json(Path(lora_result.logical_map_path))
-    )
-    base_logical_map = LogicalTokenMap.model_validate(
-        _read_json(Path(base_result.logical_map_path))
-    )
-    if base_logical_map != logical_map:
-        raise RuntimeError("Base and LoRA Megatron workers produced different maps")
-
-    megatron_base = ScoreBundle.model_validate(_read_json(Path(base_result.score_path)))
-    megatron_lora = ScoreBundle.model_validate(_read_json(Path(lora_result.score_path)))
-    _assert_lora_active(megatron_base, megatron_lora, side="megatron")
-
-    rollout_comparisons: list[RolloutComparison] = []
-    for rollout_mode in config.rollout_modes:
-        vllm_base = await _score_vllm_base(
-            config=config,
-            rollout_mode=rollout_mode,
-            logical_map=logical_map,
-            artifact_dir=artifact_dir,
-        )
-        if rollout_mode == "native_lora":
-            vllm_lora = await _score_vllm_native_lora(
-                config=config,
-                adapter_path=lora_result.adapter_path,
-                logical_map=logical_map,
-                artifact_dir=artifact_dir,
-            )
-        else:
-            vllm_lora = await _score_vllm_merged_lora(
-                config=config,
-                adapter_path=lora_result.adapter_path,
-                logical_map=logical_map,
-                artifact_dir=artifact_dir,
-            )
-        _assert_lora_active(vllm_base, vllm_lora, side="vllm")
-        _write_json(
-            artifact_dir / f"vllm_{rollout_mode}_base_scores.json",
-            vllm_base.model_dump(mode="json"),
-        )
-        _write_json(
-            artifact_dir / f"vllm_{rollout_mode}_lora_scores.json",
-            vllm_lora.model_dump(mode="json"),
-        )
-        rollout_comparisons.append(
-            compare_rollout(
-                rollout_mode=rollout_mode,
-                megatron_base=megatron_base,
-                megatron_lora=megatron_lora,
-                vllm_base=vllm_base,
-                vllm_lora=vllm_lora,
-                logical_map=logical_map,
-            )
-        )
-
-    passed = all(
-        comparison.base.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
-        and comparison.lora.mean_abs_pct <= BF16_FWD_MEAN_ABS_PCT_LIMIT
-        for comparison in rollout_comparisons
-    )
-    report = TrainInfOutputParityReport(
-        base_model=config.base_model,
-        artifact_dir=str(artifact_dir),
-        topology=config.topology.slug(),
-        trainer_gpu_ids=config.trainer_gpu_ids,
-        inference_gpu_ids=config.inference_gpu_ids,
-        logical_prompt_count=len(logical_map.prompts),
-        logical_token_count=len(logical_map.tokens),
-        adapter_path=lora_result.adapter_path,
-        megatron_base_scores=base_result.score_path,
-        megatron_lora_scores=lora_result.score_path,
-        rollout_comparisons=rollout_comparisons,
-        passed=passed,
-    )
-    _write_json(artifact_dir / "comparison_report.json", report.model_dump(mode="json"))
-    return report
-
-
-def _worker_cli(request_path: Path) -> None:
-    request = MegatronWorkerRequest.model_validate(_read_json(request_path))
-    _megatron_worker(request)
-
-
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--request", type=Path)
-    return parser.parse_args(argv)
-
-
-def _main(argv: list[str]) -> int:
-    args = _parse_args(argv)
-    if args.worker:
-        if args.request is None:
-            raise ValueError("--worker requires --request")
-        _worker_cli(args.request)
-        return 0
-    raise ValueError("This module is intended to be run through pytest or --worker")
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main(sys.argv[1:]))

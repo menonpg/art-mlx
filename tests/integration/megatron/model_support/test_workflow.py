@@ -5,12 +5,13 @@ from art.megatron.model_support.spec import (
     LayerFamilyInstance,
 )
 
-from .validation_spec import ValidationStageResult
+from .validation_spec import ValidationReport, ValidationStageResult
 from .workflow import (
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
     assess_minimal_layer_coverage,
+    build_all_architectures_validation_report,
     build_validation_report,
     build_validation_stage_names,
     run_chat_template_rollout_stage,
@@ -21,6 +22,7 @@ from .workflow import (
     run_packed_position_ids_stage,
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
+    validated_architecture_representative_models,
 )
 
 
@@ -34,6 +36,62 @@ def test_build_validation_stage_names_has_fixed_order() -> None:
         *MANDATORY_VALIDATION_STAGES,
         NATIVE_VLLM_LORA_STAGE,
     ]
+
+
+def test_validated_architecture_representative_models_are_fixed() -> None:
+    assert validated_architecture_representative_models() == [
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-27B",
+    ]
+
+
+def test_build_all_architectures_validation_report_stops_on_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+
+    def _build_validation_report(
+        *,
+        base_model,
+        include_sensitivity=None,
+        output_json=None,
+        skip_stages=None,
+        stop_on_failure=False,
+        allow_unvalidated_arch=False,
+    ):
+        del include_sensitivity
+        del output_json
+        del skip_stages
+        del stop_on_failure
+        del allow_unvalidated_arch
+        calls.append(base_model)
+        return ValidationReport(
+            base_model=base_model,
+            model_key="qwen3_dense",
+            stages=[
+                ValidationStageResult(
+                    name="train_inf_mismatch",
+                    passed=base_model != "Qwen/Qwen3-32B",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.build_validation_report",
+        _build_validation_report,
+    )
+
+    report = build_all_architectures_validation_report(
+        output_json=tmp_path / "all_architectures.json",
+        stop_on_failure=True,
+    )
+
+    assert calls == ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-32B"]
+    assert report.passed is False
+    assert [item.base_model for item in report.reports] == calls
 
 
 def test_build_validation_report_populates_architecture_stage(
@@ -331,6 +389,69 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
     assert lora_coverage_stage.passed is False
     assert lora_coverage_stage.metrics == {
         "error": "RuntimeError: missing wrapped targets"
+    }
+
+
+def test_build_validation_report_writes_incremental_output_and_stops(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[],
+            recommended_min_layers=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.detect_dependency_versions",
+        lambda: {},
+    )
+
+    def _run_stage_in_subprocess(
+        *,
+        stage_name,
+        base_model,
+        architecture,
+        allow_unvalidated_arch=False,
+    ):
+        calls.append(stage_name)
+        return ValidationStageResult(
+            name=stage_name,
+            passed=stage_name != "lora_coverage",
+            metrics={"stage": stage_name},
+        )
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+    output_json = tmp_path / "workflow_report.json"
+
+    report = build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        output_json=output_json,
+        stop_on_failure=True,
+    )
+
+    assert calls == ["hf_parity", "lora_coverage"]
+    assert output_json.exists()
+    saved = ValidationReport.model_validate_json(output_json.read_text())
+    assert saved == report
+    failed_stage = next(
+        stage for stage in saved.stages if stage.name == "lora_coverage"
+    )
+    skipped_stage = next(
+        stage for stage in saved.stages if stage.name == "train_inf_mismatch"
+    )
+    assert failed_stage.passed is False
+    assert skipped_stage.metrics == {
+        "skipped": True,
+        "reason": "stopped after lora_coverage failed",
     }
 
 

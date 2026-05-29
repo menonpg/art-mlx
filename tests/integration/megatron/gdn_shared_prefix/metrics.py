@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor
 
@@ -9,9 +11,23 @@ from ..metrics import (
     mean_abs_pct_from_sums,
 )
 
-GDN_CORRECTNESS_DTYPE = torch.float32
+# FLA's Hopper gated backward path requires TileLang with Triton >= 3.4, and
+# TileLang does not compile this kernel for fp32. Production Qwen3.5 GDN runs bf16.
+GDN_CORRECTNESS_DTYPE = torch.bfloat16
 MEAN_ABS_PCT_THRESHOLD = DEFAULT_MEAN_ABS_PCT_THRESHOLD
 MEAN_ABS_PCT_MISMATCH_THRESHOLD = 0.1
+REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD = (
+    3.0 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else MEAN_ABS_PCT_THRESHOLD
+)
+REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD = (
+    3.0 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else MEAN_ABS_PCT_THRESHOLD
+)
+REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD = (
+    5.0 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else MEAN_ABS_PCT_THRESHOLD
+)
+REAL_GDN_SCALAR_LOSS_ABS_THRESHOLD = (
+    5e-3 if GDN_CORRECTNESS_DTYPE == torch.bfloat16 else 0.0
+)
 
 
 def assert_mean_abs_pct(
@@ -23,6 +39,46 @@ def assert_mean_abs_pct(
 ) -> None:
     pct = mean_abs_pct(reference, candidate)
     assert pct <= threshold, f"{name}: mean_abs_pct={pct:.6g}% > {threshold}%"
+
+
+def assert_scalar_loss_close(
+    reference: Tensor,
+    candidate: Tensor,
+    name: str,
+    *,
+    threshold: float = REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD,
+    abs_threshold: float = REAL_GDN_SCALAR_LOSS_ABS_THRESHOLD,
+) -> None:
+    pct = mean_abs_pct(reference, candidate)
+    abs_diff = float((candidate.detach().float() - reference.detach().float()).abs())
+    assert pct <= threshold or abs_diff <= abs_threshold, (
+        f"{name}: mean_abs_pct={pct:.6g}% > {threshold}% and "
+        f"abs_diff={abs_diff:.6g} > {abs_threshold}"
+    )
+
+
+def assert_real_gdn_metrics(metrics: Any, name: str) -> None:
+    assert metrics.loss_mean_abs_pct <= REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD or (
+        getattr(metrics, "loss_abs_diff", float("inf"))
+        <= REAL_GDN_SCALAR_LOSS_ABS_THRESHOLD
+    ), (
+        f"{name}: loss_mean_abs_pct={metrics.loss_mean_abs_pct:.6g}% > "
+        f"{REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD}% and "
+        f"loss_abs_diff={getattr(metrics, 'loss_abs_diff', float('inf')):.6g} > "
+        f"{REAL_GDN_SCALAR_LOSS_ABS_THRESHOLD}"
+    )
+    assert metrics.output_mean_abs_pct <= REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD, (
+        f"{name}: output_mean_abs_pct={metrics.output_mean_abs_pct:.6g}% > "
+        f"{REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD}%"
+    )
+    assert metrics.hidden_grad_mean_abs_pct <= REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD, (
+        f"{name}: hidden_grad_mean_abs_pct={metrics.hidden_grad_mean_abs_pct:.6g}% > "
+        f"{REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD}%"
+    )
+    assert metrics.param_grad_mean_abs_pct <= REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD, (
+        f"{name}: param_grad_mean_abs_pct={metrics.param_grad_mean_abs_pct:.6g}% > "
+        f"{REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD}%"
+    )
 
 
 def parameter_grad_mean_abs_pct_with_name(

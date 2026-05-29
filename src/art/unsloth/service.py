@@ -25,7 +25,7 @@ from ..utils.lifecycle import (
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
-    ExternalVllmRuntime,
+    ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
 )
 from ..weight_transfer import (
@@ -122,8 +122,8 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
-    _vllm_runtime: ExternalVllmRuntime = field(
-        default_factory=ExternalVllmRuntime,
+    _vllm_runtime: ManagedVllmRuntime = field(
+        default_factory=ManagedVllmRuntime,
         init=False,
         repr=False,
     )

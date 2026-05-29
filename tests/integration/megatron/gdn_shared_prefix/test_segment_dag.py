@@ -464,7 +464,7 @@ def test_cp_local_schedule_uses_family_cohesion_with_matching_attention_layout()
     assert max(rank_loads) - min(rank_loads) <= 256
 
 
-def test_cp_default_schedule_splits_oversized_non_chain_family_by_segments() -> None:
+def test_cp_rank_plan_splits_oversized_non_chain_family_by_segments() -> None:
     group_ids, parent_ids = _dominant_with_background_group_tensors()
     spec = parse_gdn_shared_prefix_segments(
         group_ids,
@@ -472,30 +472,20 @@ def test_cp_default_schedule_splits_oversized_non_chain_family_by_segments() -> 
         min_completions_per_family=1,
     )
 
-    schedule = build_gdn_cp_segment_schedule(spec, cp_size=4)
-    rank_loads = list(schedule.gdn_token_counts_by_rank)
-
-    assert schedule.chain_prefix_buckets == ()
-    assert schedule.cross_rank_token_count == 0
-    assert 0 in schedule.parent_state_exchange_family_indices
-    assert any(
-        0 in transfer.family_indices and transfer.source_rank != transfer.dest_rank
-        for transfer in schedule.parent_state_transfers
-    )
-    assert min(rank_loads) > 0
-    assert max(rank_loads) <= 1.5 * (sum(rank_loads) / len(rank_loads))
-
     rank_plans = tuple(
         build_gdn_rank_execution_plan(
             spec,
             device="cpu",
             cp_rank=rank,
             cp_size=4,
-            cp_segment_schedule=schedule,
         )
         for rank in range(4)
     )
-    assert all(plan.remote_prefix_tail_state_transfers for plan in rank_plans)
+    rank_loads = [plan.gdn_token_count for plan in rank_plans]
+
+    assert min(rank_loads) > 0
+    assert max(rank_loads) < spec.real_token_count
+    assert any(plan.remote_prefix_tail_state_transfers for plan in rank_plans)
     assert all(
         transfer.family_indices_tensor is not None
         for plan in rank_plans
@@ -604,7 +594,7 @@ def test_cp_remote_prefix_tail_plan_does_not_duplicate_legacy_work() -> None:
 
 
 @pytest.mark.parametrize("cp_size", (2, 4, 8))
-def test_cp_default_schedule_routes_64k_segments_to_native_chain(cp_size: int) -> None:
+def test_cp_default_plan_routes_64k_prefix_to_native_chain(cp_size: int) -> None:
     group_ids, parent_ids = _single_long_family_group_tensors(
         prefix_len=65_536,
         suffix_len=65_536,
@@ -616,27 +606,33 @@ def test_cp_default_schedule_routes_64k_segments_to_native_chain(cp_size: int) -
         min_completions_per_family=1,
     )
 
-    schedule = build_gdn_cp_segment_schedule(spec, cp_size=cp_size)
     plans = tuple(
         build_gdn_rank_execution_plan(
             spec,
             device="cpu",
             cp_rank=rank,
             cp_size=cp_size,
-            cp_segment_schedule=schedule,
         )
         for rank in range(cp_size)
     )
+    rank_loads = [plan.gdn_token_count for plan in plans]
 
-    assert schedule.chain_prefix_buckets
-    assert schedule.chain_completion_buckets
     assert all(plan.chain_prefix_buckets for plan in plans)
-    assert all(plan.chain_completion_buckets for plan in plans)
+    assert all(
+        plan.chain_completion_buckets or plan.local_completion_buckets for plan in plans
+    )
+    assert max(rank_loads) == min(rank_loads)
     assert all(
         int(bucket.lengths.min().item()) > 0
         for plan in plans
-        for bucket in (*plan.chain_prefix_buckets, *plan.chain_completion_buckets)
+        for bucket in (
+            *plan.chain_prefix_buckets,
+            *plan.chain_completion_buckets,
+            *plan.local_completion_buckets,
+        )
     )
+    for plan in plans:
+        _assert_plan_outputs_each_local_position_once(plan)
 
 
 @pytest.mark.parametrize("cp_size", (2, 4, 8))

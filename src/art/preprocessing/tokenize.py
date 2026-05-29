@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -5,19 +7,26 @@ from itertools import takewhile
 import json
 import math
 import random
-from typing import Any, Generator, Literal, cast
+from typing import TYPE_CHECKING, Any, Generator, Literal, cast
 
 from openai.types.chat.chat_completion import Choice
 from PIL import Image
 import torch
-from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
+)
+from .moe_routing import (
+    MoeRoutingAlignmentStats,
+    TokenRoute,
+    align_choice_routes_to_tokenized_result,
 )
 from .response_masking import response_only_labels, token_ids_for_template_part
 
@@ -151,6 +160,8 @@ class TokenizedResult:
     choice_offsets: list[int]
     extra_logprobs: dict[str, list[float]]
     _tokenizer: "PreTrainedTokenizerBase" = field(repr=False, compare=False)
+    moe_routed_experts: list[TokenRoute | None] | None = None
+    moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
@@ -177,6 +188,12 @@ class TokenizedResult:
                 key: values[self.prompt_length :]
                 for key, values in self.extra_logprobs.items()
             },
+            moe_routed_experts=(
+                self.moe_routed_experts[self.prompt_length :]
+                if self.moe_routed_experts is not None
+                else None
+            ),
+            moe_routing_alignment_stats=self.moe_routing_alignment_stats,
             _tokenizer=self._tokenizer,
             weight=self.weight,
             prompt_id=self.prompt_id,
@@ -413,6 +430,7 @@ def tokenize_trajectory(
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
     choice_offsets, choice_token_logprobs = [], []
+    trainable_choices: list[Choice] = []
 
     for message in messages_and_choices:
         if isinstance(message, dict):
@@ -446,7 +464,7 @@ def tokenize_trajectory(
             logprobs[start:end] = [float("nan")] * len(content_token_ids)
             assistant_mask[start:end] = [1] * len(content_token_ids)
         else:
-            choice = message
+            choice = cast(Choice, message)
             assert choice.logprobs or allow_training_without_logprobs, (  # ty:ignore[possibly-missing-attribute]
                 "Chat completion choices must have logprobs"
             )
@@ -461,6 +479,7 @@ def tokenize_trajectory(
                 start -= 4
             choice_offsets.append(start)
             choice_token_logprobs.append(token_logprobs)
+            trainable_choices.append(choice)
             try:
                 token_ids[start:end] = (
                     int(token_logprob.token.split(":")[1])
@@ -542,6 +561,16 @@ def tokenize_trajectory(
     else:
         pixel_values = None
         image_grid_thw = None
+    moe_routed_experts, moe_routing_alignment_stats = (
+        align_choice_routes_to_tokenized_result(
+            token_ids=token_ids,
+            choices=trainable_choices,
+            choice_offsets=choice_offsets,
+            choice_token_lengths=[
+                len(token_logprobs) for token_logprobs in choice_token_logprobs
+            ],
+        )
+    )
     return TokenizedResult(
         advantage=advantage,
         chat=chat,
@@ -554,6 +583,8 @@ def tokenize_trajectory(
         trajectory=trajectory,
         choice_offsets=choice_offsets,
         extra_logprobs=extra_logprobs,
+        moe_routed_experts=moe_routed_experts,
+        moe_routing_alignment_stats=moe_routing_alignment_stats,
         _tokenizer=tokenizer,
     )
 

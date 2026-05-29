@@ -30,7 +30,7 @@ from .cases import default_phase0_cases
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_MISMATCH_THRESHOLD,
-    MEAN_ABS_PCT_THRESHOLD,
+    assert_real_gdn_metrics,
     mean_abs_pct,
 )
 from .packed_layout import build_phase0_packed_tensors
@@ -79,12 +79,7 @@ def test_real_qwen35_gdn_cp1_matches_flattened_and_rejects_physical() -> None:
                 assistant_mask=assistant_mask,
             )
 
-            assert metrics.loss_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD, case.name
-            assert metrics.output_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD, case.name
-            assert metrics.hidden_grad_mean_abs_pct <= (MEAN_ABS_PCT_THRESHOLD), (
-                case.name
-            )
-            assert metrics.param_grad_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD, case.name
+            assert_real_gdn_metrics(metrics, case.name)
 
             real_token_mask = (group_ids != -1).transpose(0, 1).unsqueeze(-1)
             output_grads = {
@@ -126,18 +121,7 @@ def test_real_qwen35_gdn_cp1_matches_flattened_and_rejects_physical() -> None:
                     output_grad=output_grad,
                 )
 
-                assert upstream_metrics.loss_mean_abs_pct <= (MEAN_ABS_PCT_THRESHOLD), (
-                    f"{case.name}:{name}"
-                )
-                assert upstream_metrics.output_mean_abs_pct <= (
-                    MEAN_ABS_PCT_THRESHOLD
-                ), f"{case.name}:{name}"
-                assert upstream_metrics.hidden_grad_mean_abs_pct <= (
-                    MEAN_ABS_PCT_THRESHOLD
-                ), f"{case.name}:{name}"
-                assert upstream_metrics.param_grad_mean_abs_pct <= (
-                    MEAN_ABS_PCT_THRESHOLD
-                ), f"{case.name}:{name}"
+                assert_real_gdn_metrics(upstream_metrics, f"{case.name}:{name}")
 
             if case.name == "ragged_family_mix":
                 with torch.no_grad():

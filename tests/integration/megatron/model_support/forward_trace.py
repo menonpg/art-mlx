@@ -243,10 +243,12 @@ class ForwardTraceCapture:
         enabled: bool,
         capture_name_tokens: tuple[str, ...] = CAPTURE_NAME_TOKENS,
         micro_start_callback: Callable[[int | None, int], None] | None = None,
+        strict_output_match: bool = True,
     ) -> None:
         self.enabled = enabled
         self.capture_name_tokens = capture_name_tokens
         self.micro_start_callback = micro_start_callback
+        self.strict_output_match = strict_output_match
         self.current_step_index: int | None = None
         self.current_step_trace: dict[str, list[dict[str, Any]]] = {}
         self.current_micro_sample_index: int | None = None

@@ -17,8 +17,10 @@ from .cases import (
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_MISMATCH_THRESHOLD,
-    MEAN_ABS_PCT_THRESHOLD,
+    REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
+    REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
     assert_mean_abs_pct,
+    assert_scalar_loss_close,
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
 )
@@ -101,12 +103,24 @@ def test_real_qwen35_gdn_chunk_native_reference_matches_cp1(cp_size: int) -> Non
             param_name, param_pct = parameter_grad_mean_abs_pct_with_name(
                 cp1_gdn, chunk_gdn
             )
-            assert_mean_abs_pct(cp1_loss.detach(), chunk_loss.detach(), case.name)
-            assert_mean_abs_pct(cp1_out.detach(), chunk_out.detach(), case.name)
+            assert_scalar_loss_close(cp1_loss.detach(), chunk_loss.detach(), case.name)
+            assert_mean_abs_pct(
+                cp1_out.detach(),
+                chunk_out.detach(),
+                case.name,
+                threshold=REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
+            )
             assert cp1_hidden.grad is not None
             assert chunk_hidden.grad is not None
-            assert_mean_abs_pct(cp1_hidden.grad, chunk_hidden.grad, case.name)
-            assert param_pct <= MEAN_ABS_PCT_THRESHOLD, f"{case.name}:{param_name}"
+            assert_mean_abs_pct(
+                cp1_hidden.grad,
+                chunk_hidden.grad,
+                case.name,
+                threshold=REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
+            )
+            assert param_pct <= REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD, (
+                f"{case.name}:{param_name}"
+            )
 
 
 @pytest.mark.skipif(
@@ -392,12 +406,22 @@ def test_real_qwen35_gdn_mixed_local_fork_and_chain_matches_cp1(
         param_name, param_pct = parameter_grad_mean_abs_pct_with_name(
             cp1_gdn, mixed_gdn
         )
-        assert_mean_abs_pct(cp1_loss.detach(), mixed_loss.detach(), case.name)
-        assert_mean_abs_pct(cp1_out.detach(), mixed_out.detach(), case.name)
+        assert_scalar_loss_close(cp1_loss.detach(), mixed_loss.detach(), case.name)
+        assert_mean_abs_pct(
+            cp1_out.detach(),
+            mixed_out.detach(),
+            case.name,
+            threshold=REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
+        )
         assert cp1_hidden.grad is not None
         assert mixed_hidden.grad is not None
-        assert_mean_abs_pct(cp1_hidden.grad, mixed_hidden.grad, case.name)
-        assert param_pct <= MEAN_ABS_PCT_THRESHOLD, param_name
+        assert_mean_abs_pct(
+            cp1_hidden.grad,
+            mixed_hidden.grad,
+            case.name,
+            threshold=REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
+        )
+        assert param_pct <= REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD, param_name
 
 
 def _real_token_mean_abs_pct(

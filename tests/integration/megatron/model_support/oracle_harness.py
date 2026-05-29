@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 import torch
 
+from art.megatron.routing_replay import ROUTER_KEY_FORMAT_VERSION
 from art.megatron.training.streaming_weight_offload import StreamingWeightOffloadConfig
 
 from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD, mean_abs_pct_from_sums
@@ -1412,9 +1413,19 @@ class VariantRunner:
             self.shared_init_path.unlink()
         bundle_manifest = self.oracle_routing_bundle_dir / "manifest.json"
         oracle_manifest = self.oracle_dir / "manifest.json"
+        bundle_format_current = False
+        if bundle_manifest.exists():
+            try:
+                bundle_format_current = (
+                    _read_json(bundle_manifest).get("format_version")
+                    == ROUTER_KEY_FORMAT_VERSION
+                )
+            except Exception:
+                bundle_format_current = False
         need_capture = (
             regenerate
             or not bundle_manifest.exists()
+            or not bundle_format_current
             or not self.shared_init_path.exists()
         )
         run_oracle_topology = partial(

@@ -130,6 +130,18 @@ def _compact_route_from_dense(
     )
 
 
+def _rank_token_counts(
+    call_entry: dict[str, Any], token_count: int
+) -> tuple[int, ...] | None:
+    row_splits = call_entry.get("primary_output__row_splits")
+    if not isinstance(row_splits, list):
+        return None
+    counts = tuple(int(count) for count in row_splits)
+    if sum(counts) != token_count:
+        return None
+    return counts
+
+
 def _dedupe_checkpoint_router_calls(
     call_entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -216,6 +228,9 @@ def build_bundle_from_forward_trace_dir(
                 sample_index, micro_slot = _trace_call_route_metadata(call_entry)
                 compact_route.sample_index = sample_index
                 compact_route.micro_slot = micro_slot
+                compact_route.rank_token_counts = _rank_token_counts(
+                    call_entry, compact_route.num_global_tokens
+                )
                 router_calls[call_index] = compact_route
                 max_topk = max(max_topk, compact_route.max_topk)
                 token_count = compact_route.num_global_tokens

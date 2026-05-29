@@ -74,7 +74,7 @@ class VllmRuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
 
 
-class ExternalVllmRuntime:
+class ManagedVllmRuntime:
     def __init__(self, *, host: str = "127.0.0.1") -> None:
         self.host = host
         self.port = 0

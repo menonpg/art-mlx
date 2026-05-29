@@ -12,8 +12,10 @@ from art.megatron.gdn.operator import gdn_shared_prefix_forward
 from .cases import default_phase0_cases
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
-    MEAN_ABS_PCT_THRESHOLD,
+    REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
+    REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
     assert_mean_abs_pct,
+    assert_scalar_loss_close,
     parameter_grad_mean_abs_pct_with_name,
 )
 from .packed_layout import build_phase0_packed_tensors
@@ -100,12 +102,24 @@ def test_real_qwen35_gdn_cp_local_fork_matches_cp1(cp_size: int) -> None:
             param_name, param_pct = parameter_grad_mean_abs_pct_with_name(
                 cp1_gdn, local_fork_gdn
             )
-            assert_mean_abs_pct(cp1_loss.detach(), local_loss.detach(), case.name)
-            assert_mean_abs_pct(cp1_out.detach(), local_out.detach(), case.name)
+            assert_scalar_loss_close(cp1_loss.detach(), local_loss.detach(), case.name)
+            assert_mean_abs_pct(
+                cp1_out.detach(),
+                local_out.detach(),
+                case.name,
+                threshold=REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
+            )
             assert cp1_hidden.grad is not None
             assert local_hidden.grad is not None
-            assert_mean_abs_pct(cp1_hidden.grad, local_hidden.grad, case.name)
-            assert param_pct <= MEAN_ABS_PCT_THRESHOLD, f"{case.name}:{param_name}"
+            assert_mean_abs_pct(
+                cp1_hidden.grad,
+                local_hidden.grad,
+                case.name,
+                threshold=REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
+            )
+            assert param_pct <= REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD, (
+                f"{case.name}:{param_name}"
+            )
 
 
 def _real_token_indices(group_ids: torch.Tensor) -> tuple[int, ...]:

@@ -71,6 +71,13 @@ def _needs_local_hf_prefetch(task: Any) -> bool:
     if _needs_expert_slice_prefetch(task):
         return False
     mapping = task.mapping
+    # ART Qwen3.5 expert mappings slice the full HF expert tensor before
+    # delegating to the inner TP mapping, so every ETP rank needs the source.
+    if type(mapping).__name__ in {
+        "_ArtExpertMLPGateUpProjMapping",
+        "_ArtExpertMLPDownProjMapping",
+    }:
+        return True
     tp_size = int(getattr(mapping, "tp_size", 1))
     if tp_size <= 1:
         return True

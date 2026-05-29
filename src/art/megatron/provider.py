@@ -349,12 +349,6 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.expert_tensor_parallel_size = 1
 
 
-def _etp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
-    return int(provider.expert_tensor_parallel_size or 1) * int(
-        provider.expert_model_parallel_size or 1
-    )
-
-
 def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> None:
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
@@ -367,7 +361,7 @@ def _apply_art_training_runtime_finalize_defaults(
     provider: GPTModelProvider,
     runtime_env: _ProviderRuntimeEnv | None = None,
 ) -> None:
-    if _etp_ep_parallel_domain_size(provider) <= 1:
+    if int(provider.expert_model_parallel_size or 1) <= 1:
         return
     runtime_env = (
         _ProviderRuntimeEnv.from_environ() if runtime_env is None else runtime_env

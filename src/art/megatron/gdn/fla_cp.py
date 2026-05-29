@@ -281,7 +281,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             external_dht,
             rank=dist.get_rank(ctx.group),  # ty: ignore[possibly-missing-attribute]
         )
-        dq, dk, dv, db, dg, _ = chunk_gated_delta_rule_bwd(
+        dq, dk, dv, db, dg, _dh0, _dA_log, _ddt_bias = chunk_gated_delta_rule_bwd(
             q=q,
             k=k,
             v=v,
@@ -294,6 +294,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             dht=local_dht,
             cu_seqlens=ctx.cu_seqlens,
             chunk_indices=ctx.chunk_indices,
+            use_exp2=False,
         )
         dh0 = _scan_bwd_initial_state_grad(gathered_bwd_summary, external_dht)
         return (
@@ -338,10 +339,13 @@ def _fwd_summary(
         w=w,
         g=g,
         gk=None,
+        bg=None,
+        u=u,
         hm=summary,
         cu_seqlens=cu_seqlens,
         T=token_count,
         H=head_count,
+        HV=head_count,
         K=key_dim,
         V=value_dim,
         BT=64,
@@ -409,10 +413,12 @@ def _bwd_summary(
         scale=scale,
         T=token_count,
         H=head_count,
+        HV=head_count,
         K=key_dim,
         V=value_dim,
         BT=64,
         BK1=max(16, triton.next_power_of_2(key_dim)),
+        USE_BG=False,
         USE_EXP2=False,
         BLOCK_SIZE=block_size,
     )

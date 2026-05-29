@@ -30,11 +30,15 @@ from ..utils.lifecycle import (
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
-    ExternalVllmRuntime,
+    ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
 )
 from .lora import LORA_ALPHA, default_lora_rank_for_handler
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
+from .model_support.registry import (
+    UnsupportedModelArchitectureError,
+    model_uses_expert_parallel,
+)
 from .runtime.client import (
     create_megatron_job_paths,
     stream_megatron_job,
@@ -165,13 +169,14 @@ class MegatronService:
     base_model: str
     config: dev.InternalModelConfig
     output_dir: str
+    enable_expert_replay: bool = True
     _is_sleeping: bool = False
     _latest_step: int = 0
     _megatron_process: asyncio.subprocess.Process | None = None
     _megatron_log_file: Any = None
     _megatron_log_path: str | None = None
-    _vllm_runtime: ExternalVllmRuntime = field(
-        default_factory=ExternalVllmRuntime,
+    _vllm_runtime: ManagedVllmRuntime = field(
+        default_factory=ManagedVllmRuntime,
         init=False,
         repr=False,
     )
@@ -243,6 +248,48 @@ class MegatronService:
     @property
     def _allow_unvalidated_arch(self) -> bool:
         return bool(self.config.get("allow_unvalidated_arch", False))
+
+    def _model_uses_expert_replay(self) -> bool:
+        if not self.enable_expert_replay:
+            return False
+        try:
+            return model_uses_expert_parallel(
+                self.base_model,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
+            )
+        except UnsupportedModelArchitectureError:
+            return False
+
+    def _trainer_gpu_count(self) -> int:
+        if self.is_dedicated:
+            return len(self.config["trainer_gpu_ids"])
+        return max(int(torch.cuda.device_count()), 1)
+
+    @staticmethod
+    def _parallel_env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        return default if raw is None or raw == "" else int(raw)
+
+    def _data_parallel_world_size(self) -> int:
+        num_gpus = self._trainer_gpu_count()
+        tp = self._parallel_env_int("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", num_gpus)
+        cp = self._parallel_env_int("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", 1)
+        pp = self._parallel_env_int("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", 1)
+        denominator = max(tp * cp * pp, 1)
+        if num_gpus % denominator != 0:
+            raise RuntimeError(
+                "Cannot resolve Megatron data-parallel world size from trainer "
+                f"GPUs/topology: num_gpus={num_gpus}, tp={tp}, cp={cp}, pp={pp}"
+            )
+        return max(num_gpus // denominator, 1)
+
+    async def resolve_global_grad_accumulation_sequences(
+        self,
+        config: types.TrainConfig,
+    ) -> int:
+        if config.grad_accumulation_sequences is not None:
+            return int(config.grad_accumulation_sequences)
+        return self._data_parallel_world_size()
 
     def _megatron_runtime_paths(self) -> tuple[str, str, str]:
         runtime_dir = Path(self.output_dir) / "megatron_runtime"
@@ -664,6 +711,8 @@ class MegatronService:
         env["MODEL_IDENTIFIER"] = self.base_model
         if self._allow_unvalidated_arch:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
+        if self._model_uses_expert_replay():
+            env["ART_MEGATRON_ENABLE_MOE_ROUTING_REPLAY"] = "1"
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
         env[OFFLOAD_BETWEEN_JOBS_ENV] = "0" if self.is_dedicated else "1"

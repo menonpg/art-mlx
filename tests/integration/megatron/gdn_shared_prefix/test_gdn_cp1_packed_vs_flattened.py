@@ -4,7 +4,6 @@ import torch
 
 from .cases import default_phase0_cases
 from .metrics import (
-    GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_MISMATCH_THRESHOLD,
     MEAN_ABS_PCT_THRESHOLD,
     mean_abs_pct,
@@ -18,6 +17,8 @@ from .oracles import (
     run_toy_physical_stream,
 )
 from .packed_layout import build_phase0_packed_tensors
+
+TOY_ORACLE_DTYPE = torch.float32
 
 
 def test_toy_stateful_oracle_matches_flattened_grad_accumulation() -> None:
@@ -34,7 +35,7 @@ def test_toy_stateful_oracle_matches_flattened_grad_accumulation() -> None:
         len(case.rows),
         case.sequence_length,
         config.hidden_size,
-        dtype=GDN_CORRECTNESS_DTYPE,
+        dtype=TOY_ORACLE_DTYPE,
     )
 
     metrics = compare_toy_packed_to_flattened(
@@ -61,7 +62,7 @@ def test_toy_stateful_oracle_matches_flattened_grad_accumulation() -> None:
         "random_all_real_tokens": (
             torch.randn(
                 hidden.shape,
-                dtype=GDN_CORRECTNESS_DTYPE,
+                dtype=TOY_ORACLE_DTYPE,
                 generator=torch.Generator().manual_seed(4321),
             )
             * _expanded_output_mask(real_mask, config.hidden_size)
@@ -96,7 +97,7 @@ def test_toy_stateful_oracle_rejects_physical_stream() -> None:
         len(case.rows),
         case.sequence_length,
         config.hidden_size,
-        dtype=GDN_CORRECTNESS_DTYPE,
+        dtype=TOY_ORACLE_DTYPE,
     )
 
     packed = run_toy_packed(
@@ -120,9 +121,7 @@ def test_toy_stateful_oracle_rejects_physical_stream() -> None:
 
 def _expanded_output_mask(mask: torch.Tensor, hidden_size: int) -> torch.Tensor:
     return (
-        mask.unsqueeze(-1)
-        .expand(*mask.shape, hidden_size)
-        .to(dtype=GDN_CORRECTNESS_DTYPE)
+        mask.unsqueeze(-1).expand(*mask.shape, hidden_size).to(dtype=TOY_ORACLE_DTYPE)
     )
 
 

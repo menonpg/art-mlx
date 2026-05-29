@@ -31,8 +31,10 @@ from .cases import (  # noqa: E402
 from .distributed_grad import all_reduce_parameter_grads_coalesced  # noqa: E402
 from .metrics import (  # noqa: E402
     GDN_CORRECTNESS_DTYPE,
-    MEAN_ABS_PCT_THRESHOLD,
+    REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
+    REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
     assert_mean_abs_pct,
+    assert_scalar_loss_close,
     parameter_grad_mean_abs_pct_with_name,
 )
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
@@ -302,12 +304,13 @@ def _assert_cp_matches_reference(
     all_reduce_parameter_grads_coalesced(cp_gdn)
     torch.cuda.synchronize()
     flat_ref_out = ref_out.detach().transpose(0, 1).reshape(-1, ref_out.shape[-1])
-    assert_mean_abs_pct(ref_loss, cp_loss, f"{name}:loss")
+    assert_scalar_loss_close(ref_loss, cp_loss, f"{name}:loss")
     if int(local_index.numel()) != 0:
         assert_mean_abs_pct(
             flat_ref_out.index_select(0, local_index),
             cp_out.detach().squeeze(1),
             f"{name}:output",
+            threshold=REAL_GDN_OUTPUT_MEAN_ABS_PCT_THRESHOLD,
         )
         assert local_hidden.grad is not None
         flat_ref_grad = ref_hidden.grad.transpose(0, 1).reshape(
@@ -317,9 +320,10 @@ def _assert_cp_matches_reference(
             flat_ref_grad.index_select(0, local_index),
             local_hidden.grad.squeeze(1),
             f"{name}:hidden_grad",
+            threshold=REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
         )
     param_name, param_pct = parameter_grad_mean_abs_pct_with_name(ref_gdn, cp_gdn)
-    assert param_pct <= MEAN_ABS_PCT_THRESHOLD, f"{name}:{param_name}"
+    assert param_pct <= REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD, f"{name}:{param_name}"
     torch.cuda.synchronize()
 
 

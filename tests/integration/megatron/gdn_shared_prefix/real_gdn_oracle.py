@@ -31,6 +31,7 @@ class RealGdnOracleMetrics(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     loss_mean_abs_pct: float
+    loss_abs_diff: float
     output_mean_abs_pct: float
     hidden_grad_mean_abs_pct: float
     param_grad_mean_abs_pct: float
@@ -86,6 +87,9 @@ def compare_real_gdn_cp1_to_flattened(
 
     return RealGdnOracleMetrics(
         loss_mean_abs_pct=mean_abs_pct(flat_loss.detach(), packed_loss.detach()),
+        loss_abs_diff=float(
+            (flat_loss.detach().float() - packed_loss.detach().float()).abs()
+        ),
         output_mean_abs_pct=mean_abs_pct(flat_out.detach(), packed_out.detach()),
         hidden_grad_mean_abs_pct=mean_abs_pct(
             _require_grad(flat_hidden), _require_grad(packed_hidden)
@@ -128,6 +132,9 @@ def compare_real_gdn_cp1_to_flattened_with_output_grad(
 
     return RealGdnOracleMetrics(
         loss_mean_abs_pct=mean_abs_pct(flat_loss.detach(), packed_loss.detach()),
+        loss_abs_diff=float(
+            (flat_loss.detach().float() - packed_loss.detach().float()).abs()
+        ),
         output_mean_abs_pct=mean_abs_pct(flat_out.detach(), packed_out.detach()),
         hidden_grad_mean_abs_pct=mean_abs_pct(
             _require_grad(flat_hidden), _require_grad(packed_hidden)
