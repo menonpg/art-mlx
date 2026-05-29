@@ -452,6 +452,7 @@ def _run_hf_sft_step(
 ]:
     _debug("loading HF model")
     model = _load_hf_model(base_model=base_model, num_layers=num_layers, device=device)
+    _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
     route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
@@ -502,6 +503,22 @@ def _run_hf_sft_step(
         torch.cuda.empty_cache()
     _debug("finished HF step")
     return output_vector, scalar_loss, grads, routing_replay_bundle
+
+
+def _install_hf_qwen35_gdn_fp32_reference(model: Any, *, base_model: str) -> None:
+    model_key = base_model.lower()
+    if "qwen3.5" not in model_key and "qwen3_5" not in model_key:
+        return
+    patched = 0
+    for module in model.modules():
+        module_impl = sys.modules.get(type(module).__module__)
+        torch_impl = getattr(module_impl, "torch_chunk_gated_delta_rule", None)
+        if torch_impl is None or not hasattr(module, "chunk_gated_delta_rule"):
+            continue
+        module.chunk_gated_delta_rule = torch_impl
+        patched += 1
+    if patched == 0:
+        raise RuntimeError("Qwen3.5 HF parity found no GDN modules to patch")
 
 
 def _build_megatron_runtime(

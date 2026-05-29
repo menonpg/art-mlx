@@ -153,28 +153,33 @@ def test_qwen35_moe_layout_exports_vllm_3d_without_rank_rewrite() -> None:
         "out_proj",
         "experts",
     ]
-    assert set(vllm_tensors) == {
-        f"{vllm_prefix}.base_layer.lora_A.weight",
-        f"{vllm_prefix}.base_layer.lora_B.weight",
-        f"{vllm_prefix}.lora_A.weight",
-        f"{vllm_prefix}.lora_B.weight",
-    }
-    assert vllm_tensors[f"{vllm_prefix}.base_layer.lora_A.weight"].shape == (
-        num_experts * rank,
-        hidden,
-    )
-    assert vllm_tensors[f"{vllm_prefix}.base_layer.lora_B.weight"].shape == (
-        2 * intermediate,
-        num_experts * rank,
-    )
-    assert vllm_tensors[f"{vllm_prefix}.lora_A.weight"].shape == (
-        num_experts * rank,
-        intermediate,
-    )
-    assert vllm_tensors[f"{vllm_prefix}.lora_B.weight"].shape == (
-        hidden,
-        num_experts * rank,
-    )
+    expected_keys: set[str] = set()
+    for expert in range(num_experts):
+        for module in ("gate_proj", "up_proj", "down_proj"):
+            for lora in ("lora_A", "lora_B"):
+                expected_keys.add(f"{vllm_prefix}.{expert}.{module}.{lora}.weight")
+    assert set(vllm_tensors) == expected_keys
+    for expert in range(num_experts):
+        assert vllm_tensors[
+            f"{vllm_prefix}.{expert}.gate_proj.lora_A.weight"
+        ].shape == (rank, hidden)
+        assert vllm_tensors[
+            f"{vllm_prefix}.{expert}.gate_proj.lora_B.weight"
+        ].shape == (intermediate, rank)
+        assert vllm_tensors[f"{vllm_prefix}.{expert}.up_proj.lora_A.weight"].shape == (
+            rank,
+            hidden,
+        )
+        assert vllm_tensors[f"{vllm_prefix}.{expert}.up_proj.lora_B.weight"].shape == (
+            intermediate,
+            rank,
+        )
+        assert vllm_tensors[
+            f"{vllm_prefix}.{expert}.down_proj.lora_A.weight"
+        ].shape == (rank, intermediate)
+        assert vllm_tensors[
+            f"{vllm_prefix}.{expert}.down_proj.lora_B.weight"
+        ].shape == (hidden, rank)
     roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
         vllm_tensors,
         adapter_config=vllm_config,

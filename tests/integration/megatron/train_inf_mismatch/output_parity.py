@@ -816,16 +816,21 @@ def _run_logits(
 ) -> Any:
     import torch
 
-    from art.megatron.flex_attn.attention import create_shared_prefix_attention_state
+    from art.megatron.shared_prefix_state import create_shared_prefix_state
 
     device = next(runtime.model[0].parameters()).device
     input_ids = packed_tensors["tokens"].to(device=device)
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
-    attention_state = create_shared_prefix_attention_state(
+    attention_state = create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        build_gdn_execution_spec=bool(
+            getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        attention_head_dim=getattr(runtime.provider, "kv_channels", None),
+        attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
     )
     with torch.no_grad():
         logits = runtime.model[0](

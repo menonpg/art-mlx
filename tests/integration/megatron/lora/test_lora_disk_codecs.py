@@ -528,11 +528,20 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         _save_adapter(adapter_dir, vllm_tensors, vllm_config)
         loaded_modules = _assert_stock_vllm_loads(
             adapter_dir,
-            expected_modules=set(vllm_config["target_modules"]),
+            expected_modules={
+                "q_proj",
+                "experts.0.gate_proj",
+                "experts.0.up_proj",
+                "experts.0.down_proj",
+                "experts.1.gate_proj",
+                "experts.1.up_proj",
+                "experts.1.down_proj",
+            },
             mapper="qwen35",
         )
-        assert "language_model.model.layers.0.mlp.experts" in loaded_modules
-        assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+        assert "language_model.model.layers.0.mlp.experts.0.gate_proj" in loaded_modules
+        assert "language_model.model.layers.0.mlp.experts.0.up_proj" in loaded_modules
+        assert "language_model.model.layers.0.mlp.experts.0.down_proj" in loaded_modules
 
 
 def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
@@ -730,11 +739,16 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
     final_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     loaded_modules = _assert_stock_vllm_loads(
         adapter_dir,
-        expected_modules=set(final_config["target_modules"]),
+        expected_modules={
+            "experts.0.gate_proj",
+            "experts.0.up_proj",
+            "experts.0.down_proj",
+        },
         mapper="qwen35",
     )
-    assert "language_model.model.layers.0.mlp.experts" in loaded_modules
-    assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+    assert "language_model.model.layers.0.mlp.experts.0.gate_proj" in loaded_modules
+    assert "language_model.model.layers.0.mlp.experts.0.up_proj" in loaded_modules
+    assert "language_model.model.layers.0.mlp.experts.0.down_proj" in loaded_modules
 
 
 def test_lora_publish_keeps_same_key_shards_separate():
