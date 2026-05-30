@@ -107,7 +107,7 @@ from art.megatron.training.sft_batches import load_sft_batch_from_disk
 from art.megatron.training.trace import (
     attach_trace_token_uids,
     context_parallel_trace_token_uids_enabled,
-    set_replay_local_input_token_uids,
+    prepare_replay_local_input_token_uids,
 )
 from art.megatron.training.weight_offload import WeightOffloadManager
 from art.megatron.weights.lora_publish import save_vllm_lora_from_model
@@ -1039,9 +1039,10 @@ def run_megatron_sft_step(
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
-        set_replay_local_input_token_uids(
+        prepare_replay_local_input_token_uids(
             moe_routing_replay_controller,
             prepared_micro.local_token_uids,
+            prepared_micro.attention_state,
         )
         with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
             per_token_loss: torch.Tensor = model_chunks[0](
@@ -1216,9 +1217,10 @@ def run_training_step(
         cp_gdn_rank_plan_cache_hits += int(
             prepared_micro.context_parallel_gdn_rank_plan_cache_hit
         )
-        set_replay_local_input_token_uids(
+        prepare_replay_local_input_token_uids(
             moe_routing_replay_controller,
             prepared_micro.local_token_uids,
+            prepared_micro.attention_state,
         )
 
         model_forward_kwargs = dict(

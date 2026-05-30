@@ -1015,7 +1015,7 @@ def _score_context_parallel_once(
     from art.megatron.training.microbatches import _prepare_current_rl_micro
     from art.megatron.training.trace import (
         attach_trace_token_uids,
-        set_replay_local_input_token_uids,
+        prepare_replay_local_input_token_uids,
     )
 
     model_chunks = cast(list[Any], runtime.model)
@@ -1039,9 +1039,10 @@ def _score_context_parallel_once(
     )
     if pending is not None:
         raise RuntimeError("CP train/inf scoring unexpectedly returned lookahead state")
-    set_replay_local_input_token_uids(
+    prepare_replay_local_input_token_uids(
         runtime.moe_routing_replay_controller,
         prepared_micro.local_token_uids,
+        prepared_micro.attention_state,
     )
     with (
         torch.no_grad(),

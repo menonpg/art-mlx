@@ -321,6 +321,7 @@ def test_controller_uses_native_router_replay_target_indices() -> None:
     controller.install_router_patches([chunk])
     controller.set_step(step_index=0, sample_index=[0])
     controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.arange(4, dtype=torch.int64))
     _probs, routing_map = router.routing(torch.randn((4, 3), dtype=torch.float32))
 
     expected_map = torch.zeros((4, 3), dtype=torch.bool)
@@ -380,11 +381,13 @@ def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
     controller.set_step(step_index=0, sample_index=[0, 1])
 
     controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.arange(2, dtype=torch.int64))
     _probs, routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
     _probs, recompute_routing_map = router.routing(
         torch.randn((2, 3), dtype=torch.float32)
     )
     controller.begin_micro(1, 1)
+    controller.set_local_input_token_uids(torch.arange(2, dtype=torch.int64))
     _probs, next_routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
 
     calls = bundle.steps[0].routers[bundle.router_keys[0]].calls

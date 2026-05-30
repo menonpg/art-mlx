@@ -76,18 +76,41 @@ def flatten_local_token_uids(
     )
 
 
-def set_replay_local_input_token_uids(
+def prepare_replay_local_input_token_uids(
     moe_routing_replay_controller: Any | None,
     token_uids: torch.Tensor | None,
+    attention_state: Any | None = None,
 ) -> None:
     if moe_routing_replay_controller is None or not hasattr(
         moe_routing_replay_controller,
-        "set_local_input_token_uids",
+        "prepare_micro_targets",
     ):
         return
-    moe_routing_replay_controller.set_local_input_token_uids(
-        flatten_local_token_uids(token_uids)
+    token_uid_sets = _routing_replay_token_uid_sets(
+        token_uids,
+        attention_state=attention_state,
     )
+    moe_routing_replay_controller.prepare_micro_targets(token_uid_sets)
+
+
+def _routing_replay_token_uid_sets(
+    token_uids: torch.Tensor | None,
+    *,
+    attention_state: Any | None,
+) -> dict[str, torch.Tensor | None]:
+    plan = getattr(attention_state, "gdn_execution_plan", None)
+    if plan is not None:
+        return {
+            "attention": torch.tensor(
+                tuple(getattr(plan, "attention_token_indices")),
+                dtype=torch.int64,
+            ),
+            "gdn": torch.tensor(
+                tuple(getattr(plan, "gdn_token_indices")),
+                dtype=torch.int64,
+            ),
+        }
+    return {"attention": flatten_local_token_uids(token_uids)}
 
 
 def _set_root_output_trace_token_uids(

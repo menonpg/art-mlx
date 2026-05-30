@@ -1173,7 +1173,7 @@ def _enter_gdn_island_layout(
         if _layout_token_uids_enabled()
         else None
     )
-    _set_active_routing_replay_token_uids(token_uids)
+    _set_active_routing_replay_layout("gdn")
     return _attach_cp_layout(
         _attach_gdn_attention_original_shape(
             _attach_trace_token_uids(gdn_hidden, token_uids),
@@ -1216,7 +1216,7 @@ def _mark_attention_layout_active(
         if _layout_token_uids_enabled()
         else None
     )
-    _set_active_routing_replay_token_uids(token_uids)
+    _set_active_routing_replay_layout("attention")
     _attach_trace_token_uids(hidden_states, token_uids)
     _attach_cp_layout(hidden_states, "attention")
 
@@ -1241,7 +1241,7 @@ def _mark_gdn_layout_active(
         if _layout_token_uids_enabled()
         else None
     )
-    _set_active_routing_replay_token_uids(gdn_token_uids)
+    _set_active_routing_replay_layout("gdn")
     _attach_trace_token_uids(hidden_states, gdn_token_uids)
     _attach_cp_layout(hidden_states, "gdn")
 
@@ -1274,7 +1274,7 @@ def _leave_gdn_island_layout(
         if _layout_token_uids_enabled()
         else None
     )
-    _set_active_routing_replay_token_uids(token_uids)
+    _set_active_routing_replay_layout("attention")
     return _attach_cp_layout(
         _attach_trace_token_uids(attention_hidden, token_uids), "attention"
     )
@@ -1663,13 +1663,13 @@ def _layout_token_uids_enabled() -> bool:
     )
 
 
-def _set_active_routing_replay_token_uids(token_uids: Tensor | None) -> Tensor | None:
+def _set_active_routing_replay_layout(
+    layout: Literal["attention", "gdn"],
+) -> None:
     controller = _active_routing_replay_controller()
-    if controller is None or not hasattr(controller, "set_local_input_token_uids"):
-        return None
-    previous = getattr(controller, "_explicit_local_input_token_uids", None)
-    controller.set_local_input_token_uids(token_uids)
-    return previous
+    if controller is None:
+        return
+    controller.set_active_token_uid_key(layout)
 
 
 def _validate_gdn_hidden_for_cp_plan(
