@@ -34,9 +34,9 @@ def packed_sequence_token_uids(
     *,
     device: torch.device,
 ) -> torch.Tensor:
+    del device
     return torch.arange(
         int(micro["tokens"].shape[1]),
-        device=device,
         dtype=torch.int64,
     ).unsqueeze(0)
 
@@ -46,18 +46,17 @@ def sft_sequence_token_uids(
     *,
     device: torch.device,
 ) -> torch.Tensor:
+    del device
     attention_mask = inputs["attention_mask"].reshape(-1)
     actual_len = max(int(attention_mask.sum().item()), 1)
     total_tokens = int(inputs["input_ids"].numel())
     token_uids = torch.full(
         (1, total_tokens),
         -1,
-        device=device,
         dtype=torch.int64,
     )
     token_uids[:, :actual_len] = torch.arange(
         actual_len,
-        device=device,
         dtype=torch.int64,
     ).unsqueeze(0)
     return token_uids

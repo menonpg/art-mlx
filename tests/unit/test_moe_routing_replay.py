@@ -344,6 +344,7 @@ def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
     controller.set_step(step_index=0, sample_index=[0])
     controller.begin_micro(0, 0)
     controller.set_local_input_token_uids(torch.tensor([3, 1], dtype=torch.int64))
+    assert replay.targets_seen == []
     _probs, routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
 
     expected_indices = route.expert_indices.index_select(
@@ -352,8 +353,7 @@ def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
     expected_map = torch.zeros((2, 3), dtype=torch.bool)
     rows = torch.arange(2).unsqueeze(1)
     expected_map[rows, expected_indices.to(torch.long)] = True
-    _assert_target(replay, route.expert_indices, index=0)
-    _assert_target(replay, expected_indices, index=1)
+    _assert_target(replay, expected_indices, index=0)
     assert torch.equal(routing_map.cpu(), expected_map)
 
     controller.finalize_step()
@@ -389,7 +389,8 @@ def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
 
     calls = bundle.steps[0].routers[bundle.router_keys[0]].calls
     _assert_target(replay, calls[0].expert_indices, index=0)
-    _assert_target(replay, calls[1].expert_indices, index=1)
+    _assert_target(replay, calls[0].expert_indices, index=1)
+    _assert_target(replay, calls[1].expert_indices, index=2)
     assert torch.equal(routing_map.cpu(), _expected_routing_map(calls[0]))
     assert torch.equal(recompute_routing_map.cpu(), _expected_routing_map(calls[0]))
     assert torch.equal(next_routing_map.cpu(), _expected_routing_map(calls[1]))

@@ -2480,9 +2480,7 @@ def dispatch_megatron_context_parallel_training_tensors(
         if local_ref_logprobs is None
         else _to_target_device(local_ref_logprobs, target_device),
         loss_all_reduce_group=cp_group,
-        token_uids=None
-        if local_token_uids is None
-        else _to_target_device(local_token_uids, target_device),
+        token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
     )
 
 
