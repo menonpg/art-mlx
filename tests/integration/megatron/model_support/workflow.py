@@ -157,6 +157,7 @@ def _inspect_architecture_for_workflow(
     # of inheriting visible GPU count and tripping model-specific TP limits.
     with _temporary_env(
         ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE="1",
+        ART_MEGATRON_CONTEXT_PARALLEL_SIZE="1",
         ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE="1",
         ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE="1",
     ):

@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 from art.megatron.model_support.spec import (
@@ -10,6 +11,7 @@ from .workflow import (
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
+    _inspect_architecture_for_workflow,
     assess_minimal_layer_coverage,
     build_all_architectures_validation_report,
     build_validation_report,
@@ -45,6 +47,40 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-27B",
     ]
+
+
+def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) -> None:
+    seen_env: dict[str, str | None] = {}
+
+    def _inspect_architecture(base_model: str, **kwargs) -> ArchitectureReport:
+        del kwargs
+        seen_env.update(
+            {
+                "tp": os.environ.get("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE"),
+                "cp": os.environ.get("ART_MEGATRON_CONTEXT_PARALLEL_SIZE"),
+                "ep": os.environ.get("ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE"),
+                "etp": os.environ.get("ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE"),
+            }
+        )
+        return ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_dense",
+            handler_key="qwen3_dense",
+            layer_families=[LayerFamilyInstance(key="standard_attention", count=1)],
+            recommended_min_layers=1,
+        )
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        _inspect_architecture,
+    )
+
+    _inspect_architecture_for_workflow(
+        "Qwen/Qwen3-32B",
+        allow_unvalidated_arch=True,
+    )
+
+    assert seen_env == {"tp": "1", "cp": "1", "ep": "1", "etp": "1"}
 
 
 def test_build_all_architectures_validation_report_stops_on_failure(
