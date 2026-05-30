@@ -18,6 +18,7 @@ from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
 )
 from art.megatron.gdn.operator import run_gdn_layer  # noqa: E402
 
+from .metrics import stable_output_mse_loss  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
 from .real_gdn_oracle import (  # noqa: E402
     run_real_gdn_flattened_reference,
@@ -93,6 +94,7 @@ def _packed_vs_flattened_worker(
             )
             real_mask = (group_ids != -1).transpose(0, 1).unsqueeze(-1)
             output_grad = output_grad * real_mask
+            loss_denominator = real_mask.expand_as(output_grad).sum()
             flat_hidden = hidden.clone().detach().requires_grad_(True)
             flat_out = run_real_gdn_flattened_reference(
                 flat_gdn,
@@ -101,7 +103,12 @@ def _packed_vs_flattened_worker(
                 parent_ids=parent_ids,
                 execution_spec=spec,
             )
-            flat_loss = (flat_out * output_grad).sum()
+            flat_loss = stable_output_mse_loss(
+                flat_out,
+                output_grad,
+                mask=real_mask,
+                denominator=loss_denominator,
+            )
             flat_loss.backward()
 
             hidden_flat = hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
@@ -130,7 +137,11 @@ def _packed_vs_flattened_worker(
                 execution_plan=plan,
                 cp_group=torch.distributed.group.WORLD,
             )
-            cp_loss = (cp_out * local_output_grad).sum()
+            cp_loss = stable_output_mse_loss(
+                cp_out,
+                local_output_grad,
+                denominator=loss_denominator,
+            )
             cp_loss.backward()
             _assert_cp_matches_reference(
                 case.name,

@@ -23,6 +23,7 @@ from art.megatron.gdn.operator import (
 from .metrics import (
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
+    stable_output_mse_loss,
 )
 from .parser_import import parse_gdn_shared_prefix_segments
 
@@ -125,8 +126,20 @@ def compare_real_gdn_cp1_to_flattened_with_output_grad(
         parent_ids=parent_ids,
     )
 
-    packed_loss = (packed_out * output_grad).sum()
-    flat_loss = (flat_out * output_grad).sum()
+    real_mask = (group_ids != -1).transpose(0, 1).unsqueeze(-1)
+    loss_denominator = real_mask.expand_as(output_grad).sum()
+    packed_loss = stable_output_mse_loss(
+        packed_out,
+        output_grad,
+        mask=real_mask,
+        denominator=loss_denominator,
+    )
+    flat_loss = stable_output_mse_loss(
+        flat_out,
+        output_grad,
+        mask=real_mask,
+        denominator=loss_denominator,
+    )
     packed_loss.backward()
     flat_loss.backward()
 

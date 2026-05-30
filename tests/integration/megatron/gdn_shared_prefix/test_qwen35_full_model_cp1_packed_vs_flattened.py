@@ -37,6 +37,7 @@ from .metrics import (
     assert_mean_abs_pct,
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
+    stable_output_mse_loss,
 )
 from .packed_layout import build_phase0_packed_tensors
 from .parser_import import parse_gdn_shared_prefix_segments
@@ -202,7 +203,13 @@ def _assert_logits_vjp_equivalence(
         generator=torch.Generator(device=packed_logits.device).manual_seed(20280425),
     )
     output_grad = output_grad * shifted_assistant_mask.unsqueeze(-1) * 0.1
-    packed_loss = (packed_logits * output_grad).sum()
+    loss_denominator = shifted_assistant_mask.unsqueeze(-1).expand_as(output_grad).sum()
+    packed_loss = stable_output_mse_loss(
+        packed_logits,
+        output_grad,
+        mask=shifted_assistant_mask.unsqueeze(-1),
+        denominator=loss_denominator,
+    )
     packed_loss.backward()
 
     flat_loss_sum: torch.Tensor | None = None
@@ -236,11 +243,24 @@ def _assert_logits_vjp_equivalence(
                 parent_ids=torch.zeros_like(ref_tokens),
             )
             ref_output_grad = torch.zeros_like(ref_logits)
+            ref_output_mask = torch.zeros(
+                ref_logits.shape[:2],
+                device=ref_logits.device,
+                dtype=torch.bool,
+            )
             if completion.length > 1:
                 ref_output_grad[
                     :, prefix.length : prefix.length + completion.length - 1
                 ] = output_grad[row : row + 1, completion.start : completion.end - 1]
-            ref_loss = (ref_logits * ref_output_grad).sum()
+                ref_output_mask[
+                    :, prefix.length : prefix.length + completion.length - 1
+                ] = True
+            ref_loss = stable_output_mse_loss(
+                ref_logits,
+                ref_output_grad,
+                mask=ref_output_mask.unsqueeze(-1),
+                denominator=loss_denominator,
+            )
             ref_loss.backward()
             flat_loss_sum = (
                 ref_loss.detach()
@@ -263,7 +283,7 @@ def _assert_logits_vjp_equivalence(
     grad_name, grad_pct = parameter_grad_mean_abs_pct_with_name(
         flat_model, packed_model
     )
-    assert_mean_abs_pct(flat_loss_sum, packed_loss.detach(), "vjp_loss")
+    assert_mean_abs_pct(flat_loss_sum, packed_loss.detach(), "stable_loss")
     assert logits_mean_abs_pct <= MEAN_ABS_PCT_THRESHOLD
     assert grad_pct <= MEAN_ABS_PCT_THRESHOLD, grad_name
 

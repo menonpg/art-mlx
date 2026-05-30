@@ -36,6 +36,7 @@ from .metrics import (  # noqa: E402
     assert_mean_abs_pct,
     assert_scalar_loss_close,
     parameter_grad_mean_abs_pct_with_name,
+    stable_output_mse_loss,
 )
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
 from .real_gdn_oracle import zero_parameter_grads  # noqa: E402
@@ -153,6 +154,7 @@ def _assert_case_matches_cp1(
     hidden, output_grad = _hidden_and_grad(case, seed=seed)
     real_mask = (group_ids != -1).transpose(0, 1).unsqueeze(-1)
     output_grad = output_grad * real_mask
+    loss_denominator = real_mask.expand_as(output_grad).sum()
     ref_hidden = hidden.clone().detach().requires_grad_(True)
     ref_out, _ = run_gdn_layer(
         ref_gdn,
@@ -160,7 +162,12 @@ def _assert_case_matches_cp1(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
-    ref_loss = (ref_out * output_grad).sum()
+    ref_loss = stable_output_mse_loss(
+        ref_out,
+        output_grad,
+        mask=real_mask,
+        denominator=loss_denominator,
+    )
     ref_loss.backward()
 
     flat_hidden = hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
@@ -185,7 +192,11 @@ def _assert_case_matches_cp1(
         execution_plan=plan,
         cp_group=torch.distributed.group.WORLD,
     )
-    cp_loss = (cp_out * local_output_grad).sum()
+    cp_loss = stable_output_mse_loss(
+        cp_out,
+        local_output_grad,
+        denominator=loss_denominator,
+    )
     cp_loss.backward()
     _assert_cp_matches_reference(
         case.name,
@@ -233,7 +244,9 @@ def _assert_sibling_order_matches_cp1(
         planner_config=GdnPlannerConfig(),
     )
     hidden, output_grad = _hidden_and_grad(case, seed=20520426 + cp_size)
-    output_grad = output_grad * (group_ids != -1).transpose(0, 1).unsqueeze(-1)
+    real_mask = (group_ids != -1).transpose(0, 1).unsqueeze(-1)
+    output_grad = output_grad * real_mask
+    loss_denominator = real_mask.expand_as(output_grad).sum()
     swapped_hidden = _swap_siblings(hidden)
     swapped_grad = _swap_siblings(output_grad)
 
@@ -244,7 +257,12 @@ def _assert_sibling_order_matches_cp1(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
-    ref_loss = (ref_out * output_grad).sum()
+    ref_loss = stable_output_mse_loss(
+        ref_out,
+        output_grad,
+        mask=real_mask,
+        denominator=loss_denominator,
+    )
     ref_loss.backward()
 
     flat_hidden = swapped_hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
@@ -269,7 +287,11 @@ def _assert_sibling_order_matches_cp1(
         execution_plan=plan,
         cp_group=torch.distributed.group.WORLD,
     )
-    cp_loss = (cp_out * local_output_grad).sum()
+    cp_loss = stable_output_mse_loss(
+        cp_out,
+        local_output_grad,
+        denominator=loss_denominator,
+    )
     cp_loss.backward()
     expected_out = _swap_siblings(ref_out)
     assert ref_hidden.grad is not None

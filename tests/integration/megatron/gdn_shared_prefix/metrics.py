@@ -52,6 +52,26 @@ def assert_scalar_loss_close(
     assert pct <= threshold, f"{name}: mean_abs_pct={pct:.6g}% > {threshold}%"
 
 
+def stable_output_mse_loss(
+    output: Tensor,
+    target: Tensor,
+    *,
+    mask: Tensor | None = None,
+    denominator: Tensor | None = None,
+) -> Tensor:
+    diff = output.float() - target.float()
+    if mask is not None:
+        diff = diff * mask.to(device=diff.device, dtype=diff.dtype)
+        if denominator is None:
+            denominator = (
+                mask.to(device=diff.device, dtype=diff.dtype).expand_as(diff).sum()
+            )
+    if denominator is None:
+        denominator = diff.new_tensor(float(diff.numel()))
+    denominator = denominator.to(device=diff.device, dtype=diff.dtype)
+    return diff.square().sum() / (denominator + 1e-18)
+
+
 def assert_real_gdn_metrics(metrics: Any, name: str) -> None:
     assert metrics.loss_mean_abs_pct <= REAL_GDN_LOSS_MEAN_ABS_PCT_THRESHOLD, (
         f"{name}: loss_mean_abs_pct={metrics.loss_mean_abs_pct:.6g}% > "

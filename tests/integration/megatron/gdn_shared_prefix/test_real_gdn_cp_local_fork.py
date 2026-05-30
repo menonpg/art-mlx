@@ -17,6 +17,7 @@ from .metrics import (
     assert_mean_abs_pct,
     assert_scalar_loss_close,
     parameter_grad_mean_abs_pct_with_name,
+    stable_output_mse_loss,
 )
 from .packed_layout import build_phase0_packed_tensors
 from .real_gdn_oracle import (
@@ -72,6 +73,7 @@ def test_real_qwen35_gdn_cp_local_fork_matches_cp1(cp_size: int) -> None:
                 )
                 * real_token_mask
             )
+            loss_denominator = real_token_mask.expand_as(output_grad).sum()
             cp1_hidden = hidden_states.clone().detach().requires_grad_(True)
             local_hidden = hidden_states.clone().detach().requires_grad_(True)
 
@@ -94,8 +96,18 @@ def test_real_qwen35_gdn_cp_local_fork_matches_cp1(cp_size: int) -> None:
                     )
                 ),
             )
-            cp1_loss = (cp1_out * output_grad).sum()
-            local_loss = (local_out * output_grad).sum()
+            cp1_loss = stable_output_mse_loss(
+                cp1_out,
+                output_grad,
+                mask=real_token_mask,
+                denominator=loss_denominator,
+            )
+            local_loss = stable_output_mse_loss(
+                local_out,
+                output_grad,
+                mask=real_token_mask,
+                denominator=loss_denominator,
+            )
             cp1_loss.backward()
             local_loss.backward()
 

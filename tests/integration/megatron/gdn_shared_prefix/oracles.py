@@ -7,7 +7,11 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from .metrics import mean_abs_pct, parameter_grad_mean_abs_pct_with_name
+from .metrics import (
+    mean_abs_pct,
+    parameter_grad_mean_abs_pct_with_name,
+    stable_output_mse_loss,
+)
 from .parser_import import parse_gdn_shared_prefix_segments
 
 
@@ -245,8 +249,25 @@ def compare_toy_packed_to_flattened_with_output_grad(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
-    packed_loss = (packed_out * output_grad).sum()
-    flat_loss = (flat_out * output_grad).sum()
+    real_mask = group_ids != -1
+    real_mask = (
+        real_mask.unsqueeze(-1)
+        if output_grad.shape[:2] == real_mask.shape
+        else real_mask.transpose(0, 1).unsqueeze(-1)
+    )
+    loss_denominator = real_mask.expand_as(output_grad).sum()
+    packed_loss = stable_output_mse_loss(
+        packed_out,
+        output_grad,
+        mask=real_mask,
+        denominator=loss_denominator,
+    )
+    flat_loss = stable_output_mse_loss(
+        flat_out,
+        output_grad,
+        mask=real_mask,
+        denominator=loss_denominator,
+    )
     packed_loss.backward()
     flat_loss.backward()
 

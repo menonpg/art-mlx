@@ -23,6 +23,7 @@ from .metrics import (
     assert_scalar_loss_close,
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
+    stable_output_mse_loss,
 )
 from .packed_layout import build_phase0_packed_tensors
 from .real_gdn_oracle import (
@@ -81,6 +82,7 @@ def test_real_qwen35_gdn_chunk_native_reference_matches_cp1(cp_size: int) -> Non
                 )
                 * real_token_mask
             )
+            loss_denominator = real_token_mask.expand_as(output_grad).sum()
             cp1_hidden = hidden_states.clone().detach().requires_grad_(True)
             chunk_hidden = hidden_states.clone().detach().requires_grad_(True)
             cp1_out, _ = gdn_shared_prefix_forward(
@@ -95,8 +97,18 @@ def test_real_qwen35_gdn_chunk_native_reference_matches_cp1(cp_size: int) -> Non
                 group_ids=group_ids,
                 parent_ids=parent_ids,
             )
-            cp1_loss = (cp1_out * output_grad).sum()
-            chunk_loss = (chunk_out * output_grad).sum()
+            cp1_loss = stable_output_mse_loss(
+                cp1_out,
+                output_grad,
+                mask=real_token_mask,
+                denominator=loss_denominator,
+            )
+            chunk_loss = stable_output_mse_loss(
+                chunk_out,
+                output_grad,
+                mask=real_token_mask,
+                denominator=loss_denominator,
+            )
             cp1_loss.backward()
             chunk_loss.backward()
 
@@ -240,6 +252,7 @@ def test_real_qwen35_gdn_cp_chain_detached_prefix_state_loses_gradients() -> Non
             )
             * suffix_mask
         )
+        loss_denominator = suffix_mask.expand_as(output_grad).sum()
         cp1_hidden = hidden_states.clone().detach().requires_grad_(True)
         bad_hidden = hidden_states.clone().detach().requires_grad_(True)
 
@@ -257,8 +270,18 @@ def test_real_qwen35_gdn_cp_chain_detached_prefix_state_loses_gradients() -> Non
             cp_size=4,
             mutation="detach_prefix_state",
         )
-        cp1_loss = (cp1_out * output_grad).sum()
-        bad_loss = (bad_out * output_grad).sum()
+        cp1_loss = stable_output_mse_loss(
+            cp1_out,
+            output_grad,
+            mask=suffix_mask,
+            denominator=loss_denominator,
+        )
+        bad_loss = stable_output_mse_loss(
+            bad_out,
+            output_grad,
+            mask=suffix_mask,
+            denominator=loss_denominator,
+        )
         cp1_loss.backward()
         bad_loss.backward()
 
@@ -381,6 +404,7 @@ def test_real_qwen35_gdn_mixed_local_fork_and_chain_matches_cp1(
             )
             * real_token_mask
         )
+        loss_denominator = real_token_mask.expand_as(output_grad).sum()
         cp1_hidden = hidden_states.clone().detach().requires_grad_(True)
         mixed_hidden = hidden_states.clone().detach().requires_grad_(True)
 
@@ -398,8 +422,18 @@ def test_real_qwen35_gdn_mixed_local_fork_and_chain_matches_cp1(
             cp_size=cp_size,
             local_fork_max_tokens=16,
         )
-        cp1_loss = (cp1_out * output_grad).sum()
-        mixed_loss = (mixed_out * output_grad).sum()
+        cp1_loss = stable_output_mse_loss(
+            cp1_out,
+            output_grad,
+            mask=real_token_mask,
+            denominator=loss_denominator,
+        )
+        mixed_loss = stable_output_mse_loss(
+            mixed_out,
+            output_grad,
+            mask=real_token_mask,
+            denominator=loss_denominator,
+        )
         cp1_loss.backward()
         mixed_loss.backward()
 
