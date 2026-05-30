@@ -361,6 +361,47 @@ def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
     controller.remove_router_patches()
 
 
+def test_controller_switches_prestaged_layout_targets() -> None:
+    bundle, route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    controller.prepare_micro_targets(
+        {
+            "attention": torch.tensor([0, 1], dtype=torch.int64),
+            "gdn": torch.tensor([3, 1], dtype=torch.int64),
+        }
+    )
+    assert replay.targets_seen == []
+
+    _probs, attention_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+    controller.set_active_token_uid_key("gdn")
+    _probs, gdn_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+
+    attention_indices = route.expert_indices.index_select(
+        0, torch.tensor([0, 1], dtype=torch.long)
+    )
+    gdn_indices = route.expert_indices.index_select(
+        0, torch.tensor([3, 1], dtype=torch.long)
+    )
+    _assert_target(replay, attention_indices, index=0)
+    _assert_target(replay, gdn_indices, index=1)
+    assert torch.equal(
+        attention_map.cpu(), _expected_routing_map(_make_route([[0, 2], [1, 0]]))
+    )
+    assert torch.equal(
+        gdn_map.cpu(), _expected_routing_map(_make_route([[1, 0], [1, 0]]))
+    )
+
+    controller.finalize_step()
+    controller.remove_router_patches()
+
+
 def test_controller_finalize_fails_when_unconsumed_calls_remain() -> None:
     bundle, _route = _make_bundle()
     controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
