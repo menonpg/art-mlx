@@ -21,6 +21,7 @@ from .output_parity import (
     compare_topk,
     config_from_env,
     fwd_mean_abs_pct_limit_for_model,
+    logical_logit_uids,
     top20_kl_candidate_to_target_limit_for_model,
 )
 from .real_path import RealPathConfig, _delete_adapter_safetensors_on_pass
@@ -52,6 +53,40 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
         3,
         4,
     ]
+
+
+def test_logical_logit_uids_follow_cp_valid_token_order() -> None:
+    packed = {
+        "tokens": torch.tensor(
+            [
+                [10, 11, 12, 13, 14, 12, 15, 16],
+                [20, 21, 22, 23, 24, 22, 25, 0],
+            ]
+        ),
+        "group_ids": torch.tensor(
+            [
+                [0, 0, 1, 1, 1, 2, 2, 2],
+                [0, 0, 1, 1, 1, 2, 2, -1],
+            ]
+        ),
+        "parent_ids": torch.tensor(
+            [
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, -1],
+            ]
+        ),
+    }
+    logical_map = build_logical_token_map(packed)
+
+    assert logical_logit_uids(
+        packed_tensors=packed,
+        logical_tokens=logical_map.tokens,
+    ) == [2, 3, 5, 6, 10, 11, 13]
+    assert logical_logit_uids(
+        packed_tensors={key: value[1:2] for key, value in packed.items()},
+        logical_tokens=[token for token in logical_map.tokens if token.sample_id == 1],
+        sample_id_to_row={1: 0},
+    ) == [2, 3, 5]
 
 
 def test_aggregate_mean_abs_pct_uses_vllm_merge_formula() -> None:
@@ -258,8 +293,11 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     import subprocess
 
     captured_env = {}
+    original_run = subprocess.run
 
     def fake_run(*args, **kwargs):
+        if "env" not in kwargs:
+            return original_run(*args, **kwargs)
         captured_env.update(kwargs["env"])
         return subprocess.CompletedProcess(
             args=args,

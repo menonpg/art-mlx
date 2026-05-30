@@ -45,6 +45,7 @@ from .output_parity import (
     compare_topk,
     fwd_mean_abs_pct_limit_for_model,
     model_support_is_moe,
+    score_context_parallel_runtime,
     top20_kl_candidate_to_target_limit_for_model,
 )
 
@@ -483,9 +484,6 @@ async def _score_base_real_generation_path(
 ) -> RealPathBaseDiagnosticBundle:
     import art
     from art.megatron.backend import MegatronBackend
-    from art.megatron.routing_replay import (
-        build_moe_routing_replay_bundle_from_packed_tensors,
-    )
     from art.preprocessing.moe_routing import MoeRoutingPackStats
     from art.preprocessing.pack import packed_tensors_to_dir
 
@@ -580,8 +578,9 @@ async def _score_base_real_generation_path(
     global_grad_accumulation_sequences = int(packed_tensors["tokens"].shape[0])
     if is_moe:
         routing_replay_dir = artifact_dir / "real_path_base_moe_routing_replay"
-        build_moe_routing_replay_bundle_from_packed_tensors(
+        _build_real_path_moe_routing_replay_bundle(
             packed_tensors=packed_tensors,
+            config=parity_config,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         ).to_dir(routing_replay_dir)
         routing_replay_path = str(routing_replay_dir)
@@ -655,6 +654,154 @@ def _move_adapter_to_step_zero(*, adapter_path: str, model: Any, backend: Any) -
     return step_zero
 
 
+def _routing_topology_from_config(config: TrainInfOutputParityConfig) -> Any:
+    from art.megatron.routing_replay import ParallelTopology
+
+    return ParallelTopology(
+        tp=config.topology.tp,
+        ep=config.topology.ep,
+        etp=config.topology.etp,
+        dp=config.topology.dp,
+        sp=config.topology.tp > 1,
+        cp=config.topology.cp,
+        pp=config.topology.pp,
+    )
+
+
+def _sample_tensors(packed_tensors: Any, sample_index: int) -> Any:
+    import torch
+
+    return {
+        key: (
+            value[sample_index : sample_index + 1]
+            if isinstance(value, torch.Tensor)
+            and value.shape[:1] == packed_tensors["tokens"].shape[:1]
+            else value
+        )
+        for key, value in packed_tensors.items()
+    }
+
+
+def _cp_rank_token_uids_for_sample(
+    *,
+    packed_tensors: Any,
+    sample_index: int,
+    config: TrainInfOutputParityConfig,
+) -> list[Any]:
+    import torch
+
+    from art.megatron.context_parallel.runtime import prepare_cp_micro
+    from art.megatron.context_parallel.types import (
+        ContextParallelConfig,
+        ParallelTopology,
+    )
+
+    if config.topology.tp != 1:
+        raise RuntimeError(
+            "train/inf CP routing replay layout currently expects tp=1; "
+            f"got tp={config.topology.tp}"
+        )
+    topology = ParallelTopology(
+        tp=config.topology.tp,
+        cp=config.topology.cp,
+        dp=config.topology.dp,
+        pp=config.topology.pp,
+        sp=False,
+    )
+    sample = _sample_tensors(packed_tensors, sample_index)
+    rank_uids = []
+    for cp_rank in range(config.topology.cp):
+        prepared = prepare_cp_micro(
+            micro=sample,
+            topology=topology,
+            config=ContextParallelConfig(),
+            cp_group=None,
+            cp_rank=cp_rank,
+            build_gdn_execution_spec=False,
+            trace_token_uids=True,
+            prepare_execution_state=False,
+            target_device=torch.device("cpu"),
+        )
+        token_uids = prepared.tensors.token_uids
+        if token_uids is None:
+            raise RuntimeError("CP routing replay layout requires token_uids")
+        flat = token_uids.reshape(-1).to(dtype=torch.long)
+        rank_uids.append(flat[flat >= 0].contiguous())
+    return rank_uids
+
+
+def _apply_cp_route_layout(
+    *,
+    bundle: Any,
+    packed_tensors: Any,
+    config: TrainInfOutputParityConfig,
+) -> Any:
+    import torch
+
+    from art.megatron.routing_replay import RouterCallRoute
+
+    if config.topology.cp <= 1:
+        return bundle
+    rank_uids_by_sample = {
+        sample_index: _cp_rank_token_uids_for_sample(
+            packed_tensors=packed_tensors,
+            sample_index=sample_index,
+            config=config,
+        )
+        for sample_index in range(int(packed_tensors["tokens"].shape[0]))
+    }
+    for step_routes in bundle.steps.values():
+        for router_routes in step_routes.routers.values():
+            for call_index, route in list(router_routes.calls.items()):
+                if route.sample_index is None:
+                    continue
+                rank_uids = rank_uids_by_sample[int(route.sample_index)]
+                local_routes = [
+                    route.expert_indices.index_select(0, uids) for uids in rank_uids
+                ]
+                expert_indices = torch.cat(local_routes, dim=0)
+                router_routes.calls[call_index] = RouterCallRoute(
+                    expert_indices=expert_indices,
+                    expert_probs=None
+                    if route.expert_probs is None
+                    else torch.cat(
+                        [
+                            route.expert_probs.index_select(0, uids)
+                            for uids in rank_uids
+                        ],
+                        dim=0,
+                    ),
+                    expert_mask=torch.ones_like(expert_indices, dtype=torch.bool),
+                    num_experts=route.num_experts,
+                    sample_index=route.sample_index,
+                    micro_slot=route.micro_slot,
+                    rank_token_counts=tuple(int(uids.numel()) for uids in rank_uids),
+                )
+    return bundle
+
+
+def _build_real_path_moe_routing_replay_bundle(
+    *,
+    packed_tensors: Any,
+    config: TrainInfOutputParityConfig,
+    global_grad_accumulation_sequences: int,
+) -> Any:
+    from art.megatron.routing_replay import (
+        build_moe_routing_replay_bundle_from_packed_tensors,
+    )
+
+    bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+        packed_tensors=packed_tensors,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        topology=_routing_topology_from_config(config),
+    )
+    return _apply_cp_route_layout(
+        bundle=bundle,
+        packed_tensors=packed_tensors,
+        config=config,
+    )
+
+
 def _make_nonzero_adapter(
     *,
     config: TrainInfOutputParityConfig,
@@ -716,6 +863,58 @@ def _run_logits_with_replay(
         )
         runtime.moe_routing_replay_controller.finalize_step()
     return torch.cat(logits_by_sample, dim=0)
+
+
+def _score_megatron_runtime(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+    logical_map: LogicalTokenMap,
+    weight_state: WeightState,
+    global_grad_accumulation_sequences: int,
+    forward_trace_capture: Any | None,
+    forward_trace_dir: str | None,
+) -> ScoreBundle:
+    from megatron.core import parallel_state as ps
+    import torch
+
+    if int(ps.get_context_parallel_world_size()) > 1:
+        if forward_trace_capture is not None or forward_trace_dir is not None:
+            if forward_trace_capture is not None:
+                forward_trace_capture.close()
+            raise RuntimeError(
+                "CP train/inf mismatch scoring uses sparse UID records, not gathered "
+                "full logits, so forward trace logits capture is unsupported here."
+            )
+        return score_context_parallel_runtime(
+            runtime=runtime,
+            packed_tensors=packed_tensors,
+            logical_map=logical_map,
+            weight_state=weight_state,
+            rollout_mode="native_lora",
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+
+    try:
+        logits = _run_logits_with_replay(
+            runtime=runtime,
+            packed_tensors=packed_tensors,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        if forward_trace_capture is not None and forward_trace_dir is not None:
+            trace_dir = Path(forward_trace_dir)
+            forward_trace_capture.save_current_step(trace_dir)
+            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
+    finally:
+        if forward_trace_capture is not None:
+            forward_trace_capture.close()
+    return _extract_scores_from_logits(
+        logits=logits,
+        logical_map=logical_map,
+        side="megatron",
+        weight_state=weight_state,
+        rollout_mode="native_lora",
+    )
 
 
 def _real_path_megatron_worker(
@@ -826,25 +1025,14 @@ def _real_path_megatron_worker(
             0,
             list(range(int(packed_tensors["tokens"].shape[0]))),
         )
-    try:
-        logits = _run_logits_with_replay(
-            runtime=runtime,
-            packed_tensors=cast(dict[str, Any], packed_tensors),
-            global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
-        )
-        if forward_trace_capture is not None and request.forward_trace_dir is not None:
-            trace_dir = Path(request.forward_trace_dir)
-            forward_trace_capture.save_current_step(trace_dir)
-            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
-    finally:
-        if forward_trace_capture is not None:
-            forward_trace_capture.close()
-    score = _extract_scores_from_logits(
-        logits=logits,
+    score = _score_megatron_runtime(
+        runtime=runtime,
+        packed_tensors=cast(dict[str, Any], packed_tensors),
         logical_map=logical_map,
-        side="megatron",
         weight_state=request.weight_state,
-        rollout_mode="native_lora",
+        global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
+        forward_trace_capture=forward_trace_capture,
+        forward_trace_dir=request.forward_trace_dir,
     )
 
     if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
@@ -946,9 +1134,6 @@ async def run_real_path_train_inf_mismatch(
 ) -> RealPathTrainInfReport:
     import art
     from art.megatron.backend import MegatronBackend
-    from art.megatron.routing_replay import (
-        build_moe_routing_replay_bundle_from_packed_tensors,
-    )
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
@@ -1020,8 +1205,9 @@ async def run_real_path_train_inf_mismatch(
         global_grad_accumulation_sequences = int(packed_tensors["tokens"].shape[0])
         routing_replay_path: str | None = None
         if is_moe:
-            build_moe_routing_replay_bundle_from_packed_tensors(
+            _build_real_path_moe_routing_replay_bundle(
                 packed_tensors=packed_tensors,
+                config=parity_config,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             ).to_dir(routing_replay_dir)
             routing_replay_path = str(routing_replay_dir)
