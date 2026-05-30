@@ -694,9 +694,11 @@ class MoeRoutingReplayController:
         self._local_router_keys: set[str] = set()
         self._router_bindings: dict[str, dict[str, Any]] = {}
         self._preloaded_targets: dict[tuple[str, int], torch.Tensor] = {}
+        self._router_prepared_target_keys: dict[str, tuple[int, int]] = {}
         self._target_buffers: dict[str, torch.Tensor] = {}
         self._explicit_local_input_token_uids: torch.Tensor | None = None
         self._last_router_local_input_token_uids: torch.Tensor | None = None
+        self._explicit_uid_generation: int = 0
 
     def _target_device(self) -> torch.device:
         if self._device is not None:
@@ -814,6 +816,7 @@ class MoeRoutingReplayController:
         if local_token_uids is None:
             self._explicit_local_input_token_uids = None
             self._last_router_local_input_token_uids = None
+            self._explicit_uid_generation += 1
             return
         if local_token_uids.device.type != "cpu":
             raise RuntimeError(
@@ -824,6 +827,7 @@ class MoeRoutingReplayController:
             local_token_uids.detach().to(dtype=torch.int64).contiguous().reshape(-1)
         )
         self._last_router_local_input_token_uids = self._explicit_local_input_token_uids
+        self._explicit_uid_generation += 1
 
     def set_step(
         self,
@@ -847,6 +851,7 @@ class MoeRoutingReplayController:
         self._active_micro_order = None
         self._active_step_routes = step_routes
         self._preloaded_targets = {}
+        self._router_prepared_target_keys = {}
         self._router_call_cursors = {}
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
@@ -866,6 +871,7 @@ class MoeRoutingReplayController:
         )
         self._explicit_local_input_token_uids = None
         self._last_router_local_input_token_uids = None
+        self._explicit_uid_generation += 1
 
         for router_key in sorted(self._local_router_keys):
             if router_key not in step_routes.routers:
@@ -935,11 +941,13 @@ class MoeRoutingReplayController:
         self._router_last_call_keys = {}
         self._router_reuse_counts = {}
         self._preloaded_targets = {}
+        self._router_prepared_target_keys = {}
         self._global_uid_to_row_index = {}
         self._global_uid_dense_start = None
         self._global_uid_count = 0
         self._explicit_local_input_token_uids = None
         self._last_router_local_input_token_uids = None
+        self._explicit_uid_generation += 1
 
     @staticmethod
     def _clear_native_router_replay_state() -> None:
@@ -1214,6 +1222,14 @@ class MoeRoutingReplayController:
                 f"router='{router_key}', expected={call_indices[0]}, "
                 f"actual={call_index}"
             )
+        target_key = (
+            call_index,
+            self._explicit_uid_generation
+            if self._explicit_local_input_token_uids is not None
+            else -1,
+        )
+        if self._router_prepared_target_keys.get(router_key) == target_key:
+            return
         target = self._target_for_router_call(
             router_key=router_key,
             call_index=call_index,
@@ -1225,6 +1241,7 @@ class MoeRoutingReplayController:
         router_replay.set_router_replay_action(
             _router_replay_classes()[1].REPLAY_FORWARD
         )
+        self._router_prepared_target_keys[router_key] = target_key
 
     def _preload_target(self, router_key: str, call_index: int) -> None:
         key = (router_key, call_index)

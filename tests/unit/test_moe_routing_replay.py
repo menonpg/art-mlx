@@ -389,8 +389,7 @@ def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
 
     calls = bundle.steps[0].routers[bundle.router_keys[0]].calls
     _assert_target(replay, calls[0].expert_indices, index=0)
-    _assert_target(replay, calls[0].expert_indices, index=1)
-    _assert_target(replay, calls[1].expert_indices, index=2)
+    _assert_target(replay, calls[1].expert_indices, index=1)
     assert torch.equal(routing_map.cpu(), _expected_routing_map(calls[0]))
     assert torch.equal(recompute_routing_map.cpu(), _expected_routing_map(calls[0]))
     assert torch.equal(next_routing_map.cpu(), _expected_routing_map(calls[1]))
