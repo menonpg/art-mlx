@@ -333,6 +333,33 @@ def test_controller_uses_native_router_replay_target_indices() -> None:
     controller.remove_router_patches()
 
 
+def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
+    bundle, route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.tensor([3, 1], dtype=torch.int64))
+    _probs, routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+
+    expected_indices = route.expert_indices.index_select(
+        0, torch.tensor([3, 1], dtype=torch.long)
+    )
+    expected_map = torch.zeros((2, 3), dtype=torch.bool)
+    rows = torch.arange(2).unsqueeze(1)
+    expected_map[rows, expected_indices.to(torch.long)] = True
+    _assert_target(replay, route.expert_indices, index=0)
+    _assert_target(replay, expected_indices, index=1)
+    assert torch.equal(routing_map.cpu(), expected_map)
+
+    controller.finalize_step()
+    controller.remove_router_patches()
+
+
 def test_controller_finalize_fails_when_unconsumed_calls_remain() -> None:
     bundle, _route = _make_bundle()
     controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")

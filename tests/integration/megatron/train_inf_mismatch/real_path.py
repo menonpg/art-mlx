@@ -668,118 +668,6 @@ def _routing_topology_from_config(config: TrainInfOutputParityConfig) -> Any:
     )
 
 
-def _sample_tensors(packed_tensors: Any, sample_index: int) -> Any:
-    import torch
-
-    return {
-        key: (
-            value[sample_index : sample_index + 1]
-            if isinstance(value, torch.Tensor)
-            and value.shape[:1] == packed_tensors["tokens"].shape[:1]
-            else value
-        )
-        for key, value in packed_tensors.items()
-    }
-
-
-def _cp_rank_token_uids_for_sample(
-    *,
-    packed_tensors: Any,
-    sample_index: int,
-    config: TrainInfOutputParityConfig,
-) -> list[Any]:
-    import torch
-
-    from art.megatron.context_parallel.runtime import prepare_cp_micro
-    from art.megatron.context_parallel.types import (
-        ContextParallelConfig,
-        ParallelTopology,
-    )
-
-    if config.topology.tp != 1:
-        raise RuntimeError(
-            "train/inf CP routing replay layout currently expects tp=1; "
-            f"got tp={config.topology.tp}"
-        )
-    topology = ParallelTopology(
-        tp=config.topology.tp,
-        cp=config.topology.cp,
-        dp=config.topology.dp,
-        pp=config.topology.pp,
-        sp=False,
-    )
-    sample = _sample_tensors(packed_tensors, sample_index)
-    rank_uids = []
-    for cp_rank in range(config.topology.cp):
-        prepared = prepare_cp_micro(
-            micro=sample,
-            topology=topology,
-            config=ContextParallelConfig(),
-            cp_group=None,
-            cp_rank=cp_rank,
-            build_gdn_execution_spec=False,
-            trace_token_uids=True,
-            prepare_execution_state=False,
-            target_device=torch.device("cpu"),
-        )
-        token_uids = prepared.tensors.token_uids
-        if token_uids is None:
-            raise RuntimeError("CP routing replay layout requires token_uids")
-        flat = token_uids.reshape(-1).to(dtype=torch.long)
-        rank_uids.append(flat[flat >= 0].contiguous())
-    return rank_uids
-
-
-def _apply_cp_route_layout(
-    *,
-    bundle: Any,
-    packed_tensors: Any,
-    config: TrainInfOutputParityConfig,
-) -> Any:
-    import torch
-
-    from art.megatron.routing_replay import RouterCallRoute
-
-    if config.topology.cp <= 1:
-        return bundle
-    rank_uids_by_sample = {
-        sample_index: _cp_rank_token_uids_for_sample(
-            packed_tensors=packed_tensors,
-            sample_index=sample_index,
-            config=config,
-        )
-        for sample_index in range(int(packed_tensors["tokens"].shape[0]))
-    }
-    for step_routes in bundle.steps.values():
-        for router_routes in step_routes.routers.values():
-            for call_index, route in list(router_routes.calls.items()):
-                if route.sample_index is None:
-                    continue
-                rank_uids = rank_uids_by_sample[int(route.sample_index)]
-                local_routes = [
-                    route.expert_indices.index_select(0, uids) for uids in rank_uids
-                ]
-                expert_indices = torch.cat(local_routes, dim=0)
-                router_routes.calls[call_index] = RouterCallRoute(
-                    expert_indices=expert_indices,
-                    expert_probs=None
-                    if route.expert_probs is None
-                    else torch.cat(
-                        [
-                            route.expert_probs.index_select(0, uids)
-                            for uids in rank_uids
-                        ],
-                        dim=0,
-                    ),
-                    expert_mask=torch.ones_like(expert_indices, dtype=torch.bool),
-                    num_experts=route.num_experts,
-                    sample_index=route.sample_index,
-                    micro_slot=route.micro_slot,
-                    rank_token_counts=tuple(int(uids.numel()) for uids in rank_uids),
-                )
-    return bundle
-
-
 def _build_real_path_moe_routing_replay_bundle(
     *,
     packed_tensors: Any,
@@ -790,15 +678,10 @@ def _build_real_path_moe_routing_replay_bundle(
         build_moe_routing_replay_bundle_from_packed_tensors,
     )
 
-    bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+    return build_moe_routing_replay_bundle_from_packed_tensors(
         packed_tensors=packed_tensors,
         global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         topology=_routing_topology_from_config(config),
-    )
-    return _apply_cp_route_layout(
-        bundle=bundle,
-        packed_tensors=packed_tensors,
-        config=config,
     )
 
 

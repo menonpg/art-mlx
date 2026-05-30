@@ -687,10 +687,13 @@ class MoeRoutingReplayController:
         self._router_last_call_indices: dict[str, int] = {}
         self._router_last_call_keys: dict[str, tuple[str, int] | None] = {}
         self._router_reuse_counts: dict[str, int] = {}
+        self._global_uid_to_row_index: dict[int, int] = {}
         self._local_router_keys: set[str] = set()
         self._router_bindings: dict[str, dict[str, Any]] = {}
         self._preloaded_targets: dict[tuple[str, int], torch.Tensor] = {}
         self._target_buffers: dict[str, torch.Tensor] = {}
+        self._explicit_local_input_token_uids: torch.Tensor | None = None
+        self._last_router_local_input_token_uids: torch.Tensor | None = None
 
     def _target_device(self) -> torch.device:
         if self._device is not None:
@@ -790,6 +793,22 @@ class MoeRoutingReplayController:
                 _router_replay_classes()[1].REPLAY_FORWARD
             )
 
+    def set_local_input_token_uids(
+        self,
+        local_token_uids: torch.Tensor | None,
+    ) -> None:
+        if local_token_uids is None:
+            self._explicit_local_input_token_uids = None
+            self._last_router_local_input_token_uids = None
+            return
+        self._explicit_local_input_token_uids = _to_tensor_cpu_contiguous(
+            local_token_uids, dtype=torch.int64
+        ).reshape(-1)
+        self._last_router_local_input_token_uids = self._explicit_local_input_token_uids
+        if self._active_step_routes is None or self._active_micro_order is None:
+            return
+        self._refresh_explicit_native_targets()
+
     def set_step(
         self,
         *,
@@ -817,6 +836,12 @@ class MoeRoutingReplayController:
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
         self._router_reuse_counts = {}
+        self._global_uid_to_row_index = {
+            int(uid.item()): row_index
+            for row_index, uid in enumerate(step_routes.global_token_uids)
+        }
+        self._explicit_local_input_token_uids = None
+        self._last_router_local_input_token_uids = None
 
         for router_key in sorted(self._local_router_keys):
             if router_key not in step_routes.routers:
@@ -888,6 +913,9 @@ class MoeRoutingReplayController:
         self._router_last_call_keys = {}
         self._router_reuse_counts = {}
         self._preloaded_targets = {}
+        self._global_uid_to_row_index = {}
+        self._explicit_local_input_token_uids = None
+        self._last_router_local_input_token_uids = None
 
     @staticmethod
     def _clear_native_router_replay_state() -> None:
@@ -1149,6 +1177,19 @@ class MoeRoutingReplayController:
         router_key: str,
         call_index: int,
     ) -> torch.Tensor:
+        if self._explicit_local_input_token_uids is not None:
+            target = self._explicit_target_for_router_call(
+                router_key=router_key,
+                call_index=call_index,
+            )
+            topk = int(self._router_bindings[router_key]["topk"])
+            if int(target.shape[1]) != topk:
+                raise RuntimeError(
+                    "Routing replay explicit target topk mismatch at router call: "
+                    f"router='{router_key}', call={call_index}, "
+                    f"target_topk={int(target.shape[1])}, router_topk={topk}"
+                )
+            return target
         key = (router_key, call_index)
         if key not in self._preloaded_targets:
             raise RuntimeError(
@@ -1165,6 +1206,81 @@ class MoeRoutingReplayController:
                 f"target_topk={int(target.shape[1])}, router_topk={topk}"
             )
         return target
+
+    def _refresh_explicit_native_targets(self) -> None:
+        if self._explicit_local_input_token_uids is None:
+            return
+        for router_key in sorted(self._local_router_keys):
+            call_indices = self._active_micro_call_indices(router_key)
+            if not call_indices:
+                continue
+            if len(call_indices) != 1:
+                raise RuntimeError(
+                    "Routing replay expected exactly one active router call while "
+                    f"refreshing explicit token uids for router='{router_key}', "
+                    f"got {call_indices}"
+                )
+            target = self._target_for_router_call(
+                router_key=router_key,
+                call_index=call_indices[0],
+            )
+            router_replay = self._router_bindings[router_key]["router_replay"]
+            router_replay.set_target_indices(
+                self._copy_into_stable_target_buffer(router_key, target)
+            )
+            router_replay.set_router_replay_action(
+                _router_replay_classes()[1].REPLAY_FORWARD
+            )
+
+    def _explicit_target_for_router_call(
+        self,
+        *,
+        router_key: str,
+        call_index: int,
+    ) -> torch.Tensor:
+        if self._active_step_routes is None:
+            raise RuntimeError("Routing replay explicit target used before set_step")
+        explicit_uids = self._explicit_local_input_token_uids
+        if explicit_uids is None:
+            raise RuntimeError("Routing replay explicit target used without token uids")
+        route = self._active_step_routes.routers[router_key].calls[call_index]
+        local_uids = explicit_uids.reshape(-1).contiguous()
+        target_cpu = torch.empty(
+            (int(local_uids.numel()), route.max_topk),
+            dtype=torch.long,
+        )
+        valid_positions = torch.nonzero(local_uids >= 0, as_tuple=False).reshape(-1)
+        if int(valid_positions.numel()) > 0:
+            try:
+                row_indices = [
+                    self._global_uid_to_row_index[int(uid)]
+                    for uid in local_uids[valid_positions].tolist()
+                ]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "Explicit routing replay token uid is missing from the active "
+                    f"step map: step={self._active_step_index}, "
+                    f"router='{router_key}', call={call_index}, uid={exc.args[0]}"
+                ) from exc
+            target_cpu[valid_positions] = route.expert_indices.index_select(
+                0,
+                torch.tensor(row_indices, dtype=torch.long),
+            ).to(dtype=torch.long)
+        invalid_positions = torch.nonzero(local_uids < 0, as_tuple=False).reshape(-1)
+        if int(invalid_positions.numel()) > 0:
+            target_cpu[invalid_positions] = _synthetic_replay_rows(
+                row_positions=invalid_positions,
+                num_experts=route.num_experts,
+                topk=route.max_topk,
+                dtype=torch.long,
+                seed=(int(self._active_step_index or 0) + 1) * 1_000_003
+                + (call_index + 1) * 97_003,
+            )
+        return target_cpu.to(
+            device=self._target_device(),
+            dtype=torch.long,
+            non_blocking=True,
+        )
 
     def _copy_into_stable_target_buffer(
         self, router_key: str, target: torch.Tensor
