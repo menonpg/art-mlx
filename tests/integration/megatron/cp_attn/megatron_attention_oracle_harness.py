@@ -25,6 +25,10 @@ from .megatron_attention_oracle_worker import (
 
 ATTN_SENSITIVITY_MUTATION_ENV = "ART_ATTN_SENSITIVITY_MUTATIONS"
 ATTN_TOPOLOGY_INDICES_ENV = "ART_ATTN_TOPOLOGY_INDICES"
+# Testing design: the full model oracle remains fp32, while this suite
+# intentionally validates the production bf16 FLASH CP-attention path against a
+# Triton reference backend. Do not change this backend/dtype split or loosen the
+# gate without discussing the oracle coverage tradeoff.
 ATTN_BF16_MEAN_ABS_PCT_THRESHOLD = 2.0
 
 ATTN_SENSITIVITY_MUTATIONS = (

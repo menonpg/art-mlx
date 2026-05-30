@@ -24,6 +24,7 @@ from art.preprocessing.pack import PackedTensors
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
+from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
 from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
     SUPPORTED_SENSITIVITY_MUTATIONS,
@@ -1325,6 +1326,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
     flex_patch_stack.enter_context(
         _apply_test_attention_full_fp32_patch(request.flex_backend)
     )
+    if request.case_config.precision == "fp32":
+        install_megatron_qwen35_gdn_fp32_reference(
+            flex_patch_stack,
+            base_model=request.case_config.base_model,
+        )
 
     with provider_topology_env(request.topology):
         _debug(

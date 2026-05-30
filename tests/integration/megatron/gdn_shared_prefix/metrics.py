@@ -11,9 +11,11 @@ from ..metrics import (
     mean_abs_pct_from_sums,
 )
 
-# FLA/TileLang does not compile the real Qwen3.5 GDN kernels for fp32 here.
-# Production Qwen3.5 GDN runs bf16, so real-GDN correctness tests use bf16
-# relative gates instead of scalar absolute tolerances.
+# Testing design: the full model oracle remains fp32 and uses a narrow torch
+# reference for the Qwen3.5 GDN recurrent math because the current FLA/TileLang
+# stack has no valid fp32 GDN backward path. These real-GDN tests intentionally
+# exercise the production bf16 kernels and CP machinery instead. Do not change
+# this dtype/threshold split without discussing the oracle coverage tradeoff.
 GDN_CORRECTNESS_DTYPE = torch.bfloat16
 MEAN_ABS_PCT_THRESHOLD = DEFAULT_MEAN_ABS_PCT_THRESHOLD
 MEAN_ABS_PCT_MISMATCH_THRESHOLD = 0.1
