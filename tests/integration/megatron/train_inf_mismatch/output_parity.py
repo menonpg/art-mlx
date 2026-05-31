@@ -937,13 +937,15 @@ def _local_score_records_from_logits(
         return {}
     records: dict[int, ScoreRecord] = {}
     log_probs = torch.log_softmax(logits.detach().float(), dim=-1)
-    mask = (labels != -100) & (token_uids >= 0)
+    labels_cpu = labels.detach().to(device="cpu")
+    token_uids_cpu = token_uids.detach().to(device="cpu")
+    mask = (labels_cpu != -100) & (token_uids_cpu >= 0)
     for batch_index, seq_index in torch.nonzero(mask, as_tuple=False).tolist():
-        uid = int(token_uids[batch_index, seq_index].item())
+        uid = int(token_uids_cpu[batch_index, seq_index].item())
         if uid not in desired_uids:
             continue
         row = log_probs[batch_index, seq_index]
-        token_id = int(labels[batch_index, seq_index].item())
+        token_id = int(labels_cpu[batch_index, seq_index].item())
         values, indices = torch.topk(row, TOP_K)
         records[uid] = (
             token_id,
