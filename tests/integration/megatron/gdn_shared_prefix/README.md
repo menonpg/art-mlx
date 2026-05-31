@@ -14,13 +14,8 @@ Implemented layout:
 - `packed_layout.py`: deterministic packed-row generation and segment-DAG assertions.
 - `artifacts.py`: manifest writing with git commit and dirty-state capture.
 - `nsys_profile_tables.py`: nsys SQLite export parser that writes JSON, CSV, and Markdown profile tables.
-- `oracles.py`: CPU toy-state oracle for validating packed-vs-flattened mechanics.
 - `real_gdn_oracle.py`: real Megatron/FLA GDN CP1 packed-vs-flattened and CP reference oracle helpers.
 - `src/art/megatron/gdn/layout.py`: reusable CP boundary token-layout plan for attention-order to GDN-order exchange.
-- `parser_import.py`: direct source import for CPU parser tests without Megatron extras.
-- `test_segment_dag.py`: parser, malformed-input, and generated-case coverage.
-- `test_gdn_cp_layout.py`: CP2/CP4/CP8 layout/all-to-all roundtrip reference, including gradients and empty ranks.
-- `test_gdn_cp1_packed_vs_flattened.py`: CPU toy-state CP1 oracle and known-bad physical-stream sensitivity.
 - `test_real_gdn_cp1_packed_vs_flattened.py`: CUDA real-GDN CP1 oracle and physical-stream sensitivity.
 - `test_real_gdn_tp_lora.py`: CUDA real-GDN LoRA gradient and TP2 gradient oracle coverage.
 - `test_real_gdn_cp_chain.py`: CP chain reference, boundary-state, and known-bad mutation coverage. This is a semantic reference until native FLA CP summary scan supports ART parent-state injection and final-state emission.
@@ -39,12 +34,9 @@ Expected future layout:
 - `configs/`: frozen config snapshots.
 - `scratch/`: run artifacts for validation and benchmark outputs.
 
-Current CPU checks:
+Current checks:
 
 ```
-env -u VIRTUAL_ENV uv run pytest tests/integration/megatron/gdn_shared_prefix/test_segment_dag.py
-env -u VIRTUAL_ENV uv run pytest tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_layout.py
-env -u VIRTUAL_ENV uv run pytest tests/integration/megatron/gdn_shared_prefix/test_gdn_cp1_packed_vs_flattened.py
 env -u VIRTUAL_ENV uv run pytest tests/integration/megatron/gdn_shared_prefix/test_real_gdn_cp1_packed_vs_flattened.py
 env -u VIRTUAL_ENV uv run pytest tests/integration/megatron/gdn_shared_prefix/test_real_gdn_tp_lora.py
 env -u VIRTUAL_ENV uv run pytest tests/integration/megatron/gdn_shared_prefix/test_qwen35_full_model_cp1_packed_vs_flattened.py
