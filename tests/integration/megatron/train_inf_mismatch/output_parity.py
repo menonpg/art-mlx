@@ -851,6 +851,11 @@ def _run_logits(
     import torch
 
     from art.megatron.shared_prefix_state import create_shared_prefix_state
+    from art.megatron.training.trace import (
+        packed_sequence_token_uids,
+        prepare_replay_local_input_token_uids,
+    )
+    from art.preprocessing.pack import PackedTensors
 
     device = next(runtime.model[0].parameters()).device
     input_ids = packed_tensors["tokens"].to(device=device)
@@ -865,6 +870,11 @@ def _run_logits(
         ),
         attention_head_dim=getattr(runtime.provider, "kv_channels", None),
         attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
+    )
+    prepare_replay_local_input_token_uids(
+        runtime.moe_routing_replay_controller,
+        packed_sequence_token_uids(cast(PackedTensors, packed_tensors), device=device),
+        attention_state,
     )
     with torch.no_grad():
         logits = runtime.model[0](

@@ -23,6 +23,7 @@ from art.megatron.routing_replay import (
 from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
 )
+from art.megatron.training.trace import prepare_replay_local_input_token_uids
 from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
 
@@ -724,6 +725,11 @@ def _run_megatron_sft_step(
             device=device,
             provider=runtime.provider,
             model_support_handler=runtime.model_support_handler,
+        )
+        prepare_replay_local_input_token_uids(
+            runtime.moe_routing_replay_controller,
+            prepared_micro.local_token_uids,
+            prepared_micro.attention_state,
         )
         attention_mask = megatron_train._placeholder_attention_mask(device)
         forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
