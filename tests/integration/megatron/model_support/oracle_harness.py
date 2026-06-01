@@ -1775,12 +1775,9 @@ class VariantRunner:
         return bool(output_rows) and all(row.pass_signal for row in output_rows)
 
     @classmethod
-    def _router_scores_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
+    def _router_scores_pass(cls, rows: list[MetricRow], step_index: int) -> bool:
         router_rows = cls._step_phase_rows(rows, step_index, "router_scores")
-        return bool(router_rows) and all(
-            row.pass_signal and row.relative_l2 == 0.0 and row.mean_abs_pct == 0.0
-            for row in router_rows
-        )
+        return bool(router_rows) and all(row.pass_signal for row in router_rows)
 
     @classmethod
     def _router_topk_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
@@ -1801,7 +1798,7 @@ class VariantRunner:
         gate_by_step = {
             step: (
                 cls._outputs_for_step_pass(rows, step)
-                and cls._router_scores_exact(rows, step)
+                and cls._router_scores_pass(rows, step)
                 and cls._router_topk_exact(rows, step)
             )
             for step in steps
@@ -2094,7 +2091,9 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
         minimums=non_zero_scales,
     )
     router_scores_rule = MetricThresholdRule(
-        limits={"relative_l2": 0.0, "mean_abs_pct": 0.0}
+        # RouterReplay replays top-k ids; probabilities are gathered from the
+        # candidate router scores and can differ by normal fp32 CP trace noise.
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT}
     )
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay
