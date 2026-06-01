@@ -724,6 +724,22 @@ class ForwardTraceCapture:
         if total_rows == 0 or int(primary_output.shape[0]) != total_rows:
             return [trace_item]
 
+        valid_rows = torch.nonzero(row_token_uids >= 0, as_tuple=False).reshape(-1)
+        if int(valid_rows.numel()) == 0:
+            return []
+        if int(valid_rows.numel()) != total_rows:
+            trace_item = {
+                key: cls._slice_row_aligned_value(
+                    value,
+                    row_indices=valid_rows,
+                    total_rows=total_rows,
+                )
+                for key, value in trace_item.items()
+                if key not in {"call_index", "micro_sample_index", "row_token_uids"}
+            }
+            row_token_uids = row_token_uids.index_select(0, valid_rows)
+            total_rows = int(row_token_uids.numel())
+
         trace_item["row_token_uids"] = row_token_uids
         if uid_span is None:
             return [trace_item]
