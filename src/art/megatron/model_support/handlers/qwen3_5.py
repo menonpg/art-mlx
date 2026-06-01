@@ -30,6 +30,7 @@ _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "flex_token_dispatch_combine",
+    "moe_routed_experts_compute",
     "te_triton_permute_with_mask_map",
 )
 _QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
