@@ -32,7 +32,6 @@ from .segment_layout import (
 
 _NVTX_ENABLED: ContextVar[bool] = ContextVar("art_gdn_nvtx_enabled", default=False)
 _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR = "_art_gdn_attention_original_shape"
-_GDN_CP_LAYOUT_ATTR = "_art_gdn_cp_layout"
 _GDN_TRACE_TOKEN_UID_HOOKS: Any | None = None
 
 
@@ -160,16 +159,6 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
 
     boundary = cast(_GdnIslandBoundary, self._art_gdn_island_boundary)
     if not boundary.is_gdn:
-        actual_layout = _infer_cp_hidden_layout(
-            hidden_states,
-            plan,
-            gdn=getattr(attention_bias, "gdn_active_module", None),
-        )
-        if actual_layout == "gdn":
-            raise RuntimeError(
-                "non-GDN TransformerLayer received GDN-layout hidden states; "
-                "the static GDN island boundary map expected attention layout"
-            )
         if getattr(attention_bias, "gdn_hidden_layout", "attention") != "attention":
             _mark_attention_layout_active(attention_bias, hidden_states)
         return original_forward(*args, **kwargs)
@@ -1181,9 +1170,7 @@ def _enter_gdn_island_layout(
 ) -> Tensor:
     plan = _require_gdn_cp_plan(attention_bias)
     if not force and getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn":
-        return _attach_cp_layout(
-            _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn), "gdn"
-        )
+        return _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
     gdn_hidden, original_shape = gdn_cp_attention_to_gdn_layout(
         hidden_states,
         plan,
@@ -1202,12 +1189,9 @@ def _enter_gdn_island_layout(
         else None
     )
     _set_active_routing_replay_layout("gdn")
-    return _attach_cp_layout(
-        _attach_gdn_attention_original_shape(
-            _attach_trace_token_uids(gdn_hidden, token_uids),
-            original_shape,
-        ),
-        "gdn",
+    return _attach_gdn_attention_original_shape(
+        _attach_trace_token_uids(gdn_hidden, token_uids),
+        original_shape,
     )
 
 
@@ -1249,7 +1233,6 @@ def _mark_attention_layout_active(
     )
     _set_active_routing_replay_layout("attention")
     _attach_trace_token_uids(hidden_states, token_uids)
-    _attach_cp_layout(hidden_states, "attention")
 
 
 def _mark_gdn_layout_active(
@@ -1277,7 +1260,6 @@ def _mark_gdn_layout_active(
     )
     _set_active_routing_replay_layout("gdn")
     _attach_trace_token_uids(hidden_states, gdn_token_uids)
-    _attach_cp_layout(hidden_states, "gdn")
 
 
 def _leave_gdn_island_layout(
@@ -1314,9 +1296,7 @@ def _leave_gdn_island_layout(
         else None
     )
     _set_active_routing_replay_layout("attention")
-    return _attach_cp_layout(
-        _attach_trace_token_uids(attention_hidden, token_uids), "attention"
-    )
+    return _attach_trace_token_uids(attention_hidden, token_uids)
 
 
 def _require_gdn_cp_plan(attention_bias: Any) -> GdnRankExecutionPlan:
@@ -1495,48 +1475,6 @@ def _attach_trace_token_uids(tensor: Tensor, token_uids: Tensor | None) -> Tenso
         return tensor
     attach = getattr(hooks, "attach_token_uids", None)
     return tensor if attach is None else cast(Tensor, attach(tensor, token_uids))
-
-
-def _attach_cp_layout(tensor: Tensor, layout: Literal["attention", "gdn"]) -> Tensor:
-    setattr(tensor, _GDN_CP_LAYOUT_ATTR, layout)
-    return tensor
-
-
-def _cp_layout_from_tensor(tensor: Tensor) -> Literal["attention", "gdn"] | None:
-    layout = getattr(tensor, _GDN_CP_LAYOUT_ATTR, None)
-    if layout in ("attention", "gdn"):
-        return cast(Literal["attention", "gdn"], layout)
-    return None
-
-
-def _infer_cp_hidden_layout(
-    hidden_states: Tensor,
-    plan: GdnRankExecutionPlan,
-    *,
-    gdn: Any | None,
-) -> Literal["attention", "gdn"] | None:
-    explicit = _cp_layout_from_tensor(hidden_states)
-    if explicit is not None:
-        return explicit
-    if hidden_states.ndim != 3 or int(hidden_states.shape[1]) != 1:
-        return None
-    token_count = int(hidden_states.shape[0])
-    attention_count = _local_layout_token_count_for_hidden(
-        plan, "attention", hidden_states=hidden_states, gdn=gdn
-    )
-    gdn_count = _local_layout_token_count_for_hidden(
-        plan, "gdn", hidden_states=hidden_states, gdn=gdn
-    )
-    if token_count == attention_count and token_count != gdn_count:
-        return "attention"
-    if token_count == gdn_count and token_count != attention_count:
-        return "gdn"
-    if (
-        token_count == gdn_count
-        and _gdn_attention_original_shape_from_tensor(hidden_states) is not None
-    ):
-        return "gdn"
-    return None
 
 
 def _prepare_in_proj_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
