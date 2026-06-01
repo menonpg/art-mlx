@@ -248,7 +248,7 @@ def _collect_lora_state(
                     raise RuntimeError(
                         f"Duplicate LoRA key while collecting state: {key}"
                     )
-                local_state[key] = value.detach().cpu()
+                local_state[key] = value.detach().cpu().contiguous()
     return _gather_full_state(local_state, local_manifest)
 
 
@@ -276,7 +276,7 @@ def _collect_lora_grads(
                     raise RuntimeError(
                         f"Duplicate LoRA grad key while collecting grads: {key}"
                     )
-                local_grads[key] = value.detach().cpu()
+                local_grads[key] = value.detach().cpu().contiguous()
     return _gather_full_state(local_grads, local_manifest)
 
 
