@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from types import MethodType
-from typing import Any, Callable, Iterator, Literal, Sequence, cast
+from typing import Any, Callable, Iterator, Literal, NamedTuple, Sequence, cast
 
 import torch
 from torch import Tensor
@@ -34,6 +34,13 @@ _NVTX_ENABLED: ContextVar[bool] = ContextVar("art_gdn_nvtx_enabled", default=Fal
 _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR = "_art_gdn_attention_original_shape"
 _GDN_CP_LAYOUT_ATTR = "_art_gdn_cp_layout"
 _GDN_TRACE_TOKEN_UID_HOOKS: Any | None = None
+
+
+class _GdnIslandBoundary(NamedTuple):
+    is_gdn: bool
+    island_id: int | None
+    input_layout: Literal["attention", "gdn"]
+    output_layout: Literal["attention", "gdn"]
 
 
 def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
@@ -69,6 +76,7 @@ def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
     if gated_delta_net_type is None or transformer_layer_type is None:
         return
 
+    next_island_id = 0
     for chunk in model_chunks:
         _install_empty_safe_norm_hooks(chunk)
         layers = [
@@ -77,21 +85,50 @@ def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
             if isinstance(module, transformer_layer_type)
             and hasattr(module, "self_attention")
         ]
-        layer_is_gdn = [
-            isinstance(layer.self_attention, gated_delta_net_type) for layer in layers
-        ]
-        for index, layer in enumerate(layers):
-            is_gdn = layer_is_gdn[index]
-            layer._art_gdn_island_is_gdn = is_gdn
-            layer._art_gdn_island_prev_is_gdn = index > 0 and layer_is_gdn[index - 1]
-            layer._art_gdn_island_next_is_gdn = (
-                index + 1 < len(layers) and layer_is_gdn[index + 1]
-            )
+        boundaries, next_island_id = _build_gdn_island_boundaries(
+            layers,
+            gated_delta_net_type,
+            next_island_id=next_island_id,
+        )
+        for layer, boundary in zip(layers, boundaries, strict=True):
+            layer._art_gdn_island_boundary = boundary
             if getattr(layer, "_art_gdn_island_hooked", False):
                 continue
             layer._art_gdn_island_physical_forward = layer.forward
             layer.forward = MethodType(_gdn_island_layer_forward, layer)
             layer._art_gdn_island_hooked = True
+
+
+def _build_gdn_island_boundaries(
+    layers: Sequence[Any],
+    gated_delta_net_type: type[Any],
+    *,
+    next_island_id: int,
+) -> tuple[list[_GdnIslandBoundary], int]:
+    layer_is_gdn = [
+        isinstance(layer.self_attention, gated_delta_net_type) for layer in layers
+    ]
+    boundaries: list[_GdnIslandBoundary] = []
+    active_island_id: int | None = None
+    for index, is_gdn in enumerate(layer_is_gdn):
+        prev_is_gdn = index > 0 and layer_is_gdn[index - 1]
+        next_is_gdn = index + 1 < len(layer_is_gdn) and layer_is_gdn[index + 1]
+        if is_gdn:
+            if not prev_is_gdn:
+                active_island_id = next_island_id
+                next_island_id += 1
+            boundaries.append(
+                _GdnIslandBoundary(
+                    True,
+                    active_island_id,
+                    "gdn" if prev_is_gdn else "attention",
+                    "gdn" if next_is_gdn else "attention",
+                )
+            )
+        else:
+            active_island_id = None
+            boundaries.append(_GdnIslandBoundary(False, None, "attention", "attention"))
+    return boundaries, next_island_id
 
 
 def _optional_gated_delta_net_type() -> type[Any] | None:
@@ -121,60 +158,49 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     if hidden_states is None:
         return original_forward(*args, **kwargs)
 
-    is_gdn = bool(getattr(self, "_art_gdn_island_is_gdn", False))
-    if not is_gdn:
-        if getattr(attention_bias, "gdn_hidden_layout", "attention") == "gdn":
-            active_gdn = getattr(attention_bias, "gdn_active_module", None)
-            actual_layout = _infer_cp_hidden_layout(hidden_states, plan, gdn=active_gdn)
-            if actual_layout == "attention":
-                _mark_attention_layout_active(
-                    attention_bias, hidden_states, gdn=active_gdn
-                )
-                return original_forward(*args, **kwargs)
-            if actual_layout == "gdn" or _recompute_state_matches_gdn_layout(
-                hidden_states,
-                attention_bias,
-                plan,
-                gdn=active_gdn,
-            ):
-                hidden_states = _leave_gdn_island_layout(
-                    hidden_states,
-                    attention_bias,
-                    gdn=active_gdn,
-                )
-                args, kwargs = _replace_layer_hidden_states(args, kwargs, hidden_states)
-                return original_forward(*args, **kwargs)
-            if _is_megatron_checkpoint_recompute() and active_gdn is not None:
-                raise RuntimeError(
-                    "checkpoint recompute reached a non-GDN TransformerLayer with "
-                    "stale GDN-layout metadata, but the hidden_states tensor layout "
-                    "could not be inferred safely"
-                )
+    boundary = cast(_GdnIslandBoundary, self._art_gdn_island_boundary)
+    if not boundary.is_gdn:
+        actual_layout = _infer_cp_hidden_layout(
+            hidden_states,
+            plan,
+            gdn=getattr(attention_bias, "gdn_active_module", None),
+        )
+        if actual_layout == "gdn":
             raise RuntimeError(
                 "non-GDN TransformerLayer received GDN-layout hidden states; "
-                "the preceding GDN island did not close back to attention layout"
+                "the static GDN island boundary map expected attention layout"
             )
+        if getattr(attention_bias, "gdn_hidden_layout", "attention") != "attention":
+            _mark_attention_layout_active(attention_bias, hidden_states)
         return original_forward(*args, **kwargs)
 
-    prev_is_gdn = bool(getattr(self, "_art_gdn_island_prev_is_gdn", False))
-    next_is_gdn = bool(getattr(self, "_art_gdn_island_next_is_gdn", False))
-    if prev_is_gdn:
+    if boundary.input_layout == "gdn":
         original_shape = _gdn_attention_original_shape_from_tensor(
             hidden_states
         ) or _gdn_attention_original_shape_from_state(
             attention_bias,
-            gdn=getattr(attention_bias, "gdn_active_module", None),
+            gdn=self.self_attention,
+            island_id=boundary.island_id,
         )
         if original_shape is not None:
             _store_gdn_attention_original_shape(
-                attention_bias, original_shape, gdn=self.self_attention
+                attention_bias,
+                original_shape,
+                gdn=self.self_attention,
+                island_id=boundary.island_id,
             )
-        _mark_gdn_layout_active(attention_bias, hidden_states, gdn=self.self_attention)
+        _mark_gdn_layout_active(
+            attention_bias,
+            hidden_states,
+            gdn=self.self_attention,
+            island_id=boundary.island_id,
+        )
     else:
         hidden_states = _enter_gdn_island_layout(
             hidden_states,
             attention_bias,
             gdn=self.self_attention,
+            island_id=boundary.island_id,
             force=True,
         )
         args, kwargs = _replace_layer_hidden_states(args, kwargs, hidden_states)
@@ -188,20 +214,26 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     finally:
         setattr(attention_bias, "gdn_input_layout", previous_input_layout)
         setattr(attention_bias, "gdn_output_layout", previous_output_layout)
-    if next_is_gdn:
+    if boundary.output_layout == "gdn":
         original_shape = _gdn_attention_original_shape_from_state(
-            attention_bias, gdn=self.self_attention
+            attention_bias, gdn=self.self_attention, island_id=boundary.island_id
         )
         hidden_out = _attach_gdn_attention_original_shape(
             _layer_output_hidden_states(output),
             original_shape,
         )
-        _mark_gdn_layout_active(attention_bias, hidden_out, gdn=self.self_attention)
+        _mark_gdn_layout_active(
+            attention_bias,
+            hidden_out,
+            gdn=self.self_attention,
+            island_id=boundary.island_id,
+        )
         return _replace_layer_output_hidden_states(output, hidden_out)
     hidden_out = _leave_gdn_island_layout(
         _layer_output_hidden_states(output),
         attention_bias,
         gdn=self.self_attention,
+        island_id=boundary.island_id,
     )
     return _replace_layer_output_hidden_states(output, hidden_out)
 
@@ -241,14 +273,6 @@ def _replace_layer_output_hidden_states(output: Any, hidden_states: Tensor) -> A
     if isinstance(output, tuple):
         return (hidden_states, *output[1:])
     return hidden_states
-
-
-def _is_megatron_checkpoint_recompute() -> bool:
-    try:
-        from megatron.core.tensor_parallel.random import is_checkpointing
-    except ImportError:
-        return False
-    return bool(is_checkpointing()) and torch.is_grad_enabled()
 
 
 def _install_empty_safe_norm_hooks(root: Any) -> None:
@@ -1152,6 +1176,7 @@ def _enter_gdn_island_layout(
     attention_bias: Any,
     *,
     gdn: Any | None = None,
+    island_id: int | None = None,
     force: bool = False,
 ) -> Tensor:
     plan = _require_gdn_cp_plan(attention_bias)
@@ -1166,7 +1191,9 @@ def _enter_gdn_island_layout(
         gdn=gdn,
     )
     attention_bias.gdn_hidden_layout = "gdn"
-    _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
+    _store_gdn_attention_original_shape(
+        attention_bias, original_shape, gdn=gdn, island_id=island_id
+    )
     if gdn is not None:
         attention_bias.gdn_active_module = gdn
     token_uids = (
@@ -1189,10 +1216,13 @@ def _mark_cp_layout_active(
     hidden_states: Tensor | None,
     *,
     gdn: Any | None,
+    island_id: int | None = None,
     layout: Literal["attention", "gdn"],
 ) -> None:
     if layout == "gdn":
-        _mark_gdn_layout_active(attention_bias, hidden_states, gdn=gdn)
+        _mark_gdn_layout_active(
+            attention_bias, hidden_states, gdn=gdn, island_id=island_id
+        )
     else:
         _mark_attention_layout_active(attention_bias, hidden_states, gdn=gdn)
 
@@ -1227,6 +1257,7 @@ def _mark_gdn_layout_active(
     hidden_states: Tensor | None,
     *,
     gdn: Any | None = None,
+    island_id: int | None = None,
 ) -> None:
     plan = _require_gdn_cp_plan(attention_bias)
     attention_bias.gdn_hidden_layout = "gdn"
@@ -1236,7 +1267,9 @@ def _mark_gdn_layout_active(
         return
     original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
     if original_shape is not None:
-        _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
+        _store_gdn_attention_original_shape(
+            attention_bias, original_shape, gdn=gdn, island_id=island_id
+        )
     gdn_token_uids = (
         _local_layout_token_uids(plan, "gdn", hidden_states=hidden_states, gdn=gdn)
         if _layout_token_uids_enabled()
@@ -1252,14 +1285,19 @@ def _leave_gdn_island_layout(
     attention_bias: Any,
     *,
     gdn: Any | None = None,
+    island_id: int | None = None,
 ) -> Tensor:
     plan = _require_gdn_cp_plan(attention_bias)
     gdn_hidden = _validate_gdn_hidden_for_cp_plan(hidden_states, plan, gdn=gdn)
-    original_shape = _gdn_attention_original_shape_from_state(attention_bias, gdn=gdn)
+    original_shape = _gdn_attention_original_shape_from_state(
+        attention_bias, gdn=gdn, island_id=island_id
+    )
     if original_shape is None:
         original_shape = _gdn_attention_original_shape_from_tensor(hidden_states)
         if original_shape is not None:
-            _store_gdn_attention_original_shape(attention_bias, original_shape, gdn=gdn)
+            _store_gdn_attention_original_shape(
+                attention_bias, original_shape, gdn=gdn, island_id=island_id
+            )
     attention_hidden = gdn_cp_gdn_to_attention_layout(
         gdn_hidden,
         plan,
@@ -1501,27 +1539,6 @@ def _infer_cp_hidden_layout(
     return None
 
 
-def _recompute_state_matches_gdn_layout(
-    hidden_states: Tensor,
-    attention_bias: Any,
-    plan: GdnRankExecutionPlan,
-    *,
-    gdn: Any | None,
-) -> bool:
-    if not _is_megatron_checkpoint_recompute() or gdn is None:
-        return False
-    if _gdn_attention_original_shape_from_state(attention_bias, gdn=gdn) is None:
-        return False
-    return (
-        hidden_states.ndim == 3
-        and int(hidden_states.shape[1]) == 1
-        and int(hidden_states.shape[0])
-        == _local_layout_token_count_for_hidden(
-            plan, "gdn", hidden_states=hidden_states, gdn=gdn
-        )
-    )
-
-
 def _prepare_in_proj_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
     hooks = _GDN_TRACE_TOKEN_UID_HOOKS
     if hooks is None:
@@ -1592,6 +1609,7 @@ def _store_gdn_attention_original_shape(
     original_shape: tuple[int, int, int],
     *,
     gdn: Any | None,
+    island_id: int | None = None,
 ) -> tuple[int, int, int]:
     normalized = (
         int(original_shape[0]),
@@ -1599,9 +1617,10 @@ def _store_gdn_attention_original_shape(
         int(original_shape[2]),
     )
     attention_bias.gdn_attention_original_shape = normalized
-    _gdn_attention_original_shape_cache(attention_bias)[
-        _gdn_attention_original_shape_cache_key(gdn)
-    ] = normalized
+    cache = _gdn_attention_original_shape_cache(attention_bias)
+    cache[_gdn_attention_original_shape_cache_key(gdn)] = normalized
+    if island_id is not None:
+        cache[_gdn_attention_original_shape_cache_key(None, island_id)] = normalized
     return normalized
 
 
@@ -1609,9 +1628,16 @@ def _gdn_attention_original_shape_from_state(
     attention_bias: Any,
     *,
     gdn: Any | None,
+    island_id: int | None = None,
 ) -> tuple[int, int, int] | None:
     cache = getattr(attention_bias, "gdn_attention_original_shapes", None)
     if isinstance(cache, dict):
+        if island_id is not None:
+            original_shape = _normalize_gdn_attention_original_shape(
+                cache.get(_gdn_attention_original_shape_cache_key(None, island_id))
+            )
+            if original_shape is not None:
+                return original_shape
         if gdn is not None:
             original_shape = _normalize_gdn_attention_original_shape(
                 cache.get(_gdn_attention_original_shape_cache_key(gdn))
@@ -1652,7 +1678,11 @@ def _gdn_attention_original_shape_cache(
     return cast(dict[int, tuple[int, int, int]], cache)
 
 
-def _gdn_attention_original_shape_cache_key(gdn: Any | None) -> int:
+def _gdn_attention_original_shape_cache_key(
+    gdn: Any | None, island_id: int | None = None
+) -> int:
+    if island_id is not None:
+        return -int(island_id) - 1
     return 0 if gdn is None else id(gdn)
 
 
