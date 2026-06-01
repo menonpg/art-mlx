@@ -87,6 +87,7 @@ def install_torch_compile_workarounds(
             )
         return
     from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.transformer.moe import experts as moe_experts
     from megatron.core.transformer.moe import moe_layer, moe_utils, token_dispatcher
 
     if "fake_sync_dealloc" in flags:
@@ -191,8 +192,6 @@ def install_torch_compile_workarounds(
         moe_layer.MoELayer.preprocess = _disable(moe_layer.MoELayer.preprocess)
     if "moe_forward" in flags:
         moe_layer.MoELayer.forward = _disable(moe_layer.MoELayer.forward)
-    if "moe_routed_experts_compute" in flags:
-        moe_layer.MoELayer.routed_experts_compute = _disable(
-            moe_layer.MoELayer.routed_experts_compute
-        )
+    if "te_grouped_mlp_forward" in flags:
+        moe_experts.TEGroupedMLP.forward = _disable(moe_experts.TEGroupedMLP.forward)
     _INSTALLED_CONFIG = installed_config
