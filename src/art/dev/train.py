@@ -21,6 +21,7 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     ]
     kimi_k2_tau: float | None
     kl_penalty_coef: float
+    kl_penalty_reference_step: int | None
     kl_penalty_source: Literal["current_learner", "sample"]
     kl_ref_adapter_path: str | None
     logprob_calculation_chunk_size: int
