@@ -14,8 +14,8 @@ _QWEN35_MOE_COMPILE_FLAGS = (
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "flex_token_dispatch_combine",
-    "te_grouped_mlp_forward",
     "te_triton_permute_with_mask_map",
+    "weighted_bias_swiglu_no_inner_forward_cast",
 )
 
 

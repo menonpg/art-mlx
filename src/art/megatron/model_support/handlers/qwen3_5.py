@@ -30,10 +30,10 @@ _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "deepep_dispatch_combine",
     "deepep_permute_restore",
     "flex_token_dispatch_combine",
-    # Torch 2.11.0 compilation through TEGroupedMLP.forward drops Qwen3.5
-    # fused expert/router grads; investigate the precise compiler root cause.
-    "te_grouped_mlp_forward",
     "te_triton_permute_with_mask_map",
+    # Torch 2.11.0 compiles Megatron's weighted SwiGLU custom autograd
+    # function with zero cotangents when its forward casts internally.
+    "weighted_bias_swiglu_no_inner_forward_cast",
 )
 _QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
