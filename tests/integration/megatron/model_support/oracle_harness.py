@@ -89,6 +89,7 @@ REQUIRED_PACKED_TENSOR_FILES = (
 )
 NON_FINITE_METRIC_VALUE = 1e30
 ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = DEFAULT_MEAN_ABS_PCT_THRESHOLD
+ROUTER_SCORE_MEAN_ABS_PCT_LIMIT = 1e-4
 FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT = 3e-4
 FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
 EXPERT_TABLE_ROW_LIMIT = 8
@@ -1770,14 +1771,11 @@ class VariantRunner:
         ]
 
     @classmethod
-    def _outputs_for_step_pass(cls, rows: list[MetricRow], step_index: int) -> bool:
-        output_rows = cls._step_phase_rows(rows, step_index, "outputs")
-        return bool(output_rows) and all(row.pass_signal for row in output_rows)
-
-    @classmethod
-    def _router_scores_pass(cls, rows: list[MetricRow], step_index: int) -> bool:
-        router_rows = cls._step_phase_rows(rows, step_index, "router_scores")
-        return bool(router_rows) and all(row.pass_signal for row in router_rows)
+    def _phase_rows_pass(
+        cls, rows: list[MetricRow], step_index: int, phase: str
+    ) -> bool:
+        phase_rows = cls._step_phase_rows(rows, step_index, phase)
+        return bool(phase_rows) and all(row.pass_signal for row in phase_rows)
 
     @classmethod
     def _router_topk_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
@@ -1797,8 +1795,8 @@ class VariantRunner:
         steps = {row.step_index for row in rows}
         gate_by_step = {
             step: (
-                cls._outputs_for_step_pass(rows, step)
-                and cls._router_scores_pass(rows, step)
+                cls._phase_rows_pass(rows, step, "outputs")
+                and cls._phase_rows_pass(rows, step, "router_scores")
                 and cls._router_topk_exact(rows, step)
             )
             for step in steps
@@ -2091,9 +2089,9 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
         minimums=non_zero_scales,
     )
     router_scores_rule = MetricThresholdRule(
-        # RouterReplay replays top-k ids; probabilities are gathered from the
-        # candidate router scores and can differ by normal fp32 CP trace noise.
-        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT}
+        # Production RouterReplay replays top-k ids and gathers probabilities from
+        # live candidate scores, so scores are close but not bit-exact.
+        limits={"mean_abs_pct": ROUTER_SCORE_MEAN_ABS_PCT_LIMIT}
     )
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay

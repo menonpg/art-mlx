@@ -14,6 +14,7 @@ from .oracle_harness import (
     FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT,
     ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT,
     ORACLE_TOPOLOGY,
+    ROUTER_SCORE_MEAN_ABS_PCT_LIMIT,
     TEST_DEFAULT_FLEX_BACKEND,
     TOPOLOGIES,
     DiffAccumulator,
@@ -598,7 +599,6 @@ def test_default_phase_rules_require_non_zero_forward_outputs_grads_and_deltas()
     assert not phase_pass["outputs"](zero_signal_summary)
     assert not phase_pass["grads"](zero_signal_summary)
     assert not phase_pass["deltas"](zero_signal_summary)
-    assert not phase_pass["router_scores"]({"relative_l2": 0.0, "mean_abs_pct": 1e-12})
     assert phase_pass["losses"](zero_signal_summary)
 
 
@@ -625,6 +625,16 @@ def test_default_phase_rules_use_default_mean_abs_pct_limit() -> None:
     assert not phase_pass["grads"](failing_summary)
     assert not phase_pass["deltas"](failing_summary)
     assert not phase_pass["losses"](failing_summary)
+
+
+def test_router_score_rule_uses_tight_dedicated_limit() -> None:
+    phase_pass = _default_phase_pass_fns()
+    assert phase_pass["router_scores"](
+        {"relative_l2": 1.0, "mean_abs_pct": ROUTER_SCORE_MEAN_ABS_PCT_LIMIT}
+    )
+    assert not phase_pass["router_scores"](
+        {"relative_l2": 0.0, "mean_abs_pct": ROUTER_SCORE_MEAN_ABS_PCT_LIMIT + 1e-8}
+    )
 
 
 def test_forward_expert_lora_noise_pass_requires_clean_step_gates() -> None:
