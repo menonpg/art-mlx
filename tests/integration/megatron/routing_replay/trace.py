@@ -31,26 +31,49 @@ def _dispatcher_local_token_uids(
     step_routes = controller._active_step_routes
     if step_routes is None:
         raise RuntimeError("Routing replay dispatcher used without an active step")
-    route_uids, rank_sliced = _active_route_global_token_uids(controller)
-    if int(route_uids.numel()) == num_local_tokens:
-        local_uids = route_uids
-    elif rank_sliced:
-        local_uids = torch.arange(num_local_tokens, dtype=torch.int64)
-    else:
-        local_uids = controller.local_token_indexer.build_local_token_uids(
-            global_token_uids=route_uids,
+    sequence_parallel = bool(
+        getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
+    )
+    prepared_uids = getattr(
+        controller,
+        "local_token_uids_for_active_dispatch",
+        None,
+    )
+    if callable(prepared_uids):
+        local_uids = prepared_uids(
             num_local_tokens=num_local_tokens,
-            sequence_parallel=bool(
-                getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
-            ),
-            context_parallel_size=int(
-                getattr(getattr(dispatcher, "config", None), "context_parallel_size", 1)
-            ),
+            sequence_parallel=sequence_parallel,
         )
+    else:
+        local_uids = None
+    if local_uids is None:
+        route_uids, rank_sliced = _active_route_global_token_uids(controller)
+        if int(route_uids.numel()) == num_local_tokens:
+            local_uids = route_uids
+        elif rank_sliced:
+            local_uids = torch.arange(num_local_tokens, dtype=torch.int64)
+        else:
+            local_uids = controller.local_token_indexer.build_local_token_uids(
+                global_token_uids=route_uids,
+                num_local_tokens=num_local_tokens,
+                sequence_parallel=sequence_parallel,
+                context_parallel_size=int(
+                    getattr(
+                        getattr(dispatcher, "config", None),
+                        "context_parallel_size",
+                        1,
+                    )
+                ),
+            )
     sample_index = getattr(controller, "_active_sample_index", None)
     uid_span = int(step_routes.global_token_uids.numel())
     if isinstance(sample_index, int) and sample_index >= 0 and uid_span > 0:
-        local_uids = local_uids + sample_index * uid_span
+        if bool((local_uids >= 0).all().item()):
+            local_uids = local_uids + sample_index * uid_span
+        else:
+            local_uids = local_uids.clone()
+            valid_mask = local_uids >= 0
+            local_uids[valid_mask] += sample_index * uid_span
     return local_uids
 
 

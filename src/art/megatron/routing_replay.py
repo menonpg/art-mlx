@@ -678,6 +678,7 @@ class MoeRoutingReplayController:
         self._global_uid_count: int = 0
         self._local_router_keys: set[str] = set()
         self._router_bindings: dict[str, dict[str, Any]] = {}
+        self._prepared_uid_sets: dict[str, torch.Tensor] = {}
         self._prepared_targets: dict[tuple[str, str, int], torch.Tensor] = {}
         self._router_prepared_target_keys: dict[str, tuple[str, int]] = {}
         self._target_buffers: dict[tuple[str, str, int], torch.Tensor] = {}
@@ -825,6 +826,7 @@ class MoeRoutingReplayController:
                 "Routing replay active token UID key was not prepared: "
                 f"key='{active_token_uid_key}', prepared={sorted(prepared_uid_sets)}"
             )
+        self._prepared_uid_sets = prepared_uid_sets
         if not self._local_router_keys:
             self._active_token_uid_key = active_token_uid_key
             return
@@ -876,6 +878,28 @@ class MoeRoutingReplayController:
                 "UIDs would force a host/device synchronization in the model path."
             )
         return local_token_uids.detach().to(dtype=torch.int64).contiguous().reshape(-1)
+
+    def local_token_uids_for_active_dispatch(
+        self,
+        *,
+        num_local_tokens: int,
+        sequence_parallel: bool,
+    ) -> torch.Tensor | None:
+        if self._active_token_uid_key is None:
+            return None
+        token_uids = self._prepared_uid_sets.get(self._active_token_uid_key)
+        if token_uids is None:
+            return None
+        local_uids = self._token_uids_for_router_binding(
+            token_uids,
+            sequence_parallel=sequence_parallel,
+        )
+        if int(local_uids.numel()) == int(num_local_tokens):
+            return local_uids.contiguous()
+        compact_uids = local_uids[local_uids >= 0]
+        if int(compact_uids.numel()) == int(num_local_tokens):
+            return compact_uids.contiguous()
+        return None
 
     def set_step(
         self,
@@ -989,6 +1013,7 @@ class MoeRoutingReplayController:
         self._global_uid_count = 0
 
     def _reset_staged_micro_targets(self) -> None:
+        self._prepared_uid_sets = {}
         self._prepared_targets = {}
         self._router_prepared_target_keys = {}
         self._host_target_staging = []
