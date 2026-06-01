@@ -131,10 +131,11 @@ def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
                     attention_bias, hidden_states, gdn=active_gdn
                 )
                 return original_forward(*args, **kwargs)
-            if (
-                actual_layout == "gdn"
-                and _is_megatron_checkpoint_recompute()
-                and active_gdn is not None
+            if actual_layout == "gdn" or _recompute_state_matches_gdn_layout(
+                hidden_states,
+                attention_bias,
+                plan,
+                gdn=active_gdn,
             ):
                 hidden_states = _leave_gdn_island_layout(
                     hidden_states,
@@ -1498,6 +1499,27 @@ def _infer_cp_hidden_layout(
     ):
         return "gdn"
     return None
+
+
+def _recompute_state_matches_gdn_layout(
+    hidden_states: Tensor,
+    attention_bias: Any,
+    plan: GdnRankExecutionPlan,
+    *,
+    gdn: Any | None,
+) -> bool:
+    if not _is_megatron_checkpoint_recompute() or gdn is None:
+        return False
+    if _gdn_attention_original_shape_from_state(attention_bias, gdn=gdn) is None:
+        return False
+    return (
+        hidden_states.ndim == 3
+        and int(hidden_states.shape[1]) == 1
+        and int(hidden_states.shape[0])
+        == _local_layout_token_count_for_hidden(
+            plan, "gdn", hidden_states=hidden_states, gdn=gdn
+        )
+    )
 
 
 def _prepare_in_proj_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
