@@ -578,6 +578,41 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
 
 
+def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
+    tmp_path: Path,
+) -> None:
+    art_prefix = "base_model.model.model.layers.0"
+    original = _qwen35_moe_art_tensors(art_prefix)
+    expected = _qwen35_fused_expert_vllm_tensors(original, art_prefix)
+    raw = {
+        key.replace(
+            "base_model.model.model.language_model.layers.",
+            "base_model.model.model.layers.",
+            1,
+        ): tensor
+        for key, tensor in expected.items()
+    }
+    _save_adapter(
+        tmp_path,
+        raw,
+        {
+            **_qwen35_config("Qwen/Qwen3.5-35B-A3B"),
+            "target_parameters": [
+                "model.layers.0.mlp.experts.gate_up_proj",
+                "model.layers.0.mlp.experts.down_proj",
+            ],
+        },
+    )
+
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=QWEN3_5_MOE_HANDLER,
+        adapter_config=_qwen35_config("Qwen/Qwen3.5-35B-A3B"),
+    )
+
+    _assert_tensors_equal(load_file(tmp_path / "adapter_model.safetensors"), expected)
+
+
 def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
     original = {
         "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(

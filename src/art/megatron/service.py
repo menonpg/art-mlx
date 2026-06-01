@@ -20,7 +20,6 @@ from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..types import MegatronTopologyConfig
-from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
@@ -80,9 +79,8 @@ def create_identity_lora(
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model.
 
-    For MoE models, this targets fused expert parameters and converts them to
-    per-expert format. The conversion swaps lora_A/lora_B, producing A=zeros and
-    B=Kaiming — which is critical for stable training when alpha/rank is large.
+    For MoE models, this targets fused expert parameters and lets the model
+    support handler normalize the saved PEFT tensors to vLLM layout.
 
     Args:
         base_model: HuggingFace model identifier.
@@ -143,7 +141,6 @@ def create_identity_lora(
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)
-    convert_checkpoint_if_needed(lora_path)
 
     final_config = LoraConfig(
         base_model_name_or_path=base_model,
