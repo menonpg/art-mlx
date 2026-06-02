@@ -7,6 +7,7 @@ from .compressor import (
     compress_projected_kv,
 )
 from .cp_attention import (
+    accumulate_materialized_dsv4_attention_backward,
     compute_single_sink_grad,
     merge_materialized_stage_records,
     merge_single_sink_branch,
@@ -39,6 +40,7 @@ from .sparse_kernel import (
 from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
+    Dsv4AttentionGradientResult,
     Dsv4BranchView,
     Dsv4CompressedEntry,
     Dsv4CompressedLayout,
@@ -63,6 +65,7 @@ from .types import (
 __all__ = [
     "Dsv4AttentionBackwardReplayResult",
     "Dsv4AttentionForwardResult",
+    "Dsv4AttentionGradientResult",
     "Dsv4BranchView",
     "Dsv4CompressedEntry",
     "Dsv4CompressedLayout",
@@ -82,6 +85,7 @@ __all__ = [
     "Dsv4StreamSpec",
     "Dsv4TokenInView",
     "Dsv4TopkResult",
+    "accumulate_materialized_dsv4_attention_backward",
     "build_dsv4_compressed_layout",
     "build_dsv4_compressed_layout_from_cp_state",
     "build_dsv4_stage_inputs",

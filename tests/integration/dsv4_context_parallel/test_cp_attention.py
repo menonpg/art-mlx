@@ -4,11 +4,14 @@ import pytest
 import torch
 
 from art.megatron.dsv4 import (
+    Dsv4AttentionBackwardReplayResult,
     Dsv4MaterializedStage,
     Dsv4SparseBackwardResult,
     Dsv4SparseForwardResult,
+    Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
+    accumulate_materialized_dsv4_attention_backward,
     compute_single_sink_grad,
     merge_materialized_stage_records,
     merge_single_sink_branch,
@@ -284,9 +287,82 @@ def test_materialized_stage_merge_rejects_unknown_query_id() -> None:
         merge_materialized_stage_records(records=(record,), query_token_ids=(10, 11))
 
 
+def test_accumulate_materialized_backward_sums_by_explicit_ids() -> None:
+    stage0 = _materialized_stage(0, (10, 11), raw_id=20, compressed_id=100)
+    stage1 = _materialized_stage(1, (11, 12), raw_id=20, compressed_id=101)
+    replay = Dsv4AttentionBackwardReplayResult(
+        stage_records=(
+            _stage_backward_record(
+                stage0, dq_value=1.0, raw_value=10.0, compressed_value=100.0
+            ),
+            _stage_backward_record(
+                stage1, dq_value=2.0, raw_value=20.0, compressed_value=200.0
+            ),
+        ),
+        d_attn_sink=torch.tensor([3.0, 4.0], dtype=torch.float64),
+    )
+
+    result = accumulate_materialized_dsv4_attention_backward(
+        replay_result=replay,
+        query_token_ids=(10, 11, 12),
+        raw_token_ids=(20,),
+        compressed_entry_ids=(100, 101),
+    )
+
+    torch.testing.assert_close(result.dq, _stage_tensor(((1.0, 3.0, 2.0),)))
+    torch.testing.assert_close(
+        result.draw_kv,
+        torch.full((1, 1, 3), 30.0, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        result.dcompressed_kv,
+        torch.tensor(
+            [[[100.0, 100.0, 100.0], [200.0, 200.0, 200.0]]], dtype=torch.float64
+        ),
+    )
+    torch.testing.assert_close(result.d_attn_sink, replay.d_attn_sink)
+    assert result.query_token_ids == (10, 11, 12)
+    assert result.raw_token_ids == (20,)
+    assert result.compressed_entry_ids == (100, 101)
+
+
+def test_accumulate_materialized_backward_rejects_bad_id_spaces() -> None:
+    stage = _materialized_stage(0, (10,), raw_id=20, compressed_id=100)
+    replay = Dsv4AttentionBackwardReplayResult(
+        stage_records=(
+            _stage_backward_record(
+                stage, dq_value=1.0, raw_value=10.0, compressed_value=100.0
+            ),
+        ),
+        d_attn_sink=torch.tensor([3.0, 4.0], dtype=torch.float64),
+    )
+
+    with pytest.raises(ValueError, match="missing from raw_token_ids"):
+        accumulate_materialized_dsv4_attention_backward(
+            replay_result=replay,
+            query_token_ids=(10,),
+            raw_token_ids=(21,),
+            compressed_entry_ids=(100,),
+        )
+    with pytest.raises(ValueError, match="raw_token_ids contains duplicate"):
+        accumulate_materialized_dsv4_attention_backward(
+            replay_result=replay,
+            query_token_ids=(10,),
+            raw_token_ids=(20, 20),
+            compressed_entry_ids=(100,),
+        )
+
+
 def _materialized_stage(
-    stage_index: int, query_token_ids: tuple[int, ...]
+    stage_index: int,
+    query_token_ids: tuple[int, ...],
+    raw_id: int | None = None,
+    compressed_id: int | None = None,
 ) -> Dsv4MaterializedStage:
+    if raw_id is None:
+        raw_id = stage_index
+    if compressed_id is None:
+        compressed_id = stage_index + 100
     q_stage = torch.full(
         (1, len(query_token_ids), 2, 3),
         float(stage_index),
@@ -302,7 +378,7 @@ def _materialized_stage(
         raw_count=1,
         compressed_count=1,
         key_kinds=(Dsv4StageKeyKind.RAW, Dsv4StageKeyKind.COMPRESSED),
-        key_global_ids=(stage_index, stage_index + 100),
+        key_global_ids=(raw_id, compressed_id),
     )
 
 
@@ -340,4 +416,26 @@ def _fake_forward_for_replay(
     return Dsv4SparseForwardResult(
         out=_stage_tensor(((3.0, 4.0),)),
         lse=_stage_lse(((6.0, 8.0),)),
+    )
+
+
+def _stage_backward_record(
+    stage: Dsv4MaterializedStage,
+    *,
+    dq_value: float,
+    raw_value: float,
+    compressed_value: float,
+) -> Dsv4StageBackwardRecord:
+    return Dsv4StageBackwardRecord(
+        materialized_stage=stage,
+        dq_stage=torch.full_like(stage.q_stage, dq_value),
+        dkv_stage=torch.tensor(
+            [
+                [
+                    [raw_value, raw_value, raw_value],
+                    [compressed_value, compressed_value, compressed_value],
+                ]
+            ],
+            dtype=stage.kv_stage.dtype,
+        ),
     )

@@ -8,9 +8,11 @@ from . import sparse_kernel
 from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
+    Dsv4AttentionGradientResult,
     Dsv4MaterializedStage,
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
+    Dsv4StageKeyKind,
 )
 
 
@@ -299,6 +301,117 @@ def replay_materialized_dsv4_attention_backward(
     )
 
 
+def accumulate_materialized_dsv4_attention_backward(
+    *,
+    replay_result: Dsv4AttentionBackwardReplayResult,
+    query_token_ids: Sequence[int],
+    raw_token_ids: Sequence[int],
+    compressed_entry_ids: Sequence[int],
+) -> Dsv4AttentionGradientResult:
+    """Accumulate replayed stage grads into explicit local id spaces.
+
+    This is the local reduce step before distributed owner reduction. It sums
+    per-stage query gradients by query token id, splits each `dkv_stage` into raw
+    and compressed slices using the materialized-stage metadata, and sums those
+    slices by raw token id or compressed entry id.
+    """
+    if len(replay_result.stage_records) == 0:
+        raise ValueError("at least one DSV4 replay stage record is required")
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    raw_ids = tuple(int(token_id) for token_id in raw_token_ids)
+    compressed_ids = tuple(int(entry_id) for entry_id in compressed_entry_ids)
+    query_index = _row_by_id(ids=query_ids, name="query_token_ids")
+    raw_index = _row_by_id(ids=raw_ids, name="raw_token_ids")
+    compressed_index = _row_by_id(
+        ids=compressed_ids,
+        name="compressed_entry_ids",
+    )
+
+    first = replay_result.stage_records[0]
+    _validate_stage_backward_shapes(first)
+    batch_size, _, head_count, dim = first.dq_stage.shape
+    kv_dim = int(first.dkv_stage.shape[-1])
+    target_dtype = _accum_output_dtype(first.dq_stage.dtype)
+    dq = torch.zeros(
+        (batch_size, len(query_ids), head_count, dim),
+        device=first.dq_stage.device,
+        dtype=target_dtype,
+    )
+    draw_kv = torch.zeros(
+        (batch_size, len(raw_ids), kv_dim),
+        device=first.dkv_stage.device,
+        dtype=target_dtype,
+    )
+    dcompressed_kv = torch.zeros(
+        (batch_size, len(compressed_ids), kv_dim),
+        device=first.dkv_stage.device,
+        dtype=target_dtype,
+    )
+
+    for record in replay_result.stage_records:
+        _validate_stage_backward_shapes(record)
+        if (
+            int(record.dq_stage.shape[0]) != batch_size
+            or int(record.dq_stage.shape[2]) != head_count
+            or int(record.dq_stage.shape[-1]) != dim
+        ):
+            raise ValueError("all DSV4 replay dq_stage tensors must share shape")
+        if (
+            int(record.dkv_stage.shape[0]) != batch_size
+            or int(record.dkv_stage.shape[-1]) != kv_dim
+        ):
+            raise ValueError("all DSV4 replay dkv_stage tensors must share shape")
+
+        q_indices = _query_indices_for_stage(
+            stage_query_ids=record.materialized_stage.query_token_ids,
+            query_index=query_index,
+            device=dq.device,
+        )
+        dq.index_add_(1, q_indices, record.dq_stage.to(dtype=target_dtype))
+
+        raw_ids_stage, compressed_ids_stage = _stage_raw_and_compressed_key_ids(
+            record.materialized_stage,
+        )
+        raw_count = len(raw_ids_stage)
+        compressed_count = len(compressed_ids_stage)
+        if raw_count:
+            raw_indices = _indices_for_ids(
+                ids=raw_ids_stage,
+                id_index=raw_index,
+                name="raw_token_ids",
+                device=draw_kv.device,
+            )
+            draw_kv.index_add_(
+                1,
+                raw_indices,
+                record.dkv_stage[:, :raw_count].to(dtype=target_dtype),
+            )
+        if compressed_count:
+            compressed_indices = _indices_for_ids(
+                ids=compressed_ids_stage,
+                id_index=compressed_index,
+                name="compressed_entry_ids",
+                device=dcompressed_kv.device,
+            )
+            dcompressed_kv.index_add_(
+                1,
+                compressed_indices,
+                record.dkv_stage[:, raw_count : raw_count + compressed_count].to(
+                    dtype=target_dtype
+                ),
+            )
+
+    return Dsv4AttentionGradientResult(
+        query_token_ids=query_ids,
+        raw_token_ids=raw_ids,
+        compressed_entry_ids=compressed_ids,
+        dq=dq,
+        draw_kv=draw_kv,
+        dcompressed_kv=dcompressed_kv,
+        d_attn_sink=replay_result.d_attn_sink,
+    )
+
+
 def compute_single_sink_grad(
     grad_out: torch.Tensor,
     global_out: torch.Tensor,
@@ -331,6 +444,51 @@ def compute_single_sink_grad(
     p_sink = _safe_exp_diff(sink_lse, global_lse)
     reduce_dims = tuple(range(delta.ndim - 1))
     return -(delta * p_sink).sum(dim=reduce_dims)
+
+
+def _validate_stage_backward_shapes(record: Dsv4StageBackwardRecord) -> None:
+    stage = record.materialized_stage
+    if record.dq_stage.shape != stage.q_stage.shape:
+        raise ValueError(
+            "DSV4 replay dq_stage must match q_stage, got "
+            f"dq={tuple(record.dq_stage.shape)}, q={tuple(stage.q_stage.shape)}"
+        )
+    if record.dkv_stage.shape != stage.kv_stage.shape:
+        raise ValueError(
+            "DSV4 replay dkv_stage must match kv_stage, got "
+            f"dkv={tuple(record.dkv_stage.shape)}, kv={tuple(stage.kv_stage.shape)}"
+        )
+    expected_keys = int(stage.raw_count) + int(stage.compressed_count)
+    if expected_keys != int(stage.kv_stage.shape[1]):
+        raise ValueError(
+            "DSV4 materialized stage raw+compressed count must match kv rows, got "
+            f"raw={stage.raw_count}, compressed={stage.compressed_count}, "
+            f"kv={tuple(stage.kv_stage.shape)}"
+        )
+
+
+def _stage_raw_and_compressed_key_ids(
+    stage: Dsv4MaterializedStage,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    raw_count = int(stage.raw_count)
+    compressed_count = int(stage.compressed_count)
+    if len(stage.key_global_ids) != raw_count + compressed_count:
+        raise ValueError("DSV4 key_global_ids length must match raw+compressed count")
+    if len(stage.key_kinds) != len(stage.key_global_ids):
+        raise ValueError("DSV4 key_kinds length must match key_global_ids")
+    raw_kinds = stage.key_kinds[:raw_count]
+    compressed_kinds = stage.key_kinds[raw_count : raw_count + compressed_count]
+    if any(kind != Dsv4StageKeyKind.RAW for kind in raw_kinds):
+        raise ValueError("DSV4 raw key slice contains non-raw key kind")
+    if any(kind != Dsv4StageKeyKind.COMPRESSED for kind in compressed_kinds):
+        raise ValueError("DSV4 compressed key slice contains non-compressed key kind")
+    return (
+        tuple(int(id_) for id_ in stage.key_global_ids[:raw_count]),
+        tuple(
+            int(id_)
+            for id_ in stage.key_global_ids[raw_count : raw_count + compressed_count]
+        ),
+    )
 
 
 def _validate_stage_forward_shapes(
@@ -374,6 +532,24 @@ def _query_indices_for_stage(
         )
     return torch.tensor(
         [query_index[int(token_id)] for token_id in stage_query_ids],
+        device=device,
+        dtype=torch.long,
+    )
+
+
+def _indices_for_ids(
+    *,
+    ids: Sequence[int],
+    id_index: dict[int, int],
+    name: str,
+    device: torch.device,
+) -> torch.Tensor:
+    _row_by_id(ids=ids, name=f"stage_{name}")
+    missing = tuple(int(id_) for id_ in ids if int(id_) not in id_index)
+    if missing:
+        raise ValueError(f"DSV4 stage ids missing from {name}: {missing}")
+    return torch.tensor(
+        [id_index[int(id_)] for id_ in ids],
         device=device,
         dtype=torch.long,
     )
