@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+from typing import Any, cast
+
 from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
+from torch.distributed import destroy_process_group, init_process_group
+import torch.multiprocessing as mp
 
 from art.megatron.dsv4 import (
     Dsv4AttentionBackwardReplayResult,
@@ -25,6 +31,7 @@ from art.megatron.dsv4 import (
     build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
     compute_single_sink_grad,
+    launch_dsv4_attention_backward_from_stage_plan_slots,
     launch_dsv4_attention_forward_from_stage_plan_groups,
     launch_dsv4_csa_attention_forward_from_stage_plan_slots,
     launch_dsv4_hca_attention_forward_from_stage_plan_slots,
@@ -628,6 +635,105 @@ def test_exchanged_attention_backward_replays_and_reduces_owner_gradients(
     )
 
 
+def test_attention_backward_launcher_uses_stage_plan_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slots = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (
+                _stage_plan(
+                    stage_index=0,
+                    q_ranges=((3, 4), (7, 8)),
+                    k_ranges=((0, 8),),
+                ),
+            ),
+        ),
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    forward = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+        compressed_entry_ids=(0, 1),
+        indexer_q=torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=torch.float32),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float32),
+        indexer_kv=torch.tensor([[2.0, 0.0], [3.0, 0.0]], dtype=torch.float32),
+        indexer_kv_entry_ids=(0, 1),
+        indexer_topk=2,
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+    grad_out = torch.arange(forward.out.numel(), dtype=forward.out.dtype).reshape_as(
+        forward.out
+    )
+
+    work = launch_dsv4_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        forward_result=forward,
+        grad_out=grad_out,
+        group=None,
+        async_op=True,
+    )
+    result = work.wait_post_process()
+
+    torch.testing.assert_close(result.dq, _stage_tensor(((10.0, 10.0),)))
+    torch.testing.assert_close(
+        result.draw_kv,
+        _kv_rows((20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0)),
+    )
+    torch.testing.assert_close(
+        result.dcompressed_kv,
+        _kv_rows((28.0, 29.0)),
+    )
+    torch.testing.assert_close(
+        result.d_attn_sink,
+        compute_single_sink_grad(
+            grad_out=grad_out,
+            global_out=forward.out,
+            global_lse=forward.lse,
+            attn_sink=attn_sink,
+        ),
+    )
+
+
+def test_attention_backward_launcher_reduces_owner_grads_from_stage_plan_slots(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_attention_slot_backward_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _slot_backward_worker,
+        args=(2, str(init_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def test_exchanged_attention_backward_handles_empty_owner_receives() -> None:
     template = Dsv4AttentionGradientResult(
         query_token_ids=(),
@@ -922,6 +1028,39 @@ def _single_rank_layout(
     )
 
 
+def _two_rank_layout() -> Dsv4CompressedLayout:
+    return build_dsv4_compressed_layout(
+        group_ids=torch.tensor([[0] * 8]),
+        parent_ids=torch.tensor([[0] * 8]),
+        token_layout_index=_LayoutIndex(
+            ownership_ranges_by_rank=(((0, 4, 0),), ((4, 8, 0),)),
+            token_counts_by_rank=(4, 4),
+        ),
+        spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
+    )
+
+
+def _two_rank_slots() -> tuple[Any, ...]:
+    return build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (
+                _stage_plan(
+                    stage_index=0,
+                    q_ranges=((2, 4),),
+                    k_ranges=((0, 8),),
+                ),
+            ),
+            (
+                _stage_plan(
+                    stage_index=0,
+                    q_ranges=((6, 8),),
+                    k_ranges=((0, 8),),
+                ),
+            ),
+        ),
+    )
+
+
 def _stage_plan(
     *,
     stage_index: int,
@@ -935,11 +1074,46 @@ def _stage_plan(
     )
 
 
+def _full_kv_materialized_stage(
+    stage_index: int,
+    query_token_ids: tuple[int, ...],
+) -> Dsv4MaterializedStage:
+    return Dsv4MaterializedStage(
+        stage_index=stage_index,
+        query_token_ids=query_token_ids,
+        q_stage=torch.full(
+            (1, len(query_token_ids), 2, 3),
+            float(stage_index),
+            dtype=torch.float64,
+        ),
+        kv_stage=torch.zeros(1, 10, 3, dtype=torch.float64),
+        topk_stage_local=torch.zeros(
+            1,
+            len(query_token_ids),
+            10,
+            dtype=torch.long,
+        ),
+        raw_count=8,
+        compressed_count=2,
+        key_kinds=(Dsv4StageKeyKind.RAW,) * 8 + (Dsv4StageKeyKind.COMPRESSED,) * 2,
+        key_global_ids=tuple(range(8)) + (0, 1),
+    )
+
+
 def _stage_tensor(values_by_batch: tuple[tuple[float, ...], ...]) -> torch.Tensor:
     rows = []
     for values in values_by_batch:
         rows.append(torch.tensor(values, dtype=torch.float64).view(len(values), 1, 1))
     return torch.stack(rows, dim=0).expand(-1, -1, 2, 3).contiguous()
+
+
+def _kv_rows(values: tuple[float, ...]) -> torch.Tensor:
+    return (
+        torch.tensor(values, dtype=torch.float64)
+        .view(1, len(values), 1)
+        .expand(-1, -1, 3)
+        .contiguous()
+    )
 
 
 def _stage_lse(values_by_batch: tuple[tuple[float, ...], ...]) -> torch.Tensor:
@@ -994,6 +1168,78 @@ def _fake_backward_for_bridge(
         dkv=dkv,
         d_attn_sink=torch.full_like(attn_sink, 999.0),
     )
+
+
+def _slot_backward_worker(rank: int, world_size: int, init_path: str) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29631")
+    init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _fake_forward_for_replay)
+        setattr(
+            cp_attention.sparse_kernel, "dsv4_sparse_bwd", _fake_backward_for_bridge
+        )
+        query_ids = (2, 3) if rank == 0 else (6, 7)
+        layout = _two_rank_layout()
+        attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+        forward = run_materialized_dsv4_attention_forward(
+            stages=(_full_kv_materialized_stage(0, query_ids),),
+            query_token_ids=query_ids,
+            attn_sink=attn_sink,
+            scale=0.25,
+        )
+        grad_out = torch.ones_like(forward.out) * float(rank + 1)
+
+        work = launch_dsv4_attention_backward_from_stage_plan_slots(
+            layout=layout,
+            rank=rank,
+            stage_plan_slots=_two_rank_slots(),
+            forward_result=forward,
+            grad_out=grad_out,
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        )
+        result = work.wait_post_process()
+
+        expected_sink = compute_single_sink_grad(
+            grad_out=torch.ones_like(forward.out),
+            global_out=forward.out,
+            global_lse=forward.lse,
+            attn_sink=attn_sink,
+        ) + compute_single_sink_grad(
+            grad_out=torch.ones_like(forward.out) * 2.0,
+            global_out=forward.out,
+            global_lse=forward.lse,
+            attn_sink=attn_sink,
+        )
+        torch.testing.assert_close(result.d_attn_sink, expected_sink)
+        if rank == 0:
+            assert result.query_token_ids == (2, 3)
+            assert result.raw_token_ids == (0, 1, 2, 3)
+            assert result.compressed_entry_ids == (0,)
+            torch.testing.assert_close(result.dq, _stage_tensor(((10.0, 10.0),)))
+            torch.testing.assert_close(
+                result.draw_kv,
+                _kv_rows((40.0, 42.0, 44.0, 46.0)),
+            )
+            torch.testing.assert_close(result.dcompressed_kv, _kv_rows((56.0,)))
+        else:
+            assert result.query_token_ids == (6, 7)
+            assert result.raw_token_ids == (4, 5, 6, 7)
+            assert result.compressed_entry_ids == (1,)
+            torch.testing.assert_close(result.dq, _stage_tensor(((10.0, 10.0),)))
+            torch.testing.assert_close(
+                result.draw_kv,
+                _kv_rows((48.0, 50.0, 52.0, 54.0)),
+            )
+            torch.testing.assert_close(result.dcompressed_kv, _kv_rows((58.0,)))
+    finally:
+        destroy_process_group()
 
 
 def _stage_backward_record(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -17,6 +17,7 @@ from .cp_stage import (
 from .indexer import (
     build_dsv4_indexer_stage_plan_from_stage_plans,
     launch_dsv4_indexer_topk_from_stage_plans,
+    stage_candidate_entry_ids,
 )
 from .types import (
     Dsv4AttentionBackwardReplayResult,
@@ -585,6 +586,127 @@ def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
 
 
 @torch.compiler.disable
+def launch_dsv4_attention_backward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    forward_result: Dsv4AttentionForwardResult,
+    grad_out: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    owned_query_token_ids: Sequence[int] | None = None,
+    owned_raw_token_ids: Sequence[int] | None = None,
+    owned_compressed_entry_ids: Sequence[int] | None = None,
+) -> Dsv4ExchangedAttentionBackwardWork:
+    """Replay DSV4 backward and reduce owner grads from ART StagePlan slots.
+
+    This is the backward counterpart to the CSA/HCA StagePlan-slot forward
+    launchers. It derives gradient id spaces and owner-receive plans from host
+    StagePlan metadata only, then delegates to the existing global-LSE replay and
+    explicit-id owner exchange. Custom communication remains eager and outside
+    compiled regions.
+    """
+    rank_int = int(rank)
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    _validate_exchange_rank(rank=rank_int, rank_count=rank_count)
+    slots = _validate_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=stage_plan_slots,
+    )
+    id_spaces = _stage_plan_slot_gradient_id_spaces(layout=layout, slots=slots)
+    local_query_ids = id_spaces[0][rank_int]
+    if tuple(forward_result.query_token_ids) != local_query_ids:
+        raise RuntimeError(
+            "DSV4 forward_result query ids do not match StagePlan-slot query ids: "
+            f"{tuple(forward_result.query_token_ids)} vs {local_query_ids}"
+        )
+    recv_query = _recv_gradient_ids_by_peer(
+        ids_by_rank=id_spaces[0],
+        rank=rank_int,
+        rank_count=rank_count,
+        owner_rank=lambda token_id: _layout_raw_owner_rank(
+            layout=layout,
+            token_id=token_id,
+        ),
+    )
+    recv_raw = _recv_gradient_ids_by_peer(
+        ids_by_rank=id_spaces[1],
+        rank=rank_int,
+        rank_count=rank_count,
+        owner_rank=lambda token_id: _layout_raw_owner_rank(
+            layout=layout,
+            token_id=token_id,
+        ),
+    )
+    recv_compressed = _recv_gradient_ids_by_peer(
+        ids_by_rank=id_spaces[2],
+        rank=rank_int,
+        rank_count=rank_count,
+        owner_rank=lambda entry_id: _layout_entry_owner_rank(
+            layout=layout,
+            entry_id=entry_id,
+        ),
+    )
+    return launch_exchanged_dsv4_attention_backward(
+        forward_result=forward_result,
+        grad_out=grad_out,
+        query_token_ids=local_query_ids,
+        raw_token_ids=id_spaces[1][rank_int],
+        compressed_entry_ids=id_spaces[2][rank_int],
+        query_owner_ranks=tuple(
+            _layout_raw_owner_rank(layout=layout, token_id=token_id)
+            for token_id in local_query_ids
+        ),
+        raw_owner_ranks=tuple(
+            _layout_raw_owner_rank(layout=layout, token_id=token_id)
+            for token_id in id_spaces[1][rank_int]
+        ),
+        compressed_owner_ranks=tuple(
+            _layout_entry_owner_rank(layout=layout, entry_id=entry_id)
+            for entry_id in id_spaces[2][rank_int]
+        ),
+        recv_query_token_ids_by_peer=recv_query,
+        recv_raw_token_ids_by_peer=recv_raw,
+        recv_compressed_entry_ids_by_peer=recv_compressed,
+        owned_query_token_ids=owned_query_token_ids
+        if owned_query_token_ids is not None
+        else _owned_gradient_ids(
+            ids_by_rank=id_spaces[0],
+            rank=rank_int,
+            owner_rank=lambda token_id: _layout_raw_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+        ),
+        owned_raw_token_ids=owned_raw_token_ids
+        if owned_raw_token_ids is not None
+        else _owned_gradient_ids(
+            ids_by_rank=id_spaces[1],
+            rank=rank_int,
+            owner_rank=lambda token_id: _layout_raw_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+        ),
+        owned_compressed_entry_ids=owned_compressed_entry_ids
+        if owned_compressed_entry_ids is not None
+        else _owned_gradient_ids(
+            ids_by_rank=id_spaces[2],
+            rank=rank_int,
+            owner_rank=lambda entry_id: _layout_entry_owner_rank(
+                layout=layout,
+                entry_id=entry_id,
+            ),
+        ),
+        rank=rank_int,
+        rank_count=rank_count,
+        group=group,
+        async_op=async_op,
+    )
+
+
+@torch.compiler.disable
 def launch_exchanged_dsv4_attention_backward(
     *,
     forward_result: Dsv4AttentionForwardResult,
@@ -851,6 +973,132 @@ def _validate_stage_plan_slots(
             raise RuntimeError(f"DSV4 duplicate StagePlan slot {stage_index}")
         seen.add(stage_index)
     return slots
+
+
+def _stage_plan_slot_gradient_id_spaces(
+    *,
+    layout: Dsv4CompressedLayout,
+    slots: Sequence[Dsv4StagePlanSlot],
+) -> tuple[
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...], ...],
+]:
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    query_by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    raw_by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    compressed_by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    for slot in slots:
+        for rank, stage_plan in enumerate(slot.stage_plans_by_rank):
+            _append_unique(
+                query_by_rank[rank],
+                _token_ids_from_ranges(stage_plan.global_q_ranges),
+            )
+            _append_unique(
+                raw_by_rank[rank],
+                _raw_token_ids_from_ranges(
+                    layout=layout,
+                    ranges=stage_plan.global_k_ranges,
+                ),
+            )
+            _append_unique(
+                compressed_by_rank[rank],
+                stage_candidate_entry_ids(
+                    layout=layout,
+                    global_k_ranges=stage_plan.global_k_ranges,
+                ),
+            )
+    return (
+        tuple(tuple(ids) for ids in query_by_rank),
+        tuple(tuple(ids) for ids in raw_by_rank),
+        tuple(tuple(ids) for ids in compressed_by_rank),
+    )
+
+
+def _append_unique(target: list[int], ids: Sequence[int]) -> None:
+    seen = set(target)
+    for id_ in ids:
+        id_int = int(id_)
+        if id_int not in seen:
+            target.append(id_int)
+            seen.add(id_int)
+
+
+def _recv_gradient_ids_by_peer(
+    *,
+    ids_by_rank: tuple[tuple[int, ...], ...],
+    rank: int,
+    rank_count: int,
+    owner_rank: Callable[[int], int],
+) -> tuple[tuple[int, ...], ...]:
+    if len(ids_by_rank) != int(rank_count):
+        raise RuntimeError(
+            "DSV4 gradient id space rank count mismatch: "
+            f"{len(ids_by_rank)} vs {rank_count}"
+        )
+    return tuple(
+        tuple(id_ for id_ in peer_ids if int(owner_rank(id_)) == int(rank))
+        for peer_ids in ids_by_rank
+    )
+
+
+def _owned_gradient_ids(
+    *,
+    ids_by_rank: tuple[tuple[int, ...], ...],
+    rank: int,
+    owner_rank: Callable[[int], int],
+) -> tuple[int, ...]:
+    owned: list[int] = []
+    for peer_ids in ids_by_rank:
+        _append_unique(
+            owned,
+            tuple(id_ for id_ in peer_ids if int(owner_rank(id_)) == int(rank)),
+        )
+    return tuple(owned)
+
+
+def _raw_token_ids_from_ranges(
+    *,
+    layout: Dsv4CompressedLayout,
+    ranges: Sequence[Any],
+) -> tuple[int, ...]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for range_ in ranges:
+        for token_id in range(int(range_.start), int(range_.end)):
+            if token_id in seen:
+                continue
+            if 0 <= token_id < len(layout.raw_token_owner_ranks):
+                owner = int(layout.raw_token_owner_ranks[token_id])
+                if owner >= 0:
+                    ids.append(token_id)
+                    seen.add(token_id)
+    return tuple(ids)
+
+
+def _token_ids_from_ranges(ranges: Sequence[Any]) -> tuple[int, ...]:
+    ids: list[int] = []
+    for range_ in ranges:
+        ids.extend(range(int(range_.start), int(range_.end)))
+    _row_by_id(ids=tuple(ids), name="stage_plan_token_ranges")
+    return tuple(ids)
+
+
+def _layout_raw_owner_rank(*, layout: Dsv4CompressedLayout, token_id: int) -> int:
+    token_int = int(token_id)
+    if token_int < 0 or token_int >= len(layout.raw_token_owner_ranks):
+        raise RuntimeError(f"DSV4 raw/query token {token_int} has no CP owner")
+    owner = int(layout.raw_token_owner_ranks[token_int])
+    if owner < 0:
+        raise RuntimeError(f"DSV4 raw/query token {token_int} has no CP owner")
+    return owner
+
+
+def _layout_entry_owner_rank(*, layout: Dsv4CompressedLayout, entry_id: int) -> int:
+    entry_int = int(entry_id)
+    if entry_int < 0 or entry_int >= len(layout.entries):
+        raise RuntimeError(f"DSV4 compressed entry {entry_int} does not exist")
+    return int(layout.entries[entry_int].owner_rank)
 
 
 def _normalize_output_ids(ids: Sequence[int], *, name: str) -> tuple[int, ...]:
