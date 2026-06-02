@@ -1,3 +1,4 @@
+/README.md
 /bench_gdn_conv_gelu.py
 /bench_gdn_cp_layout_exchange.py
 /bench_gdn_cp_packed_layer.py
