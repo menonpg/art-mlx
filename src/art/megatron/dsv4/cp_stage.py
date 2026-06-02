@@ -893,13 +893,19 @@ def _stage_raw_token_ids(
 ) -> tuple[int, ...]:
     seen: set[int] = set()
     token_ids: list[int] = []
+    valid_ranges = _layout_stream_ranges(layout)
     for range_ in ranges:
-        for token_id in range(int(range_.start), int(range_.end)):
-            if token_id not in seen and _token_in_layout(
-                layout=layout, token_id=token_id
-            ):
-                seen.add(token_id)
-                token_ids.append(token_id)
+        range_start = int(range_.start)
+        range_end = int(range_.end)
+        for stream_start, stream_end in valid_ranges:
+            start = max(range_start, stream_start)
+            end = min(range_end, stream_end)
+            if start >= end:
+                continue
+            for token_id in range(start, end):
+                if token_id not in seen:
+                    seen.add(token_id)
+                    token_ids.append(token_id)
     return tuple(token_ids)
 
 
@@ -1158,6 +1164,12 @@ def _token_in_layout(*, layout: Dsv4CompressedLayout, token_id: int) -> bool:
     return any(
         int(stream.start) <= int(token_id) < int(stream.end)
         for stream in layout.streams
+    )
+
+
+def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted((int(stream.start), int(stream.end)) for stream in layout.streams)
     )
 
 
@@ -1550,15 +1562,23 @@ def _query_branch_view(
     layout: Dsv4CompressedLayout,
     query_token_id: int,
 ) -> tuple[Dsv4BranchView, int]:
+    stream_id = _stream_id_for_query_token(layout=layout, token_id=query_token_id)
     for view in layout.branch_views:
-        for token in view.tokens:
-            if int(token.packed_token_id) == int(query_token_id):
-                return view, int(token.view_pos)
+        if int(view.branch_stream_id) != int(stream_id):
+            continue
+        query_pos = view.position_of_token(query_token_id)
+        if query_pos is not None:
+            return view, int(query_pos)
     raise RuntimeError(f"DSV4 query token {query_token_id} is not in any branch view")
 
 
 def _position_in_view(*, view: Dsv4BranchView, token_id: int) -> int | None:
-    for token in view.tokens:
-        if int(token.packed_token_id) == int(token_id):
-            return int(token.view_pos)
-    return None
+    return view.position_of_token(token_id)
+
+
+def _stream_id_for_query_token(*, layout: Dsv4CompressedLayout, token_id: int) -> int:
+    token_int = int(token_id)
+    for stream in layout.streams:
+        if int(stream.start) <= token_int < int(stream.end):
+            return int(stream.stream_id)
+    raise RuntimeError(f"DSV4 query token {token_int} is not in any stream")

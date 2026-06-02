@@ -62,11 +62,82 @@ class Dsv4BranchView(BaseModel):
     branch_stream_id: int
     prefix_stream_id: int
     suffix_stream_id: int | None
-    tokens: tuple[Dsv4TokenInView, ...]
+    prefix_start: int
+    prefix_end: int
+    suffix_start: int | None = None
+    suffix_end: int | None = None
     prefix_token_count: int
 
     def size(self) -> int:
-        return len(self.tokens)
+        return int(self.prefix_token_count) + self.suffix_size()
+
+    def suffix_size(self) -> int:
+        if self.suffix_start is None or self.suffix_end is None:
+            return 0
+        return int(self.suffix_end) - int(self.suffix_start)
+
+    def token_id_at(self, view_pos: int) -> int:
+        pos = int(view_pos)
+        if pos < 0 or pos >= self.size():
+            raise RuntimeError(
+                f"DSV4 branch view {self.branch_stream_id} position {pos} "
+                f"is outside length {self.size()}"
+            )
+        prefix_count = int(self.prefix_token_count)
+        if pos < prefix_count:
+            return int(self.prefix_start) + pos
+        if self.suffix_start is None:
+            raise RuntimeError(
+                f"DSV4 branch view {self.branch_stream_id} has no suffix position {pos}"
+            )
+        return int(self.suffix_start) + pos - prefix_count
+
+    def position_of_token(self, token_id: int) -> int | None:
+        token = int(token_id)
+        if int(self.prefix_start) <= token < int(self.prefix_end):
+            return token - int(self.prefix_start)
+        if (
+            self.suffix_start is not None
+            and self.suffix_end is not None
+            and int(self.suffix_start) <= token < int(self.suffix_end)
+        ):
+            return int(self.prefix_token_count) + token - int(self.suffix_start)
+        return None
+
+    @property
+    def tokens(self) -> tuple[Dsv4TokenInView, ...]:
+        tokens: list[Dsv4TokenInView] = []
+        cursor = 0
+        for offset, packed_id in enumerate(
+            range(int(self.prefix_start), int(self.prefix_end))
+        ):
+            tokens.append(
+                Dsv4TokenInView(
+                    packed_token_id=packed_id,
+                    stream_id=int(self.prefix_stream_id),
+                    view_pos=cursor,
+                    stream_pos=offset,
+                )
+            )
+            cursor += 1
+        if (
+            self.suffix_stream_id is not None
+            and self.suffix_start is not None
+            and self.suffix_end is not None
+        ):
+            for offset, packed_id in enumerate(
+                range(int(self.suffix_start), int(self.suffix_end))
+            ):
+                tokens.append(
+                    Dsv4TokenInView(
+                        packed_token_id=packed_id,
+                        stream_id=int(self.suffix_stream_id),
+                        view_pos=cursor,
+                        stream_pos=offset,
+                    )
+                )
+                cursor += 1
+        return tuple(tokens)
 
 
 class Dsv4CompressedEntry(BaseModel):
@@ -361,6 +432,8 @@ class Dsv4CompressedLayout(BaseModel):
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
     raw_token_owner_ranks: tuple[int, ...]
     entry_ids_by_branch_stream: dict[int, tuple[int, ...]] = Field(default_factory=dict)
+    entry_ids_by_closure_token: dict[int, tuple[int, ...]] = Field(default_factory=dict)
+    closure_token_ids: tuple[int, ...] = ()
 
 
 class Dsv4PreparedPlan(BaseModel):

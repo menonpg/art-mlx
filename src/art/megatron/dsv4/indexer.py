@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -100,11 +101,20 @@ def stage_candidate_entry_ids(
     """Return compressed ids whose raw closure token is in a CP stage K range."""
     if not global_k_ranges:
         return ()
-    return tuple(
-        int(entry.entry_id)
-        for entry in layout.entries
-        if _token_in_ranges(int(entry.closure_token_id), global_k_ranges)
-    )
+    if layout.entries and (
+        not layout.entry_ids_by_closure_token or not layout.closure_token_ids
+    ):
+        raise RuntimeError(
+            "DSV4 compressed layout is missing closure-token entry index"
+        )
+    candidates: set[int] = set()
+    closure_tokens = layout.closure_token_ids
+    for range_ in global_k_ranges:
+        start = bisect_left(closure_tokens, int(range_.start))
+        end = bisect_left(closure_tokens, int(range_.end))
+        for token_id in closure_tokens[start:end]:
+            candidates.update(layout.entry_ids_by_closure_token.get(token_id, ()))
+    return tuple(sorted(candidates))
 
 
 def build_dsv4_indexer_kv_exchange_peer_plans(
@@ -1112,14 +1122,16 @@ def _query_visibility(
 ) -> tuple[int, int, int]:
     stream = _stream_for_token(layout=layout, token_id=query_token_id)
     view = _branch_view_by_stream(layout=layout, branch_stream_id=int(stream.stream_id))
-    for token in view.tokens:
-        if int(token.packed_token_id) == int(query_token_id):
-            return (
-                int(view.branch_stream_id),
-                int(view.prefix_stream_id),
-                int(token.view_pos),
-            )
-    raise RuntimeError(f"DSV4 query token {query_token_id} is not in its branch view")
+    query_pos = view.position_of_token(query_token_id)
+    if query_pos is None:
+        raise RuntimeError(
+            f"DSV4 query token {query_token_id} is not in its branch view"
+        )
+    return (
+        int(view.branch_stream_id),
+        int(view.prefix_stream_id),
+        int(query_pos),
+    )
 
 
 def _query_visibility_tensors(

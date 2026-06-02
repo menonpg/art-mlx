@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .compressor import build_dsv4_compressed_layout_from_cp_state
+from .compressor import build_dsv4_compressed_layouts_from_cp_state
 from .cp_attention import build_dsv4_attention_backward_plan_from_stage_plan_slots
 from .cp_stage import (
     build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
@@ -68,28 +68,36 @@ def prepare_dsv4_context_parallel_state(
             rank_plan.stage_plans for rank_plan in runtime_plan.rank_plans
         ),
     )
-    csa_layout = (
-        build_dsv4_compressed_layout_from_cp_state(
-            state=cp_state,
-            spec=Dsv4CompressionSpec(
+    layout_names: list[str] = []
+    layout_specs: list[Dsv4CompressionSpec] = []
+    if include_csa:
+        layout_names.append("csa")
+        layout_specs.append(
+            Dsv4CompressionSpec(
                 kind=Dsv4CompressionKind.CSA,
                 ratio=int(csa_ratio),
-            ),
+            )
         )
-        if include_csa
-        else None
-    )
-    hca_layout = (
-        build_dsv4_compressed_layout_from_cp_state(
-            state=cp_state,
-            spec=Dsv4CompressionSpec(
+    if include_hca:
+        layout_names.append("hca")
+        layout_specs.append(
+            Dsv4CompressionSpec(
                 kind=Dsv4CompressionKind.HCA,
                 ratio=int(hca_ratio),
-            ),
+            )
         )
-        if include_hca
-        else None
+    built_layouts = dict(
+        zip(
+            layout_names,
+            build_dsv4_compressed_layouts_from_cp_state(
+                state=cp_state,
+                specs=tuple(layout_specs),
+            ),
+            strict=True,
+        )
     )
+    csa_layout = built_layouts.get("csa")
+    hca_layout = built_layouts.get("hca")
     csa_indexer_stage_plans = (
         tuple(
             build_dsv4_indexer_stage_plan_from_stage_plans(
