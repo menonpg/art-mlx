@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 import torch
+import torch.distributed as dist
 
 from . import sparse_kernel
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
@@ -19,6 +20,8 @@ from .types import (
     Dsv4StageKeyKind,
     Dsv4TensorExchangePlan,
 )
+
+_DIST = cast(Any, dist)
 
 
 class Dsv4GradientOwnerExchangeWork(BaseModel):
@@ -110,6 +113,25 @@ class Dsv4GradientOwnerExchangeWork(BaseModel):
         return tuple(buckets)
 
 
+class Dsv4SinkGradientReduceWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    d_attn_sink: torch.Tensor
+    handle: Any | None
+    _wait_complete: bool = PrivateAttr(default=False)
+
+    def wait(self) -> None:
+        if self._wait_complete:
+            return
+        if self.handle is not None:
+            self.handle.wait()
+        self._wait_complete = True
+
+    def wait_post_process(self) -> torch.Tensor:
+        self.wait()
+        return self.d_attn_sink
+
+
 class Dsv4ExchangedAttentionForwardWork(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -140,25 +162,33 @@ class Dsv4ExchangedAttentionBackwardWork(BaseModel):
 
     local_gradients: Dsv4AttentionGradientResult
     owner_work: Any
+    sink_work: Any | None = None
     owned_query_token_ids: tuple[int, ...]
     owned_raw_token_ids: tuple[int, ...]
     owned_compressed_entry_ids: tuple[int, ...]
 
     def wait(self) -> None:
         self.owner_work.wait()
+        if self.sink_work is not None:
+            self.sink_work.wait()
 
     def wait_post_process(self) -> Dsv4AttentionGradientResult:
         buckets = _owner_buckets_from_work(self.owner_work)
+        d_attn_sink = _sink_gradient_from_work(
+            sink_work=self.sink_work,
+            local_d_attn_sink=self.local_gradients.d_attn_sink,
+        )
         if buckets:
             return accumulate_dsv4_gradient_owner_buckets(
                 buckets=buckets,
                 query_token_ids=self.owned_query_token_ids,
                 raw_token_ids=self.owned_raw_token_ids,
                 compressed_entry_ids=self.owned_compressed_entry_ids,
-                d_attn_sink=self.local_gradients.d_attn_sink,
+                d_attn_sink=d_attn_sink,
             )
         return _empty_owned_gradient_result(
             template=self.local_gradients,
+            d_attn_sink=d_attn_sink,
             query_token_ids=self.owned_query_token_ids,
             raw_token_ids=self.owned_raw_token_ids,
             compressed_entry_ids=self.owned_compressed_entry_ids,
@@ -399,13 +429,50 @@ def launch_exchanged_dsv4_attention_backward(
         group=group,
         async_op=async_op,
     )
+    sink_work = launch_dsv4_attn_sink_gradient_reduce(
+        d_attn_sink=local_gradients.d_attn_sink,
+        rank=rank,
+        rank_count=rank_count,
+        group=group,
+        async_op=async_op,
+    )
     return Dsv4ExchangedAttentionBackwardWork(
         local_gradients=local_gradients,
         owner_work=owner_work,
+        sink_work=sink_work,
         owned_query_token_ids=owned_query_ids,
         owned_raw_token_ids=owned_raw_ids,
         owned_compressed_entry_ids=owned_compressed_ids,
     )
+
+
+@torch.compiler.disable
+def launch_dsv4_attn_sink_gradient_reduce(
+    *,
+    d_attn_sink: torch.Tensor,
+    rank: int,
+    rank_count: int,
+    group: Any,
+    async_op: bool,
+) -> Dsv4SinkGradientReduceWork:
+    """Launch CP-wide reduction for the DSV4 attention-sink gradient.
+
+    Sink is merged once globally in forward, but its gradient is accumulated from
+    every rank's local query rows. This eager same-stream all-reduce keeps the
+    custom communication boundary outside compiled regions.
+    """
+    rank = int(rank)
+    rank_count = int(rank_count)
+    _validate_exchange_rank(rank=rank, rank_count=rank_count)
+    if d_attn_sink.ndim != 1:
+        raise ValueError(
+            f"DSV4 d_attn_sink must be a per-head vector, got {d_attn_sink.shape}"
+        )
+    reduced = d_attn_sink.contiguous().clone()
+    handle = None
+    if rank_count > 1:
+        handle = _DIST.all_reduce(reduced, group=group, async_op=async_op)
+    return Dsv4SinkGradientReduceWork(d_attn_sink=reduced, handle=handle)
 
 
 def _validate_stage_exchange_work(*, work: Any, position: int) -> None:
@@ -444,9 +511,36 @@ def _owner_buckets_from_work(work: Any) -> tuple[Dsv4GradientOwnerBucket, ...]:
     return buckets
 
 
+def _sink_gradient_from_work(
+    *,
+    sink_work: Any | None,
+    local_d_attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    if sink_work is None:
+        return local_d_attn_sink
+    if not callable(getattr(sink_work, "wait", None)):
+        raise ValueError("DSV4 sink-gradient reduce work is missing wait()")
+    if not callable(getattr(sink_work, "wait_post_process", None)):
+        raise ValueError(
+            "DSV4 sink-gradient reduce work is missing wait_post_process()"
+        )
+    result = sink_work.wait_post_process()
+    if not isinstance(result, torch.Tensor):
+        raise TypeError(
+            f"DSV4 sink-gradient reduce returned {type(result)!r}, expected Tensor"
+        )
+    if result.shape != local_d_attn_sink.shape:
+        raise ValueError(
+            "DSV4 reduced sink gradient shape mismatch: "
+            f"{tuple(result.shape)} vs {tuple(local_d_attn_sink.shape)}"
+        )
+    return result
+
+
 def _empty_owned_gradient_result(
     *,
     template: Dsv4AttentionGradientResult,
+    d_attn_sink: torch.Tensor,
     query_token_ids: tuple[int, ...],
     raw_token_ids: tuple[int, ...],
     compressed_entry_ids: tuple[int, ...],
@@ -467,7 +561,7 @@ def _empty_owned_gradient_result(
         dcompressed_kv=template.dcompressed_kv.new_zeros(
             (batch_size, len(compressed_entry_ids), kv_dim)
         ),
-        d_attn_sink=template.d_attn_sink,
+        d_attn_sink=d_attn_sink,
     )
 
 

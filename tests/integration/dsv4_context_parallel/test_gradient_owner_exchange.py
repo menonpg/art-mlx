@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 from art.megatron.dsv4 import (
     Dsv4AttentionGradientResult,
     accumulate_dsv4_gradient_owner_buckets,
+    launch_dsv4_attn_sink_gradient_reduce,
     launch_dsv4_gradient_owner_bucket_exchange,
 )
 
@@ -56,13 +57,21 @@ def _gradient_owner_exchange_worker(rank: int, world_size: int, init_path: str) 
             group=cast(Any, torch.distributed).group.WORLD,
             async_op=True,
         )
+        sink_work = launch_dsv4_attn_sink_gradient_reduce(
+            d_attn_sink=_rank_sink_grad(rank),
+            rank=rank,
+            rank_count=world_size,
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        )
         buckets = work.wait_post_process()
+        reduced_sink = sink_work.wait_post_process()
         reduced = accumulate_dsv4_gradient_owner_buckets(
             buckets=buckets,
             query_token_ids=_owned_query_ids(rank),
             raw_token_ids=_owned_raw_ids(rank),
             compressed_entry_ids=_owned_compressed_ids(rank),
-            d_attn_sink=torch.zeros(2, dtype=torch.float64),
+            d_attn_sink=reduced_sink,
         )
         expected = _expected_reduced(rank)
         torch.testing.assert_close(reduced.dq, expected.dq, rtol=0, atol=0)
@@ -73,6 +82,7 @@ def _gradient_owner_exchange_worker(rank: int, world_size: int, init_path: str) 
             rtol=0,
             atol=0,
         )
+        torch.testing.assert_close(reduced.d_attn_sink, _expected_sink_grad())
     finally:
         destroy_process_group()
 
@@ -97,6 +107,14 @@ def _rank_gradients(rank: int) -> Dsv4AttentionGradientResult:
         dcompressed_kv=_kv_rows((8.0,)),
         d_attn_sink=torch.zeros(2, dtype=torch.float64),
     )
+
+
+def _rank_sink_grad(rank: int) -> torch.Tensor:
+    return torch.tensor([float(rank + 1), float(rank + 3)], dtype=torch.float64)
+
+
+def _expected_sink_grad() -> torch.Tensor:
+    return torch.tensor([3.0, 7.0], dtype=torch.float64)
 
 
 def _expected_reduced(rank: int) -> Dsv4AttentionGradientResult:
