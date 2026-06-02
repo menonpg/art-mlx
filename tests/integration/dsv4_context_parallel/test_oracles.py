@@ -722,17 +722,27 @@ def test_distributed_projected_hca_wrapper_matches_packed_oracle(
         init_path.unlink()
 
 
+@pytest.mark.parametrize(
+    ("world_size", "master_port"),
+    (
+        (2, "29638"),
+        (4, "29639"),
+        (8, "29640"),
+    ),
+)
 def test_distributed_projected_real_planner_context_state_matches_packed_oracle(
     tmp_path: Path,
+    world_size: int,
+    master_port: str,
 ) -> None:
     pytest.importorskip("megatron.core")
-    init_path = tmp_path / "dsv4_projected_real_planner_oracle_gloo"
+    init_path = tmp_path / f"dsv4_projected_real_planner_cp{world_size}_oracle_gloo"
     if init_path.exists():
         init_path.unlink()
     mp.start_processes(
         _distributed_projected_real_planner_oracle_worker,
-        args=(2, str(init_path)),
-        nprocs=2,
+        args=(int(world_size), str(init_path), master_port),
+        nprocs=int(world_size),
         join=True,
         start_method="spawn",
     )
@@ -981,9 +991,10 @@ def _distributed_projected_real_planner_oracle_worker(
     rank: int,
     world_size: int,
     init_path: str,
+    master_port: str,
 ) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29638")
+    os.environ["MASTER_PORT"] = master_port
     init_process_group(
         "gloo",
         init_method=f"file://{init_path}",
@@ -993,7 +1004,10 @@ def _distributed_projected_real_planner_oracle_worker(
     try:
         setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
         setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
-        context_state = _real_planner_dsv4_context_state(rank=rank)
+        context_state = _real_planner_dsv4_context_state(
+            rank=rank,
+            world_size=world_size,
+        )
         local_token_ids = _local_token_ids_from_context_state(context_state)
         _run_real_planner_csa_context_oracle(
             context_state=context_state,
@@ -1007,7 +1021,7 @@ def _distributed_projected_real_planner_oracle_worker(
         destroy_process_group()
 
 
-def _real_planner_dsv4_context_state(*, rank: int) -> Any:
+def _real_planner_dsv4_context_state(*, rank: int, world_size: int) -> Any:
     from art.megatron.context_parallel import ContextParallelConfig, ParallelTopology
     from art.megatron.context_parallel.runtime import (
         prepare_megatron_context_parallel_state,
@@ -1015,7 +1029,7 @@ def _real_planner_dsv4_context_state(*, rank: int) -> Any:
 
     cp_state, _rank_plan, _spec, _pad = prepare_megatron_context_parallel_state(
         micro=_real_planner_micro(),
-        topology=ParallelTopology(cp=2),
+        topology=ParallelTopology(cp=int(world_size)),
         config=ContextParallelConfig(block_size=4, planner_chunk_size=4),
         cp_group=cast(Any, torch.distributed).group.WORLD,
         cp_rank=int(rank),
@@ -1211,8 +1225,11 @@ def _run_real_planner_csa_context_oracle(
         backward.main_compressor.dpositional_bias, ref_main_bias.grad
     )
     torch.testing.assert_close(backward.attention.d_attn_sink, ref_sink.grad)
-    assert not bool(backward.attention.dq.abs().sum().eq(0).item())
-    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+    _assert_distributed_nonzero(backward.attention.dq, name="real planner CSA dq")
+    _assert_distributed_nonzero(
+        backward.main_compressor.dprojected_kv,
+        name="real planner CSA dprojected_kv",
+    )
 
 
 def _run_real_planner_hca_context_oracle(
@@ -1340,8 +1357,11 @@ def _run_real_planner_hca_context_oracle(
     )
     torch.testing.assert_close(backward.main_compressor.dpositional_bias, ref_bias.grad)
     torch.testing.assert_close(backward.attention.d_attn_sink, ref_sink.grad)
-    assert not bool(backward.attention.dq.abs().sum().eq(0).item())
-    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+    _assert_distributed_nonzero(backward.attention.dq, name="real planner HCA dq")
+    _assert_distributed_nonzero(
+        backward.main_compressor.dprojected_kv,
+        name="real planner HCA dprojected_kv",
+    )
 
 
 def _distributed_projected_csa_oracle_worker(
@@ -2775,6 +2795,14 @@ def _assert_id_aligned_rows_close(
         rtol=rtol,
         atol=atol,
     )
+
+
+def _assert_distributed_nonzero(tensor: torch.Tensor, *, name: str) -> None:
+    total = tensor.detach().abs().sum()
+    if cast(Any, torch.distributed).is_initialized():
+        total = total.clone()
+        cast(Any, torch.distributed).all_reduce(total)
+    assert not bool(total.eq(0).item()), f"{name} is zero across all ranks"
 
 
 def _dense_fake_fwd(
