@@ -17,6 +17,11 @@ class Dsv4CompressionKind(str, Enum):
     HCA = "hca"
 
 
+class Dsv4StageKeyKind(str, Enum):
+    RAW = "raw"
+    COMPRESSED = "compressed"
+
+
 class Dsv4StreamKind(str, Enum):
     PREFIX = "prefix"
     COMPLETION = "completion"
@@ -98,6 +103,20 @@ class Dsv4TopkResult(BaseModel):
     scores: torch.Tensor
 
 
+class Dsv4StageInputs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    stage_index: int
+    query_token_ids: tuple[int, ...]
+    raw_token_ids: tuple[int, ...]
+    compressed_entry_ids: tuple[int, ...]
+    key_kinds: tuple[Dsv4StageKeyKind, ...]
+    key_global_ids: tuple[int, ...]
+    raw_token_ids_by_query: tuple[tuple[int, ...], ...]
+    compressed_entry_ids_by_query: tuple[tuple[int, ...], ...]
+    topk_stage_local: torch.Tensor
+
+
 class Dsv4CompressedLayout(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -126,3 +145,4 @@ class Dsv4ContextParallelState(BaseModel):
 
 
 Dsv4TopkResult.model_rebuild()
+Dsv4StageInputs.model_rebuild()
