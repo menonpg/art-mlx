@@ -612,6 +612,23 @@ def test_distributed_projected_csa_cp4_empty_rank_matches_packed_oracle(
         init_path.unlink()
 
 
+def test_distributed_projected_csa_cp8_empty_rank_matches_packed_oracle(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_projected_csa_cp8_empty_rank_oracle_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_csa_cp8_empty_rank_oracle_worker,
+        args=(8, str(init_path)),
+        nprocs=8,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.device_count() < 2
@@ -738,14 +755,14 @@ def _layout(kind: Dsv4CompressionKind, rank_count: int = 2) -> Dsv4CompressedLay
             ((8, 18, 0),),
         )
         token_counts_by_rank = (8, 10)
-    elif rank_count == 4:
+    elif rank_count in (4, 8):
         ownership_ranges_by_rank = (
             ((0, 8, 0),),
             ((8, 13, 0),),
             ((13, 18, 0),),
-            (),
+            *(((),) * (rank_count - 3)),
         )
-        token_counts_by_rank = (8, 5, 5, 0)
+        token_counts_by_rank = (8, 5, 5) + ((0,) * (rank_count - 3))
     else:
         raise RuntimeError(f"unsupported test rank_count {rank_count}")
     return build_dsv4_compressed_layout(
@@ -803,31 +820,54 @@ def _two_rank_full_stage_slot(
 
 
 def _four_rank_empty_slot() -> tuple[Dsv4StagePlanSlot, ...]:
+    return _n_rank_empty_slot(rank_count=4)
+
+
+def _empty_rank_token_ids_by_rank(*, rank_count: int) -> tuple[tuple[int, ...], ...]:
+    if int(rank_count) < 3:
+        raise RuntimeError(
+            f"empty-rank token layout requires at least 3 ranks: {rank_count}"
+        )
+    return (
+        tuple(range(0, 8)),
+        tuple(range(8, 13)),
+        tuple(range(13, 18)),
+        *(((),) * (int(rank_count) - 3)),
+    )
+
+
+def _n_rank_empty_slot(*, rank_count: int) -> tuple[Dsv4StagePlanSlot, ...]:
+    if int(rank_count) < 3:
+        raise RuntimeError(f"empty-rank slot requires at least 3 ranks: {rank_count}")
+    stage_plans = [
+        _StagePlan(
+            stage_index=0,
+            global_q_ranges=(_Range(start=0, end=8),),
+            global_k_ranges=(_Range(start=0, end=18),),
+        ),
+        _StagePlan(
+            stage_index=0,
+            global_q_ranges=(_Range(start=8, end=13),),
+            global_k_ranges=(_Range(start=0, end=18),),
+        ),
+        _StagePlan(
+            stage_index=0,
+            global_q_ranges=(_Range(start=13, end=18),),
+            global_k_ranges=(_Range(start=0, end=18),),
+        ),
+    ]
+    for _ in range(int(rank_count) - 3):
+        stage_plans.append(
+            _StagePlan(
+                stage_index=0,
+                global_q_ranges=(),
+                global_k_ranges=(_Range(start=0, end=18),),
+            )
+        )
     return (
         Dsv4StagePlanSlot(
             stage_index=0,
-            stage_plans_by_rank=(
-                _StagePlan(
-                    stage_index=0,
-                    global_q_ranges=(_Range(start=0, end=8),),
-                    global_k_ranges=(_Range(start=0, end=18),),
-                ),
-                _StagePlan(
-                    stage_index=0,
-                    global_q_ranges=(_Range(start=8, end=13),),
-                    global_k_ranges=(_Range(start=0, end=18),),
-                ),
-                _StagePlan(
-                    stage_index=0,
-                    global_q_ranges=(_Range(start=13, end=18),),
-                    global_k_ranges=(_Range(start=0, end=18),),
-                ),
-                _StagePlan(
-                    stage_index=0,
-                    global_q_ranges=(),
-                    global_k_ranges=(_Range(start=0, end=18),),
-                ),
-            ),
+            stage_plans_by_rank=tuple(stage_plans),
         ),
     )
 
@@ -1032,7 +1072,7 @@ def _distributed_projected_csa_cp4_empty_rank_oracle_worker(
     try:
         setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
         setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
-        layout = _layout(Dsv4CompressionKind.CSA, rank_count=4)
+        layout = _layout(Dsv4CompressionKind.CSA, rank_count=world_size)
         torch.manual_seed(141)
         query = torch.randn(18, 2, 4, dtype=torch.float64)
         raw_kv = torch.randn(18, 4, dtype=torch.float64)
@@ -1046,12 +1086,7 @@ def _distributed_projected_csa_cp4_empty_rank_oracle_worker(
         indexer_weights = torch.randn(18, 2, dtype=torch.float64)
         attn_sink = torch.randn(2, dtype=torch.float64)
         grad_out = torch.randn(1, 18, 2, 4, dtype=torch.float64)
-        local_token_ids_by_rank = (
-            tuple(range(0, 8)),
-            tuple(range(8, 13)),
-            tuple(range(13, 18)),
-            (),
-        )
+        local_token_ids_by_rank = _empty_rank_token_ids_by_rank(rank_count=world_size)
         local_token_ids = local_token_ids_by_rank[rank]
         local_positions = torch.tensor(local_token_ids, dtype=torch.long)
         local_index = list(local_token_ids)
@@ -1059,7 +1094,7 @@ def _distributed_projected_csa_cp4_empty_rank_oracle_worker(
         forward = launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
             layout=layout,
             rank=rank,
-            stage_plan_slots=_four_rank_empty_slot(),
+            stage_plan_slots=_n_rank_empty_slot(rank_count=world_size),
             query=query[local_index],
             query_token_ids=local_token_ids,
             raw_kv=raw_kv[local_index],
@@ -1132,7 +1167,7 @@ def _distributed_projected_csa_cp4_empty_rank_oracle_worker(
         backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
             layout=layout,
             rank=rank,
-            stage_plan_slots=_four_rank_empty_slot(),
+            stage_plan_slots=_n_rank_empty_slot(rank_count=world_size),
             forward_result=forward,
             grad_out=grad_out.index_select(1, local_positions),
             group=cast(Any, torch.distributed).group.WORLD,
@@ -1213,6 +1248,18 @@ def _distributed_projected_csa_cp4_empty_rank_oracle_worker(
             assert backward.main_compressor.dprojected_gate.numel() == 0
     finally:
         destroy_process_group()
+
+
+def _distributed_projected_csa_cp8_empty_rank_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+) -> None:
+    _distributed_projected_csa_cp4_empty_rank_oracle_worker(
+        rank=rank,
+        world_size=world_size,
+        init_path=init_path,
+    )
 
 
 def _distributed_projected_csa_nccl_oracle_worker(
