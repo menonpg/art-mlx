@@ -9,7 +9,7 @@ class Dsv4FamilyShape(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     prefix_length: int = Field(ge=1)
-    completion_lengths: tuple[int, ...] = Field(min_length=1)
+    completion_lengths: tuple[int, ...] = ()
 
     @field_validator("completion_lengths")
     @classmethod
@@ -95,6 +95,8 @@ def randomized_repeated_case(
     completion_mean: int = 100,
     completion_jitter: int = 24,
     prefix_jitter: int = 512,
+    exact_token_count: bool = False,
+    tags: tuple[str, ...] = ("randomized_completions", "weak_scaling_candidate"),
 ) -> Dsv4WorkloadCase:
     rng = random.Random(seed)
     rows: list[Dsv4PackedRowShape] = []
@@ -105,6 +107,14 @@ def randomized_repeated_case(
             remaining = sequence_length - cursor
             prefix = max(1, prefix_length + rng.randint(-prefix_jitter, prefix_jitter))
             if remaining < prefix + 2:
+                if exact_token_count:
+                    families.append(
+                        Dsv4FamilyShape(
+                            prefix_length=remaining,
+                            completion_lengths=(),
+                        )
+                    )
+                    cursor += remaining
                 break
             lengths = _randomized_completion_lengths(
                 rng,
@@ -123,6 +133,13 @@ def randomized_repeated_case(
                 break
             families.append(family)
             cursor += dsv4_family_token_count(family)
+        if exact_token_count and cursor < sequence_length and families:
+            families.append(
+                Dsv4FamilyShape(
+                    prefix_length=sequence_length - cursor,
+                    completion_lengths=(),
+                )
+            )
         if not families:
             families.append(
                 Dsv4FamilyShape(
@@ -140,7 +157,74 @@ def randomized_repeated_case(
             "Randomized shared-prefix workload with completion lengths varied per "
             "completion and per packed sequence."
         ),
-        tags=("randomized_completions", "weak_scaling_candidate"),
+        tags=tags,
+    )
+
+
+def canonical_benchmark_cases() -> tuple[Dsv4WorkloadCase, ...]:
+    weak_scale = tuple(
+        randomized_repeated_case(
+            name=f"weak_scale_{topology}_{token_count}",
+            sequence_length=token_count,
+            seed=1000 + index,
+            prefix_length=5000,
+            completion_count=16,
+            completion_mean=100,
+            completion_jitter=24,
+            prefix_jitter=384,
+            exact_token_count=True,
+            tags=(
+                "benchmark",
+                "weak_scaling_candidate",
+                "randomized_completions",
+            ),
+        )
+        for index, (topology, token_count) in enumerate(
+            (
+                ("cp1", 81920),
+                ("cp2", 163840),
+                ("cp4", 327680),
+                ("cp8", 655360),
+            )
+        )
+    )
+    return weak_scale + (
+        randomized_repeated_case(
+            name="long_prefix_20k_4x120k",
+            sequence_length=500000,
+            seed=2001,
+            prefix_length=20000,
+            completion_count=4,
+            completion_mean=120000,
+            completion_jitter=8192,
+            prefix_jitter=1024,
+            exact_token_count=True,
+            tags=("benchmark", "long_context", "randomized_completions"),
+        ),
+        randomized_repeated_case(
+            name="many_small_families_81920",
+            sequence_length=81920,
+            seed=2002,
+            prefix_length=256,
+            completion_count=4,
+            completion_mean=256,
+            completion_jitter=96,
+            prefix_jitter=64,
+            exact_token_count=True,
+            tags=("benchmark", "many_small_families", "randomized_completions"),
+        ),
+        randomized_repeated_case(
+            name="dominant_family_with_background_81920",
+            sequence_length=81920,
+            seed=2003,
+            prefix_length=20000,
+            completion_count=8,
+            completion_mean=4096,
+            completion_jitter=1024,
+            prefix_jitter=256,
+            exact_token_count=True,
+            tags=("benchmark", "dominant_family", "randomized_completions"),
+        ),
     )
 
 

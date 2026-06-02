@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 
 from artifacts import Dsv4Metric, write_manifest, write_readable_summary
-from cases import default_validation_cases, randomized_repeated_case
+from cases import (
+    canonical_benchmark_cases,
+    default_validation_cases,
+    dsv4_row_token_count,
+    randomized_repeated_case,
+)
 from packed_layout import (
     build_dsv4_packed_tensors,
     format_case_summary,
@@ -75,6 +80,37 @@ def test_randomized_case_is_deterministic_and_varies_completion_lengths() -> Non
     assert any(len(set(lengths)) > 1 for lengths in per_family_lengths)
     assert len({lengths for lengths in per_family_lengths}) > 1
     assert summarize_case(case_a).completion_lengths_vary
+
+
+def test_canonical_benchmark_cases_match_token_and_randomization_contract() -> None:
+    cases = {case.name: case for case in canonical_benchmark_cases()}
+    expected_lengths = {
+        "weak_scale_cp1_81920": 81920,
+        "weak_scale_cp2_163840": 163840,
+        "weak_scale_cp4_327680": 327680,
+        "weak_scale_cp8_655360": 655360,
+        "long_prefix_20k_4x120k": 500000,
+        "many_small_families_81920": 81920,
+        "dominant_family_with_background_81920": 81920,
+    }
+    assert set(cases) == set(expected_lengths)
+    for name, expected_length in expected_lengths.items():
+        case = cases[name]
+        summary = summarize_case(case)
+        assert case.sequence_length == expected_length
+        assert summary.total_tokens == expected_length * len(case.rows)
+        assert all(dsv4_row_token_count(row) == expected_length for row in case.rows)
+        assert summary.completion_lengths_vary
+        assert "randomized_completions" in case.tags
+    assert any(
+        not family.completion_lengths
+        for case in cases.values()
+        for row in case.rows
+        for family in row.families
+    )
+    assert (
+        summarize_case(cases["long_prefix_20k_4x120k"]).max_completion_length > 100000
+    )
 
 
 def test_packed_tensors_preserve_masked_context_token_mechanic() -> None:

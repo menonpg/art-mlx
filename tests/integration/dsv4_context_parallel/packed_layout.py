@@ -159,17 +159,14 @@ def summarize_case(
         completion_count=len(completion_lengths),
         max_segment_length=max(
             (
-                max(
-                    family.prefix_length,
-                    *(family.completion_lengths),
-                )
+                max((family.prefix_length, *family.completion_lengths))
                 for row in case.rows
                 for family in row.families
             ),
             default=0,
         ),
-        min_completion_length=min(completion_lengths),
-        max_completion_length=max(completion_lengths),
+        min_completion_length=min(completion_lengths, default=0),
+        max_completion_length=max(completion_lengths, default=0),
         unique_completion_lengths=tuple(sorted(set(completion_lengths))),
         completion_lengths_vary=(
             "randomized_completions" in tags or len(set(completion_lengths)) > 1
