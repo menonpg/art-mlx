@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass, field
 import gc
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -71,8 +72,7 @@ class _RuntimeRequestKwargs(TypedDict, total=False):
 def create_identity_lora(
     base_model: str,
     lora_path: str,
-    rank: int | None = None,
-    lora_alpha: int = LORA_ALPHA,
+    lora_config: dev.LoRAConfig | None = None,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> None:
@@ -85,8 +85,7 @@ def create_identity_lora(
     Args:
         base_model: HuggingFace model identifier.
         lora_path: Directory to save the adapter files.
-        rank: LoRA rank. Defaults to rank 1 for MoE models and rank 8 for dense models.
-        lora_alpha: LoRA alpha scaling factor.
+        lora_config: Normalized ART LoRA configuration.
     """
     from unittest.mock import patch
 
@@ -98,13 +97,16 @@ def create_identity_lora(
 
     if random_state is not None:
         torch.manual_seed(random_state)
-    target_modules = default_target_modules(base_model)
+    resolved_lora_config = lora_config or dev.LoRAConfig()
+    target_modules = resolved_lora_config.get(
+        "target_modules", default_target_modules(base_model)
+    )
     handler = get_model_support_handler(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    if rank is None:
-        rank = default_lora_rank_for_handler(handler)
+    rank = resolved_lora_config.get("rank", default_lora_rank_for_handler(handler))
+    alpha = resolved_lora_config.get("alpha", LORA_ALPHA)
     base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
     model_config = handler.identity_lora_model_config(base_config)
     with init_empty_weights():
@@ -113,10 +115,10 @@ def create_identity_lora(
         )
     model.name_or_path = base_model
 
-    lora_config = LoraConfig(
+    peft_lora_config = LoraConfig(
         base_model_name_or_path=base_model,
         r=rank,
-        lora_alpha=lora_alpha,
+        lora_alpha=alpha,
         target_modules=[],
         target_parameters=handler.identity_lora_target_parameters(
             model,
@@ -137,7 +139,7 @@ def create_identity_lora(
         return orig_to(module, *args, **kwargs)
 
     with patch.object(torch.nn.Module, "to", _skip_meta_to):
-        peft_model = get_peft_model(model, lora_config)
+        peft_model = get_peft_model(model, peft_lora_config)
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)
@@ -146,7 +148,7 @@ def create_identity_lora(
     final_config = LoraConfig(
         base_model_name_or_path=base_model,
         r=rank,
-        lora_alpha=lora_alpha,
+        lora_alpha=alpha,
         target_modules=target_modules,
         bias="none",
     ).to_dict()
@@ -217,11 +219,16 @@ class MegatronService:
         return f"http://{self._vllm_host}:{self._vllm_port}"
 
     def _megatron_random_state(self) -> int | None:
-        for config_key in ("peft_args", "init_args"):
-            random_state = self.config.get(config_key, {}).get("random_state")
-            if random_state is not None:
-                return int(random_state)
+        random_state = self._lora_config.get("random_state") or self.config.get(
+            "init_args", {}
+        ).get("random_state")
+        if random_state is not None:
+            return int(random_state)
         return None
+
+    @property
+    def _lora_config(self) -> dev.LoRAConfig:
+        return cast(dev.BackendModelConfig, self.config).get("lora_config", {})
 
     @property
     def _allow_unvalidated_arch(self) -> bool:
@@ -332,11 +339,14 @@ class MegatronService:
             self.base_model,
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
+        lora_config = self._lora_config
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=default_lora_rank_for_handler(handler),
-            lora_alpha=LORA_ALPHA,
-            target_modules=default_target_modules(self.base_model),
+            r=lora_config.get("rank", default_lora_rank_for_handler(handler)),
+            lora_alpha=lora_config.get("alpha", LORA_ALPHA),
+            target_modules=lora_config.get(
+                "target_modules", default_target_modules(self.base_model)
+            ),
             bias="none",
         )
 
@@ -356,6 +366,7 @@ class MegatronService:
         create_identity_lora(
             self.base_model,
             lora_path,
+            lora_config=self._lora_config,
             random_state=self._megatron_random_state(),
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
@@ -670,6 +681,7 @@ class MegatronService:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         env["MODEL_IDENTIFIER"] = self.base_model
+        env["ART_MEGATRON_LORA_CONFIG"] = json.dumps(self._lora_config)
         if self._allow_unvalidated_arch:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir

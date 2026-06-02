@@ -160,11 +160,12 @@ def _register_trainable_parameter_mode(
     provider: Any,
     *,
     trainable_parameter_mode: Literal["lora", "base_model"],
+    lora_config: dev.LoRAConfig | None,
 ) -> None:
     if trainable_parameter_mode == "lora":
         provider.register_pre_wrap_hook(freeze_model)
         provider.register_pre_wrap_hook(
-            lambda chunks: apply_lora_adapters(chunks, provider)
+            lambda chunks: apply_lora_adapters(chunks, provider, lora_config)
         )
         return
     if trainable_parameter_mode == "base_model":
@@ -323,6 +324,7 @@ def build_training_runtime(
     print_env: bool = True,
     build_optimizer: bool = True,
     trainable_parameter_mode: Literal["lora", "base_model"] = "lora",
+    lora_config: dev.LoRAConfig | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
@@ -347,6 +349,7 @@ def build_training_runtime(
     _register_trainable_parameter_mode(
         provider,
         trainable_parameter_mode=trainable_parameter_mode,
+        lora_config=lora_config,
     )
 
     model = cast(
@@ -1436,6 +1439,9 @@ def main() -> None:
     runtime = build_training_runtime(
         model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         build_optimizer=False,
+        lora_config=cast(
+            dev.LoRAConfig, json.loads(os.environ.get("ART_MEGATRON_LORA_CONFIG", "{}"))
+        ),
         allow_unvalidated_arch=os.environ.get(
             "ART_MEGATRON_ALLOW_UNVALIDATED_ARCH", ""
         ).lower()

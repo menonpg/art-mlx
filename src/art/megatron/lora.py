@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import math
 from typing import Any, Literal, cast
 
@@ -1376,17 +1376,20 @@ def wrap_shared_experts_mlp(
 def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,
+    lora_config: Mapping[str, Any] | None = None,
 ) -> list[torch.nn.Module]:
+    lora_config = lora_config or {}
     provider = cast(Any, provider)
     handler = provider._art_model_support_handler
     spec = provider._art_model_support_spec
-    target_modules = list(spec.default_target_modules)
-    rank = default_lora_rank_for_handler(handler)
+    target_modules = list(
+        lora_config.get("target_modules", spec.default_target_modules)
+    )
     handler.apply_lora_adapters(
         model,
         provider,
         target_modules=target_modules,
-        rank=rank,
-        alpha=LORA_ALPHA,
+        rank=lora_config.get("rank", default_lora_rank_for_handler(handler)),
+        alpha=lora_config.get("alpha", LORA_ALPHA),
     )
     return list(model)
