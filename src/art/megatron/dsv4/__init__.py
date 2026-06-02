@@ -16,6 +16,7 @@ from .cp_stage import (
     build_dsv4_stage_inputs,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
+    materialize_dsv4_stage_tensors,
     raw_swa_token_ids_for_query,
 )
 from .indexer import (
@@ -35,6 +36,7 @@ from .types import (
     Dsv4CompressionSpec,
     Dsv4ContextParallelState,
     Dsv4HaloTransfer,
+    Dsv4MaterializedStage,
     Dsv4PreparedPlan,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
@@ -52,6 +54,7 @@ __all__ = [
     "Dsv4CompressionSpec",
     "Dsv4ContextParallelState",
     "Dsv4HaloTransfer",
+    "Dsv4MaterializedStage",
     "Dsv4PreparedPlan",
     "Dsv4StageInputs",
     "Dsv4StageKeyKind",
@@ -74,6 +77,7 @@ __all__ = [
     "merge_indexer_topk_results",
     "merge_stage_outputs",
     "merge_two_stage_outputs",
+    "materialize_dsv4_stage_tensors",
     "raw_swa_token_ids_for_query",
     "stable_topk_by_score_and_id",
     "stage_candidate_entry_ids",

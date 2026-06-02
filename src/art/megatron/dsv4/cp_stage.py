@@ -10,6 +10,7 @@ from .types import (
     Dsv4BranchView,
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
+    Dsv4MaterializedStage,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
 )
@@ -193,6 +194,96 @@ def raw_swa_token_ids_for_query(
     )
 
 
+def materialize_dsv4_stage_tensors(
+    *,
+    stage_inputs: Dsv4StageInputs,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+) -> Dsv4MaterializedStage:
+    """Gather already-available DSV4 stage tensors into sparse-kernel order.
+
+    This function does no communication and makes no physical-id shortcut. The
+    caller supplies explicit row-id maps for local/fetched tensors. The returned
+    KV rows are exactly `stage.raw_token_ids + stage.compressed_entry_ids`, which
+    is the id space used by `stage.topk_stage_local`.
+    """
+    q_stage = _gather_mapped_rows(
+        tensor=query,
+        tensor_ids=query_token_ids,
+        selected_ids=stage_inputs.query_token_ids,
+        name="query",
+    )
+    raw_stage = _gather_mapped_rows(
+        tensor=raw_kv,
+        tensor_ids=raw_token_ids,
+        selected_ids=stage_inputs.raw_token_ids,
+        name="raw_kv",
+    )
+    compressed_stage = _gather_mapped_rows(
+        tensor=compressed_kv,
+        tensor_ids=compressed_entry_ids,
+        selected_ids=stage_inputs.compressed_entry_ids,
+        name="compressed_kv",
+    )
+
+    q_stage = _ensure_batched_stage_tensor(q_stage, name="query")
+    raw_stage = _ensure_batched_stage_tensor(raw_stage, name="raw_kv")
+    compressed_stage = _ensure_batched_stage_tensor(
+        compressed_stage,
+        name="compressed_kv",
+    )
+    if q_stage.ndim != 4:
+        raise RuntimeError(
+            f"DSV4 materialized query must be [B,Q,H,D], got {tuple(q_stage.shape)}"
+        )
+    if raw_stage.ndim != 3 or compressed_stage.ndim != 3:
+        raise RuntimeError(
+            "DSV4 materialized KV tensors must be [B,K,D], got "
+            f"raw={tuple(raw_stage.shape)}, compressed={tuple(compressed_stage.shape)}"
+        )
+    if q_stage.shape[-1] != raw_stage.shape[-1]:
+        raise RuntimeError(
+            "DSV4 query and raw KV dims must match, got "
+            f"{int(q_stage.shape[-1])} vs {int(raw_stage.shape[-1])}"
+        )
+    if raw_stage.shape[-1] != compressed_stage.shape[-1]:
+        raise RuntimeError(
+            "DSV4 raw and compressed KV dims must match, got "
+            f"{int(raw_stage.shape[-1])} vs {int(compressed_stage.shape[-1])}"
+        )
+
+    topk = stage_inputs.topk_stage_local.to(device=q_stage.device, dtype=torch.int64)
+    batch_size = max(
+        int(q_stage.shape[0]),
+        int(raw_stage.shape[0]),
+        int(compressed_stage.shape[0]),
+        int(topk.shape[0]),
+    )
+    q_stage = _expand_stage_batch(q_stage, batch_size=batch_size, name="query")
+    raw_stage = _expand_stage_batch(raw_stage, batch_size=batch_size, name="raw_kv")
+    compressed_stage = _expand_stage_batch(
+        compressed_stage,
+        batch_size=batch_size,
+        name="compressed_kv",
+    )
+    topk = _expand_stage_batch(topk, batch_size=batch_size, name="topk")
+    kv_stage = torch.cat((raw_stage, compressed_stage), dim=1).contiguous()
+
+    return Dsv4MaterializedStage(
+        q_stage=q_stage.contiguous(),
+        kv_stage=kv_stage,
+        topk_stage_local=topk.contiguous(),
+        raw_count=len(stage_inputs.raw_token_ids),
+        compressed_count=len(stage_inputs.compressed_entry_ids),
+        key_kinds=stage_inputs.key_kinds,
+        key_global_ids=stage_inputs.key_global_ids,
+    )
+
+
 def _stage_raw_token_ids(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
     seen: set[int] = set()
     token_ids: list[int] = []
@@ -322,6 +413,77 @@ def _build_stage_local_topk(
                     compressed_local[int(entry_id)]
                 )
     return local
+
+
+def _gather_mapped_rows(
+    *,
+    tensor: torch.Tensor,
+    tensor_ids: Sequence[int],
+    selected_ids: Sequence[int],
+    name: str,
+) -> torch.Tensor:
+    if name == "query" and tensor.ndim == 3:
+        token_dim = 0
+    elif name == "query" and tensor.ndim == 4:
+        token_dim = 1
+    elif name != "query" and tensor.ndim == 2:
+        token_dim = 0
+    elif name != "query" and tensor.ndim == 3:
+        token_dim = 1
+    else:
+        raise RuntimeError(f"DSV4 {name} tensor has unsupported rank {tensor.ndim}")
+    if len(tensor_ids) != int(tensor.shape[token_dim]):
+        raise RuntimeError(
+            f"DSV4 {name} id count {len(tensor_ids)} does not match token "
+            f"dimension {int(tensor.shape[token_dim])}"
+        )
+
+    row_by_id = _row_by_id(tensor_ids=tensor_ids, name=name)
+    missing = tuple(int(id_) for id_ in selected_ids if int(id_) not in row_by_id)
+    if missing:
+        raise RuntimeError(f"DSV4 {name} tensor is missing ids {missing}")
+    indices = torch.tensor(
+        [row_by_id[int(id_)] for id_ in selected_ids],
+        device=tensor.device,
+        dtype=torch.long,
+    )
+    return tensor.index_select(token_dim, indices)
+
+
+def _row_by_id(*, tensor_ids: Sequence[int], name: str) -> dict[int, int]:
+    row_by_id: dict[int, int] = {}
+    for row, id_ in enumerate(tensor_ids):
+        id_int = int(id_)
+        if id_int in row_by_id:
+            raise RuntimeError(f"DSV4 {name} ids contain duplicate id {id_int}")
+        row_by_id[id_int] = row
+    return row_by_id
+
+
+def _ensure_batched_stage_tensor(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
+    if name == "query":
+        if tensor.ndim == 3:
+            return tensor.unsqueeze(0)
+        return tensor
+    if tensor.ndim == 2:
+        return tensor.unsqueeze(0)
+    return tensor
+
+
+def _expand_stage_batch(
+    tensor: torch.Tensor,
+    *,
+    batch_size: int,
+    name: str,
+) -> torch.Tensor:
+    if int(tensor.shape[0]) == int(batch_size):
+        return tensor
+    if int(tensor.shape[0]) != 1:
+        raise RuntimeError(
+            f"DSV4 {name} batch cannot expand from {int(tensor.shape[0])} "
+            f"to {int(batch_size)}"
+        )
+    return tensor.expand(batch_size, *tensor.shape[1:])
 
 
 def _normalize_global_topk(

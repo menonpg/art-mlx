@@ -117,6 +117,18 @@ class Dsv4StageInputs(BaseModel):
     topk_stage_local: torch.Tensor
 
 
+class Dsv4MaterializedStage(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    q_stage: torch.Tensor
+    kv_stage: torch.Tensor
+    topk_stage_local: torch.Tensor
+    raw_count: int
+    compressed_count: int
+    key_kinds: tuple[Dsv4StageKeyKind, ...]
+    key_global_ids: tuple[int, ...]
+
+
 class Dsv4CompressedLayout(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -146,3 +158,4 @@ class Dsv4ContextParallelState(BaseModel):
 
 Dsv4TopkResult.model_rebuild()
 Dsv4StageInputs.model_rebuild()
+Dsv4MaterializedStage.model_rebuild()

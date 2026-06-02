@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
+import pytest
 import torch
 
 from art.megatron.dsv4 import (
@@ -11,6 +12,7 @@ from art.megatron.dsv4 import (
     build_dsv4_compressed_layout,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
+    materialize_dsv4_stage_tensors,
     raw_swa_token_ids_for_query,
 )
 
@@ -132,6 +134,109 @@ def test_hca_stage_inputs_include_all_visible_compressed_entries() -> None:
     assert stage.topk_stage_local[0, 2].tolist() == [-1, -1, -1, -1, -1]
 
 
+def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:
+    layout = _layout(Dsv4CompressionKind.CSA)
+    stage = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=6,
+        query_token_ids=(8, 11, 16),
+        global_k_ranges=(_Range(start=8, end=13),),
+        global_topk=torch.tensor([[2, 0, -1], [2, 1, -1], [2, 3, -1]]),
+        window_size=4,
+    )
+
+    query_ids = (16, 8, 11)
+    query = _query_rows(query_ids)
+    raw_ids = (12, 8, 11, 10, 9)
+    raw_kv = _kv_rows(raw_ids)
+    compressed_ids = (2,)
+    compressed_kv = _kv_rows((202,))
+
+    materialized = materialize_dsv4_stage_tensors(
+        stage_inputs=stage,
+        query=query,
+        query_token_ids=query_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_ids,
+    )
+
+    assert materialized.raw_count == 5
+    assert materialized.compressed_count == 1
+    assert materialized.key_global_ids == (8, 9, 10, 11, 12, 2)
+    assert materialized.q_stage.shape == (1, 3, 2, 4)
+    assert materialized.kv_stage.shape == (1, 6, 4)
+    assert materialized.q_stage[0, :, 0, 0].tolist() == [8.0, 11.0, 16.0]
+    assert materialized.kv_stage[0, :, 0].tolist() == [
+        8.0,
+        9.0,
+        10.0,
+        11.0,
+        12.0,
+        202.0,
+    ]
+    torch.testing.assert_close(materialized.topk_stage_local, stage.topk_stage_local)
+
+
+def test_materialize_stage_tensors_preserves_batch_topk_and_expands_singletons() -> (
+    None
+):
+    layout = _layout(Dsv4CompressionKind.CSA)
+    stage = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=7,
+        query_token_ids=(11,),
+        global_k_ranges=(_Range(start=8, end=13), _Range(start=13, end=18)),
+        global_topk=torch.tensor([[[2, -1]], [[3, 2]]], dtype=torch.long),
+        window_size=4,
+    )
+    query = torch.stack((_query_rows((11,)), _query_rows((111,))), dim=0)
+
+    materialized = materialize_dsv4_stage_tensors(
+        stage_inputs=stage,
+        query=query,
+        query_token_ids=(11,),
+        raw_kv=_kv_rows(tuple(reversed(range(8, 18)))),
+        raw_token_ids=tuple(reversed(range(8, 18))),
+        compressed_kv=_kv_rows((202, 203)),
+        compressed_entry_ids=(2, 3),
+    )
+
+    assert materialized.q_stage.shape == (2, 1, 2, 4)
+    assert materialized.kv_stage.shape == (2, 12, 4)
+    assert materialized.q_stage[:, 0, 0, 0].tolist() == [11.0, 111.0]
+    assert materialized.kv_stage[0, :, 0].tolist() == [
+        *[float(token_id) for token_id in range(8, 18)],
+        202.0,
+        203.0,
+    ]
+    torch.testing.assert_close(materialized.kv_stage[0], materialized.kv_stage[1])
+    torch.testing.assert_close(materialized.topk_stage_local, stage.topk_stage_local)
+
+
+def test_materialize_stage_tensors_rejects_missing_ids() -> None:
+    layout = _layout(Dsv4CompressionKind.HCA)
+    stage = build_stage_local_topk_for_hca(
+        layout=layout,
+        stage_index=8,
+        query_token_ids=(11,),
+        global_k_ranges=(_Range(start=8, end=13),),
+        window_size=4,
+    )
+
+    with pytest.raises(RuntimeError, match="raw_kv tensor is missing ids"):
+        materialize_dsv4_stage_tensors(
+            stage_inputs=stage,
+            query=_query_rows((11,)),
+            query_token_ids=(11,),
+            raw_kv=_kv_rows((8, 9, 10)),
+            raw_token_ids=(8, 9, 10),
+            compressed_kv=_kv_rows((202,)),
+            compressed_entry_ids=(2,),
+        )
+
+
 def _layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:
     return build_dsv4_compressed_layout(
         group_ids=torch.tensor([[0] * 8 + [1] * 5 + [2] * 5 + [-1] * 2]),
@@ -144,4 +249,18 @@ def _layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:
             token_counts_by_rank=(8, 10),
         ),
         spec=Dsv4CompressionSpec(kind=kind, ratio=4),
+    )
+
+
+def _query_rows(token_ids: tuple[int, ...]) -> torch.Tensor:
+    return torch.stack(
+        [torch.full((2, 4), float(token_id)) for token_id in token_ids],
+        dim=0,
+    )
+
+
+def _kv_rows(token_ids: tuple[int, ...]) -> torch.Tensor:
+    return torch.stack(
+        [torch.full((4,), float(token_id)) for token_id in token_ids],
+        dim=0,
     )
