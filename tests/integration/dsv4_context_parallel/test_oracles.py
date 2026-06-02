@@ -772,6 +772,42 @@ def test_distributed_projected_real_planner_context_state_matches_packed_oracle(
         init_path.unlink()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not cast(Any, torch.distributed).is_nccl_available(),
+    reason="DSV4 real-planner real-Miles CUDA/NCCL oracle requires CUDA and NCCL",
+)
+@pytest.mark.parametrize(
+    ("world_size", "master_port"),
+    (
+        (2, "29646"),
+        (4, "29647"),
+        (8, "29648"),
+    ),
+)
+def test_distributed_projected_real_planner_real_miles_context_state_matches_packed_oracle_cuda_nccl(
+    tmp_path: Path,
+    world_size: int,
+    master_port: str,
+) -> None:
+    pytest.importorskip("megatron.core")
+    _ensure_miles_sparse_available()
+    if torch.cuda.device_count() < int(world_size):
+        pytest.skip(f"requires {world_size} CUDA devices")
+    init_path = tmp_path / f"dsv4_real_planner_real_miles_cp{world_size}_oracle_nccl"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_real_planner_real_miles_nccl_oracle_worker,
+        args=(int(world_size), str(init_path), master_port),
+        nprocs=int(world_size),
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle(
     tmp_path: Path,
 ) -> None:
@@ -1055,6 +1091,59 @@ def _distributed_projected_real_planner_oracle_worker(
         destroy_process_group()
 
 
+def _distributed_projected_real_planner_real_miles_nccl_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+    master_port: str,
+) -> None:
+    _add_miles_path_to_sys_path()
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = master_port
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        context_state = _real_planner_dsv4_context_state(
+            rank=rank,
+            world_size=world_size,
+        )
+        local_token_ids = _local_token_ids_from_context_state(context_state)
+        _run_real_planner_csa_context_oracle(
+            context_state=context_state,
+            local_token_ids=local_token_ids,
+            device=device,
+            dtype=torch.bfloat16,
+            head_count=64,
+            head_dim=512,
+            indexer_dim=128,
+            scale=1.0 / (512**0.5),
+            mean_abs_pct_threshold=3.0,
+            grad_mean_abs_pct_threshold=5.0,
+            name_prefix="real planner real Miles CSA",
+        )
+        _run_real_planner_hca_context_oracle(
+            context_state=context_state,
+            local_token_ids=local_token_ids,
+            device=device,
+            dtype=torch.bfloat16,
+            head_count=64,
+            head_dim=512,
+            scale=1.0 / (512**0.5),
+            mean_abs_pct_threshold=3.0,
+            grad_mean_abs_pct_threshold=5.0,
+            name_prefix="real planner real Miles HCA",
+        )
+        torch.cuda.synchronize(device)
+    finally:
+        destroy_process_group()
+
+
 def _real_planner_dsv4_context_state(*, rank: int, world_size: int) -> Any:
     from art.megatron.context_parallel import ContextParallelConfig, ParallelTopology
     from art.megatron.context_parallel.runtime import (
@@ -1109,25 +1198,92 @@ def _run_real_planner_csa_context_oracle(
     *,
     context_state: Any,
     local_token_ids: tuple[int, ...],
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+    head_count: int = 2,
+    head_dim: int = 4,
+    indexer_dim: int = 3,
+    scale: float = 0.4,
+    mean_abs_pct_threshold: float | None = None,
+    grad_mean_abs_pct_threshold: float | None = None,
+    name_prefix: str = "real planner CSA",
 ) -> None:
     layout = context_state.dsv4_plan.csa_layout
     if layout is None:
         raise RuntimeError("real planner CSA oracle requires CSA layout")
     token_count = 24
+    if device is None:
+        device = torch.device("cpu")
+    use_mean_abs = mean_abs_pct_threshold is not None
+    bias_dtype = torch.float32 if use_mean_abs else dtype
     torch.manual_seed(157)
-    query = torch.randn(token_count, 2, 4, dtype=torch.float64)
-    raw_kv = torch.randn(token_count, 4, dtype=torch.float64)
-    main_projected_kv = torch.randn(token_count, 8, dtype=torch.float64)
-    main_projected_gate = torch.randn(token_count, 8, dtype=torch.float64)
-    main_positional_bias = torch.randn(4, 8, dtype=torch.float64)
-    indexer_projected_kv = torch.randn(token_count, 6, dtype=torch.float64)
-    indexer_projected_gate = torch.randn(token_count, 6, dtype=torch.float64)
-    indexer_positional_bias = torch.randn(4, 6, dtype=torch.float64)
-    indexer_q = torch.randn(token_count, 2, 3, dtype=torch.float64)
-    indexer_weights = torch.randn(token_count, 2, dtype=torch.float64)
-    attn_sink = torch.randn(2, dtype=torch.float64)
-    grad_out = torch.randn(1, token_count, 2, 4, dtype=torch.float64)
-    local_positions = torch.tensor(local_token_ids, dtype=torch.long)
+    query = torch.randn(
+        token_count,
+        head_count,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    raw_kv = torch.randn(token_count, head_dim, device=device, dtype=dtype)
+    main_projected_kv = torch.randn(
+        token_count,
+        2 * head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    main_projected_gate = torch.randn(
+        token_count,
+        2 * head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    main_positional_bias = torch.randn(
+        4,
+        2 * head_dim,
+        device=device,
+        dtype=bias_dtype,
+    )
+    indexer_projected_kv = torch.randn(
+        token_count,
+        2 * indexer_dim,
+        device=device,
+        dtype=dtype,
+    )
+    indexer_projected_gate = torch.randn(
+        token_count,
+        2 * indexer_dim,
+        device=device,
+        dtype=dtype,
+    )
+    indexer_positional_bias = torch.randn(
+        4,
+        2 * indexer_dim,
+        device=device,
+        dtype=bias_dtype,
+    )
+    indexer_q = torch.randn(
+        token_count,
+        head_count,
+        indexer_dim,
+        device=device,
+        dtype=dtype,
+    )
+    indexer_weights = torch.randn(
+        token_count,
+        head_count,
+        device=device,
+        dtype=dtype,
+    )
+    attn_sink = torch.randn(head_count, device=device, dtype=bias_dtype) * 0.1
+    grad_out = torch.randn(
+        1,
+        token_count,
+        head_count,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
 
     forward = launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
         context_state=context_state,
@@ -1148,7 +1304,7 @@ def _run_real_planner_csa_context_oracle(
         indexer_topk=2,
         attn_sink=attn_sink,
         async_op=True,
-        scale=0.4,
+        scale=scale,
         window_size=128,
         raw_list_size=token_count,
         compressed_list_size=2,
@@ -1177,27 +1333,47 @@ def _run_real_planner_csa_context_oracle(
     ).indices[0]
     expected = dense_dsv4_packed_attention_oracle(
         layout=layout,
-        query=query,
-        raw_kv=raw_kv,
-        compressed_kv=main_compressed,
-        attn_sink=attn_sink,
+        query=query.float() if use_mean_abs else query,
+        raw_kv=raw_kv.float() if use_mean_abs else raw_kv,
+        compressed_kv=main_compressed.float() if use_mean_abs else main_compressed,
+        attn_sink=attn_sink.float() if use_mean_abs else attn_sink,
         topk_by_query=topk,
         window_size=128,
-        scale=0.4,
+        scale=scale,
     )
-    torch.testing.assert_close(
-        forward.attention.out,
-        expected.out.index_select(1, local_positions),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    torch.testing.assert_close(
-        forward.attention.lse,
-        expected.lse.index_select(1, local_positions),
-        rtol=1e-6,
-        atol=1e-6,
-        check_dtype=False,
-    )
+    if use_mean_abs:
+        assert mean_abs_pct_threshold is not None
+        if local_token_ids:
+            threshold = float(mean_abs_pct_threshold)
+            _assert_mean_abs_pct(
+                forward.attention.out.float(),
+                expected.out.index_select(1, local_positions).float(),
+                threshold=threshold,
+                name=f"{name_prefix} fwd",
+            )
+            _assert_mean_abs_pct(
+                forward.attention.lse.float(),
+                expected.lse.index_select(1, local_positions).float(),
+                threshold=threshold,
+                name=f"{name_prefix} lse",
+            )
+        else:
+            assert forward.attention.out.numel() == 0
+            assert forward.attention.lse.numel() == 0
+    else:
+        torch.testing.assert_close(
+            forward.attention.out,
+            expected.out.index_select(1, local_positions),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            forward.attention.lse,
+            expected.lse.index_select(1, local_positions),
+            rtol=1e-6,
+            atol=1e-6,
+            check_dtype=False,
+        )
 
     backward = launch_dsv4_projected_attention_backward_from_context_parallel_state(
         context_state=context_state,
@@ -1205,12 +1381,32 @@ def _run_real_planner_csa_context_oracle(
         grad_out=grad_out.index_select(1, local_positions),
         async_op=True,
     ).wait_post_process()
-    ref_query = query.detach().clone().requires_grad_()
-    ref_raw = raw_kv.detach().clone().requires_grad_()
-    ref_main_projected = main_projected_kv.detach().clone().requires_grad_()
-    ref_main_gate = main_projected_gate.detach().clone().requires_grad_()
-    ref_main_bias = main_positional_bias.detach().clone().requires_grad_()
-    ref_sink = attn_sink.detach().clone().requires_grad_()
+    ref_query = query.detach().float() if use_mean_abs else query.detach().clone()
+    ref_query.requires_grad_()
+    ref_raw = raw_kv.detach().float() if use_mean_abs else raw_kv.detach().clone()
+    ref_raw.requires_grad_()
+    ref_main_projected = (
+        main_projected_kv.detach().float()
+        if use_mean_abs
+        else main_projected_kv.detach().clone()
+    )
+    ref_main_projected.requires_grad_()
+    ref_main_gate = (
+        main_projected_gate.detach().float()
+        if use_mean_abs
+        else main_projected_gate.detach().clone()
+    )
+    ref_main_gate.requires_grad_()
+    ref_main_bias = (
+        main_positional_bias.detach().float()
+        if use_mean_abs
+        else main_positional_bias.detach().clone()
+    )
+    ref_main_bias.requires_grad_()
+    ref_sink = (
+        attn_sink.detach().float() if use_mean_abs else attn_sink.detach().clone()
+    )
+    ref_sink.requires_grad_()
     ref_main_compressed = compress_projected_kv(
         layout=layout,
         projected_kv=ref_main_projected,
@@ -1225,9 +1421,9 @@ def _run_real_planner_csa_context_oracle(
         attn_sink=ref_sink,
         topk_by_query=topk,
         window_size=128,
-        scale=0.4,
+        scale=scale,
     )
-    (ref.out * grad_out).sum().backward()
+    (ref.out * (grad_out.float() if use_mean_abs else grad_out)).sum().backward()
 
     assert ref_query.grad is not None
     assert ref_raw.grad is not None
@@ -1235,34 +1431,83 @@ def _run_real_planner_csa_context_oracle(
     assert ref_main_gate.grad is not None
     assert ref_main_bias.grad is not None
     assert ref_sink.grad is not None
-    _assert_id_aligned_rows_close(
-        actual=backward.attention.dq,
-        actual_ids=backward.attention.query_token_ids,
-        expected=ref_query.grad.unsqueeze(0),
-    )
-    _assert_id_aligned_rows_close(
-        actual=backward.attention.draw_kv,
-        actual_ids=backward.attention.raw_token_ids,
-        expected=ref_raw.grad.unsqueeze(0),
-    )
-    _assert_id_aligned_rows_close(
-        actual=backward.main_compressor.dprojected_kv,
-        actual_ids=backward.main_compressor.token_ids,
-        expected=ref_main_projected.grad,
-    )
-    _assert_id_aligned_rows_close(
-        actual=backward.main_compressor.dprojected_gate,
-        actual_ids=backward.main_compressor.token_ids,
-        expected=ref_main_gate.grad,
-    )
-    torch.testing.assert_close(
-        backward.main_compressor.dpositional_bias, ref_main_bias.grad
-    )
-    torch.testing.assert_close(backward.attention.d_attn_sink, ref_sink.grad)
-    _assert_distributed_nonzero(backward.attention.dq, name="real planner CSA dq")
+    if use_mean_abs:
+        grad_threshold = (
+            mean_abs_pct_threshold
+            if grad_mean_abs_pct_threshold is None
+            else grad_mean_abs_pct_threshold
+        )
+        assert grad_threshold is not None
+        grad_threshold_value = float(grad_threshold)
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.attention.dq.float(),
+            actual_ids=backward.attention.query_token_ids,
+            expected=ref_query.grad.unsqueeze(0),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dq",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.attention.draw_kv.float(),
+            actual_ids=backward.attention.raw_token_ids,
+            expected=ref_raw.grad.unsqueeze(0),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} draw",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.main_compressor.dprojected_kv.float(),
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_main_projected.grad,
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dprojected_kv",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.main_compressor.dprojected_gate.float(),
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_main_gate.grad,
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dprojected_gate",
+        )
+        _assert_mean_abs_pct(
+            backward.main_compressor.dpositional_bias.float(),
+            ref_main_bias.grad.float(),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dpositional_bias",
+        )
+        _assert_mean_abs_pct(
+            backward.attention.d_attn_sink.float(),
+            ref_sink.grad.float(),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dsink",
+        )
+    else:
+        _assert_id_aligned_rows_close(
+            actual=backward.attention.dq,
+            actual_ids=backward.attention.query_token_ids,
+            expected=ref_query.grad.unsqueeze(0),
+        )
+        _assert_id_aligned_rows_close(
+            actual=backward.attention.draw_kv,
+            actual_ids=backward.attention.raw_token_ids,
+            expected=ref_raw.grad.unsqueeze(0),
+        )
+        _assert_id_aligned_rows_close(
+            actual=backward.main_compressor.dprojected_kv,
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_main_projected.grad,
+        )
+        _assert_id_aligned_rows_close(
+            actual=backward.main_compressor.dprojected_gate,
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_main_gate.grad,
+        )
+        torch.testing.assert_close(
+            backward.main_compressor.dpositional_bias, ref_main_bias.grad
+        )
+        torch.testing.assert_close(backward.attention.d_attn_sink, ref_sink.grad)
+    _assert_distributed_nonzero(backward.attention.dq, name=f"{name_prefix} dq")
     _assert_distributed_nonzero(
         backward.main_compressor.dprojected_kv,
-        name="real planner CSA dprojected_kv",
+        name=f"{name_prefix} dprojected_kv",
     )
 
 
@@ -1270,20 +1515,50 @@ def _run_real_planner_hca_context_oracle(
     *,
     context_state: Any,
     local_token_ids: tuple[int, ...],
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+    head_count: int = 2,
+    head_dim: int = 4,
+    scale: float = 0.25,
+    mean_abs_pct_threshold: float | None = None,
+    grad_mean_abs_pct_threshold: float | None = None,
+    name_prefix: str = "real planner HCA",
 ) -> None:
     layout = context_state.dsv4_plan.hca_layout
     if layout is None:
         raise RuntimeError("real planner HCA oracle requires HCA layout")
     token_count = 24
+    if device is None:
+        device = torch.device("cpu")
+    use_mean_abs = mean_abs_pct_threshold is not None
+    bias_dtype = torch.float32 if use_mean_abs else dtype
     torch.manual_seed(163)
-    query = torch.randn(token_count, 2, 4, dtype=torch.float64)
-    raw_kv = torch.randn(token_count, 4, dtype=torch.float64)
-    projected_kv = torch.randn(token_count, 4, dtype=torch.float64)
-    projected_gate = torch.randn(token_count, 4, dtype=torch.float64)
-    positional_bias = torch.randn(4, 4, dtype=torch.float64)
-    attn_sink = torch.randn(2, dtype=torch.float64)
-    grad_out = torch.randn(1, token_count, 2, 4, dtype=torch.float64)
-    local_positions = torch.tensor(local_token_ids, dtype=torch.long)
+    query = torch.randn(
+        token_count,
+        head_count,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    raw_kv = torch.randn(token_count, head_dim, device=device, dtype=dtype)
+    projected_kv = torch.randn(token_count, head_dim, device=device, dtype=dtype)
+    projected_gate = torch.randn(token_count, head_dim, device=device, dtype=dtype)
+    positional_bias = torch.randn(
+        int(layout.spec.ratio),
+        head_dim,
+        device=device,
+        dtype=bias_dtype,
+    )
+    attn_sink = torch.randn(head_count, device=device, dtype=bias_dtype) * 0.1
+    grad_out = torch.randn(
+        1,
+        token_count,
+        head_count,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
 
     forward = launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
         context_state=context_state,
@@ -1297,7 +1572,7 @@ def _run_real_planner_hca_context_oracle(
         token_ids=local_token_ids,
         attn_sink=attn_sink,
         async_op=True,
-        scale=0.25,
+        scale=scale,
         window_size=128,
         raw_list_size=token_count,
         compressed_list_size=len(layout.entries),
@@ -1311,27 +1586,47 @@ def _run_real_planner_hca_context_oracle(
     )
     expected = dense_dsv4_packed_attention_oracle(
         layout=layout,
-        query=query,
-        raw_kv=raw_kv,
-        compressed_kv=compressed,
-        attn_sink=attn_sink,
+        query=query.float() if use_mean_abs else query,
+        raw_kv=raw_kv.float() if use_mean_abs else raw_kv,
+        compressed_kv=compressed.float() if use_mean_abs else compressed,
+        attn_sink=attn_sink.float() if use_mean_abs else attn_sink,
         topk_by_query=None,
         window_size=128,
-        scale=0.25,
+        scale=scale,
     )
-    torch.testing.assert_close(
-        forward.attention.out,
-        expected.out.index_select(1, local_positions),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    torch.testing.assert_close(
-        forward.attention.lse,
-        expected.lse.index_select(1, local_positions),
-        rtol=1e-6,
-        atol=1e-6,
-        check_dtype=False,
-    )
+    if use_mean_abs:
+        assert mean_abs_pct_threshold is not None
+        if local_token_ids:
+            threshold = float(mean_abs_pct_threshold)
+            _assert_mean_abs_pct(
+                forward.attention.out.float(),
+                expected.out.index_select(1, local_positions).float(),
+                threshold=threshold,
+                name=f"{name_prefix} fwd",
+            )
+            _assert_mean_abs_pct(
+                forward.attention.lse.float(),
+                expected.lse.index_select(1, local_positions).float(),
+                threshold=threshold,
+                name=f"{name_prefix} lse",
+            )
+        else:
+            assert forward.attention.out.numel() == 0
+            assert forward.attention.lse.numel() == 0
+    else:
+        torch.testing.assert_close(
+            forward.attention.out,
+            expected.out.index_select(1, local_positions),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            forward.attention.lse,
+            expected.lse.index_select(1, local_positions),
+            rtol=1e-6,
+            atol=1e-6,
+            check_dtype=False,
+        )
 
     backward = launch_dsv4_projected_attention_backward_from_context_parallel_state(
         context_state=context_state,
@@ -1339,12 +1634,30 @@ def _run_real_planner_hca_context_oracle(
         grad_out=grad_out.index_select(1, local_positions),
         async_op=True,
     ).wait_post_process()
-    ref_query = query.detach().clone().requires_grad_()
-    ref_raw = raw_kv.detach().clone().requires_grad_()
-    ref_projected = projected_kv.detach().clone().requires_grad_()
-    ref_gate = projected_gate.detach().clone().requires_grad_()
-    ref_bias = positional_bias.detach().clone().requires_grad_()
-    ref_sink = attn_sink.detach().clone().requires_grad_()
+    ref_query = query.detach().float() if use_mean_abs else query.detach().clone()
+    ref_query.requires_grad_()
+    ref_raw = raw_kv.detach().float() if use_mean_abs else raw_kv.detach().clone()
+    ref_raw.requires_grad_()
+    ref_projected = (
+        projected_kv.detach().float() if use_mean_abs else projected_kv.detach().clone()
+    )
+    ref_projected.requires_grad_()
+    ref_gate = (
+        projected_gate.detach().float()
+        if use_mean_abs
+        else projected_gate.detach().clone()
+    )
+    ref_gate.requires_grad_()
+    ref_bias = (
+        positional_bias.detach().float()
+        if use_mean_abs
+        else positional_bias.detach().clone()
+    )
+    ref_bias.requires_grad_()
+    ref_sink = (
+        attn_sink.detach().float() if use_mean_abs else attn_sink.detach().clone()
+    )
+    ref_sink.requires_grad_()
     ref_compressed = compress_projected_kv(
         layout=layout,
         projected_kv=ref_projected,
@@ -1359,9 +1672,9 @@ def _run_real_planner_hca_context_oracle(
         attn_sink=ref_sink,
         topk_by_query=None,
         window_size=128,
-        scale=0.25,
+        scale=scale,
     )
-    (ref.out * grad_out).sum().backward()
+    (ref.out * (grad_out.float() if use_mean_abs else grad_out)).sum().backward()
 
     assert ref_query.grad is not None
     assert ref_raw.grad is not None
@@ -1369,32 +1682,83 @@ def _run_real_planner_hca_context_oracle(
     assert ref_gate.grad is not None
     assert ref_bias.grad is not None
     assert ref_sink.grad is not None
-    _assert_id_aligned_rows_close(
-        actual=backward.attention.dq,
-        actual_ids=backward.attention.query_token_ids,
-        expected=ref_query.grad.unsqueeze(0),
-    )
-    _assert_id_aligned_rows_close(
-        actual=backward.attention.draw_kv,
-        actual_ids=backward.attention.raw_token_ids,
-        expected=ref_raw.grad.unsqueeze(0),
-    )
-    _assert_id_aligned_rows_close(
-        actual=backward.main_compressor.dprojected_kv,
-        actual_ids=backward.main_compressor.token_ids,
-        expected=ref_projected.grad,
-    )
-    _assert_id_aligned_rows_close(
-        actual=backward.main_compressor.dprojected_gate,
-        actual_ids=backward.main_compressor.token_ids,
-        expected=ref_gate.grad,
-    )
-    torch.testing.assert_close(backward.main_compressor.dpositional_bias, ref_bias.grad)
-    torch.testing.assert_close(backward.attention.d_attn_sink, ref_sink.grad)
-    _assert_distributed_nonzero(backward.attention.dq, name="real planner HCA dq")
+    if use_mean_abs:
+        grad_threshold = (
+            mean_abs_pct_threshold
+            if grad_mean_abs_pct_threshold is None
+            else grad_mean_abs_pct_threshold
+        )
+        assert grad_threshold is not None
+        grad_threshold_value = float(grad_threshold)
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.attention.dq.float(),
+            actual_ids=backward.attention.query_token_ids,
+            expected=ref_query.grad.unsqueeze(0),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dq",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.attention.draw_kv.float(),
+            actual_ids=backward.attention.raw_token_ids,
+            expected=ref_raw.grad.unsqueeze(0),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} draw",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.main_compressor.dprojected_kv.float(),
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_projected.grad,
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dprojected_kv",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.main_compressor.dprojected_gate.float(),
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_gate.grad,
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dprojected_gate",
+        )
+        _assert_mean_abs_pct(
+            backward.main_compressor.dpositional_bias.float(),
+            ref_bias.grad.float(),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dpositional_bias",
+        )
+        _assert_mean_abs_pct(
+            backward.attention.d_attn_sink.float(),
+            ref_sink.grad.float(),
+            threshold=grad_threshold_value,
+            name=f"{name_prefix} dsink",
+        )
+    else:
+        _assert_id_aligned_rows_close(
+            actual=backward.attention.dq,
+            actual_ids=backward.attention.query_token_ids,
+            expected=ref_query.grad.unsqueeze(0),
+        )
+        _assert_id_aligned_rows_close(
+            actual=backward.attention.draw_kv,
+            actual_ids=backward.attention.raw_token_ids,
+            expected=ref_raw.grad.unsqueeze(0),
+        )
+        _assert_id_aligned_rows_close(
+            actual=backward.main_compressor.dprojected_kv,
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_projected.grad,
+        )
+        _assert_id_aligned_rows_close(
+            actual=backward.main_compressor.dprojected_gate,
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_gate.grad,
+        )
+        torch.testing.assert_close(
+            backward.main_compressor.dpositional_bias, ref_bias.grad
+        )
+        torch.testing.assert_close(backward.attention.d_attn_sink, ref_sink.grad)
+    _assert_distributed_nonzero(backward.attention.dq, name=f"{name_prefix} dq")
     _assert_distributed_nonzero(
         backward.main_compressor.dprojected_kv,
-        name="real planner HCA dprojected_kv",
+        name=f"{name_prefix} dprojected_kv",
     )
 
 
