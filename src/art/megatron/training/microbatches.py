@@ -40,12 +40,6 @@ class PreparedRLMicroInputs(BaseModel):
     loss_inputs: LossInputs | DispatchedPackedTensors
     ref_logprobs: torch.Tensor | None = None
     local_token_uids: torch.Tensor | None = None
-    context_parallel_plan_ms: float = 0.0
-    context_parallel_dispatch_ms: float = 0.0
-    context_parallel_execution_state_ms: float = 0.0
-    context_parallel_prepare_ms: float = 0.0
-    context_parallel_plan_cache_hit: bool = False
-    context_parallel_gdn_rank_plan_cache_hit: bool = False
 
 
 class PreparedSFTMicroInputs(BaseModel):
@@ -354,12 +348,6 @@ def _prepared_rl_micro_from_cp_batch(
         if ref_logprobs is not None
         else None,
         local_token_uids=prepared.tensors.token_uids,
-        context_parallel_plan_ms=float(prepared.plan_build_ms),
-        context_parallel_dispatch_ms=float(prepared.dispatch_ms),
-        context_parallel_execution_state_ms=float(prepared.execution_state_prepare_ms),
-        context_parallel_prepare_ms=float(prepared.total_prepare_ms),
-        context_parallel_plan_cache_hit=bool(prepared.plan_cache_hit),
-        context_parallel_gdn_rank_plan_cache_hit=bool(prepared.gdn_rank_plan_cache_hit),
     )
 
 

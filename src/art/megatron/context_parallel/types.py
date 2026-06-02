@@ -277,9 +277,6 @@ class ArtContextParallelState(BaseModel):
     gdn_attention_token_uids: torch.Tensor | None = None
     gdn_active_module: Any | None = None
     planner_provenance: PlannerProvenance
-    plan_build_ms: float = 0.0
-    plan_cache_hit: bool = False
-    gdn_rank_plan_cache_hit: bool = False
     trace_token_uids: torch.Tensor | None = None
     execution_cache: ContextParallelExecutionCache = Field(
         default_factory=ContextParallelExecutionCache
@@ -294,12 +291,6 @@ class PreparedMegatronBatch(BaseModel):
     attention_state: Any
     rank_plan: RankRuntimePlan | None = None
     pad_multiple: int = 1
-    plan_build_ms: float = 0.0
-    dispatch_ms: float = 0.0
-    execution_state_prepare_ms: float = 0.0
-    total_prepare_ms: float = 0.0
-    plan_cache_hit: bool = False
-    gdn_rank_plan_cache_hit: bool = False
 
 
 class FlexMaskSpec(BaseModel):

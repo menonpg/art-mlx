@@ -177,12 +177,6 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
-    context_parallel_plan_ms: float = 0.0
-    context_parallel_dispatch_ms: float = 0.0
-    context_parallel_execution_state_ms: float = 0.0
-    context_parallel_prepare_ms: float = 0.0
-    context_parallel_plan_cache_hits: int = 0
-    context_parallel_gdn_rank_plan_cache_hits: int = 0
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -576,12 +570,6 @@ def run_megatron_rl_job(
                             "loss": step_result.reduced_loss.item(),
                             "grad_norm": step_result.grad_norm,
                             "probs_corr": step_result.probs_corr,
-                            "context_parallel_plan_ms": step_result.context_parallel_plan_ms,
-                            "context_parallel_dispatch_ms": step_result.context_parallel_dispatch_ms,
-                            "context_parallel_execution_state_ms": step_result.context_parallel_execution_state_ms,
-                            "context_parallel_prepare_ms": step_result.context_parallel_prepare_ms,
-                            "context_parallel_plan_cache_hits": step_result.context_parallel_plan_cache_hits,
-                            "context_parallel_gdn_rank_plan_cache_hits": step_result.context_parallel_gdn_rank_plan_cache_hits,
                             TRAIN_GRADIENT_STEPS_KEY: num_steps,
                         }
                     )
@@ -1158,12 +1146,6 @@ def run_training_step(
     loss_inputs_for_count: list[LossInputs | DispatchedPackedTensors] = []
     probs_corr_total: torch.Tensor | None = None
     new_logprobs_gpu: list[torch.Tensor] = []
-    cp_plan_ms = 0.0
-    cp_dispatch_ms = 0.0
-    cp_execution_state_ms = 0.0
-    cp_prepare_ms = 0.0
-    cp_plan_cache_hits = 0
-    cp_gdn_rank_plan_cache_hits = 0
 
     def begin_micro(micro_order: int) -> None:
         if moe_routing_replay_controller is not None:
@@ -1183,16 +1165,6 @@ def run_training_step(
             ref_logprobs=ref_logprobs,
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
-        )
-        cp_plan_ms += float(prepared_micro.context_parallel_plan_ms)
-        cp_dispatch_ms += float(prepared_micro.context_parallel_dispatch_ms)
-        cp_execution_state_ms += float(
-            prepared_micro.context_parallel_execution_state_ms
-        )
-        cp_prepare_ms += float(prepared_micro.context_parallel_prepare_ms)
-        cp_plan_cache_hits += int(prepared_micro.context_parallel_plan_cache_hit)
-        cp_gdn_rank_plan_cache_hits += int(
-            prepared_micro.context_parallel_gdn_rank_plan_cache_hit
         )
         prepare_replay_local_input_token_uids(
             moe_routing_replay_controller,
@@ -1321,12 +1293,6 @@ def run_training_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
-        context_parallel_plan_ms=cp_plan_ms,
-        context_parallel_dispatch_ms=cp_dispatch_ms,
-        context_parallel_execution_state_ms=cp_execution_state_ms,
-        context_parallel_prepare_ms=cp_prepare_ms,
-        context_parallel_plan_cache_hits=cp_plan_cache_hits,
-        context_parallel_gdn_rank_plan_cache_hits=cp_gdn_rank_plan_cache_hits,
     )
 
 

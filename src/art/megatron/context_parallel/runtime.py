@@ -3,7 +3,6 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 import hashlib
 import json
-import time
 from typing import Any, cast
 import warnings
 
@@ -2153,7 +2152,6 @@ def prepare_cp_micro(
     older direct callers, but it reintroduces D2H syncs and invalidates the
     host-ahead/device-behind lookahead assumption.
     """
-    total_start = time.perf_counter()
     state, rank_plan, spec, pad_multiple = prepare_megatron_context_parallel_state(
         micro=micro,
         topology=topology,
@@ -2163,7 +2161,6 @@ def prepare_cp_micro(
         build_gdn_execution_spec=build_gdn_execution_spec,
         target_device=target_device,
     )
-    dispatch_start = time.perf_counter()
     tensors = dispatch_megatron_context_parallel_training_tensors(
         micro=micro,
         rank_plan=rank_plan,
@@ -2174,31 +2171,21 @@ def prepare_cp_micro(
         cp_group=cp_group,
         ref_logprobs=ref_logprobs,
     )
-    dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
     if tensors.token_uids is not None:
         state = state.model_copy(update={"trace_token_uids": tensors.token_uids})
-    execution_state_prepare_ms = 0.0
     if prepare_execution_state:
         from .executor import prepare_context_parallel_execution_state
 
-        execution_start = time.perf_counter()
         prepare_context_parallel_execution_state(
             state=state,
             device=tensors.tokens.device,
         )
-        execution_state_prepare_ms = (time.perf_counter() - execution_start) * 1000.0
     return PreparedMegatronBatch(
         tensors=tensors,
         packed_seq_params=None,
         attention_state=state,
         rank_plan=rank_plan,
         pad_multiple=pad_multiple,
-        plan_build_ms=float(state.plan_build_ms),
-        dispatch_ms=dispatch_ms,
-        execution_state_prepare_ms=execution_state_prepare_ms,
-        total_prepare_ms=(time.perf_counter() - total_start) * 1000.0,
-        plan_cache_hit=bool(state.plan_cache_hit),
-        gdn_rank_plan_cache_hit=bool(state.gdn_rank_plan_cache_hit),
     )
 
 
@@ -2219,7 +2206,6 @@ def prepare_megatron_context_parallel_state(
     microbatch. If device metadata reaches this function, scalar reads,
     cache-key hashing, and shared-prefix parsing can block the host on GPU work.
     """
-    plan_start = time.perf_counter()
     if int(topology.cp) <= 1:
         raise RuntimeError(
             "prepare_cp_micro is CP-only. Non-CP runs must bypass the context parallel dispatcher in train.py."
@@ -2246,7 +2232,6 @@ def prepare_megatron_context_parallel_state(
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
     bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
-    plan_cache_hit = bundle is not None
     if bundle is None:
         spec = build_shared_prefix_attention_spec(
             group_ids=group_ids_cpu,
@@ -2280,7 +2265,6 @@ def prepare_megatron_context_parallel_state(
         _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
     rank_plan = bundle.runtime_plan.rank_plans[int(cp_rank)]
     gdn_execution_plan = None
-    gdn_rank_plan_cache_hit = False
     if build_gdn_execution_spec:
         if bundle.gdn_execution_spec is None:
             raise RuntimeError("GDN CP planning requires a parsed execution spec")
@@ -2293,7 +2277,6 @@ def prepare_megatron_context_parallel_state(
             cp_rank=int(cp_rank),
         )
         gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
-        gdn_rank_plan_cache_hit = gdn_execution_plan is not None
         if gdn_execution_plan is None:
             from art.megatron.gdn.gdn_shared_prefix import (
                 build_gdn_rank_execution_plan,
@@ -2313,7 +2296,6 @@ def prepare_megatron_context_parallel_state(
         warn=int(cp_rank) == 0,
     )
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1
-    plan_build_ms = (time.perf_counter() - plan_start) * 1000.0
     state = ArtContextParallelState(
         runtime_key=bundle.runtime_key,
         rank_plan=rank_plan,
@@ -2324,9 +2306,6 @@ def prepare_megatron_context_parallel_state(
         gdn_execution_spec=bundle.gdn_execution_spec,
         gdn_execution_plan=gdn_execution_plan,
         planner_provenance=planner_provenance,
-        plan_build_ms=plan_build_ms,
-        plan_cache_hit=plan_cache_hit,
-        gdn_rank_plan_cache_hit=gdn_rank_plan_cache_hit,
         trace_token_uids=None,
     )
     return state, rank_plan, bundle.spec, pad_multiple
