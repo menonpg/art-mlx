@@ -227,20 +227,26 @@ def test_indexer_kv_exchange_peer_plan_uses_compressed_ownership() -> None:
 def test_exchanged_indexer_topk_merges_stage_work_results() -> None:
     stage_works = (
         _FakeIndexerStageWork(
+            (11,),
             Dsv4TopkResult(
                 scores=torch.tensor([[[5.0, 1.0]]]),
                 indices=torch.tensor([[[10, 2]]]),
-            )
+            ),
         ),
         _FakeIndexerStageWork(
+            (11,),
             Dsv4TopkResult(
                 scores=torch.tensor([[[5.0, 2.0]]]),
                 indices=torch.tensor([[[3, 4]]]),
-            )
+            ),
         ),
     )
 
-    work = launch_exchanged_dsv4_indexer_topk(stage_works=stage_works, topk=3)
+    work = launch_exchanged_dsv4_indexer_topk(
+        stage_works=stage_works,
+        query_token_ids=(11,),
+        topk=3,
+    )
     work.wait()
     result = work.wait_post_process()
 
@@ -251,12 +257,49 @@ def test_exchanged_indexer_topk_merges_stage_work_results() -> None:
         assert stage_work.post_process_count == 1
 
 
+def test_exchanged_indexer_topk_aligns_partial_query_stage_results() -> None:
+    stage_works = (
+        _FakeIndexerStageWork(
+            (10, 11),
+            Dsv4TopkResult(
+                scores=torch.tensor([[[3.0, 1.0], [2.0, 2.0]]]),
+                indices=torch.tensor([[[5, 2], [8, 7]]]),
+            ),
+        ),
+        _FakeIndexerStageWork(
+            (11, 12),
+            Dsv4TopkResult(
+                scores=torch.tensor([[[4.0, 2.0], [9.0, 1.0]]]),
+                indices=torch.tensor([[[3, 6], [1, 4]]]),
+            ),
+        ),
+    )
+
+    result = launch_exchanged_dsv4_indexer_topk(
+        stage_works=stage_works,
+        query_token_ids=(10, 11, 12),
+        topk=3,
+    ).wait_post_process()
+
+    assert result.scores[0, 0].tolist() == [3.0, 1.0, float("-inf")]
+    assert result.indices[0, 0].tolist() == [5, 2, -1]
+    assert result.scores[0, 1].tolist() == [4.0, 2.0, 2.0]
+    assert result.indices[0, 1].tolist() == [3, 6, 7]
+    assert result.scores[0, 2].tolist() == [9.0, 1.0, float("-inf")]
+    assert result.indices[0, 2].tolist() == [1, 4, -1]
+
+
 def test_exchanged_indexer_topk_rejects_bad_stage_work() -> None:
     with pytest.raises(RuntimeError, match="missing wait"):
-        launch_exchanged_dsv4_indexer_topk(stage_works=(object(),), topk=1)
+        launch_exchanged_dsv4_indexer_topk(
+            stage_works=(object(),),
+            query_token_ids=(11,),
+            topk=1,
+        )
 
     work = launch_exchanged_dsv4_indexer_topk(
         stage_works=(_BadIndexerStageWork(),),
+        query_token_ids=(11,),
         topk=1,
     )
     with pytest.raises(TypeError, match="expected Dsv4TopkResult"):
@@ -380,7 +423,12 @@ def _layout() -> Dsv4CompressedLayout:
 
 
 class _FakeIndexerStageWork:
-    def __init__(self, result: Dsv4TopkResult) -> None:
+    def __init__(
+        self,
+        query_token_ids: tuple[int, ...],
+        result: Dsv4TopkResult,
+    ) -> None:
+        self.query_token_ids = query_token_ids
         self.result = result
         self.wait_count = 0
         self.post_process_count = 0
@@ -399,6 +447,8 @@ class _FakeIndexerStageWork:
 
 
 class _BadIndexerStageWork:
+    query_token_ids = (11,)
+
     def wait(self) -> None:
         pass
 

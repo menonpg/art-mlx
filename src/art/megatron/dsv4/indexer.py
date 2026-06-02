@@ -68,6 +68,7 @@ class Dsv4ExchangedIndexerTopkWork(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     stage_works: tuple[Any, ...]
+    query_token_ids: tuple[int, ...]
     topk: int
 
     def wait(self) -> None:
@@ -75,11 +76,18 @@ class Dsv4ExchangedIndexerTopkWork(BaseModel):
             work.wait()
 
     def wait_post_process(self) -> Dsv4TopkResult:
-        results = tuple(
-            _indexer_topk_result_from_work(work=work, position=position)
+        stage_results = tuple(
+            (
+                _query_token_ids_from_stage_work(work=work, position=position),
+                _indexer_topk_result_from_work(work=work, position=position),
+            )
             for position, work in enumerate(self.stage_works)
         )
-        return merge_indexer_topk_results(results=results, topk=int(self.topk))
+        return merge_indexer_stage_topk_results(
+            stage_results=stage_results,
+            query_token_ids=self.query_token_ids,
+            topk=int(self.topk),
+        )
 
 
 class Dsv4IndexerKvExchangePeerPlan(BaseModel):
@@ -426,22 +434,32 @@ def launch_planned_dsv4_indexer_kv_exchange(
 def launch_exchanged_dsv4_indexer_topk(
     *,
     stage_works: Sequence[Any],
+    query_token_ids: Sequence[int],
     topk: int,
 ) -> Dsv4ExchangedIndexerTopkWork:
     """Create the eager bridge from exchanged indexer stages to global topk.
 
     Each stage work owns custom DSV4 indexer KV communication plus stage-local
-    topk scoring. This wrapper keeps that wait/materialization boundary eager
-    and merges the stage results into one global compressed-id topk tensor.
+    topk scoring. ART stages may cover only a subset of this rank's query rows,
+    so this wrapper keeps the wait/materialization boundary eager and merges by
+    explicit query token id before selecting one global compressed-id topk.
     """
     works = tuple(stage_works)
     if not works:
         raise RuntimeError("DSV4 exchanged indexer topk requires at least one stage")
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    if not query_ids:
+        raise RuntimeError("DSV4 exchanged indexer topk requires query_token_ids")
+    _row_by_id(query_ids, name="query_token_ids")
     if int(topk) < 0:
         raise RuntimeError(f"DSV4 exchanged indexer topk must be non-negative: {topk}")
     for position, work in enumerate(works):
         _validate_indexer_stage_work(work=work, position=position)
-    return Dsv4ExchangedIndexerTopkWork(stage_works=works, topk=int(topk))
+    return Dsv4ExchangedIndexerTopkWork(
+        stage_works=works,
+        query_token_ids=query_ids,
+        topk=int(topk),
+    )
 
 
 def merge_indexer_topk_results(
@@ -462,6 +480,71 @@ def merge_indexer_topk_results(
     return Dsv4TopkResult(indices=merged_ids.to(torch.int64), scores=merged_scores)
 
 
+def merge_indexer_stage_topk_results(
+    *,
+    stage_results: Sequence[tuple[Sequence[int], Dsv4TopkResult]],
+    query_token_ids: Sequence[int],
+    topk: int,
+) -> Dsv4TopkResult:
+    if not stage_results:
+        raise RuntimeError("DSV4 indexer stage topk merge requires at least one result")
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    query_index = _row_by_id(query_ids, name="query_token_ids")
+    score_parts: list[torch.Tensor] = []
+    index_parts: list[torch.Tensor] = []
+    batch_size: int | None = None
+    for position, (stage_query_ids, result) in enumerate(stage_results):
+        if result.scores.shape != result.indices.shape or result.scores.ndim != 3:
+            raise RuntimeError(
+                "DSV4 indexer stage topk result must have matching [B,Q,K] "
+                f"scores/indices, got {tuple(result.scores.shape)} and "
+                f"{tuple(result.indices.shape)}"
+            )
+        stage_ids = tuple(int(token_id) for token_id in stage_query_ids)
+        _row_by_id(stage_ids, name=f"stage{position}_query_token_ids")
+        if len(stage_ids) != int(result.scores.shape[1]):
+            raise RuntimeError(
+                "DSV4 indexer stage query id count must match result Q dim, got "
+                f"{len(stage_ids)} vs {int(result.scores.shape[1])}"
+            )
+        missing = tuple(
+            token_id for token_id in stage_ids if token_id not in query_index
+        )
+        if missing:
+            raise RuntimeError(
+                f"DSV4 indexer stage query ids missing from global ids: {missing}"
+            )
+        if batch_size is None:
+            batch_size = int(result.scores.shape[0])
+        elif batch_size != int(result.scores.shape[0]):
+            raise RuntimeError("DSV4 indexer stage topk batch sizes must match")
+        rows = torch.tensor(
+            tuple(query_index[token_id] for token_id in stage_ids),
+            device=result.scores.device,
+            dtype=torch.long,
+        )
+        scores = result.scores.new_full(
+            (int(result.scores.shape[0]), len(query_ids), int(result.scores.shape[2])),
+            float("-inf"),
+        )
+        indices = torch.full(
+            scores.shape,
+            _INVALID_INDEX,
+            device=result.indices.device,
+            dtype=torch.long,
+        )
+        scores.index_copy_(1, rows, result.scores)
+        indices.index_copy_(1, rows.to(result.indices.device), result.indices.long())
+        score_parts.append(scores)
+        index_parts.append(indices)
+    merged_scores, merged_ids = stable_select_from_scored_ids(
+        scores=torch.cat(score_parts, dim=-1),
+        indices=torch.cat(index_parts, dim=-1),
+        topk=topk,
+    )
+    return Dsv4TopkResult(indices=merged_ids.to(torch.int64), scores=merged_scores)
+
+
 def _validate_indexer_stage_work(*, work: Any, position: int) -> None:
     if not callable(getattr(work, "wait", None)):
         raise RuntimeError(f"DSV4 indexer stage work {position} is missing wait()")
@@ -469,6 +552,15 @@ def _validate_indexer_stage_work(*, work: Any, position: int) -> None:
         raise RuntimeError(
             f"DSV4 indexer stage work {position} is missing wait_post_process()"
         )
+
+
+def _query_token_ids_from_stage_work(*, work: Any, position: int) -> tuple[int, ...]:
+    ids = getattr(work, "query_token_ids", None)
+    if ids is None:
+        raise RuntimeError(
+            f"DSV4 indexer stage work {position} is missing query_token_ids"
+        )
+    return tuple(int(token_id) for token_id in ids)
 
 
 def _indexer_topk_result_from_work(*, work: Any, position: int) -> Dsv4TopkResult:
