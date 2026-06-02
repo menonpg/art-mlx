@@ -4,8 +4,10 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
+from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
@@ -18,6 +20,7 @@ from .types import (
     Dsv4ProjectedTokenBuffer,
     Dsv4StreamKind,
     Dsv4StreamSpec,
+    Dsv4TensorExchangePlan,
     Dsv4TokenInView,
 )
 
@@ -32,6 +35,57 @@ _PADDING_GROUP_ID = -1
 class TokenLayoutIndexLike(Protocol):
     ownership_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...]
     token_counts_by_rank: tuple[int, ...]
+
+
+class Dsv4CompressionHaloExchangeWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    rank: int
+    projected_dim: int
+    incoming_transfers: tuple[Dsv4HaloTransfer, ...]
+    tensor_work: Dsv4TensorExchangeWork
+
+    def wait(self) -> None:
+        self.tensor_work.wait()
+
+    def wait_post_process(self) -> tuple[Dsv4CompressionHaloPayload, ...]:
+        result = self.tensor_work.wait_post_process()
+        expected_ids = tuple(
+            int(token_id)
+            for transfer in self.incoming_transfers
+            for token_id in transfer.token_ids
+        )
+        if result.ids != expected_ids:
+            raise RuntimeError(
+                "DSV4 compression halo exchange received unexpected token ids: "
+                f"{result.ids} vs {expected_ids}"
+            )
+        expected_width = int(self.projected_dim) * 2
+        if int(result.tensor.shape[-1]) != expected_width:
+            raise RuntimeError(
+                "DSV4 compression halo fused tensor width mismatch: "
+                f"{int(result.tensor.shape[-1])} vs {expected_width}"
+            )
+        projected_kv, projected_gate = result.tensor.split(
+            int(self.projected_dim),
+            dim=-1,
+        )
+        payloads: list[Dsv4CompressionHaloPayload] = []
+        cursor = 0
+        for transfer in self.incoming_transfers:
+            count = len(transfer.token_ids)
+            payloads.append(
+                Dsv4CompressionHaloPayload(
+                    source_rank=int(transfer.source_rank),
+                    target_rank=int(self.rank),
+                    token_ids=transfer.token_ids,
+                    entry_ids=transfer.entry_ids,
+                    projected_kv=_narrow_token_dim(projected_kv, cursor, count),
+                    projected_gate=_narrow_token_dim(projected_gate, cursor, count),
+                )
+            )
+            cursor += count
+        return tuple(payloads)
 
 
 def build_dsv4_compressed_layout(
@@ -251,6 +305,49 @@ def pack_dsv4_compression_halo_payloads(
             )
         )
     return tuple(payloads)
+
+
+@torch.compiler.disable
+def launch_dsv4_compression_halo_exchange(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    token_ids: Sequence[int],
+    group: Any,
+    async_op: bool,
+) -> Dsv4CompressionHaloExchangeWork:
+    """Launch fused projected-KV/gate halo exchange for DSV4 compression.
+
+    This is a DSV4-specific eager communication boundary. It fuses KV and gate
+    rows into one explicit-id exchange so CSA/HCA closure owners receive exactly
+    the remote projected rows needed for `materialize_dsv4_compression_token_buffer`.
+    Callers must await the returned work before using payload tensors; otherwise
+    async CUDA communication can race the compression consumer.
+    """
+    _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(projected_kv.shape[-2]),
+        name="token_ids",
+    )
+    projected_dim = int(projected_kv.shape[-1])
+    fused = torch.cat((projected_kv, projected_gate), dim=-1)
+    plan = _compression_halo_exchange_plan(layout=layout, rank=rank)
+    return Dsv4CompressionHaloExchangeWork(
+        rank=int(rank),
+        projected_dim=projected_dim,
+        incoming_transfers=_incoming_halo_transfers(layout=layout, rank=rank),
+        tensor_work=launch_dsv4_tensor_exchange(
+            tensor=fused,
+            tensor_ids=token_ids,
+            plan=plan,
+            group=group,
+            async_op=async_op,
+            label="dsv4_compression_halo_exchange",
+        ),
+    )
 
 
 def materialize_dsv4_compression_token_buffer(
@@ -482,6 +579,78 @@ def _needed_tokens_for_owner(
     )
 
 
+def _compression_halo_exchange_plan(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+) -> Dsv4TensorExchangePlan:
+    rank = int(rank)
+    rank_count = _layout_rank_count(layout)
+    _validate_layout_rank(rank=rank, rank_count=rank_count)
+    send_ids_by_peer: list[tuple[int, ...]] = [() for _ in range(rank_count)]
+    recv_ids_by_peer: list[tuple[int, ...]] = [() for _ in range(rank_count)]
+    for transfer in layout.halo_transfers:
+        source_rank = int(transfer.source_rank)
+        target_rank = int(transfer.target_rank)
+        _validate_layout_rank(rank=source_rank, rank_count=rank_count)
+        _validate_layout_rank(rank=target_rank, rank_count=rank_count)
+        if source_rank == rank:
+            if send_ids_by_peer[target_rank]:
+                raise RuntimeError(
+                    "DSV4 compression halo has duplicate source->target transfer: "
+                    f"{source_rank}->{target_rank}"
+                )
+            send_ids_by_peer[target_rank] = transfer.token_ids
+        if target_rank == rank:
+            if recv_ids_by_peer[source_rank]:
+                raise RuntimeError(
+                    "DSV4 compression halo has duplicate source->target transfer: "
+                    f"{source_rank}->{target_rank}"
+                )
+            recv_ids_by_peer[source_rank] = transfer.token_ids
+    return Dsv4TensorExchangePlan(
+        send_ids_by_peer=tuple(send_ids_by_peer),
+        recv_ids_by_peer=tuple(recv_ids_by_peer),
+    )
+
+
+def _incoming_halo_transfers(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+) -> tuple[Dsv4HaloTransfer, ...]:
+    rank = int(rank)
+    rank_count = _layout_rank_count(layout)
+    _validate_layout_rank(rank=rank, rank_count=rank_count)
+    by_source: dict[int, Dsv4HaloTransfer] = {}
+    for transfer in layout.halo_transfers:
+        if int(transfer.target_rank) != rank:
+            continue
+        source_rank = int(transfer.source_rank)
+        if source_rank in by_source:
+            raise RuntimeError(
+                "DSV4 compression halo has duplicate source->target transfer: "
+                f"{source_rank}->{rank}"
+            )
+        by_source[source_rank] = transfer
+    return tuple(
+        by_source[source_rank]
+        for source_rank in range(rank_count)
+        if source_rank in by_source
+    )
+
+
+def _layout_rank_count(layout: Dsv4CompressedLayout) -> int:
+    return len(layout.entry_ids_by_owner_rank)
+
+
+def _validate_layout_rank(*, rank: int, rank_count: int) -> None:
+    if int(rank) < 0 or int(rank) >= int(rank_count):
+        raise RuntimeError(
+            f"DSV4 compression halo rank {rank} is outside rank count {rank_count}"
+        )
+
+
 def _validate_halo_payload_tensors(payload: Dsv4CompressionHaloPayload) -> None:
     _validate_projected_pair(
         projected_kv=payload.projected_kv,
@@ -608,6 +777,14 @@ def _positions_for_token_ids(
 
 def _token_dim(tensor: torch.Tensor) -> int:
     return 0 if tensor.ndim == 2 else 1
+
+
+def _narrow_token_dim(
+    tensor: torch.Tensor,
+    start: int,
+    length: int,
+) -> torch.Tensor:
+    return tensor.narrow(_token_dim(tensor), int(start), int(length))
 
 
 def _index_select_token_dim(

@@ -2,11 +2,13 @@
 
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .compressor import (
+    Dsv4CompressionHaloExchangeWork,
     accumulate_dsv4_compression_halo_gradient_payloads,
     build_dsv4_compressed_layout,
     build_dsv4_compressed_layout_from_cp_state,
     compress_owned_projected_kv,
     compress_projected_kv,
+    launch_dsv4_compression_halo_exchange,
     materialize_dsv4_compression_token_buffer,
     pack_dsv4_compression_halo_gradient_payloads,
     pack_dsv4_compression_halo_payloads,
@@ -82,6 +84,7 @@ __all__ = [
     "Dsv4AttentionGradientResult",
     "Dsv4BranchView",
     "Dsv4CompressionHaloGradientPayload",
+    "Dsv4CompressionHaloExchangeWork",
     "Dsv4CompressionHaloPayload",
     "Dsv4CompressedEntry",
     "Dsv4CompressedLayout",
@@ -125,6 +128,7 @@ __all__ = [
     "dsv4_sparse_bwd",
     "dsv4_sparse_fwd",
     "launch_dsv4_tensor_exchange",
+    "launch_dsv4_compression_halo_exchange",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
     "merge_materialized_stage_records",
