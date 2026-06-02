@@ -953,16 +953,6 @@ def _infer_parallel_topology(model_chunks: ModelChunks) -> ParallelTopology:
     )
 
 
-def _validate_context_parallel_training_supported(
-    *,
-    model_chunks: ModelChunks,
-    model_support_handler: Any,
-    experimental_config: dev.TrainConfig,
-    topology: ParallelTopology,
-) -> None:
-    del model_chunks, model_support_handler, experimental_config, topology
-
-
 def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
@@ -1004,13 +994,6 @@ def run_megatron_sft_step(
         )
 
     topology = _infer_parallel_topology(model_chunks)
-    _validate_context_parallel_training_supported(
-        model_chunks=model_chunks,
-        model_support_handler=model_support_handler,
-        experimental_config={},
-        topology=topology,
-    )
-
     device = next(model_chunks[0].parameters()).device
     trace_token_uids = context_parallel_trace_token_uids_enabled(
         topology,
@@ -1166,12 +1149,6 @@ def run_training_step(
     )
     if cp_lookahead_state is not None and int(topology.cp) <= 1:
         cp_lookahead_state.pending_prepared_micro = None
-    _validate_context_parallel_training_supported(
-        model_chunks=model_chunks,
-        model_support_handler=model_support_handler,
-        experimental_config=experimental_config,
-        topology=topology,
-    )
 
     for chunk in model_chunks:
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]

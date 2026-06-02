@@ -14,7 +14,6 @@ from torch.distributed import destroy_process_group, init_process_group  # noqa:
 import torch.multiprocessing as mp  # noqa: E402
 
 from art.loss import LossInputs, loss_fn, shift_tensor  # noqa: E402
-from art.megatron import train as megatron_train  # noqa: E402
 from art.megatron.context_parallel.runtime import prepare_cp_micro  # noqa: E402
 from art.megatron.context_parallel.types import (  # noqa: E402
     ArtContextParallelState,
@@ -26,10 +25,6 @@ from art.preprocessing.pack import PackedTensors  # noqa: E402
 
 from .cases import default_phase0_cases  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
-
-
-class _Handler:
-    build_gdn_execution_spec = True
 
 
 def test_gdn_cp_training_batch_carries_prebuilt_rank_plan(tmp_path: Path) -> None:
@@ -110,34 +105,6 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
-
-def test_cp_training_guard_allows_attention_and_gdn_handlers() -> None:
-    for handler in (object(), _Handler()):
-        megatron_train._validate_context_parallel_training_supported(
-            model_chunks=cast(Any, []),
-            model_support_handler=handler,
-            experimental_config={},
-            topology=ParallelTopology(cp=2),
-        )
-
-
-@pytest.mark.parametrize(
-    "experimental_config",
-    (
-        {"importance_sampling_level": "sequence"},
-        {"truncated_importance_sampling": 2.0},
-    ),
-)
-def test_cp_training_guard_allows_main_loss_knobs(
-    experimental_config: dict[str, object],
-) -> None:
-    megatron_train._validate_context_parallel_training_supported(
-        model_chunks=cast(Any, []),
-        model_support_handler=_Handler(),
-        experimental_config=cast(Any, experimental_config),
-        topology=ParallelTopology(cp=2),
-    )
 
 
 def test_main_loss_matches_shifted_dispatched_loss_inputs() -> None:
@@ -226,13 +193,4 @@ def test_main_loss_matches_shifted_dispatched_loss_inputs() -> None:
     torch.testing.assert_close(
         dispatched_new_logprobs.grad,
         dense_new_logprobs.grad,
-    )
-
-
-def test_sft_cp_guard_allows_gdn_handler() -> None:
-    megatron_train._validate_context_parallel_training_supported(
-        model_chunks=cast(Any, []),
-        model_support_handler=_Handler(),
-        experimental_config={},
-        topology=ParallelTopology(cp=2),
     )
