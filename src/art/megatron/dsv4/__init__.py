@@ -28,6 +28,11 @@ from .indexer import (
     stage_candidate_entry_ids,
     visible_entry_ids_for_query,
 )
+from .sparse_kernel import (
+    dsv4_disabled_attn_sink,
+    dsv4_sparse_bwd,
+    dsv4_sparse_fwd,
+)
 from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
@@ -38,6 +43,8 @@ from .types import (
     Dsv4HaloTransfer,
     Dsv4MaterializedStage,
     Dsv4PreparedPlan,
+    Dsv4SparseBackwardResult,
+    Dsv4SparseForwardResult,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
     Dsv4StreamKind,
@@ -58,6 +65,8 @@ __all__ = [
     "Dsv4PreparedPlan",
     "Dsv4StageInputs",
     "Dsv4StageKeyKind",
+    "Dsv4SparseBackwardResult",
+    "Dsv4SparseForwardResult",
     "Dsv4StreamKind",
     "Dsv4StreamSpec",
     "Dsv4TokenInView",
@@ -73,6 +82,9 @@ __all__ = [
     "compute_indexer_topk",
     "compress_owned_projected_kv",
     "compress_projected_kv",
+    "dsv4_disabled_attn_sink",
+    "dsv4_sparse_bwd",
+    "dsv4_sparse_fwd",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
     "merge_stage_outputs",

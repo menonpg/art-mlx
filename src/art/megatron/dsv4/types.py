@@ -129,6 +129,21 @@ class Dsv4MaterializedStage(BaseModel):
     key_global_ids: tuple[int, ...]
 
 
+class Dsv4SparseForwardResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    out: torch.Tensor
+    lse: torch.Tensor
+
+
+class Dsv4SparseBackwardResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    dq: torch.Tensor
+    dkv: torch.Tensor
+    d_attn_sink: torch.Tensor
+
+
 class Dsv4CompressedLayout(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -159,3 +174,5 @@ class Dsv4ContextParallelState(BaseModel):
 Dsv4TopkResult.model_rebuild()
 Dsv4StageInputs.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
+Dsv4SparseForwardResult.model_rebuild()
+Dsv4SparseBackwardResult.model_rebuild()
