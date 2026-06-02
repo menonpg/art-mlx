@@ -31,15 +31,30 @@ def dsv4_sparse_fwd(
     all real-key stages.
     """
     _validate_sparse_inputs(q=q, kv=kv, attn_sink=attn_sink, topk=topk)
+    if int(kv.shape[1]) == 0 or int(topk.shape[-1]) == 0:
+        return Dsv4SparseForwardResult(
+            out=torch.zeros_like(q),
+            lse=_sink_only_lse(q=q, attn_sink=attn_sink),
+        )
+    topk_i32, row_has_key = _safe_topk_for_miles(topk)
     fwd, _ = _load_miles_sparse_mla()
     out, lse_log2 = fwd(
         q.contiguous(),
         kv.contiguous(),
         attn_sink.to(dtype=torch.float32).contiguous(),
-        topk.to(dtype=torch.int32).contiguous(),
+        topk_i32,
         sm_scale=scale,
     )
-    return Dsv4SparseForwardResult(out=out, lse=lse_log2 * _LN2)
+    output_row_mask = row_has_key.unsqueeze(-1).unsqueeze(-1)
+    lse_row_mask = row_has_key.unsqueeze(-1)
+    return Dsv4SparseForwardResult(
+        out=torch.where(output_row_mask, out, torch.zeros_like(out)),
+        lse=torch.where(
+            lse_row_mask,
+            lse_log2 * _LN2,
+            _sink_only_lse(q=q, attn_sink=attn_sink),
+        ),
+    )
 
 
 def dsv4_sparse_bwd(
@@ -80,23 +95,55 @@ def dsv4_sparse_bwd(
         grad_out=grad_out,
         global_lse=global_lse,
     )
+    if int(kv.shape[1]) == 0 or int(topk.shape[-1]) == 0:
+        return Dsv4SparseBackwardResult(
+            dq=torch.zeros_like(q),
+            dkv=torch.zeros_like(kv),
+            d_attn_sink=torch.zeros_like(attn_sink),
+        )
 
+    topk_i32, row_has_key = _safe_topk_for_miles(topk)
+    output_row_mask = row_has_key.unsqueeze(-1).unsqueeze(-1)
+    lse_row_mask = row_has_key.unsqueeze(-1)
     _, bwd = _load_miles_sparse_mla()
     dq, dkv, d_attn_sink = bwd(
         q.contiguous(),
         kv.contiguous(),
         attn_sink.to(dtype=torch.float32).contiguous(),
-        global_out.contiguous(),
-        grad_out.contiguous(),
-        topk.to(dtype=torch.int32).contiguous(),
-        (global_lse * _LOG2E).to(dtype=torch.float32).contiguous(),
+        torch.where(
+            output_row_mask,
+            global_out,
+            torch.zeros_like(global_out),
+        ).contiguous(),
+        torch.where(
+            output_row_mask,
+            grad_out,
+            torch.zeros_like(grad_out),
+        ).contiguous(),
+        topk_i32,
+        torch.where(lse_row_mask, global_lse, torch.zeros_like(global_lse))
+        .mul(_LOG2E)
+        .to(dtype=torch.float32)
+        .contiguous(),
         sm_scale=scale,
     )
-    return Dsv4SparseBackwardResult(dq=dq, dkv=dkv, d_attn_sink=d_attn_sink)
+    return Dsv4SparseBackwardResult(
+        dq=torch.where(output_row_mask, dq, torch.zeros_like(dq)),
+        dkv=dkv,
+        d_attn_sink=d_attn_sink,
+    )
 
 
 def dsv4_disabled_attn_sink(attn_sink: torch.Tensor) -> torch.Tensor:
     return torch.full_like(attn_sink, float("-inf"))
+
+
+def _sink_only_lse(*, q: torch.Tensor, attn_sink: torch.Tensor) -> torch.Tensor:
+    return (
+        attn_sink.to(device=q.device, dtype=torch.float32)
+        .reshape(1, 1, -1)
+        .expand(q.shape[:-1])
+    )
 
 
 def _validate_sparse_inputs(
@@ -134,6 +181,28 @@ def _validate_sparse_inputs(
             f"sink={int(attn_sink.shape[0])}, q_heads={int(q.shape[2])}"
         )
     _require_same_device(q.device, kv=kv, attn_sink=attn_sink, topk=topk)
+
+
+def _safe_topk_for_miles(topk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Avoid unsafe Miles all-invalid rows without synchronizing CUDA.
+
+    The current TileLang kernel masks `-1` indices but still reads the indexed
+    KV row. A row containing only `-1` would therefore read `KV[-1]` and, with
+    sink disabled for CP stages, produce an invalid denominator. We keep the
+    list shape stable, patch only the first index of all-invalid rows to `0`,
+    and let callers overwrite those rows to the mathematical zero-output,
+    sink-only LSE result. Backward callers also zero replay inputs for those
+    rows, so the harmless key contributes no gradient.
+    """
+    topk_i32 = topk.to(dtype=torch.int32).contiguous()
+    row_has_key = topk_i32.ge(0).any(dim=-1)
+    safe_first = torch.where(
+        row_has_key,
+        topk_i32[..., 0],
+        torch.zeros_like(topk_i32[..., 0]),
+    )
+    topk_i32[..., 0].copy_(safe_first)
+    return topk_i32, row_has_key
 
 
 def _require_same_device(
