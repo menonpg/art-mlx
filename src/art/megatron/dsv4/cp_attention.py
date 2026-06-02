@@ -9,6 +9,11 @@ import torch.distributed as dist
 
 from . import sparse_kernel
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
+from .compressor import (
+    Dsv4CompressedKvForwardWork,
+    launch_dsv4_compressed_kv_backward,
+    launch_dsv4_compressed_kv_forward,
+)
 from .cp_stage import (
     build_dsv4_stage_inputs_from_stage_plan,
     launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
@@ -23,10 +28,13 @@ from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
     Dsv4AttentionGradientResult,
+    Dsv4CompressedKvForwardResult,
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
     Dsv4GradientOwnerBucket,
     Dsv4MaterializedStage,
+    Dsv4ProjectedAttentionForwardResult,
+    Dsv4ProjectedAttentionGradientResult,
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
@@ -207,6 +215,161 @@ class Dsv4ExchangedAttentionBackwardWork(BaseModel):
             raw_token_ids=self.owned_raw_token_ids,
             compressed_entry_ids=self.owned_compressed_entry_ids,
         )
+
+
+class Dsv4ProjectedAttentionForwardWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    compression_kind: Dsv4CompressionKind
+    layout: Dsv4CompressedLayout
+    rank: int
+    stage_plan_slots: tuple[Dsv4StagePlanSlot, ...]
+    query: torch.Tensor
+    query_token_ids: tuple[int, ...]
+    raw_kv: torch.Tensor
+    raw_token_ids: tuple[int, ...]
+    main_compression_work: Dsv4CompressedKvForwardWork
+    indexer_compression_work: Dsv4CompressedKvForwardWork | None = None
+    indexer_q: torch.Tensor | None = None
+    indexer_weights: torch.Tensor | None = None
+    indexer_topk: int | None = None
+    indexer_score_scale: float = 1.0
+    attn_sink: torch.Tensor
+    group: Any
+    async_op: bool
+    scale: float | None = None
+    window_size: int = 128
+    raw_list_size: int | None = None
+    compressed_list_size: int | None = None
+    _attention_work: Any | None = PrivateAttr(default=None)
+    _main_compressed: Dsv4CompressedKvForwardResult | None = PrivateAttr(default=None)
+    _indexer_compressed: Dsv4CompressedKvForwardResult | None = PrivateAttr(
+        default=None
+    )
+    _result: Dsv4ProjectedAttentionForwardResult | None = PrivateAttr(default=None)
+
+    def wait(self) -> None:
+        self._ensure_attention_work().wait()
+
+    def wait_post_process(self) -> Dsv4ProjectedAttentionForwardResult:
+        if self._result is not None:
+            return self._result
+        attention = self._ensure_attention_work().wait_post_process()
+        if self._main_compressed is None:
+            raise RuntimeError("DSV4 projected attention missing main compression")
+        self._result = Dsv4ProjectedAttentionForwardResult(
+            compression_kind=self.compression_kind,
+            attention=attention,
+            main_compressed=self._main_compressed,
+            indexer_compressed=self._indexer_compressed,
+        )
+        return self._result
+
+    def _ensure_attention_work(self) -> Any:
+        if self._attention_work is not None:
+            return self._attention_work
+        with torch.no_grad():
+            self._main_compressed = self.main_compression_work.wait_post_process()
+            if self.indexer_compression_work is not None:
+                self._indexer_compressed = (
+                    self.indexer_compression_work.wait_post_process()
+                )
+        if self.compression_kind == Dsv4CompressionKind.CSA:
+            if (
+                self._indexer_compressed is None
+                or self.indexer_q is None
+                or self.indexer_weights is None
+                or self.indexer_topk is None
+            ):
+                raise RuntimeError("DSV4 CSA projected attention requires indexer data")
+            self._attention_work = (
+                launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+                    layout=self.layout,
+                    rank=int(self.rank),
+                    stage_plan_slots=self.stage_plan_slots,
+                    query=self.query,
+                    query_token_ids=self.query_token_ids,
+                    raw_kv=self.raw_kv,
+                    raw_token_ids=self.raw_token_ids,
+                    compressed_kv=self._main_compressed.compressed_kv,
+                    compressed_entry_ids=self._main_compressed.compressed_entry_ids,
+                    indexer_q=self.indexer_q,
+                    indexer_weights=self.indexer_weights,
+                    indexer_kv=self._indexer_compressed.compressed_kv,
+                    indexer_kv_entry_ids=self._indexer_compressed.compressed_entry_ids,
+                    indexer_topk=int(self.indexer_topk),
+                    attn_sink=self.attn_sink,
+                    group=self.group,
+                    async_op=bool(self.async_op),
+                    indexer_score_scale=float(self.indexer_score_scale),
+                    scale=self.scale,
+                    window_size=int(self.window_size),
+                    raw_list_size=self.raw_list_size,
+                    compressed_list_size=self.compressed_list_size,
+                )
+            )
+        elif self.compression_kind == Dsv4CompressionKind.HCA:
+            self._attention_work = (
+                launch_dsv4_hca_attention_forward_from_stage_plan_slots(
+                    layout=self.layout,
+                    rank=int(self.rank),
+                    stage_plan_slots=self.stage_plan_slots,
+                    query=self.query,
+                    query_token_ids=self.query_token_ids,
+                    raw_kv=self.raw_kv,
+                    raw_token_ids=self.raw_token_ids,
+                    compressed_kv=self._main_compressed.compressed_kv,
+                    compressed_entry_ids=self._main_compressed.compressed_entry_ids,
+                    attn_sink=self.attn_sink,
+                    group=self.group,
+                    async_op=bool(self.async_op),
+                    scale=self.scale,
+                    window_size=int(self.window_size),
+                    raw_list_size=self.raw_list_size,
+                    compressed_list_size=self.compressed_list_size,
+                )
+            )
+        else:
+            raise RuntimeError(
+                f"Unsupported DSV4 projected attention kind {self.compression_kind}"
+            )
+        return self._attention_work
+
+
+class Dsv4ProjectedAttentionBackwardWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    attention_work: Dsv4ExchangedAttentionBackwardWork
+    forward_result: Dsv4ProjectedAttentionForwardResult
+    group: Any
+    async_op: bool
+    _compressor_work: Any | None = PrivateAttr(default=None)
+    _result: Dsv4ProjectedAttentionGradientResult | None = PrivateAttr(default=None)
+
+    def wait(self) -> None:
+        self.wait_post_process()
+
+    def wait_post_process(self) -> Dsv4ProjectedAttentionGradientResult:
+        if self._result is not None:
+            return self._result
+        attention_gradients = self.attention_work.wait_post_process()
+        dcompressed = _align_compressed_grad_to_forward(
+            forward_result=self.forward_result.main_compressed,
+            attention_gradients=attention_gradients,
+        )
+        compressor_work = launch_dsv4_compressed_kv_backward(
+            forward_result=self.forward_result.main_compressed,
+            dcompressed_kv=dcompressed,
+            group=self.group,
+            async_op=bool(self.async_op),
+        )
+        self._compressor_work = compressor_work
+        main_compressor = compressor_work.wait_post_process()
+        self._result = Dsv4ProjectedAttentionGradientResult(
+            attention=attention_gradients,
+            main_compressor=main_compressor,
+        )
+        return self._result
 
 
 def _accum_output_dtype(input_dtype: torch.dtype) -> torch.dtype:
@@ -586,6 +749,213 @@ def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
 
 
 @torch.compiler.disable
+def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    main_projected_kv: torch.Tensor,
+    main_projected_gate: torch.Tensor,
+    main_positional_bias: torch.Tensor,
+    main_token_ids: Sequence[int],
+    indexer_projected_kv: torch.Tensor,
+    indexer_projected_gate: torch.Tensor,
+    indexer_positional_bias: torch.Tensor,
+    indexer_token_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_topk: int,
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    indexer_score_scale: float = 1.0,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ProjectedAttentionForwardWork:
+    """Launch projected-input CSA DSV4 CP attention.
+
+    The caller owns DSV4 model projections. This eager wrapper launches main
+    and frozen-indexer compression halo work over projected KV/gate tensors,
+    then feeds the resulting compressed entries into the existing StagePlan-slot
+    CSA indexer and sparse-attention path. Compression forward runs under
+    no-grad because backward is replayed explicitly from global-LSE attention
+    gradients.
+    """
+    slots = _validate_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=stage_plan_slots,
+    )
+    rank_int = int(rank)
+    _validate_exchange_rank(
+        rank=rank_int,
+        rank_count=len(layout.entry_ids_by_owner_rank),
+    )
+    query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
+    raw_ids = _normalize_output_ids(raw_token_ids, name="raw_token_ids")
+    with torch.no_grad():
+        main_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=rank_int,
+            projected_kv=main_projected_kv,
+            projected_gate=main_projected_gate,
+            positional_bias=main_positional_bias,
+            token_ids=main_token_ids,
+            group=group,
+            async_op=async_op,
+        )
+        indexer_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=rank_int,
+            projected_kv=indexer_projected_kv,
+            projected_gate=indexer_projected_gate,
+            positional_bias=indexer_positional_bias,
+            token_ids=indexer_token_ids,
+            group=group,
+            async_op=async_op,
+        )
+    return Dsv4ProjectedAttentionForwardWork(
+        compression_kind=Dsv4CompressionKind.CSA,
+        layout=layout,
+        rank=rank_int,
+        stage_plan_slots=slots,
+        query=query,
+        query_token_ids=query_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_ids,
+        main_compression_work=main_work,
+        indexer_compression_work=indexer_work,
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_topk=int(indexer_topk),
+        indexer_score_scale=float(indexer_score_scale),
+        attn_sink=attn_sink,
+        group=group,
+        async_op=async_op,
+        scale=scale,
+        window_size=int(window_size),
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+    token_ids: Sequence[int],
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ProjectedAttentionForwardWork:
+    """Launch projected-input HCA DSV4 CP attention."""
+    slots = _validate_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=stage_plan_slots,
+    )
+    rank_int = int(rank)
+    _validate_exchange_rank(
+        rank=rank_int,
+        rank_count=len(layout.entry_ids_by_owner_rank),
+    )
+    query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
+    raw_ids = _normalize_output_ids(raw_token_ids, name="raw_token_ids")
+    with torch.no_grad():
+        compressed_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=rank_int,
+            projected_kv=projected_kv,
+            projected_gate=projected_gate,
+            positional_bias=positional_bias,
+            token_ids=token_ids,
+            group=group,
+            async_op=async_op,
+        )
+    return Dsv4ProjectedAttentionForwardWork(
+        compression_kind=Dsv4CompressionKind.HCA,
+        layout=layout,
+        rank=rank_int,
+        stage_plan_slots=slots,
+        query=query,
+        query_token_ids=query_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_ids,
+        main_compression_work=compressed_work,
+        attn_sink=attn_sink,
+        group=group,
+        async_op=async_op,
+        scale=scale,
+        window_size=int(window_size),
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    forward_result: Dsv4ProjectedAttentionForwardResult,
+    grad_out: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    owned_query_token_ids: Sequence[int] | None = None,
+    owned_raw_token_ids: Sequence[int] | None = None,
+    owned_compressed_entry_ids: Sequence[int] | None = None,
+) -> Dsv4ProjectedAttentionBackwardWork:
+    """Replay DSV4 projected-input CP attention backward.
+
+    Attention backward first reduces gradients into owner query/raw/compressed
+    id spaces. The compressed-entry gradient is then scattered into the exact
+    owned compressed-entry order saved by compression forward and used to replay
+    compressor backward, including reverse halo-gradient exchange.
+    """
+    if forward_result.compression_kind != layout.spec.kind:
+        raise RuntimeError(
+            "DSV4 projected forward kind does not match layout kind: "
+            f"{forward_result.compression_kind} vs {layout.spec.kind}"
+        )
+    attention_work = launch_dsv4_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=int(rank),
+        stage_plan_slots=stage_plan_slots,
+        forward_result=forward_result.attention,
+        grad_out=grad_out,
+        group=group,
+        async_op=async_op,
+        owned_query_token_ids=owned_query_token_ids,
+        owned_raw_token_ids=owned_raw_token_ids,
+        owned_compressed_entry_ids=owned_compressed_entry_ids,
+    )
+    return Dsv4ProjectedAttentionBackwardWork(
+        attention_work=attention_work,
+        forward_result=forward_result,
+        group=group,
+        async_op=async_op,
+    )
+
+
+@torch.compiler.disable
 def launch_dsv4_attention_backward_from_stage_plan_slots(
     *,
     layout: Dsv4CompressedLayout,
@@ -813,6 +1183,72 @@ def launch_dsv4_attn_sink_gradient_reduce(
     if rank_count > 1:
         handle = _DIST.all_reduce(reduced, group=group, async_op=async_op)
     return Dsv4SinkGradientReduceWork(d_attn_sink=reduced, handle=handle)
+
+
+def _align_compressed_grad_to_forward(
+    *,
+    forward_result: Dsv4CompressedKvForwardResult,
+    attention_gradients: Dsv4AttentionGradientResult,
+) -> torch.Tensor:
+    target_ids = tuple(
+        int(entry_id) for entry_id in forward_result.compressed_entry_ids
+    )
+    source_ids = tuple(
+        int(entry_id) for entry_id in attention_gradients.compressed_entry_ids
+    )
+    target_index = _row_by_id(ids=target_ids, name="forward compressed_entry_ids")
+    source_index = _row_by_id(ids=source_ids, name="attention compressed_entry_ids")
+    missing = tuple(entry_id for entry_id in source_ids if entry_id not in target_index)
+    if missing:
+        raise RuntimeError(
+            "DSV4 attention produced compressed gradients for entries not owned "
+            f"by compressor forward: {missing}"
+        )
+
+    target = forward_result.compressed_kv
+    source = attention_gradients.dcompressed_kv
+    if target.ndim == source.ndim:
+        source_for_target = source
+    elif target.ndim == 2 and source.ndim == 3:
+        source_for_target = source.sum(dim=0)
+    else:
+        raise RuntimeError(
+            "DSV4 compressed gradient rank mismatch: "
+            f"target={tuple(target.shape)}, source={tuple(source.shape)}"
+        )
+    if int(source_for_target.shape[-2]) != len(source_ids):
+        raise RuntimeError(
+            "DSV4 attention compressed-gradient row count mismatch: "
+            f"{int(source_for_target.shape[-2])} vs {len(source_ids)}"
+        )
+    if int(source_for_target.shape[-1]) != int(target.shape[-1]):
+        raise RuntimeError(
+            "DSV4 attention compressed-gradient dim mismatch: "
+            f"{int(source_for_target.shape[-1])} vs {int(target.shape[-1])}"
+        )
+
+    aligned = torch.zeros_like(target)
+    if not source_ids:
+        return aligned
+    source_positions = []
+    target_positions = []
+    for entry_id in source_ids:
+        source_positions.append(source_index[entry_id])
+        target_positions.append(target_index[entry_id])
+    source_index_tensor = torch.tensor(
+        source_positions,
+        device=source_for_target.device,
+        dtype=torch.long,
+    )
+    target_index_tensor = torch.tensor(
+        target_positions,
+        device=aligned.device,
+        dtype=torch.long,
+    )
+    token_dim = 0 if aligned.ndim == 2 else 1
+    selected = source_for_target.index_select(token_dim, source_index_tensor)
+    aligned.index_add_(token_dim, target_index_tensor, selected)
+    return aligned
 
 
 def _validate_stage_exchange_work(*, work: Any, position: int) -> None:

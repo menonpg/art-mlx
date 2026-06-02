@@ -281,6 +281,22 @@ class Dsv4AttentionGradientResult(BaseModel):
     d_attn_sink: torch.Tensor
 
 
+class Dsv4ProjectedAttentionForwardResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    compression_kind: Dsv4CompressionKind
+    attention: Dsv4AttentionForwardResult
+    main_compressed: Dsv4CompressedKvForwardResult
+    indexer_compressed: Dsv4CompressedKvForwardResult | None = None
+
+
+class Dsv4ProjectedAttentionGradientResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    attention: Dsv4AttentionGradientResult
+    main_compressor: Dsv4CompressedKvGradientResult
+
+
 class Dsv4GradientOwnerBucket(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -341,4 +357,6 @@ Dsv4AttentionForwardResult.model_rebuild()
 Dsv4StageBackwardRecord.model_rebuild()
 Dsv4AttentionBackwardReplayResult.model_rebuild()
 Dsv4AttentionGradientResult.model_rebuild()
+Dsv4ProjectedAttentionForwardResult.model_rebuild()
+Dsv4ProjectedAttentionGradientResult.model_rebuild()
 Dsv4GradientOwnerBucket.model_rebuild()

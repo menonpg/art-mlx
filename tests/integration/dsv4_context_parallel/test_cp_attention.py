@@ -30,11 +30,15 @@ from art.megatron.dsv4 import (
     build_dsv4_compressed_layout,
     build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
+    compress_projected_kv,
     compute_single_sink_grad,
     launch_dsv4_attention_backward_from_stage_plan_slots,
     launch_dsv4_attention_forward_from_stage_plan_groups,
     launch_dsv4_csa_attention_forward_from_stage_plan_slots,
+    launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
     launch_dsv4_hca_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_projected_attention_backward_from_stage_plan_slots,
     launch_exchanged_dsv4_attention_backward,
     launch_exchanged_dsv4_attention_forward,
     merge_materialized_stage_records,
@@ -464,6 +468,211 @@ def test_hca_attention_forward_launcher_uses_stage_slots(
     assert stage.query_token_ids == (3, 7)
     assert stage.raw_count == 8
     assert stage.compressed_count == 2
+
+
+def test_csa_projected_attention_wraps_compression_indexer_and_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slots = _single_rank_slots()
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    main_kv, main_gate, main_bias = _projected_inputs(width=6)
+    indexer_kv, indexer_gate, indexer_bias = _projected_inputs(width=4)
+
+    forward_work = launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        main_projected_kv=main_kv,
+        main_projected_gate=main_gate,
+        main_positional_bias=main_bias,
+        main_token_ids=tuple(range(8)),
+        indexer_projected_kv=indexer_kv,
+        indexer_projected_gate=indexer_gate,
+        indexer_positional_bias=indexer_bias,
+        indexer_token_ids=tuple(range(8)),
+        indexer_q=torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=torch.float64),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float64),
+        indexer_topk=2,
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    )
+    forward = forward_work.wait_post_process()
+
+    assert forward.compression_kind == Dsv4CompressionKind.CSA
+    assert forward.main_compressed.compressed_entry_ids == (0, 1)
+    assert forward.indexer_compressed is not None
+    assert forward.indexer_compressed.compressed_entry_ids == (0, 1)
+    expected_main = compress_projected_kv(
+        layout=layout,
+        projected_kv=main_kv,
+        projected_gate=main_gate,
+        positional_bias=main_bias,
+    )
+    torch.testing.assert_close(
+        forward.main_compressed.compressed_kv,
+        expected_main,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    grad_out = torch.arange(
+        forward.attention.out.numel(),
+        dtype=forward.attention.out.dtype,
+    ).reshape_as(forward.attention.out)
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        forward_result=forward,
+        grad_out=grad_out,
+        group=None,
+        async_op=True,
+    ).wait_post_process()
+
+    torch.testing.assert_close(backward.attention.dq, _stage_tensor(((10.0, 10.0),)))
+    torch.testing.assert_close(
+        backward.attention.draw_kv,
+        _kv_rows((20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0)),
+    )
+    torch.testing.assert_close(
+        backward.attention.dcompressed_kv, _kv_rows((28.0, 29.0))
+    )
+    expected_kv_grad, expected_gate_grad, expected_bias_grad = _compression_grads(
+        layout=layout,
+        projected_kv=main_kv,
+        projected_gate=main_gate,
+        positional_bias=main_bias,
+        dcompressed=torch.tensor(
+            [[28.0, 28.0, 28.0], [29.0, 29.0, 29.0]],
+            dtype=torch.float64,
+        ),
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_kv,
+        expected_kv_grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_gate,
+        expected_gate_grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dpositional_bias,
+        expected_bias_grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+
+
+def test_hca_projected_attention_wraps_compression_and_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.HCA)
+    slots = _single_rank_slots()
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    projected_kv, projected_gate, positional_bias = _projected_inputs(width=3)
+
+    forward = launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        token_ids=tuple(range(8)),
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+
+    assert forward.compression_kind == Dsv4CompressionKind.HCA
+    assert forward.indexer_compressed is None
+    assert forward.main_compressed.compressed_entry_ids == (0, 1)
+
+    grad_out = torch.arange(
+        forward.attention.out.numel(),
+        dtype=forward.attention.out.dtype,
+    ).reshape_as(forward.attention.out)
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        forward_result=forward,
+        grad_out=grad_out,
+        group=None,
+        async_op=True,
+    ).wait_post_process()
+
+    torch.testing.assert_close(
+        backward.attention.dcompressed_kv, _kv_rows((28.0, 29.0))
+    )
+    expected_kv_grad, expected_gate_grad, expected_bias_grad = _compression_grads(
+        layout=layout,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        dcompressed=torch.tensor(
+            [[28.0, 28.0, 28.0], [29.0, 29.0, 29.0]],
+            dtype=torch.float64,
+        ),
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_kv,
+        expected_kv_grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_gate,
+        expected_gate_grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dpositional_bias,
+        expected_bias_grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
 
 
 def test_exchanged_attention_forward_rejects_bad_stage_work() -> None:
@@ -1028,6 +1237,20 @@ def _single_rank_layout(
     )
 
 
+def _single_rank_slots() -> tuple[Any, ...]:
+    return build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (
+                _stage_plan(
+                    stage_index=0,
+                    q_ranges=((3, 4), (7, 8)),
+                    k_ranges=((0, 8),),
+                ),
+            ),
+        ),
+    )
+
+
 def _two_rank_layout() -> Dsv4CompressedLayout:
     return build_dsv4_compressed_layout(
         group_ids=torch.tensor([[0] * 8]),
@@ -1072,6 +1295,44 @@ def _stage_plan(
         global_q_ranges=tuple(_Range(start=start, end=end) for start, end in q_ranges),
         global_k_ranges=tuple(_Range(start=start, end=end) for start, end in k_ranges),
     )
+
+
+def _projected_inputs(width: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    projected_kv = (
+        torch.arange(8 * int(width), dtype=torch.float64).reshape(8, int(width)) / 20.0
+    )
+    projected_gate = (projected_kv + 0.5).cos()
+    positional_bias = torch.linspace(
+        -0.25,
+        0.25,
+        steps=4 * int(width),
+        dtype=torch.float64,
+    ).reshape(4, int(width))
+    return projected_kv, projected_gate, positional_bias
+
+
+def _compression_grads(
+    *,
+    layout: Dsv4CompressedLayout,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+    dcompressed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ref_kv = projected_kv.detach().clone().requires_grad_()
+    ref_gate = projected_gate.detach().clone().requires_grad_()
+    ref_bias = positional_bias.detach().clone().requires_grad_()
+    compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=ref_kv,
+        projected_gate=ref_gate,
+        positional_bias=ref_bias,
+    )
+    compressed.backward(dcompressed)
+    assert ref_kv.grad is not None
+    assert ref_gate.grad is not None
+    assert ref_bias.grad is not None
+    return ref_kv.grad, ref_gate.grad, ref_bias.grad
 
 
 def _full_kv_materialized_stage(
