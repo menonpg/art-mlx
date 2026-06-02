@@ -808,6 +808,44 @@ def test_distributed_projected_real_planner_real_miles_context_state_matches_pac
         init_path.unlink()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not cast(Any, torch.distributed).is_nccl_available(),
+    reason="DSV4 HCA ratio-128 real-planner real-Miles CUDA/NCCL oracle requires CUDA and NCCL",
+)
+@pytest.mark.parametrize(
+    ("world_size", "master_port"),
+    (
+        (4, "29652"),
+        (8, "29653"),
+    ),
+)
+def test_distributed_projected_real_planner_hca_ratio128_real_miles_matches_packed_oracle_cuda_nccl(
+    tmp_path: Path,
+    world_size: int,
+    master_port: str,
+) -> None:
+    pytest.importorskip("megatron.core")
+    _ensure_miles_sparse_available()
+    if torch.cuda.device_count() < int(world_size):
+        pytest.skip(f"requires {world_size} CUDA devices")
+    init_path = (
+        tmp_path
+        / f"dsv4_real_planner_hca_ratio128_real_miles_cp{world_size}_oracle_nccl"
+    )
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_real_planner_hca_ratio128_real_miles_nccl_oracle_worker,
+        args=(int(world_size), str(init_path), master_port),
+        nprocs=int(world_size),
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle(
     tmp_path: Path,
 ) -> None:
@@ -1205,20 +1243,77 @@ def _distributed_projected_real_planner_real_miles_nccl_oracle_worker(
         destroy_process_group()
 
 
-def _real_planner_dsv4_context_state(*, rank: int, world_size: int) -> Any:
+def _distributed_projected_real_planner_hca_ratio128_real_miles_nccl_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+    master_port: str,
+) -> None:
+    _add_miles_path_to_sys_path()
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = master_port
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        context_state = _real_planner_dsv4_context_state(
+            rank=rank,
+            world_size=world_size,
+            micro=_real_planner_ratio128_micro(),
+            hca_ratio=128,
+            include_csa=False,
+            include_hca=True,
+        )
+        local_token_ids = _local_token_ids_from_context_state(context_state)
+        _run_real_planner_hca_context_oracle(
+            context_state=context_state,
+            local_token_ids=local_token_ids,
+            device=device,
+            dtype=torch.bfloat16,
+            head_count=64,
+            head_dim=512,
+            scale=1.0 / (512**0.5),
+            mean_abs_pct_threshold=3.0,
+            grad_mean_abs_pct_threshold=5.0,
+            name_prefix=f"real planner ratio128 real Miles HCA CP{world_size}",
+        )
+        torch.cuda.synchronize(device)
+    finally:
+        destroy_process_group()
+
+
+def _real_planner_dsv4_context_state(
+    *,
+    rank: int,
+    world_size: int,
+    micro: Any | None = None,
+    hca_ratio: int = 4,
+    include_csa: bool = True,
+    include_hca: bool = True,
+) -> Any:
     from art.megatron.context_parallel import ContextParallelConfig, ParallelTopology
     from art.megatron.context_parallel.runtime import (
         prepare_megatron_context_parallel_state,
     )
 
     cp_state, _rank_plan, _spec, _pad = prepare_megatron_context_parallel_state(
-        micro=_real_planner_micro(),
+        micro=_real_planner_micro() if micro is None else micro,
         topology=ParallelTopology(cp=int(world_size)),
         config=ContextParallelConfig(block_size=4, planner_chunk_size=4),
         cp_group=cast(Any, torch.distributed).group.WORLD,
         cp_rank=int(rank),
     )
-    return prepare_dsv4_context_parallel_state(cp_state=cp_state, hca_ratio=4)
+    return prepare_dsv4_context_parallel_state(
+        cp_state=cp_state,
+        hca_ratio=int(hca_ratio),
+        include_csa=include_csa,
+        include_hca=include_hca,
+    )
 
 
 def _real_planner_micro() -> Any:
@@ -1226,6 +1321,26 @@ def _real_planner_micro() -> Any:
 
     group_ids = torch.tensor([[0] * 8 + [1] * 8 + [2] * 8], dtype=torch.long)
     parent_ids = torch.tensor([[0] * 8 + [0] * 8 + [0] * 8], dtype=torch.long)
+    seq_len = int(group_ids.shape[1])
+    return PackedTensors(
+        tokens=torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        input_pos=torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
+        assistant_mask=torch.ones(1, seq_len, dtype=torch.bool),
+        logprobs=torch.zeros(1, seq_len, dtype=torch.float32),
+        advantages=torch.ones(1, seq_len, dtype=torch.float32),
+        weights=torch.ones(1, seq_len, dtype=torch.float32),
+        pixel_values=[None],
+        image_grid_thw=[None],
+    )
+
+
+def _real_planner_ratio128_micro() -> Any:
+    from art.preprocessing.pack import PackedTensors
+
+    group_ids = torch.tensor([[0] * 96 + [1] * 160 + [2] * 160], dtype=torch.long)
+    parent_ids = torch.tensor([[0] * 96 + [0] * 160 + [0] * 160], dtype=torch.long)
     seq_len = int(group_ids.shape[1])
     return PackedTensors(
         tokens=torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
@@ -1272,7 +1387,7 @@ def _run_real_planner_csa_context_oracle(
     layout = context_state.dsv4_plan.csa_layout
     if layout is None:
         raise RuntimeError("real planner CSA oracle requires CSA layout")
-    token_count = 24
+    token_count = int(context_state.cp_state.rank_plan.original_seq_len)
     if device is None:
         device = torch.device("cpu")
     use_mean_abs = mean_abs_pct_threshold is not None
@@ -1588,7 +1703,7 @@ def _run_real_planner_hca_context_oracle(
     layout = context_state.dsv4_plan.hca_layout
     if layout is None:
         raise RuntimeError("real planner HCA oracle requires HCA layout")
-    token_count = 24
+    token_count = int(context_state.cp_state.rank_plan.original_seq_len)
     if device is None:
         device = torch.device("cpu")
     use_mean_abs = mean_abs_pct_threshold is not None
