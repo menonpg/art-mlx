@@ -376,6 +376,53 @@ def launch_dsv4_indexer_kv_exchange(
 
 
 @torch.compiler.disable
+def launch_planned_dsv4_indexer_kv_exchange(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    candidate_entry_ids_by_rank: Sequence[Sequence[int]],
+    query_token_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    topk: int,
+    group: Any,
+    async_op: bool,
+    score_scale: float = 1.0,
+) -> Dsv4IndexerKvExchangeWork:
+    """Launch one rank's indexer KV exchange from DSV4 host metadata.
+
+    The peer-id plan is CPU metadata derived from compressed-entry ownership.
+    The actual exchange remains the existing eager custom-communication path,
+    outside compiled regions.
+    """
+    rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
+    plans = build_dsv4_indexer_kv_exchange_peer_plans(
+        layout=layout,
+        candidate_entry_ids_by_rank=candidate_entry_ids_by_rank,
+    )
+    plan = plans[rank_int]
+    return launch_dsv4_indexer_kv_exchange(
+        layout=layout,
+        query_token_ids=query_token_ids,
+        candidate_entry_ids=tuple(
+            int(id_) for id_ in candidate_entry_ids_by_rank[rank_int]
+        ),
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_kv=indexer_kv,
+        indexer_kv_entry_ids=indexer_kv_entry_ids,
+        send_entry_ids_by_peer=plan.send_entry_ids_by_peer,
+        recv_entry_ids_by_peer=plan.recv_entry_ids_by_peer,
+        topk=topk,
+        group=group,
+        async_op=async_op,
+        score_scale=score_scale,
+    )
+
+
+@torch.compiler.disable
 def launch_exchanged_dsv4_indexer_topk(
     *,
     stage_works: Sequence[Any],
@@ -659,6 +706,13 @@ def _ids_by_owner_rank(
             raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
         by_rank[rank].append(id_int)
     return tuple(tuple(peer_ids) for peer_ids in by_rank)
+
+
+def _validate_rank(*, rank: int, rank_count: int) -> int:
+    rank_int = int(rank)
+    if rank_int < 0 or rank_int >= int(rank_count):
+        raise RuntimeError(f"DSV4 rank {rank_int} is outside rank count {rank_count}")
+    return rank_int
 
 
 def _transpose_peer_ids(

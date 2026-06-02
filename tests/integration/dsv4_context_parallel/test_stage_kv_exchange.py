@@ -16,7 +16,7 @@ from art.megatron.dsv4 import (
     build_dsv4_compressed_layout,
     build_dsv4_stage_kv_exchange_peer_plans,
     build_stage_local_topk_for_csa,
-    launch_dsv4_stage_kv_exchange,
+    launch_planned_dsv4_stage_kv_exchange,
 )
 
 
@@ -94,22 +94,16 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
             local_compressed_ids,
             local_compressed_ids,
         )
-        work = launch_dsv4_stage_kv_exchange(
-            stage_inputs=stage,
+        work = launch_planned_dsv4_stage_kv_exchange(
+            layout=layout,
+            rank=rank,
+            stage_inputs_by_rank=stages,
             query=_query_rows(query_ids),
             query_token_ids=query_ids,
             raw_kv=_kv_rows(local_raw_ids),
             raw_token_ids=local_raw_ids,
             compressed_kv=_compressed_rows(local_compressed_ids),
             compressed_entry_ids=local_compressed_ids,
-            send_raw_token_ids_by_peer=peer_plan.send_raw_token_ids_by_peer,
-            send_compressed_entry_ids_by_peer=(
-                peer_plan.send_compressed_entry_ids_by_peer
-            ),
-            recv_raw_token_ids_by_peer=peer_plan.recv_raw_token_ids_by_peer,
-            recv_compressed_entry_ids_by_peer=(
-                peer_plan.recv_compressed_entry_ids_by_peer
-            ),
             group=cast(Any, torch.distributed).group.WORLD,
             async_op=True,
         )
