@@ -13,9 +13,11 @@ from art.megatron.dsv4 import (
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
+    accumulate_dsv4_compression_halo_gradient_payloads,
     build_dsv4_compressed_layout,
     compress_owned_projected_kv,
     launch_dsv4_compression_halo_exchange,
+    launch_dsv4_compression_halo_gradient_exchange,
     materialize_dsv4_compression_token_buffer,
 )
 
@@ -72,54 +74,129 @@ def _halo_exchange_worker(rank: int, world_size: int, init_path: str) -> None:
             async_op=True,
         )
         payloads = work.wait_post_process()
+        grad_token_ids = local_ids
+        grad_kv = torch.zeros_like(full_kv.index_select(0, local_index))
+        grad_gate = torch.zeros_like(full_gate.index_select(0, local_index))
 
         if rank == 0:
             assert payloads == ()
+        else:
+            assert len(payloads) == 1
+            payload = payloads[0]
+            assert payload.source_rank == 0
+            assert payload.target_rank == 1
+            assert payload.token_ids == (4, 5, 6, 7)
+            assert payload.entry_ids == (2, 3)
+            torch.testing.assert_close(
+                payload.projected_kv,
+                full_kv.index_select(0, torch.tensor(payload.token_ids)),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                payload.projected_gate,
+                full_gate.index_select(0, torch.tensor(payload.token_ids)),
+                rtol=0,
+                atol=0,
+            )
+
+            buffer = materialize_dsv4_compression_token_buffer(
+                layout=layout,
+                owner_rank=rank,
+                projected_kv=full_kv.index_select(0, local_index),
+                projected_gate=full_gate.index_select(0, local_index),
+                token_ids=local_ids,
+                halo_payloads=payloads,
+            )
+            actual = compress_owned_projected_kv(
+                layout=layout,
+                owner_rank=rank,
+                projected_kv=buffer.projected_kv,
+                projected_gate=buffer.projected_gate,
+                positional_bias=positional_bias,
+                token_ids=buffer.token_ids,
+            )
+            expected = compress_owned_projected_kv(
+                layout=layout,
+                owner_rank=rank,
+                projected_kv=full_kv,
+                projected_gate=full_gate,
+                positional_bias=positional_bias,
+            )
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+            buffer_kv = buffer.projected_kv.detach().clone().requires_grad_()
+            buffer_gate = buffer.projected_gate.detach().clone().requires_grad_()
+            grad_actual = compress_owned_projected_kv(
+                layout=layout,
+                owner_rank=rank,
+                projected_kv=buffer_kv,
+                projected_gate=buffer_gate,
+                positional_bias=positional_bias,
+                token_ids=buffer.token_ids,
+            )
+            grad_actual.square().sum().backward()
+            assert buffer_kv.grad is not None
+            assert buffer_gate.grad is not None
+            grad_token_ids = buffer.token_ids
+            grad_kv = buffer_kv.grad
+            grad_gate = buffer_gate.grad
+
+        grad_work = launch_dsv4_compression_halo_gradient_exchange(
+            layout=layout,
+            rank=rank,
+            token_ids=grad_token_ids,
+            dprojected_kv=grad_kv,
+            dprojected_gate=grad_gate,
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        )
+        grad_payloads = grad_work.wait_post_process()
+
+        if rank == 1:
+            assert grad_payloads == ()
             return
 
-        assert len(payloads) == 1
-        payload = payloads[0]
-        assert payload.source_rank == 0
-        assert payload.target_rank == 1
-        assert payload.token_ids == (4, 5, 6, 7)
-        assert payload.entry_ids == (2, 3)
-        torch.testing.assert_close(
-            payload.projected_kv,
-            full_kv.index_select(0, torch.tensor(payload.token_ids)),
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            payload.projected_gate,
-            full_gate.index_select(0, torch.tensor(payload.token_ids)),
-            rtol=0,
-            atol=0,
-        )
+        assert len(grad_payloads) == 1
+        grad_payload = grad_payloads[0]
+        assert grad_payload.source_rank == 1
+        assert grad_payload.target_rank == 0
+        assert grad_payload.token_ids == (4, 5, 6, 7)
+        assert grad_payload.entry_ids == (2, 3)
 
-        buffer = materialize_dsv4_compression_token_buffer(
+        ref_grad_kv, ref_grad_gate = _global_owner_one_grads(
             layout=layout,
-            owner_rank=rank,
-            projected_kv=full_kv.index_select(0, local_index),
-            projected_gate=full_gate.index_select(0, local_index),
+            full_kv=full_kv,
+            full_gate=full_gate,
+            positional_bias=positional_bias,
+        )
+        returned = accumulate_dsv4_compression_halo_gradient_payloads(
+            target_rank=rank,
             token_ids=local_ids,
-            halo_payloads=payloads,
+            dprojected_kv=torch.zeros_like(full_kv.index_select(0, local_index)),
+            dprojected_gate=torch.zeros_like(full_gate.index_select(0, local_index)),
+            halo_gradient_payloads=grad_payloads,
         )
-        actual = compress_owned_projected_kv(
-            layout=layout,
-            owner_rank=rank,
-            projected_kv=buffer.projected_kv,
-            projected_gate=buffer.projected_gate,
-            positional_bias=positional_bias,
-            token_ids=buffer.token_ids,
+        torch.testing.assert_close(
+            returned.projected_kv[:4],
+            torch.zeros_like(returned.projected_kv[:4]),
         )
-        expected = compress_owned_projected_kv(
-            layout=layout,
-            owner_rank=rank,
-            projected_kv=full_kv,
-            projected_gate=full_gate,
-            positional_bias=positional_bias,
+        torch.testing.assert_close(
+            returned.projected_gate[:4],
+            torch.zeros_like(returned.projected_gate[:4]),
         )
-        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            returned.projected_kv[4:],
+            ref_grad_kv[:8][4:],
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            returned.projected_gate[4:],
+            ref_grad_gate[:8][4:],
+            rtol=1e-6,
+            atol=1e-6,
+        )
     finally:
         destroy_process_group()
 
@@ -129,6 +206,28 @@ def _global_projected(token_count: int, width: int) -> torch.Tensor:
         token_count,
         width,
     )
+
+
+def _global_owner_one_grads(
+    *,
+    layout: Dsv4CompressedLayout,
+    full_kv: torch.Tensor,
+    full_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ref_kv = full_kv.detach().clone().requires_grad_()
+    ref_gate = full_gate.detach().clone().requires_grad_()
+    expected = compress_owned_projected_kv(
+        layout=layout,
+        owner_rank=1,
+        projected_kv=ref_kv,
+        projected_gate=ref_gate,
+        positional_bias=positional_bias,
+    )
+    expected.square().sum().backward()
+    assert ref_kv.grad is not None
+    assert ref_gate.grad is not None
+    return ref_kv.grad, ref_gate.grad
 
 
 def _layout() -> Dsv4CompressedLayout:

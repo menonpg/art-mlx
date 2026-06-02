@@ -88,6 +88,61 @@ class Dsv4CompressionHaloExchangeWork(BaseModel):
         return tuple(payloads)
 
 
+class Dsv4CompressionHaloGradientExchangeWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    rank: int
+    projected_dim: int
+    incoming_transfers: tuple[Dsv4HaloTransfer, ...]
+    tensor_work: Dsv4TensorExchangeWork
+
+    def wait(self) -> None:
+        self.tensor_work.wait()
+
+    def wait_post_process(self) -> tuple[Dsv4CompressionHaloGradientPayload, ...]:
+        result = self.tensor_work.wait_post_process()
+        expected_ids = tuple(
+            int(token_id)
+            for transfer in self.incoming_transfers
+            for token_id in transfer.token_ids
+        )
+        if result.ids != expected_ids:
+            raise RuntimeError(
+                "DSV4 compression halo gradient exchange received unexpected "
+                f"token ids: {result.ids} vs {expected_ids}"
+            )
+        expected_width = int(self.projected_dim) * 2
+        if int(result.tensor.shape[-1]) != expected_width:
+            raise RuntimeError(
+                "DSV4 compression halo gradient fused tensor width mismatch: "
+                f"{int(result.tensor.shape[-1])} vs {expected_width}"
+            )
+        dprojected_kv, dprojected_gate = result.tensor.split(
+            int(self.projected_dim),
+            dim=-1,
+        )
+        payloads: list[Dsv4CompressionHaloGradientPayload] = []
+        cursor = 0
+        for transfer in self.incoming_transfers:
+            count = len(transfer.token_ids)
+            payloads.append(
+                Dsv4CompressionHaloGradientPayload(
+                    source_rank=int(transfer.target_rank),
+                    target_rank=int(self.rank),
+                    token_ids=transfer.token_ids,
+                    entry_ids=transfer.entry_ids,
+                    dprojected_kv=_narrow_token_dim(dprojected_kv, cursor, count),
+                    dprojected_gate=_narrow_token_dim(
+                        dprojected_gate,
+                        cursor,
+                        count,
+                    ),
+                )
+            )
+            cursor += count
+        return tuple(payloads)
+
+
 def build_dsv4_compressed_layout(
     *,
     group_ids: torch.Tensor,
@@ -470,6 +525,51 @@ def pack_dsv4_compression_halo_gradient_payloads(
     return tuple(payloads)
 
 
+@torch.compiler.disable
+def launch_dsv4_compression_halo_gradient_exchange(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    token_ids: Sequence[int],
+    dprojected_kv: torch.Tensor,
+    dprojected_gate: torch.Tensor,
+    group: Any,
+    async_op: bool,
+) -> Dsv4CompressionHaloGradientExchangeWork:
+    """Launch fused reverse halo-gradient exchange for DSV4 compression.
+
+    Compression owners call this with gradients for their local+halo token
+    buffers. Raw-token owners receive projected KV/gate gradients for imported
+    boundary rows and can pass the returned payloads to
+    `accumulate_dsv4_compression_halo_gradient_payloads`.
+    """
+    _validate_projected_pair(
+        projected_kv=dprojected_kv,
+        projected_gate=dprojected_gate,
+    )
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(dprojected_kv.shape[-2]),
+        name="token_ids",
+    )
+    projected_dim = int(dprojected_kv.shape[-1])
+    fused = torch.cat((dprojected_kv, dprojected_gate), dim=-1)
+    plan = _compression_halo_gradient_exchange_plan(layout=layout, rank=rank)
+    return Dsv4CompressionHaloGradientExchangeWork(
+        rank=int(rank),
+        projected_dim=projected_dim,
+        incoming_transfers=_incoming_halo_gradient_transfers(layout=layout, rank=rank),
+        tensor_work=launch_dsv4_tensor_exchange(
+            tensor=fused,
+            tensor_ids=token_ids,
+            plan=plan,
+            group=group,
+            async_op=async_op,
+            label="dsv4_compression_halo_gradient_exchange",
+        ),
+    )
+
+
 def accumulate_dsv4_compression_halo_gradient_payloads(
     *,
     target_rank: int,
@@ -631,6 +731,67 @@ def _incoming_halo_transfers(
             raise RuntimeError(
                 "DSV4 compression halo has duplicate source->target transfer: "
                 f"{source_rank}->{rank}"
+            )
+        by_source[source_rank] = transfer
+    return tuple(
+        by_source[source_rank]
+        for source_rank in range(rank_count)
+        if source_rank in by_source
+    )
+
+
+def _compression_halo_gradient_exchange_plan(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+) -> Dsv4TensorExchangePlan:
+    rank = int(rank)
+    rank_count = _layout_rank_count(layout)
+    _validate_layout_rank(rank=rank, rank_count=rank_count)
+    send_ids_by_peer: list[tuple[int, ...]] = [() for _ in range(rank_count)]
+    recv_ids_by_peer: list[tuple[int, ...]] = [() for _ in range(rank_count)]
+    for transfer in layout.halo_transfers:
+        source_rank = int(transfer.source_rank)
+        target_rank = int(transfer.target_rank)
+        _validate_layout_rank(rank=source_rank, rank_count=rank_count)
+        _validate_layout_rank(rank=target_rank, rank_count=rank_count)
+        if target_rank == rank:
+            if send_ids_by_peer[source_rank]:
+                raise RuntimeError(
+                    "DSV4 compression halo has duplicate source->target transfer: "
+                    f"{source_rank}->{target_rank}"
+                )
+            send_ids_by_peer[source_rank] = transfer.token_ids
+        if source_rank == rank:
+            if recv_ids_by_peer[target_rank]:
+                raise RuntimeError(
+                    "DSV4 compression halo has duplicate source->target transfer: "
+                    f"{source_rank}->{target_rank}"
+                )
+            recv_ids_by_peer[target_rank] = transfer.token_ids
+    return Dsv4TensorExchangePlan(
+        send_ids_by_peer=tuple(send_ids_by_peer),
+        recv_ids_by_peer=tuple(recv_ids_by_peer),
+    )
+
+
+def _incoming_halo_gradient_transfers(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+) -> tuple[Dsv4HaloTransfer, ...]:
+    rank = int(rank)
+    rank_count = _layout_rank_count(layout)
+    _validate_layout_rank(rank=rank, rank_count=rank_count)
+    by_source: dict[int, Dsv4HaloTransfer] = {}
+    for transfer in layout.halo_transfers:
+        if int(transfer.source_rank) != rank:
+            continue
+        source_rank = int(transfer.target_rank)
+        if source_rank in by_source:
+            raise RuntimeError(
+                "DSV4 compression halo has duplicate source->target transfer: "
+                f"{rank}->{source_rank}"
             )
         by_source[source_rank] = transfer
     return tuple(
