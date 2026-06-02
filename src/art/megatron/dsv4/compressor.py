@@ -10,9 +10,12 @@ from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
     Dsv4CompressedLayout,
+    Dsv4CompressionHaloGradientPayload,
+    Dsv4CompressionHaloPayload,
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
     Dsv4HaloTransfer,
+    Dsv4ProjectedTokenBuffer,
     Dsv4StreamKind,
     Dsv4StreamSpec,
     Dsv4TokenInView,
@@ -205,6 +208,437 @@ def compress_owned_projected_kv(
         entry_ids=layout.entry_ids_by_owner_rank[int(owner_rank)],
         token_ids=token_ids,
     )
+
+
+def pack_dsv4_compression_halo_payloads(
+    *,
+    layout: Dsv4CompressedLayout,
+    source_rank: int,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    token_ids: Sequence[int],
+) -> tuple[Dsv4CompressionHaloPayload, ...]:
+    """Pack projected compressor tensors needed by remote closure owners.
+
+    The returned payloads are the stable inputs for an eager DSV4 halo
+    communication path. Future NCCL/P2P code should launch outside compiled
+    regions and make producer-to-comm, comm-to-consumer, and tensor lifetime
+    ordering explicit.
+    """
+    _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(projected_kv.shape[-2]),
+        name="token_ids",
+    )
+    payloads: list[Dsv4CompressionHaloPayload] = []
+    for transfer in layout.halo_transfers:
+        if int(transfer.source_rank) != int(source_rank):
+            continue
+        positions = _positions_for_token_ids(
+            available_token_ids=token_ids,
+            requested_token_ids=transfer.token_ids,
+            name="halo source token_ids",
+        )
+        payloads.append(
+            Dsv4CompressionHaloPayload(
+                source_rank=int(source_rank),
+                target_rank=int(transfer.target_rank),
+                token_ids=transfer.token_ids,
+                entry_ids=transfer.entry_ids,
+                projected_kv=_index_select_token_dim(projected_kv, positions),
+                projected_gate=_index_select_token_dim(projected_gate, positions),
+            )
+        )
+    return tuple(payloads)
+
+
+def materialize_dsv4_compression_token_buffer(
+    *,
+    layout: Dsv4CompressedLayout,
+    owner_rank: int,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    token_ids: Sequence[int],
+    halo_payloads: Sequence[Dsv4CompressionHaloPayload] = (),
+) -> Dsv4ProjectedTokenBuffer:
+    """Build the compact local+halo token buffer for owned compression entries.
+
+    Compression ownership is by closure token. This helper consumes local
+    projected compressor tensors plus received halo payloads and returns exactly
+    the packed-token rows required by `compress_owned_projected_kv`.
+    """
+    _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(projected_kv.shape[-2]),
+        name="token_ids",
+    )
+    needed_token_ids = _needed_tokens_for_owner(layout=layout, owner_rank=owner_rank)
+    all_kv = [projected_kv]
+    all_gate = [projected_gate]
+    all_token_ids = list(token_ids)
+    for payload in halo_payloads:
+        if int(payload.target_rank) != int(owner_rank):
+            raise RuntimeError(
+                "DSV4 compression halo payload target rank mismatch: "
+                f"payload={payload.target_rank}, owner={owner_rank}"
+            )
+        _validate_payload_matches_plan(
+            layout=layout,
+            source_rank=int(payload.source_rank),
+            target_rank=int(owner_rank),
+            token_ids=payload.token_ids,
+            entry_ids=payload.entry_ids,
+        )
+        _validate_halo_payload_tensors(payload)
+        _validate_payload_compatible(
+            reference=projected_kv,
+            payload_tensor=payload.projected_kv,
+            name="projected_kv",
+        )
+        _validate_payload_compatible(
+            reference=projected_gate,
+            payload_tensor=payload.projected_gate,
+            name="projected_gate",
+        )
+        all_kv.append(payload.projected_kv)
+        all_gate.append(payload.projected_gate)
+        all_token_ids.extend(int(token_id) for token_id in payload.token_ids)
+    _row_by_token_id(all_token_ids, name="local+halo token_ids")
+
+    if not needed_token_ids:
+        return Dsv4ProjectedTokenBuffer(
+            token_ids=(),
+            projected_kv=_empty_token_rows_like(projected_kv),
+            projected_gate=_empty_token_rows_like(projected_gate),
+        )
+
+    merged_kv = torch.cat(all_kv, dim=_token_dim(projected_kv))
+    merged_gate = torch.cat(all_gate, dim=_token_dim(projected_gate))
+    positions = _positions_for_token_ids(
+        available_token_ids=tuple(all_token_ids),
+        requested_token_ids=needed_token_ids,
+        name="local+halo token_ids",
+    )
+    return Dsv4ProjectedTokenBuffer(
+        token_ids=needed_token_ids,
+        projected_kv=_index_select_token_dim(merged_kv, positions),
+        projected_gate=_index_select_token_dim(merged_gate, positions),
+    )
+
+
+def pack_dsv4_compression_halo_gradient_payloads(
+    *,
+    layout: Dsv4CompressedLayout,
+    owner_rank: int,
+    token_ids: Sequence[int],
+    dprojected_kv: torch.Tensor,
+    dprojected_gate: torch.Tensor,
+) -> tuple[Dsv4CompressionHaloGradientPayload, ...]:
+    """Pack gradients for remote projected tokens imported by this owner.
+
+    This is the reverse payload of `pack_dsv4_compression_halo_payloads`: the
+    compression owner sends gradients back to the raw-token owner. Actual
+    communication should stay eager with explicit stream and lifetime ordering.
+    """
+    _validate_projected_pair(
+        projected_kv=dprojected_kv,
+        projected_gate=dprojected_gate,
+    )
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(dprojected_kv.shape[-2]),
+        name="token_ids",
+    )
+    payloads: list[Dsv4CompressionHaloGradientPayload] = []
+    for transfer in layout.halo_transfers:
+        if int(transfer.target_rank) != int(owner_rank):
+            continue
+        positions = _positions_for_token_ids(
+            available_token_ids=token_ids,
+            requested_token_ids=transfer.token_ids,
+            name="owner buffer token_ids",
+        )
+        payloads.append(
+            Dsv4CompressionHaloGradientPayload(
+                source_rank=int(owner_rank),
+                target_rank=int(transfer.source_rank),
+                token_ids=transfer.token_ids,
+                entry_ids=transfer.entry_ids,
+                dprojected_kv=_index_select_token_dim(dprojected_kv, positions),
+                dprojected_gate=_index_select_token_dim(dprojected_gate, positions),
+            )
+        )
+    return tuple(payloads)
+
+
+def accumulate_dsv4_compression_halo_gradient_payloads(
+    *,
+    target_rank: int,
+    token_ids: Sequence[int],
+    dprojected_kv: torch.Tensor,
+    dprojected_gate: torch.Tensor,
+    halo_gradient_payloads: Sequence[Dsv4CompressionHaloGradientPayload],
+) -> Dsv4ProjectedTokenBuffer:
+    """Add returned halo gradients into this raw-token owner's grad space."""
+    _validate_projected_pair(
+        projected_kv=dprojected_kv,
+        projected_gate=dprojected_gate,
+    )
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(dprojected_kv.shape[-2]),
+        name="token_ids",
+    )
+    kv = dprojected_kv.clone()
+    gate = dprojected_gate.clone()
+    token_index = _row_by_token_id(token_ids, name="token_ids")
+    for payload in halo_gradient_payloads:
+        if int(payload.target_rank) != int(target_rank):
+            raise RuntimeError(
+                "DSV4 compression halo gradient target rank mismatch: "
+                f"payload={payload.target_rank}, target={target_rank}"
+            )
+        _validate_halo_gradient_payload_tensors(payload)
+        _validate_payload_compatible(
+            reference=kv,
+            payload_tensor=payload.dprojected_kv,
+            name="dprojected_kv",
+        )
+        _validate_payload_compatible(
+            reference=gate,
+            payload_tensor=payload.dprojected_gate,
+            name="dprojected_gate",
+        )
+        positions = _positions_for_token_ids(
+            available_token_ids=token_ids,
+            requested_token_ids=payload.token_ids,
+            name="gradient target token_ids",
+            precomputed_index=token_index,
+        )
+        _index_add_token_dim(kv, positions, payload.dprojected_kv)
+        _index_add_token_dim(gate, positions, payload.dprojected_gate)
+    return Dsv4ProjectedTokenBuffer(
+        token_ids=token_ids,
+        projected_kv=kv,
+        projected_gate=gate,
+    )
+
+
+def _validate_projected_pair(
+    *,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+) -> None:
+    if projected_kv.shape != projected_gate.shape:
+        raise RuntimeError(
+            "DSV4 projected KV and gate tensors must share shape, got "
+            f"{tuple(projected_kv.shape)} vs {tuple(projected_gate.shape)}"
+        )
+    if projected_kv.device != projected_gate.device:
+        raise RuntimeError(
+            "DSV4 projected KV and gate tensors must share device, got "
+            f"{projected_kv.device} vs {projected_gate.device}"
+        )
+    if projected_kv.ndim not in (2, 3):
+        raise RuntimeError(
+            "DSV4 projected tensors must have shape [T, C] or [B, T, C], got "
+            f"{tuple(projected_kv.shape)}"
+        )
+
+
+def _normalize_token_ids(
+    *,
+    token_ids: Sequence[int],
+    tensor_token_count: int,
+    name: str,
+) -> tuple[int, ...]:
+    token_ids = tuple(int(token_id) for token_id in token_ids)
+    if len(token_ids) != int(tensor_token_count):
+        raise RuntimeError(
+            f"DSV4 {name} length must match projected tensor token count, got "
+            f"{len(token_ids)} vs {tensor_token_count}"
+        )
+    _row_by_token_id(token_ids, name=name)
+    return token_ids
+
+
+def _needed_tokens_for_owner(
+    *,
+    layout: Dsv4CompressedLayout,
+    owner_rank: int,
+) -> tuple[int, ...]:
+    if int(owner_rank) < 0 or int(owner_rank) >= len(layout.entry_ids_by_owner_rank):
+        raise RuntimeError(f"DSV4 owner rank {owner_rank} is outside layout rank count")
+    return tuple(
+        sorted(
+            {
+                int(token_id)
+                for entry_id in layout.entry_ids_by_owner_rank[int(owner_rank)]
+                for token_id in layout.entries[int(entry_id)].dependency_token_ids
+            }
+        )
+    )
+
+
+def _validate_halo_payload_tensors(payload: Dsv4CompressionHaloPayload) -> None:
+    _validate_projected_pair(
+        projected_kv=payload.projected_kv,
+        projected_gate=payload.projected_gate,
+    )
+    _normalize_token_ids(
+        token_ids=payload.token_ids,
+        tensor_token_count=int(payload.projected_kv.shape[-2]),
+        name="halo payload token_ids",
+    )
+    _row_by_token_id(payload.entry_ids, name="halo payload entry_ids")
+
+
+def _validate_halo_gradient_payload_tensors(
+    payload: Dsv4CompressionHaloGradientPayload,
+) -> None:
+    _validate_projected_pair(
+        projected_kv=payload.dprojected_kv,
+        projected_gate=payload.dprojected_gate,
+    )
+    _normalize_token_ids(
+        token_ids=payload.token_ids,
+        tensor_token_count=int(payload.dprojected_kv.shape[-2]),
+        name="halo gradient payload token_ids",
+    )
+    _row_by_token_id(payload.entry_ids, name="halo gradient payload entry_ids")
+
+
+def _validate_payload_matches_plan(
+    *,
+    layout: Dsv4CompressedLayout,
+    source_rank: int,
+    target_rank: int,
+    token_ids: Sequence[int],
+    entry_ids: Sequence[int],
+) -> None:
+    transfer = next(
+        (
+            transfer
+            for transfer in layout.halo_transfers
+            if int(transfer.source_rank) == int(source_rank)
+            and int(transfer.target_rank) == int(target_rank)
+        ),
+        None,
+    )
+    if transfer is None:
+        raise RuntimeError(
+            "DSV4 compression halo payload has no planned transfer: "
+            f"source={source_rank}, target={target_rank}"
+        )
+    if tuple(int(token_id) for token_id in token_ids) != transfer.token_ids:
+        raise RuntimeError(
+            "DSV4 compression halo payload token ids do not match planned transfer"
+        )
+    if tuple(int(entry_id) for entry_id in entry_ids) != transfer.entry_ids:
+        raise RuntimeError(
+            "DSV4 compression halo payload entry ids do not match planned transfer"
+        )
+
+
+def _validate_payload_compatible(
+    *,
+    reference: torch.Tensor,
+    payload_tensor: torch.Tensor,
+    name: str,
+) -> None:
+    if payload_tensor.ndim != reference.ndim:
+        raise RuntimeError(
+            f"DSV4 {name} rank mismatch: {payload_tensor.ndim} vs {reference.ndim}"
+        )
+    if payload_tensor.device != reference.device:
+        raise RuntimeError(
+            f"DSV4 {name} device mismatch: {payload_tensor.device} vs {reference.device}"
+        )
+    if payload_tensor.dtype != reference.dtype:
+        raise RuntimeError(
+            f"DSV4 {name} dtype mismatch: {payload_tensor.dtype} vs {reference.dtype}"
+        )
+    token_dim = _token_dim(reference)
+    reference_outer = tuple(
+        size for dim, size in enumerate(reference.shape) if dim != token_dim
+    )
+    payload_outer = tuple(
+        size for dim, size in enumerate(payload_tensor.shape) if dim != token_dim
+    )
+    if payload_outer != reference_outer:
+        raise RuntimeError(
+            f"DSV4 {name} non-token shape mismatch: {payload_outer} vs {reference_outer}"
+        )
+
+
+def _row_by_token_id(ids: Sequence[int], name: str) -> dict[int, int]:
+    row_by_id: dict[int, int] = {}
+    for row, token_id in enumerate(ids):
+        token = int(token_id)
+        if token in row_by_id:
+            raise RuntimeError(f"DSV4 {name} contains duplicate id {token}")
+        row_by_id[token] = row
+    return row_by_id
+
+
+def _positions_for_token_ids(
+    *,
+    available_token_ids: Sequence[int],
+    requested_token_ids: Sequence[int],
+    name: str,
+    precomputed_index: dict[int, int] | None = None,
+) -> tuple[int, ...]:
+    _row_by_token_id(requested_token_ids, name=f"requested {name}")
+    token_index = (
+        _row_by_token_id(available_token_ids, name=name)
+        if precomputed_index is None
+        else precomputed_index
+    )
+    missing = tuple(
+        int(token_id)
+        for token_id in requested_token_ids
+        if int(token_id) not in token_index
+    )
+    if missing:
+        raise RuntimeError(f"DSV4 requested tokens missing from {name}: {missing}")
+    return tuple(token_index[int(token_id)] for token_id in requested_token_ids)
+
+
+def _token_dim(tensor: torch.Tensor) -> int:
+    return 0 if tensor.ndim == 2 else 1
+
+
+def _index_select_token_dim(
+    tensor: torch.Tensor,
+    positions: Sequence[int],
+) -> torch.Tensor:
+    indices = torch.tensor(
+        tuple(int(position) for position in positions),
+        device=tensor.device,
+        dtype=torch.long,
+    )
+    return tensor.index_select(_token_dim(tensor), indices)
+
+
+def _index_add_token_dim(
+    target: torch.Tensor,
+    positions: Sequence[int],
+    source: torch.Tensor,
+) -> None:
+    indices = torch.tensor(
+        tuple(int(position) for position in positions),
+        device=target.device,
+        dtype=torch.long,
+    )
+    target.index_add_(_token_dim(target), indices, source)
+
+
+def _empty_token_rows_like(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim == 2:
+        return tensor.new_empty((0, int(tensor.shape[-1])))
+    return tensor.new_empty((int(tensor.shape[0]), 0, int(tensor.shape[-1])))
 
 
 def _validate_metadata(

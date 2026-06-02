@@ -96,6 +96,36 @@ class Dsv4HaloTransfer(BaseModel):
     entry_ids: tuple[int, ...]
 
 
+class Dsv4ProjectedTokenBuffer(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    token_ids: tuple[int, ...]
+    projected_kv: torch.Tensor
+    projected_gate: torch.Tensor
+
+
+class Dsv4CompressionHaloPayload(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    source_rank: int
+    target_rank: int
+    token_ids: tuple[int, ...]
+    entry_ids: tuple[int, ...]
+    projected_kv: torch.Tensor
+    projected_gate: torch.Tensor
+
+
+class Dsv4CompressionHaloGradientPayload(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    source_rank: int
+    target_rank: int
+    token_ids: tuple[int, ...]
+    entry_ids: tuple[int, ...]
+    dprojected_kv: torch.Tensor
+    dprojected_gate: torch.Tensor
+
+
 class Dsv4TopkResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -234,6 +264,9 @@ class Dsv4ContextParallelState(BaseModel):
 
 
 Dsv4TopkResult.model_rebuild()
+Dsv4ProjectedTokenBuffer.model_rebuild()
+Dsv4CompressionHaloPayload.model_rebuild()
+Dsv4CompressionHaloGradientPayload.model_rebuild()
 Dsv4StageInputs.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
 Dsv4SparseForwardResult.model_rebuild()
