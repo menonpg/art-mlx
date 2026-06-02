@@ -611,6 +611,23 @@ def test_distributed_projected_hca_wrapper_matches_packed_oracle(
         init_path.unlink()
 
 
+def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_projected_hca_ratio128_oracle_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_hca_ratio128_oracle_worker,
+        args=(2, str(init_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     max_visible = max(
         sum(
@@ -686,19 +703,27 @@ def _single_rank_slot() -> tuple[Dsv4StagePlanSlot, ...]:
 
 
 def _two_rank_slot() -> tuple[Dsv4StagePlanSlot, ...]:
+    return _two_rank_full_stage_slot(first_rank_end=8, token_count=18)
+
+
+def _two_rank_full_stage_slot(
+    *,
+    first_rank_end: int,
+    token_count: int,
+) -> tuple[Dsv4StagePlanSlot, ...]:
     return (
         Dsv4StagePlanSlot(
             stage_index=0,
             stage_plans_by_rank=(
                 _StagePlan(
                     stage_index=0,
-                    global_q_ranges=(_Range(start=0, end=8),),
-                    global_k_ranges=(_Range(start=0, end=18),),
+                    global_q_ranges=(_Range(start=0, end=first_rank_end),),
+                    global_k_ranges=(_Range(start=0, end=token_count),),
                 ),
                 _StagePlan(
                     stage_index=0,
-                    global_q_ranges=(_Range(start=8, end=18),),
-                    global_k_ranges=(_Range(start=0, end=18),),
+                    global_q_ranges=(_Range(start=first_rank_end, end=token_count),),
+                    global_k_ranges=(_Range(start=0, end=token_count),),
                 ),
             ),
         ),
@@ -905,147 +930,219 @@ def _distributed_projected_hca_oracle_worker(
     try:
         setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
         setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
-        layout = _layout(Dsv4CompressionKind.HCA, rank_count=2)
-        torch.manual_seed(131)
-        query = torch.randn(18, 2, 4, dtype=torch.float64)
-        raw_kv = torch.randn(18, 4, dtype=torch.float64)
-        projected_kv = torch.randn(18, 4, dtype=torch.float64)
-        projected_gate = torch.randn(18, 4, dtype=torch.float64)
-        positional_bias = torch.randn(4, 4, dtype=torch.float64)
-        attn_sink = torch.randn(2, dtype=torch.float64)
-        grad_out = torch.randn(1, 18, 2, 4, dtype=torch.float64)
-        local_token_ids = tuple(range(0, 8)) if rank == 0 else tuple(range(8, 18))
-
-        forward = launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
-            layout=layout,
+        _run_distributed_projected_hca_oracle_case(
             rank=rank,
+            layout=_layout(Dsv4CompressionKind.HCA, rank_count=2),
             stage_plan_slots=_two_rank_slot(),
-            query=query[list(local_token_ids)],
-            query_token_ids=local_token_ids,
-            raw_kv=raw_kv[list(local_token_ids)],
-            raw_token_ids=local_token_ids,
-            projected_kv=projected_kv[list(local_token_ids)],
-            projected_gate=projected_gate[list(local_token_ids)],
-            positional_bias=positional_bias,
-            token_ids=local_token_ids,
-            attn_sink=attn_sink,
-            group=cast(Any, torch.distributed).group.WORLD,
-            async_op=True,
-            scale=0.25,
-            window_size=128,
-            raw_list_size=18,
-            compressed_list_size=4,
-        ).wait_post_process()
-
-        compressed = compress_projected_kv(
-            layout=layout,
-            projected_kv=projected_kv,
-            projected_gate=projected_gate,
-            positional_bias=positional_bias,
-        )
-        expected = dense_dsv4_packed_attention_oracle(
-            layout=layout,
-            query=query,
-            raw_kv=raw_kv,
-            compressed_kv=compressed,
-            attn_sink=attn_sink,
-            topk_by_query=None,
-            window_size=128,
-            scale=0.25,
-        )
-        local_positions = torch.tensor(local_token_ids, dtype=torch.long)
-        torch.testing.assert_close(
-            forward.attention.out,
-            expected.out.index_select(1, local_positions),
-            rtol=1e-6,
-            atol=1e-6,
-        )
-        torch.testing.assert_close(
-            forward.attention.lse,
-            expected.lse.index_select(1, local_positions),
-            rtol=1e-6,
-            atol=1e-6,
-            check_dtype=False,
-        )
-
-        backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
-            layout=layout,
-            rank=rank,
-            stage_plan_slots=_two_rank_slot(),
-            forward_result=forward,
-            grad_out=grad_out.index_select(1, local_positions),
-            group=cast(Any, torch.distributed).group.WORLD,
-            async_op=True,
-        ).wait_post_process()
-
-        ref_query = query.detach().clone().requires_grad_()
-        ref_raw = raw_kv.detach().clone().requires_grad_()
-        ref_projected = projected_kv.detach().clone().requires_grad_()
-        ref_gate = projected_gate.detach().clone().requires_grad_()
-        ref_bias = positional_bias.detach().clone().requires_grad_()
-        ref_sink = attn_sink.detach().clone().requires_grad_()
-        ref_compressed = compress_projected_kv(
-            layout=layout,
-            projected_kv=ref_projected,
-            projected_gate=ref_gate,
-            positional_bias=ref_bias,
-        )
-        ref = dense_dsv4_packed_attention_oracle(
-            layout=layout,
-            query=ref_query,
-            raw_kv=ref_raw,
-            compressed_kv=ref_compressed,
-            attn_sink=ref_sink,
-            topk_by_query=None,
-            window_size=128,
-            scale=0.25,
-        )
-        (ref.out * grad_out).sum().backward()
-
-        assert ref_query.grad is not None
-        assert ref_raw.grad is not None
-        assert ref_projected.grad is not None
-        assert ref_gate.grad is not None
-        assert ref_bias.grad is not None
-        assert ref_sink.grad is not None
-        _assert_id_aligned_rows_close(
-            actual=backward.attention.dq,
-            actual_ids=backward.attention.query_token_ids,
-            expected=ref_query.grad.unsqueeze(0),
-        )
-        _assert_id_aligned_rows_close(
-            actual=backward.attention.draw_kv,
-            actual_ids=backward.attention.raw_token_ids,
-            expected=ref_raw.grad.unsqueeze(0),
-        )
-        _assert_id_aligned_rows_close(
-            actual=backward.main_compressor.dprojected_kv,
-            actual_ids=backward.main_compressor.token_ids,
-            expected=ref_projected.grad,
-        )
-        _assert_id_aligned_rows_close(
-            actual=backward.main_compressor.dprojected_gate,
-            actual_ids=backward.main_compressor.token_ids,
-            expected=ref_gate.grad,
-        )
-        torch.testing.assert_close(
-            backward.main_compressor.dpositional_bias,
-            ref_bias.grad,
-            rtol=1e-6,
-            atol=1e-6,
-        )
-        torch.testing.assert_close(
-            backward.attention.d_attn_sink,
-            ref_sink.grad,
-            rtol=1e-6,
-            atol=1e-6,
-        )
-        assert not bool(backward.attention.dq.abs().sum().eq(0).item())
-        assert not bool(
-            backward.main_compressor.dprojected_gate.abs().sum().eq(0).item()
+            local_token_ids=tuple(range(0, 8)) if rank == 0 else tuple(range(8, 18)),
+            token_count=18,
+            seed=131,
+            expect_rank0_halo_grad=False,
         )
     finally:
         destroy_process_group()
+
+
+def _distributed_projected_hca_ratio128_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29630")
+    init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
+        layout = _hca_ratio128_boundary_layout()
+        _run_distributed_projected_hca_oracle_case(
+            rank=rank,
+            layout=layout,
+            stage_plan_slots=_two_rank_full_stage_slot(
+                first_rank_end=96,
+                token_count=416,
+            ),
+            local_token_ids=tuple(range(0, 96)) if rank == 0 else tuple(range(96, 416)),
+            token_count=416,
+            seed=137,
+            expect_rank0_halo_grad=True,
+        )
+    finally:
+        destroy_process_group()
+
+
+def _hca_ratio128_boundary_layout() -> Dsv4CompressedLayout:
+    return build_dsv4_compressed_layout(
+        group_ids=torch.tensor([[0] * 96 + [1] * 160 + [2] * 160]),
+        parent_ids=torch.tensor([[0] * 96 + [0] * 160 + [0] * 160]),
+        token_layout_index=_LayoutIndex(
+            ownership_ranges_by_rank=(
+                ((0, 96, 0),),
+                ((96, 416, 0),),
+            ),
+            token_counts_by_rank=(96, 320),
+        ),
+        spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.HCA, ratio=128),
+    )
+
+
+def _run_distributed_projected_hca_oracle_case(
+    *,
+    rank: int,
+    layout: Dsv4CompressedLayout,
+    stage_plan_slots: tuple[Dsv4StagePlanSlot, ...],
+    local_token_ids: tuple[int, ...],
+    token_count: int,
+    seed: int,
+    expect_rank0_halo_grad: bool,
+) -> None:
+    if expect_rank0_halo_grad:
+        assert layout.halo_transfers
+    torch.manual_seed(seed)
+    query = torch.randn(token_count, 2, 4, dtype=torch.float64)
+    raw_kv = torch.randn(token_count, 4, dtype=torch.float64)
+    projected_kv = torch.randn(token_count, 4, dtype=torch.float64)
+    projected_gate = torch.randn(token_count, 4, dtype=torch.float64)
+    positional_bias = torch.randn(int(layout.spec.ratio), 4, dtype=torch.float64)
+    attn_sink = torch.randn(2, dtype=torch.float64)
+    grad_out = torch.randn(1, token_count, 2, 4, dtype=torch.float64)
+
+    forward = launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=rank,
+        stage_plan_slots=stage_plan_slots,
+        query=query[list(local_token_ids)],
+        query_token_ids=local_token_ids,
+        raw_kv=raw_kv[list(local_token_ids)],
+        raw_token_ids=local_token_ids,
+        projected_kv=projected_kv[list(local_token_ids)],
+        projected_gate=projected_gate[list(local_token_ids)],
+        positional_bias=positional_bias,
+        token_ids=local_token_ids,
+        attn_sink=attn_sink,
+        group=cast(Any, torch.distributed).group.WORLD,
+        async_op=True,
+        scale=0.25,
+        window_size=128,
+        raw_list_size=min(128, token_count),
+        compressed_list_size=len(layout.entries),
+    ).wait_post_process()
+
+    compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+    )
+    expected = dense_dsv4_packed_attention_oracle(
+        layout=layout,
+        query=query,
+        raw_kv=raw_kv,
+        compressed_kv=compressed,
+        attn_sink=attn_sink,
+        topk_by_query=None,
+        window_size=128,
+        scale=0.25,
+    )
+    local_positions = torch.tensor(local_token_ids, dtype=torch.long)
+    torch.testing.assert_close(
+        forward.attention.out,
+        expected.out.index_select(1, local_positions),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        forward.attention.lse,
+        expected.lse.index_select(1, local_positions),
+        rtol=1e-6,
+        atol=1e-6,
+        check_dtype=False,
+    )
+
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=rank,
+        stage_plan_slots=stage_plan_slots,
+        forward_result=forward,
+        grad_out=grad_out.index_select(1, local_positions),
+        group=cast(Any, torch.distributed).group.WORLD,
+        async_op=True,
+    ).wait_post_process()
+
+    ref_query = query.detach().clone().requires_grad_()
+    ref_raw = raw_kv.detach().clone().requires_grad_()
+    ref_projected = projected_kv.detach().clone().requires_grad_()
+    ref_gate = projected_gate.detach().clone().requires_grad_()
+    ref_bias = positional_bias.detach().clone().requires_grad_()
+    ref_sink = attn_sink.detach().clone().requires_grad_()
+    ref_compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=ref_projected,
+        projected_gate=ref_gate,
+        positional_bias=ref_bias,
+    )
+    ref = dense_dsv4_packed_attention_oracle(
+        layout=layout,
+        query=ref_query,
+        raw_kv=ref_raw,
+        compressed_kv=ref_compressed,
+        attn_sink=ref_sink,
+        topk_by_query=None,
+        window_size=128,
+        scale=0.25,
+    )
+    (ref.out * grad_out).sum().backward()
+
+    assert ref_query.grad is not None
+    assert ref_raw.grad is not None
+    assert ref_projected.grad is not None
+    assert ref_gate.grad is not None
+    assert ref_bias.grad is not None
+    assert ref_sink.grad is not None
+    _assert_id_aligned_rows_close(
+        actual=backward.attention.dq,
+        actual_ids=backward.attention.query_token_ids,
+        expected=ref_query.grad.unsqueeze(0),
+    )
+    _assert_id_aligned_rows_close(
+        actual=backward.attention.draw_kv,
+        actual_ids=backward.attention.raw_token_ids,
+        expected=ref_raw.grad.unsqueeze(0),
+    )
+    _assert_id_aligned_rows_close(
+        actual=backward.main_compressor.dprojected_kv,
+        actual_ids=backward.main_compressor.token_ids,
+        expected=ref_projected.grad,
+    )
+    _assert_id_aligned_rows_close(
+        actual=backward.main_compressor.dprojected_gate,
+        actual_ids=backward.main_compressor.token_ids,
+        expected=ref_gate.grad,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dpositional_bias,
+        ref_bias.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.attention.d_attn_sink,
+        ref_sink.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert not bool(backward.attention.dq.abs().sum().eq(0).item())
+    assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
+    if expect_rank0_halo_grad and rank == 0:
+        assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+        assert not bool(
+            backward.main_compressor.dprojected_gate.abs().sum().eq(0).item()
+        )
 
 
 def _assert_id_aligned_rows_close(
