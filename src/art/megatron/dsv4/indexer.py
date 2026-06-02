@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Any, Protocol
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
+from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
     Dsv4CompressedLayout,
+    Dsv4TensorExchangePlan,
     Dsv4TopkResult,
 )
 
@@ -18,6 +21,47 @@ _INVALID_INDEX = -1
 class TokenRangeLike(Protocol):
     start: int
     end: int
+
+
+class Dsv4IndexerKvExchangeWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    layout: Dsv4CompressedLayout
+    query_token_ids: tuple[int, ...]
+    candidate_entry_ids: tuple[int, ...]
+    indexer_q: torch.Tensor
+    indexer_weights: torch.Tensor
+    topk: int
+    score_scale: float
+    recv_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    tensor_work: Dsv4TensorExchangeWork
+
+    def wait(self) -> None:
+        self.tensor_work.wait()
+
+    def wait_post_process(self) -> Dsv4TopkResult:
+        result = self.tensor_work.wait_post_process()
+        expected_ids = tuple(
+            entry_id
+            for peer_ids in self.recv_entry_ids_by_peer
+            for entry_id in peer_ids
+        )
+        if result.ids != expected_ids:
+            raise RuntimeError(
+                "DSV4 indexer KV exchange received ids "
+                f"{result.ids} but expected {expected_ids}"
+            )
+        return compute_indexer_stage_topk(
+            layout=self.layout,
+            query_token_ids=self.query_token_ids,
+            candidate_entry_ids=self.candidate_entry_ids,
+            indexer_q=self.indexer_q,
+            indexer_weights=self.indexer_weights,
+            indexer_kv=result.tensor,
+            indexer_kv_entry_ids=result.ids,
+            topk=int(self.topk),
+            score_scale=float(self.score_scale),
+        )
 
 
 def stage_candidate_entry_ids(
@@ -196,6 +240,74 @@ def compute_indexer_stage_topk(
         query_token_ids=query_token_ids,
         layout=layout,
         score_scale=score_scale,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_indexer_kv_exchange(
+    *,
+    layout: Dsv4CompressedLayout,
+    query_token_ids: Sequence[int],
+    candidate_entry_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    send_entry_ids_by_peer: Sequence[Sequence[int]],
+    recv_entry_ids_by_peer: Sequence[Sequence[int]],
+    topk: int,
+    group: Any,
+    async_op: bool,
+    score_scale: float = 1.0,
+) -> Dsv4IndexerKvExchangeWork:
+    """Launch distributed indexer-compressed KV fetch and stage topk scoring.
+
+    This is the DSV4 CSA indexer communication path. The indexer KV projection
+    has its own dim and is intentionally separate from main-attention KV
+    communication; after fetch, `wait_post_process` runs the existing frozen
+    no-grad stage topk implementation over explicit compressed entry ids.
+    """
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    candidate_ids = tuple(int(entry_id) for entry_id in candidate_entry_ids)
+    _row_by_id(candidate_ids, name="candidate_entry_ids")
+    local_entry_ids = tuple(int(entry_id) for entry_id in indexer_kv_entry_ids)
+    if len(local_entry_ids) != int(indexer_kv.shape[-2]):
+        raise RuntimeError(
+            "DSV4 indexer_kv_entry_ids length must match KV rows, got "
+            f"{len(local_entry_ids)} vs {int(indexer_kv.shape[-2])}"
+        )
+    _row_by_id(local_entry_ids, name="indexer_kv_entry_ids")
+    rank_count = _indexer_peer_count(send_entry_ids_by_peer, recv_entry_ids_by_peer)
+    send_ids = _normalize_indexer_peer_ids(
+        send_entry_ids_by_peer,
+        rank_count=rank_count,
+        name="send_entry_ids_by_peer",
+    )
+    recv_ids = _normalize_indexer_peer_ids(
+        recv_entry_ids_by_peer,
+        rank_count=rank_count,
+        name="recv_entry_ids_by_peer",
+    )
+    return Dsv4IndexerKvExchangeWork(
+        layout=layout,
+        query_token_ids=query_ids,
+        candidate_entry_ids=candidate_ids,
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        topk=int(topk),
+        score_scale=float(score_scale),
+        recv_entry_ids_by_peer=recv_ids,
+        tensor_work=launch_dsv4_tensor_exchange(
+            tensor=indexer_kv,
+            tensor_ids=local_entry_ids,
+            plan=Dsv4TensorExchangePlan(
+                send_ids_by_peer=send_ids,
+                recv_ids_by_peer=recv_ids,
+            ),
+            group=group,
+            async_op=async_op,
+            label="dsv4_indexer_kv_exchange",
+        ),
     )
 
 
@@ -414,6 +526,33 @@ def _gather_indexer_kv_by_ids(
         dtype=torch.long,
     )
     return tensor.index_select(0 if tensor.ndim == 2 else 1, indices)
+
+
+def _indexer_peer_count(*peers: Sequence[Sequence[int]]) -> int:
+    counts = {len(peer_ids) for peer_ids in peers}
+    if len(counts) != 1:
+        raise RuntimeError("DSV4 indexer exchange peer-list counts must match")
+    return counts.pop()
+
+
+def _normalize_indexer_peer_ids(
+    ids_by_peer: Sequence[Sequence[int]],
+    *,
+    rank_count: int,
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    if len(ids_by_peer) != int(rank_count):
+        raise RuntimeError(
+            f"DSV4 {name} peer count {len(ids_by_peer)} does not match {rank_count}"
+        )
+    normalized: list[tuple[int, ...]] = []
+    for peer, ids in enumerate(ids_by_peer):
+        peer_ids = tuple(int(entry_id) for entry_id in ids)
+        if any(entry_id < 0 for entry_id in peer_ids):
+            raise RuntimeError(f"DSV4 {name}[{peer}] ids must be non-negative")
+        _row_by_id(peer_ids, name=f"{name}[{peer}]")
+        normalized.append(peer_ids)
+    return tuple(normalized)
 
 
 def _row_by_id(ids: Sequence[int], name: str) -> dict[int, int]:

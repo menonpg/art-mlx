@@ -39,10 +39,12 @@ from .cp_stage import (
     raw_swa_token_ids_for_query,
 )
 from .indexer import (
+    Dsv4IndexerKvExchangeWork,
     build_indexer_visibility_mask,
     compute_indexer_scores,
     compute_indexer_stage_topk,
     compute_indexer_topk,
+    launch_dsv4_indexer_kv_exchange,
     merge_indexer_topk_results,
     stable_topk_by_score_and_id,
     stage_candidate_entry_ids,
@@ -101,6 +103,7 @@ __all__ = [
     "Dsv4GradientOwnerBucket",
     "Dsv4GradientOwnerExchangeWork",
     "Dsv4HaloTransfer",
+    "Dsv4IndexerKvExchangeWork",
     "Dsv4MaterializedStage",
     "Dsv4PreparedPlan",
     "Dsv4ProjectedTokenBuffer",
@@ -140,6 +143,7 @@ __all__ = [
     "launch_dsv4_compression_halo_exchange",
     "launch_dsv4_compression_halo_gradient_exchange",
     "launch_dsv4_gradient_owner_bucket_exchange",
+    "launch_dsv4_indexer_kv_exchange",
     "launch_dsv4_stage_kv_exchange",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
