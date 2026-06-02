@@ -659,21 +659,32 @@ def test_distributed_projected_csa_wrapper_matches_packed_oracle_cuda_nccl(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.device_count() < 2
     or not cast(Any, torch.distributed).is_nccl_available(),
-    reason="DSV4 real-Miles CUDA/NCCL oracle requires at least two CUDA devices and NCCL",
+    reason="DSV4 real-Miles CUDA/NCCL oracle requires CUDA devices and NCCL",
+)
+@pytest.mark.parametrize(
+    ("world_size", "master_port"),
+    (
+        (2, "29636"),
+        (4, "29642"),
+        (8, "29643"),
+    ),
 )
 def test_distributed_projected_csa_real_miles_matches_packed_oracle_cuda_nccl(
     tmp_path: Path,
+    world_size: int,
+    master_port: str,
 ) -> None:
     _ensure_miles_sparse_available()
-    init_path = tmp_path / "dsv4_projected_csa_real_miles_oracle_nccl"
+    if torch.cuda.device_count() < int(world_size):
+        pytest.skip(f"requires {world_size} CUDA devices")
+    init_path = tmp_path / f"dsv4_projected_csa_real_miles_cp{world_size}_oracle_nccl"
     if init_path.exists():
         init_path.unlink()
     mp.start_processes(
         _distributed_projected_csa_real_miles_nccl_oracle_worker,
-        args=(2, str(init_path)),
-        nprocs=2,
+        args=(int(world_size), str(init_path), master_port),
+        nprocs=int(world_size),
         join=True,
         start_method="spawn",
     )
@@ -683,21 +694,32 @@ def test_distributed_projected_csa_real_miles_matches_packed_oracle_cuda_nccl(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.device_count() < 2
     or not cast(Any, torch.distributed).is_nccl_available(),
-    reason="DSV4 real-Miles CUDA/NCCL oracle requires at least two CUDA devices and NCCL",
+    reason="DSV4 real-Miles CUDA/NCCL oracle requires CUDA devices and NCCL",
+)
+@pytest.mark.parametrize(
+    ("world_size", "master_port"),
+    (
+        (2, "29637"),
+        (4, "29644"),
+        (8, "29645"),
+    ),
 )
 def test_distributed_projected_hca_real_miles_matches_packed_oracle_cuda_nccl(
     tmp_path: Path,
+    world_size: int,
+    master_port: str,
 ) -> None:
     _ensure_miles_sparse_available()
-    init_path = tmp_path / "dsv4_projected_hca_real_miles_oracle_nccl"
+    if torch.cuda.device_count() < int(world_size):
+        pytest.skip(f"requires {world_size} CUDA devices")
+    init_path = tmp_path / f"dsv4_projected_hca_real_miles_cp{world_size}_oracle_nccl"
     if init_path.exists():
         init_path.unlink()
     mp.start_processes(
         _distributed_projected_hca_real_miles_nccl_oracle_worker,
-        args=(2, str(init_path)),
-        nprocs=2,
+        args=(int(world_size), str(init_path), master_port),
+        nprocs=int(world_size),
         join=True,
         start_method="spawn",
     )
@@ -985,6 +1007,18 @@ def _n_rank_empty_slot(*, rank_count: int) -> tuple[Dsv4StagePlanSlot, ...]:
             stage_plans_by_rank=tuple(stage_plans),
         ),
     )
+
+
+def _small_stage_slot(*, rank_count: int) -> tuple[Dsv4StagePlanSlot, ...]:
+    if int(rank_count) == 2:
+        return _two_rank_slot()
+    return _n_rank_empty_slot(rank_count=int(rank_count))
+
+
+def _small_token_ids_by_rank(*, rank_count: int) -> tuple[tuple[int, ...], ...]:
+    if int(rank_count) == 2:
+        return (tuple(range(0, 8)), tuple(range(8, 18)))
+    return _empty_rank_token_ids_by_rank(rank_count=int(rank_count))
 
 
 def _distributed_projected_real_planner_oracle_worker(
@@ -1961,10 +1995,11 @@ def _distributed_projected_csa_real_miles_nccl_oracle_worker(
     rank: int,
     world_size: int,
     init_path: str,
+    master_port: str,
 ) -> None:
     _add_miles_path_to_sys_path()
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29636")
+    os.environ["MASTER_PORT"] = master_port
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     init_process_group(
@@ -1974,7 +2009,9 @@ def _distributed_projected_csa_real_miles_nccl_oracle_worker(
         world_size=world_size,
     )
     try:
-        layout = _layout(Dsv4CompressionKind.CSA, rank_count=2)
+        layout = _layout(Dsv4CompressionKind.CSA, rank_count=world_size)
+        stage_plan_slots = _small_stage_slot(rank_count=world_size)
+        local_token_ids = _small_token_ids_by_rank(rank_count=world_size)[rank]
         torch.manual_seed(151)
         query = torch.randn(18, 64, 512, device=device, dtype=torch.bfloat16)
         raw_kv = torch.randn(18, 512, device=device, dtype=torch.bfloat16)
@@ -2015,13 +2052,12 @@ def _distributed_projected_csa_real_miles_nccl_oracle_worker(
             device=device,
             dtype=torch.bfloat16,
         )
-        local_token_ids = tuple(range(0, 8)) if rank == 0 else tuple(range(8, 18))
         local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
 
         forward = launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
             layout=layout,
             rank=rank,
-            stage_plan_slots=_two_rank_slot(),
+            stage_plan_slots=stage_plan_slots,
             query=query[list(local_token_ids)],
             query_token_ids=local_token_ids,
             raw_kv=raw_kv[list(local_token_ids)],
@@ -2078,23 +2114,27 @@ def _distributed_projected_csa_real_miles_nccl_oracle_worker(
             window_size=128,
             scale=1.0 / (512**0.5),
         )
-        _assert_mean_abs_pct(
-            forward.attention.out.float(),
-            expected.out.index_select(1, local_positions).float(),
-            threshold=3.0,
-            name="real Miles distributed CSA fwd",
-        )
-        _assert_mean_abs_pct(
-            forward.attention.lse.float(),
-            expected.lse.index_select(1, local_positions).float(),
-            threshold=3.0,
-            name="real Miles distributed CSA lse",
-        )
+        if local_token_ids:
+            _assert_mean_abs_pct(
+                forward.attention.out.float(),
+                expected.out.index_select(1, local_positions).float(),
+                threshold=3.0,
+                name="real Miles distributed CSA fwd",
+            )
+            _assert_mean_abs_pct(
+                forward.attention.lse.float(),
+                expected.lse.index_select(1, local_positions).float(),
+                threshold=3.0,
+                name="real Miles distributed CSA lse",
+            )
+        else:
+            assert forward.attention.out.numel() == 0
+            assert forward.attention.lse.numel() == 0
 
         backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
             layout=layout,
             rank=rank,
-            stage_plan_slots=_two_rank_slot(),
+            stage_plan_slots=stage_plan_slots,
             forward_result=forward,
             grad_out=grad_out.index_select(1, local_positions),
             group=cast(Any, torch.distributed).group.WORLD,
@@ -2171,8 +2211,14 @@ def _distributed_projected_csa_real_miles_nccl_oracle_worker(
             threshold=5.0,
             name="real Miles distributed CSA dsink",
         )
-        assert not bool(forward.attention.out.abs().sum().eq(0).item())
-        assert not bool(backward.attention.dq.abs().sum().eq(0).item())
+        _assert_distributed_nonzero(
+            forward.attention.out,
+            name="real Miles distributed CSA fwd",
+        )
+        _assert_distributed_nonzero(
+            backward.attention.dq,
+            name="real Miles distributed CSA dq",
+        )
         torch.cuda.synchronize(device)
     finally:
         destroy_process_group()
@@ -2211,10 +2257,11 @@ def _distributed_projected_hca_real_miles_nccl_oracle_worker(
     rank: int,
     world_size: int,
     init_path: str,
+    master_port: str,
 ) -> None:
     _add_miles_path_to_sys_path()
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29637")
+    os.environ["MASTER_PORT"] = master_port
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     init_process_group(
@@ -2224,11 +2271,12 @@ def _distributed_projected_hca_real_miles_nccl_oracle_worker(
         world_size=world_size,
     )
     try:
+        local_token_ids_by_rank = _small_token_ids_by_rank(rank_count=world_size)
         _run_distributed_projected_hca_oracle_case(
             rank=rank,
-            layout=_layout(Dsv4CompressionKind.HCA, rank_count=2),
-            stage_plan_slots=_two_rank_slot(),
-            local_token_ids=tuple(range(0, 8)) if rank == 0 else tuple(range(8, 18)),
+            layout=_layout(Dsv4CompressionKind.HCA, rank_count=world_size),
+            stage_plan_slots=_small_stage_slot(rank_count=world_size),
+            local_token_ids=local_token_ids_by_rank[rank],
             token_count=18,
             seed=153,
             expect_rank0_halo_grad=False,
@@ -2550,18 +2598,22 @@ def _run_distributed_projected_hca_oracle_case(
             check_dtype=False,
         )
     else:
-        _assert_mean_abs_pct(
-            forward.attention.out.float(),
-            expected.out.index_select(1, local_positions).float(),
-            threshold=mean_abs_pct_threshold,
-            name="real Miles distributed HCA fwd",
-        )
-        _assert_mean_abs_pct(
-            forward.attention.lse.float(),
-            expected.lse.index_select(1, local_positions).float(),
-            threshold=mean_abs_pct_threshold,
-            name="real Miles distributed HCA lse",
-        )
+        if local_token_ids:
+            _assert_mean_abs_pct(
+                forward.attention.out.float(),
+                expected.out.index_select(1, local_positions).float(),
+                threshold=mean_abs_pct_threshold,
+                name="real Miles distributed HCA fwd",
+            )
+            _assert_mean_abs_pct(
+                forward.attention.lse.float(),
+                expected.lse.index_select(1, local_positions).float(),
+                threshold=mean_abs_pct_threshold,
+                name="real Miles distributed HCA lse",
+            )
+        else:
+            assert forward.attention.out.numel() == 0
+            assert forward.attention.lse.numel() == 0
 
     backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
         layout=layout,
@@ -2754,6 +2806,9 @@ def _assert_id_aligned_rows_mean_abs_pct(
     threshold: float,
     name: str,
 ) -> None:
+    if not actual_ids:
+        assert actual.numel() == 0
+        return
     positions = torch.tensor(actual_ids, device=expected.device, dtype=torch.long)
     token_dim = 0 if expected.ndim == 2 else 1
     target = expected.index_select(token_dim, positions).to(device=actual.device)
