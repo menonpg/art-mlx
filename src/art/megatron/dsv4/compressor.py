@@ -383,7 +383,7 @@ def compress_projected_kv(
         weights,
         torch.zeros((), dtype=weights.dtype, device=weights.device),
     )
-    return (gathered_kv * weights).sum(dim=-2)
+    return (gathered_kv * weights).sum(dim=-2).to(dtype=projected_kv.dtype)
 
 
 def compress_owned_projected_kv(

@@ -97,6 +97,23 @@ def test_hca_projected_compression_matches_slow_reference() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+def test_projected_compression_preserves_projected_kv_dtype() -> None:
+    layout = _layout(Dsv4CompressionKind.HCA)
+    torch.manual_seed(23)
+    projected_kv = torch.randn(18, 6, dtype=torch.bfloat16)
+    projected_gate = torch.randn(18, 6, dtype=torch.bfloat16)
+    positional_bias = torch.randn(4, 6)
+
+    actual = compress_projected_kv(
+        layout=layout,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+    )
+
+    assert actual.dtype == projected_kv.dtype
+
+
 def test_projected_compression_supports_compact_token_buffer_and_entry_subset() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
     torch.manual_seed(3)

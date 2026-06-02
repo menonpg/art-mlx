@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 from typing import Any, cast
 
 from oracles import dense_dsv4_packed_attention_oracle
@@ -643,6 +644,30 @@ def test_distributed_projected_csa_wrapper_matches_packed_oracle_cuda_nccl(
         init_path.unlink()
     mp.start_processes(
         _distributed_projected_csa_nccl_oracle_worker,
+        args=(2, str(init_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or not cast(Any, torch.distributed).is_nccl_available(),
+    reason="DSV4 real-Miles CUDA/NCCL oracle requires at least two CUDA devices and NCCL",
+)
+def test_distributed_projected_csa_real_miles_matches_packed_oracle_cuda_nccl(
+    tmp_path: Path,
+) -> None:
+    _ensure_miles_sparse_available()
+    init_path = tmp_path / "dsv4_projected_csa_real_miles_oracle_nccl"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_csa_real_miles_nccl_oracle_worker,
         args=(2, str(init_path)),
         nprocs=2,
         join=True,
@@ -1499,6 +1524,227 @@ def _distributed_projected_csa_nccl_oracle_worker(
         destroy_process_group()
 
 
+def _distributed_projected_csa_real_miles_nccl_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+) -> None:
+    _add_miles_path_to_sys_path()
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29636")
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        layout = _layout(Dsv4CompressionKind.CSA, rank_count=2)
+        torch.manual_seed(151)
+        query = torch.randn(18, 64, 512, device=device, dtype=torch.bfloat16)
+        raw_kv = torch.randn(18, 512, device=device, dtype=torch.bfloat16)
+        main_projected_kv = torch.randn(
+            18,
+            1024,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        main_projected_gate = torch.randn(
+            18,
+            1024,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        main_positional_bias = torch.randn(4, 1024, device=device)
+        indexer_projected_kv = torch.randn(
+            18,
+            256,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        indexer_projected_gate = torch.randn(
+            18,
+            256,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        indexer_positional_bias = torch.randn(4, 256, device=device)
+        indexer_q = torch.randn(18, 64, 128, device=device, dtype=torch.bfloat16)
+        indexer_weights = torch.randn(18, 64, device=device, dtype=torch.bfloat16)
+        attn_sink = torch.randn(64, device=device) * 0.1
+        grad_out = torch.randn(
+            1,
+            18,
+            64,
+            512,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        local_token_ids = tuple(range(0, 8)) if rank == 0 else tuple(range(8, 18))
+        local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
+
+        forward = launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
+            layout=layout,
+            rank=rank,
+            stage_plan_slots=_two_rank_slot(),
+            query=query[list(local_token_ids)],
+            query_token_ids=local_token_ids,
+            raw_kv=raw_kv[list(local_token_ids)],
+            raw_token_ids=local_token_ids,
+            main_projected_kv=main_projected_kv[list(local_token_ids)],
+            main_projected_gate=main_projected_gate[list(local_token_ids)],
+            main_positional_bias=main_positional_bias,
+            main_token_ids=local_token_ids,
+            indexer_projected_kv=indexer_projected_kv[list(local_token_ids)],
+            indexer_projected_gate=indexer_projected_gate[list(local_token_ids)],
+            indexer_positional_bias=indexer_positional_bias,
+            indexer_token_ids=local_token_ids,
+            indexer_q=indexer_q[list(local_token_ids)],
+            indexer_weights=indexer_weights[list(local_token_ids)],
+            indexer_topk=2,
+            attn_sink=attn_sink,
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+            scale=1.0 / (512**0.5),
+            window_size=128,
+            raw_list_size=18,
+            compressed_list_size=2,
+        ).wait_post_process()
+
+        main_compressed = compress_projected_kv(
+            layout=layout,
+            projected_kv=main_projected_kv,
+            projected_gate=main_projected_gate,
+            positional_bias=main_positional_bias,
+        )
+        indexer_compressed = compress_projected_kv(
+            layout=layout,
+            projected_kv=indexer_projected_kv,
+            projected_gate=indexer_projected_gate,
+            positional_bias=indexer_positional_bias,
+        )
+        assert main_compressed.dtype == query.dtype
+        topk = compute_indexer_topk(
+            layout=layout,
+            query_token_ids=tuple(range(18)),
+            indexer_q=indexer_q,
+            indexer_kv=indexer_compressed,
+            indexer_weights=indexer_weights,
+            candidate_entry_ids=tuple(range(len(layout.entries))),
+            topk=2,
+        ).indices[0]
+        expected = dense_dsv4_packed_attention_oracle(
+            layout=layout,
+            query=query.float(),
+            raw_kv=raw_kv.float(),
+            compressed_kv=main_compressed.float(),
+            attn_sink=attn_sink.float(),
+            topk_by_query=topk,
+            window_size=128,
+            scale=1.0 / (512**0.5),
+        )
+        _assert_mean_abs_pct(
+            forward.attention.out.float(),
+            expected.out.index_select(1, local_positions).float(),
+            threshold=3.0,
+            name="real Miles distributed CSA fwd",
+        )
+        _assert_mean_abs_pct(
+            forward.attention.lse.float(),
+            expected.lse.index_select(1, local_positions).float(),
+            threshold=3.0,
+            name="real Miles distributed CSA lse",
+        )
+
+        backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+            layout=layout,
+            rank=rank,
+            stage_plan_slots=_two_rank_slot(),
+            forward_result=forward,
+            grad_out=grad_out.index_select(1, local_positions),
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        ).wait_post_process()
+
+        ref_query = query.detach().float().requires_grad_()
+        ref_raw = raw_kv.detach().float().requires_grad_()
+        ref_main_projected = main_projected_kv.detach().float().requires_grad_()
+        ref_main_gate = main_projected_gate.detach().float().requires_grad_()
+        ref_main_bias = main_positional_bias.detach().clone().requires_grad_()
+        ref_sink = attn_sink.detach().clone().requires_grad_()
+        ref_main_compressed = compress_projected_kv(
+            layout=layout,
+            projected_kv=ref_main_projected,
+            projected_gate=ref_main_gate,
+            positional_bias=ref_main_bias,
+        )
+        ref = dense_dsv4_packed_attention_oracle(
+            layout=layout,
+            query=ref_query,
+            raw_kv=ref_raw,
+            compressed_kv=ref_main_compressed,
+            attn_sink=ref_sink,
+            topk_by_query=topk,
+            window_size=128,
+            scale=1.0 / (512**0.5),
+        )
+        (ref.out * grad_out.float()).sum().backward()
+
+        assert ref_query.grad is not None
+        assert ref_raw.grad is not None
+        assert ref_main_projected.grad is not None
+        assert ref_main_gate.grad is not None
+        assert ref_main_bias.grad is not None
+        assert ref_sink.grad is not None
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.attention.dq.float(),
+            actual_ids=backward.attention.query_token_ids,
+            expected=ref_query.grad.unsqueeze(0),
+            threshold=5.0,
+            name="real Miles distributed CSA dq",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.attention.draw_kv.float(),
+            actual_ids=backward.attention.raw_token_ids,
+            expected=ref_raw.grad.unsqueeze(0),
+            threshold=5.0,
+            name="real Miles distributed CSA draw",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.main_compressor.dprojected_kv.float(),
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_main_projected.grad,
+            threshold=5.0,
+            name="real Miles distributed CSA dprojected_kv",
+        )
+        _assert_id_aligned_rows_mean_abs_pct(
+            actual=backward.main_compressor.dprojected_gate.float(),
+            actual_ids=backward.main_compressor.token_ids,
+            expected=ref_main_gate.grad,
+            threshold=5.0,
+            name="real Miles distributed CSA dprojected_gate",
+        )
+        _assert_mean_abs_pct(
+            backward.main_compressor.dpositional_bias.float(),
+            ref_main_bias.grad.float(),
+            threshold=5.0,
+            name="real Miles distributed CSA dpositional_bias",
+        )
+        _assert_mean_abs_pct(
+            backward.attention.d_attn_sink.float(),
+            ref_sink.grad.float(),
+            threshold=5.0,
+            name="real Miles distributed CSA dsink",
+        )
+        assert not bool(forward.attention.out.abs().sum().eq(0).item())
+        assert not bool(backward.attention.dq.abs().sum().eq(0).item())
+        torch.cuda.synchronize(device)
+    finally:
+        destroy_process_group()
+
+
 def _distributed_projected_hca_oracle_worker(
     rank: int,
     world_size: int,
@@ -1911,6 +2157,57 @@ def _run_distributed_projected_hca_oracle_case(
         assert not bool(
             backward.main_compressor.dprojected_gate.abs().sum().eq(0).item()
         )
+
+
+def _ensure_miles_sparse_available() -> None:
+    _add_miles_path_to_sys_path()
+    pytest.importorskip(
+        "miles_plugins.models.deepseek_v4.ops.kernel.tilelang_sparse_mla_fwd"
+    )
+    pytest.importorskip(
+        "miles_plugins.models.deepseek_v4.ops.kernel.tilelang_sparse_mla_bwd"
+    )
+
+
+def _add_miles_path_to_sys_path() -> None:
+    miles_path = os.environ.get(
+        "DSV4_MILES_PATH", "/mnt/ws_pvc/ws/scratch/miles_inspect"
+    )
+    if miles_path and Path(miles_path).exists() and miles_path not in sys.path:
+        sys.path.insert(0, miles_path)
+
+
+def _assert_id_aligned_rows_mean_abs_pct(
+    *,
+    actual: torch.Tensor,
+    actual_ids: tuple[int, ...],
+    expected: torch.Tensor,
+    threshold: float,
+    name: str,
+) -> None:
+    positions = torch.tensor(actual_ids, device=expected.device, dtype=torch.long)
+    token_dim = 0 if expected.ndim == 2 else 1
+    target = expected.index_select(token_dim, positions).to(device=actual.device)
+    _assert_mean_abs_pct(
+        actual.float(),
+        target.float(),
+        threshold=threshold,
+        name=name,
+    )
+
+
+def _assert_mean_abs_pct(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    threshold: float,
+    name: str,
+) -> None:
+    denominator = expected.abs().mean().clamp_min(1e-8)
+    value = float(((actual - expected).abs().mean() / denominator * 100.0).item())
+    assert value <= float(threshold), (
+        f"{name} mean_abs_pct {value:.6g}% exceeds threshold {threshold:g}%"
+    )
 
 
 def _assert_id_aligned_rows_close(

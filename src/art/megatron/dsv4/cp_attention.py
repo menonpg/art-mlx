@@ -1448,7 +1448,7 @@ def _align_compressed_grad_to_forward(
             f"{int(source_for_target.shape[-1])} vs {int(target.shape[-1])}"
         )
 
-    aligned = torch.zeros_like(target)
+    aligned = source_for_target.new_zeros(tuple(target.shape))
     if not source_ids:
         return aligned
     source_positions = []

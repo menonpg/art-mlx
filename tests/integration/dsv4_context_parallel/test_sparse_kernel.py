@@ -112,6 +112,52 @@ def test_sparse_bwd_converts_global_lse_to_miles_log2(
     assert calls["sm_scale"] == 0.25
 
 
+def test_sparse_bwd_casts_replay_tensors_to_q_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, torch.dtype] = {}
+
+    def fake_bwd(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        o: torch.Tensor,
+        do: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        lse: torch.Tensor,
+        sm_scale: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del attn_sink, topk_idxs, lse, sm_scale
+        calls["q"] = q.dtype
+        calls["kv"] = kv.dtype
+        calls["global_out"] = o.dtype
+        calls["grad_out"] = do.dtype
+        return (torch.ones_like(q), torch.ones_like(kv), torch.ones(q.shape[2]))
+
+    monkeypatch.setattr(
+        sparse_kernel, "_load_miles_sparse_mla", lambda: (None, fake_bwd)
+    )
+
+    q = torch.randn(1, 2, 2, 4, dtype=torch.bfloat16)
+    kv = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    dsv4_sparse_bwd(
+        q=q,
+        kv=kv,
+        attn_sink=torch.full((2,), float("-inf")),
+        topk=torch.tensor([[[0, 1], [2, -1]]]),
+        global_out=torch.randn(1, 2, 2, 4),
+        grad_out=torch.randn(1, 2, 2, 4),
+        global_lse=torch.randn(1, 2, 2),
+    )
+
+    assert calls == {
+        "q": torch.bfloat16,
+        "kv": torch.bfloat16,
+        "global_out": torch.bfloat16,
+        "grad_out": torch.bfloat16,
+    }
+
+
 def test_disabled_attn_sink_is_negative_infinity() -> None:
     sink = torch.randn(4)
     disabled = dsv4_disabled_attn_sink(sink)
@@ -128,6 +174,23 @@ def test_sparse_kernel_rejects_mismatched_topk_shape() -> None:
             kv=torch.randn(1, 5, 4),
             attn_sink=torch.randn(2),
             topk=torch.zeros(1, 2, 3, dtype=torch.long),
+        )
+
+
+def test_sparse_kernel_rejects_q_kv_dtype_mismatch_before_miles_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_loader() -> tuple[object, object]:
+        raise AssertionError("dtype mismatch should not load Miles")
+
+    monkeypatch.setattr(sparse_kernel, "_load_miles_sparse_mla", fail_loader)
+
+    with pytest.raises(RuntimeError, match="dtypes must match"):
+        dsv4_sparse_fwd(
+            q=torch.randn(1, 3, 2, 4, dtype=torch.bfloat16),
+            kv=torch.randn(1, 5, 4),
+            attn_sink=torch.randn(2),
+            topk=torch.zeros(1, 3, 2, dtype=torch.long),
         )
 
 

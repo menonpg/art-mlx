@@ -114,12 +114,16 @@ def dsv4_sparse_bwd(
             output_row_mask,
             global_out,
             torch.zeros_like(global_out),
-        ).contiguous(),
+        )
+        .to(dtype=q.dtype)
+        .contiguous(),
         torch.where(
             output_row_mask,
             grad_out,
             torch.zeros_like(grad_out),
-        ).contiguous(),
+        )
+        .to(dtype=q.dtype)
+        .contiguous(),
         topk_i32,
         torch.where(lse_row_mask, global_lse, torch.zeros_like(global_lse))
         .mul(_LOG2E)
@@ -169,6 +173,11 @@ def _validate_sparse_inputs(
         raise RuntimeError(
             "DSV4 sparse q/kv batch and dim must match, got "
             f"q={tuple(q.shape)}, kv={tuple(kv.shape)}"
+        )
+    if q.dtype != kv.dtype:
+        raise RuntimeError(
+            "DSV4 sparse q and kv dtypes must match before entering Miles, got "
+            f"q={q.dtype}, kv={kv.dtype}"
         )
     if tuple(topk.shape[:2]) != tuple(q.shape[:2]):
         raise RuntimeError(

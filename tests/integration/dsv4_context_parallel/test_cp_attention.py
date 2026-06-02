@@ -713,6 +713,78 @@ def test_hca_projected_attention_wraps_compression_and_backward(
     assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
 
 
+def test_projected_attention_aligns_float_compressed_grad_for_bf16_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_float_dkv_backward(
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk: torch.Tensor,
+        global_out: torch.Tensor,
+        grad_out: torch.Tensor,
+        global_lse: torch.Tensor,
+        scale: float | None = None,
+    ) -> Dsv4SparseBackwardResult:
+        del topk, global_out, grad_out, global_lse, scale
+        dkv = torch.empty(kv.shape, dtype=torch.float32)
+        for row in range(int(kv.shape[1])):
+            dkv[:, row].fill_(row + 20.0)
+        return Dsv4SparseBackwardResult(
+            dq=torch.ones_like(q),
+            dkv=dkv,
+            d_attn_sink=torch.zeros_like(attn_sink),
+        )
+
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        fake_float_dkv_backward,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.HCA)
+    slots = _single_rank_slots()
+    projected_kv, projected_gate, positional_bias = _projected_inputs(width=3)
+    projected_kv = projected_kv.to(dtype=torch.bfloat16)
+    projected_gate = projected_gate.to(dtype=torch.bfloat16)
+
+    forward = launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.bfloat16),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.bfloat16),
+        raw_token_ids=tuple(range(8)),
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias.float(),
+        token_ids=tuple(range(8)),
+        attn_sink=torch.zeros(2),
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        forward_result=forward,
+        grad_out=torch.ones_like(forward.attention.out),
+        group=None,
+        async_op=True,
+    ).wait_post_process()
+
+    assert backward.attention.dcompressed_kv.dtype == torch.float32
+    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+
+
 def test_csa_projected_attention_from_context_state_uses_prepared_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
