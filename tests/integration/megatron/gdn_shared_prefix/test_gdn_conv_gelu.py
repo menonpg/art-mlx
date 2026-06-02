@@ -21,9 +21,6 @@ from art.megatron.gdn.gdn_shared_prefix import (
     build_gdn_rank_execution_plan,
     parse_gdn_shared_prefix_segments,
 )
-from tests.integration.megatron.gdn_shared_prefix.benchmark_gdn import (
-    make_qwen35_gdn_pair,
-)
 from tests.integration.megatron.gdn_shared_prefix.cases import (
     GdnFamilyShape,
     GdnPackedRowShape,
@@ -32,6 +29,9 @@ from tests.integration.megatron.gdn_shared_prefix.cases import (
 from tests.integration.megatron.gdn_shared_prefix.metrics import assert_mean_abs_pct
 from tests.integration.megatron.gdn_shared_prefix.packed_layout import (
     build_phase0_packed_tensors,
+)
+from tests.integration.megatron.gdn_shared_prefix.test_real_gdn_cp1_packed_vs_flattened import (
+    _make_matching_qwen35_gdn_pair,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -136,9 +136,7 @@ def test_gdn_varlen_causal_conv_gelu_matches_qwen_planner_bucket() -> None:
     )
     bucket = plan.completion_with_prefix_tail_buckets[0]
     with _single_rank_model_parallel():
-        ref_gdn, _ = make_qwen35_gdn_pair(
-            params_dtype=torch.float32, linear_policy="noop"
-        )
+        ref_gdn, _ = _make_matching_qwen35_gdn_pair(params_dtype=torch.float32)
         ref_gdn.eval()
         ref_gdn_any = cast(Any, ref_gdn)
         conv1d = cast(Any, ref_gdn.conv1d)
