@@ -11,6 +11,7 @@ from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
     Dsv4CompressedLayout,
+    Dsv4IndexerStagePlan,
     Dsv4TensorExchangePlan,
     Dsv4TopkResult,
 )
@@ -148,6 +149,36 @@ def build_dsv4_indexer_kv_exchange_peer_plans(
             recv_entry_ids_by_peer=recv_by_rank[rank],
         )
         for rank in range(rank_count)
+    )
+
+
+def build_dsv4_indexer_stage_plan_from_stage_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plans_by_rank: Sequence[Any],
+) -> Dsv4IndexerStagePlan:
+    """Derive DSV4 indexer metadata from one ART `StagePlan` slot.
+
+    This is host-only metadata work. It uses ART's planned query/K ranges but
+    does not execute the generic Flex stage executor or inspect activation
+    tensors.
+    """
+    stage_plans = tuple(stage_plans_by_rank)
+    _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
+    stage_index = _shared_stage_index(stage_plans)
+    return Dsv4IndexerStagePlan(
+        stage_index=stage_index,
+        query_token_ids_by_rank=tuple(
+            _token_ids_from_ranges(stage_plan.global_q_ranges)
+            for stage_plan in stage_plans
+        ),
+        candidate_entry_ids_by_rank=tuple(
+            stage_candidate_entry_ids(
+                layout=layout,
+                global_k_ranges=stage_plan.global_k_ranges,
+            )
+            for stage_plan in stage_plans
+        ),
     )
 
 
@@ -552,6 +583,35 @@ def _validate_indexer_stage_work(*, work: Any, position: int) -> None:
         raise RuntimeError(
             f"DSV4 indexer stage work {position} is missing wait_post_process()"
         )
+
+
+def _validate_stage_plan_count(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plans_by_rank: Sequence[Any],
+) -> None:
+    if len(stage_plans_by_rank) != len(layout.entry_ids_by_owner_rank):
+        raise RuntimeError(
+            "DSV4 stage-plan metadata requires one ART StagePlan per rank, got "
+            f"{len(stage_plans_by_rank)} vs {len(layout.entry_ids_by_owner_rank)}"
+        )
+
+
+def _shared_stage_index(stage_plans: Sequence[Any]) -> int:
+    stage_indices = tuple(int(stage_plan.stage_index) for stage_plan in stage_plans)
+    if len(set(stage_indices)) != 1:
+        raise RuntimeError(
+            f"DSV4 stage-plan metadata requires one shared stage index, got {stage_indices}"
+        )
+    return stage_indices[0]
+
+
+def _token_ids_from_ranges(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
+    token_ids: list[int] = []
+    for range_ in ranges:
+        token_ids.extend(range(int(range_.start), int(range_.end)))
+    _row_by_id(tuple(token_ids), name="stage_plan_token_ranges")
+    return tuple(token_ids)
 
 
 def _query_token_ids_from_stage_work(*, work: Any, position: int) -> tuple[int, ...]:

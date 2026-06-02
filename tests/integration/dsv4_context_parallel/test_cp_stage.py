@@ -11,6 +11,7 @@ from art.megatron.dsv4 import (
     Dsv4StageKeyKind,
     build_dsv4_compressed_layout,
     build_dsv4_stage_kv_exchange_peer_plans,
+    build_dsv4_stage_plan_group_from_stage_plans,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
     materialize_dsv4_stage_tensors,
@@ -30,6 +31,14 @@ class _Range(BaseModel):
 
     start: int
     end: int
+
+
+class _StagePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage_index: int
+    global_q_ranges: tuple[_Range, ...]
+    global_k_ranges: tuple[_Range, ...]
 
 
 def test_raw_swa_visibility_uses_branch_views_not_physical_siblings() -> None:
@@ -194,6 +203,42 @@ def test_stage_kv_exchange_peer_plan_uses_layout_ownership() -> None:
     assert plans[1].send_compressed_entry_ids_by_peer == ((2,), (2, 3))
 
 
+def test_stage_plan_group_derives_stage_inputs_from_art_stage_plans() -> None:
+    layout = _layout(Dsv4CompressionKind.CSA)
+
+    group = build_dsv4_stage_plan_group_from_stage_plans(
+        layout=layout,
+        stage_plans_by_rank=(
+            _stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),
+            _stage_plan(
+                stage_index=5,
+                q_ranges=((11, 12), (16, 17)),
+                k_ranges=((8, 18),),
+            ),
+        ),
+        compression_kind=Dsv4CompressionKind.CSA,
+        global_topk_indices_by_rank=(
+            torch.tensor([[[0, 1], [1, 2], [2, 3]]], dtype=torch.long),
+            torch.tensor([[[2, 3], [3, 2], [0, 1]]], dtype=torch.long),
+        ),
+        topk_query_token_ids_by_rank=((3, 7, 8), (11, 16, 17)),
+        window_size=4,
+    )
+
+    assert group.stage_index == 5
+    assert len(group.stage_inputs_by_rank) == 2
+    rank0, rank1 = group.stage_inputs_by_rank
+    assert rank0.query_token_ids == (7,)
+    assert rank0.raw_token_ids == tuple(range(4, 13))
+    assert rank0.compressed_entry_ids == (1, 2)
+    assert rank0.topk_stage_local[0, 0].tolist() == [0, 1, 2, 3, 9, -1]
+    assert rank1.query_token_ids == (11, 16)
+    assert rank1.raw_token_ids == tuple(range(8, 18))
+    assert rank1.compressed_entry_ids == (2, 3)
+    assert rank1.topk_stage_local[0, 0].tolist() == [0, 1, 2, 3, 10, -1]
+    assert rank1.topk_stage_local[0, 1].tolist() == [5, 6, 7, 8, 11, -1]
+
+
 def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
     stage = build_stage_local_topk_for_csa(
@@ -309,6 +354,19 @@ def _layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:
             token_counts_by_rank=(8, 10),
         ),
         spec=Dsv4CompressionSpec(kind=kind, ratio=4),
+    )
+
+
+def _stage_plan(
+    *,
+    stage_index: int,
+    q_ranges: tuple[tuple[int, int], ...],
+    k_ranges: tuple[tuple[int, int], ...],
+) -> _StagePlan:
+    return _StagePlan(
+        stage_index=stage_index,
+        global_q_ranges=tuple(_Range(start=start, end=end) for start, end in q_ranges),
+        global_k_ranges=tuple(_Range(start=start, end=end) for start, end in k_ranges),
     )
 
 

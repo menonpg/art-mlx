@@ -15,6 +15,7 @@ from .types import (
     Dsv4MaterializedStage,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
+    Dsv4StagePlanGroup,
     Dsv4TensorExchangePlan,
 )
 
@@ -235,6 +236,67 @@ def build_stage_local_topk_for_hca(
         window_size=window_size,
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
+    )
+
+
+def build_dsv4_stage_plan_group_from_stage_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plans_by_rank: Sequence[Any],
+    compression_kind: Dsv4CompressionKind,
+    global_topk_indices_by_rank: Sequence[torch.Tensor] | None = None,
+    topk_query_token_ids_by_rank: Sequence[Sequence[int]] | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4StagePlanGroup:
+    """Derive DSV4 main-attention metadata from one ART `StagePlan` slot.
+
+    This is host/index metadata plus optional CSA topk row selection only. It
+    uses ART's planned query/K ranges without calling the generic Flex executor.
+    """
+    stage_plans = tuple(stage_plans_by_rank)
+    _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
+    stage_index = _shared_stage_index(stage_plans)
+    if compression_kind == Dsv4CompressionKind.CSA:
+        if global_topk_indices_by_rank is None or topk_query_token_ids_by_rank is None:
+            raise RuntimeError("DSV4 CSA StagePlan conversion requires global topk")
+        if len(global_topk_indices_by_rank) != len(stage_plans) or len(
+            topk_query_token_ids_by_rank
+        ) != len(stage_plans):
+            raise RuntimeError("DSV4 CSA topk metadata must have one entry per rank")
+    elif (
+        global_topk_indices_by_rank is not None
+        or topk_query_token_ids_by_rank is not None
+    ):
+        raise RuntimeError("DSV4 HCA StagePlan conversion does not consume topk")
+
+    stage_inputs = []
+    for rank, stage_plan in enumerate(stage_plans):
+        query_ids = _token_ids_from_ranges(stage_plan.global_q_ranges)
+        topk = None
+        if compression_kind == Dsv4CompressionKind.CSA:
+            topk = _select_topk_for_query_ids(
+                global_topk=global_topk_indices_by_rank[rank],  # type: ignore[index]
+                global_query_token_ids=topk_query_token_ids_by_rank[rank],  # type: ignore[index]
+                selected_query_token_ids=query_ids,
+            )
+        stage_inputs.append(
+            build_dsv4_stage_inputs(
+                layout=layout,
+                stage_index=stage_index,
+                query_token_ids=query_ids,
+                global_k_ranges=stage_plan.global_k_ranges,
+                compression_kind=compression_kind,
+                global_topk=topk,
+                window_size=window_size,
+                raw_list_size=raw_list_size,
+                compressed_list_size=compressed_list_size,
+            )
+        )
+    return Dsv4StagePlanGroup(
+        stage_index=stage_index,
+        stage_inputs_by_rank=tuple(stage_inputs),
     )
 
 
@@ -548,6 +610,67 @@ def _stage_raw_token_ids(
                 seen.add(token_id)
                 token_ids.append(token_id)
     return tuple(token_ids)
+
+
+def _validate_stage_plan_count(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plans_by_rank: Sequence[Any],
+) -> None:
+    if len(stage_plans_by_rank) != len(layout.entry_ids_by_owner_rank):
+        raise RuntimeError(
+            "DSV4 StagePlan conversion requires one ART StagePlan per rank, got "
+            f"{len(stage_plans_by_rank)} vs {len(layout.entry_ids_by_owner_rank)}"
+        )
+
+
+def _shared_stage_index(stage_plans: Sequence[Any]) -> int:
+    stage_indices = tuple(int(stage_plan.stage_index) for stage_plan in stage_plans)
+    if len(set(stage_indices)) != 1:
+        raise RuntimeError(
+            f"DSV4 StagePlan conversion requires one shared stage index, got {stage_indices}"
+        )
+    return stage_indices[0]
+
+
+def _token_ids_from_ranges(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
+    token_ids: list[int] = []
+    for range_ in ranges:
+        token_ids.extend(range(int(range_.start), int(range_.end)))
+    _row_by_id(tensor_ids=tuple(token_ids), name="stage_plan_token_ranges")
+    return tuple(token_ids)
+
+
+def _select_topk_for_query_ids(
+    *,
+    global_topk: torch.Tensor,
+    global_query_token_ids: Sequence[int],
+    selected_query_token_ids: Sequence[int],
+) -> torch.Tensor:
+    if global_topk.ndim != 3:
+        raise RuntimeError(
+            f"DSV4 global topk must be [B,Q,K], got {tuple(global_topk.shape)}"
+        )
+    global_ids = tuple(int(token_id) for token_id in global_query_token_ids)
+    if len(global_ids) != int(global_topk.shape[1]):
+        raise RuntimeError(
+            "DSV4 global topk query ids must match Q dim, got "
+            f"{len(global_ids)} vs {int(global_topk.shape[1])}"
+        )
+    row_by_id = _row_by_id(
+        tensor_ids=global_ids,
+        name="global_topk_query_token_ids",
+    )
+    selected_ids = tuple(int(token_id) for token_id in selected_query_token_ids)
+    missing = tuple(token_id for token_id in selected_ids if token_id not in row_by_id)
+    if missing:
+        raise RuntimeError(f"DSV4 stage query ids missing from global topk: {missing}")
+    index = torch.tensor(
+        tuple(row_by_id[token_id] for token_id in selected_ids),
+        device=global_topk.device,
+        dtype=torch.long,
+    )
+    return global_topk.index_select(1, index)
 
 
 def _ids_by_owner_rank(

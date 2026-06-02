@@ -11,6 +11,7 @@ from art.megatron.dsv4 import (
     Dsv4TopkResult,
     build_dsv4_compressed_layout,
     build_dsv4_indexer_kv_exchange_peer_plans,
+    build_dsv4_indexer_stage_plan_from_stage_plans,
     build_indexer_visibility_mask,
     compute_indexer_scores,
     compute_indexer_stage_topk,
@@ -35,6 +36,14 @@ class _Range(BaseModel):
 
     start: int
     end: int
+
+
+class _StagePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage_index: int
+    global_q_ranges: tuple[_Range, ...]
+    global_k_ranges: tuple[_Range, ...]
 
 
 def test_indexer_visibility_respects_shared_prefix_and_sibling_boundaries() -> None:
@@ -222,6 +231,28 @@ def test_indexer_kv_exchange_peer_plan_uses_compressed_ownership() -> None:
             layout=layout,
             candidate_entry_ids_by_rank=((9,), (1,)),
         )
+
+
+def test_indexer_stage_plan_derives_queries_and_candidates_from_art_stage_plan() -> (
+    None
+):
+    layout = _layout()
+
+    plan = build_dsv4_indexer_stage_plan_from_stage_plans(
+        layout=layout,
+        stage_plans_by_rank=(
+            _stage_plan(stage_index=3, q_ranges=((7, 8),), k_ranges=((4, 13),)),
+            _stage_plan(
+                stage_index=3,
+                q_ranges=((11, 12), (16, 17)),
+                k_ranges=((8, 18),),
+            ),
+        ),
+    )
+
+    assert plan.stage_index == 3
+    assert plan.query_token_ids_by_rank == ((7,), (11, 16))
+    assert plan.candidate_entry_ids_by_rank == ((1, 2), (2, 3))
 
 
 def test_exchanged_indexer_topk_merges_stage_work_results() -> None:
@@ -419,6 +450,19 @@ def _layout() -> Dsv4CompressedLayout:
             token_counts_by_rank=(8, 10),
         ),
         spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
+    )
+
+
+def _stage_plan(
+    *,
+    stage_index: int,
+    q_ranges: tuple[tuple[int, int], ...],
+    k_ranges: tuple[tuple[int, int], ...],
+) -> _StagePlan:
+    return _StagePlan(
+        stage_index=stage_index,
+        global_q_ranges=tuple(_Range(start=start, end=end) for start, end in q_ranges),
+        global_k_ranges=tuple(_Range(start=start, end=end) for start, end in k_ranges),
     )
 
 

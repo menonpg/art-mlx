@@ -161,6 +161,21 @@ class Dsv4StageInputs(BaseModel):
     topk_stage_local: torch.Tensor
 
 
+class Dsv4IndexerStagePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage_index: int
+    query_token_ids_by_rank: tuple[tuple[int, ...], ...]
+    candidate_entry_ids_by_rank: tuple[tuple[int, ...], ...]
+
+
+class Dsv4StagePlanGroup(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    stage_index: int
+    stage_inputs_by_rank: tuple[Dsv4StageInputs, ...]
+
+
 class Dsv4MaterializedStage(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -285,6 +300,8 @@ Dsv4TensorIdBuffer.model_rebuild()
 Dsv4CompressionHaloPayload.model_rebuild()
 Dsv4CompressionHaloGradientPayload.model_rebuild()
 Dsv4StageInputs.model_rebuild()
+Dsv4IndexerStagePlan.model_rebuild()
+Dsv4StagePlanGroup.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
 Dsv4SparseForwardResult.model_rebuild()
 Dsv4SparseBackwardResult.model_rebuild()
