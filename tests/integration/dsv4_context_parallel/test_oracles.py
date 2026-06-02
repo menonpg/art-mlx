@@ -882,6 +882,30 @@ def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle_cuda_
         init_path.unlink()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or not cast(Any, torch.distributed).is_nccl_available(),
+    reason="DSV4 HCA ratio-128 real-Miles CUDA/NCCL oracle requires two CUDA devices and NCCL",
+)
+def test_distributed_projected_hca_ratio128_real_miles_boundary_matches_packed_oracle_cuda_nccl(
+    tmp_path: Path,
+) -> None:
+    _ensure_miles_sparse_available()
+    init_path = tmp_path / "dsv4_projected_hca_ratio128_real_miles_oracle_nccl"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_hca_ratio128_real_miles_nccl_oracle_worker,
+        args=(2, str(init_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     max_visible = max(
         sum(
@@ -2726,6 +2750,48 @@ def _distributed_projected_hca_ratio128_nccl_oracle_worker(
             dtype=torch.float32,
             rtol=1e-4,
             atol=1e-4,
+        )
+        torch.cuda.synchronize(device)
+    finally:
+        destroy_process_group()
+
+
+def _distributed_projected_hca_ratio128_real_miles_nccl_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+) -> None:
+    _add_miles_path_to_sys_path()
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29649")
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        layout = _hca_ratio128_boundary_layout()
+        _run_distributed_projected_hca_oracle_case(
+            rank=rank,
+            layout=layout,
+            stage_plan_slots=_two_rank_full_stage_slot(
+                first_rank_end=96,
+                token_count=416,
+            ),
+            local_token_ids=tuple(range(0, 96)) if rank == 0 else tuple(range(96, 416)),
+            token_count=416,
+            seed=155,
+            expect_rank0_halo_grad=True,
+            device=device,
+            dtype=torch.bfloat16,
+            head_count=64,
+            head_dim=512,
+            scale=1.0 / (512**0.5),
+            mean_abs_pct_threshold=3.0,
+            grad_mean_abs_pct_threshold=5.0,
         )
         torch.cuda.synchronize(device)
     finally:

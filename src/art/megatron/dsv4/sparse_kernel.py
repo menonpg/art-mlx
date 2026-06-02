@@ -13,6 +13,9 @@ _LOG2E = 1.0 / _LN2
 
 _SparseFwd = Callable[..., tuple[torch.Tensor, torch.Tensor]]
 _SparseBwd = Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+_SparseKernelFactory = Callable[..., Callable[..., torch.Tensor]]
+_MILES_DIRECT_BWD_TOPK = 32
+_MILES_CHUNKED_BWD_TOPK = 64
 
 
 def dsv4_sparse_fwd(
@@ -105,32 +108,56 @@ def dsv4_sparse_bwd(
     topk_i32, row_has_key = _safe_topk_for_miles(topk)
     output_row_mask = row_has_key.unsqueeze(-1).unsqueeze(-1)
     lse_row_mask = row_has_key.unsqueeze(-1)
-    _, bwd = _load_miles_sparse_mla()
-    dq, dkv, d_attn_sink = bwd(
-        q.contiguous(),
-        kv.contiguous(),
-        attn_sink.to(dtype=torch.float32).contiguous(),
+    replay_out = (
         torch.where(
             output_row_mask,
             global_out,
             torch.zeros_like(global_out),
         )
         .to(dtype=q.dtype)
-        .contiguous(),
+        .contiguous()
+    )
+    replay_grad_out = (
         torch.where(
             output_row_mask,
             grad_out,
             torch.zeros_like(grad_out),
         )
         .to(dtype=q.dtype)
-        .contiguous(),
-        topk_i32,
+        .contiguous()
+    )
+    replay_lse_log2 = (
         torch.where(lse_row_mask, global_lse, torch.zeros_like(global_lse))
         .mul(_LOG2E)
         .to(dtype=torch.float32)
-        .contiguous(),
-        sm_scale=scale,
+        .contiguous()
     )
+    q_contiguous = q.contiguous()
+    kv_contiguous = kv.contiguous()
+    sink_float = attn_sink.to(dtype=torch.float32).contiguous()
+    if int(topk_i32.shape[-1]) <= _MILES_DIRECT_BWD_TOPK:
+        _, bwd = _load_miles_sparse_mla()
+        dq, dkv, d_attn_sink = bwd(
+            q_contiguous,
+            kv_contiguous,
+            sink_float,
+            replay_out,
+            replay_grad_out,
+            topk_i32,
+            replay_lse_log2,
+            sm_scale=scale,
+        )
+    else:
+        dq, dkv, d_attn_sink = _chunked_miles_sparse_bwd(
+            q=q_contiguous,
+            kv=kv_contiguous,
+            attn_sink=sink_float,
+            topk=topk_i32,
+            global_out=replay_out,
+            grad_out=replay_grad_out,
+            global_lse_log2=replay_lse_log2,
+            scale=scale,
+        )
     return Dsv4SparseBackwardResult(
         dq=torch.where(output_row_mask, dq, torch.zeros_like(dq)),
         dkv=dkv,
@@ -214,6 +241,106 @@ def _safe_topk_for_miles(topk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return topk_i32, row_has_key
 
 
+def _chunked_miles_sparse_bwd(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk: torch.Tensor,
+    global_out: torch.Tensor,
+    grad_out: torch.Tensor,
+    global_lse_log2: torch.Tensor,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replay Miles backward in single-block chunks for long topk lists.
+
+    The current Miles DSV4 TileLang backward emits NaNs when its internal
+    32-key loop has `NS > 1`, even for all-valid topk. A 64-key single-block
+    kernel is finite on the DSV4 Flash shape and avoids excessive launch
+    count. Attention backward is additive over keys when replay receives the
+    global output and global LSE, so each chunk contributes one slice of
+    `dq/dkv`; the sink gradient is computed analytically once to avoid
+    duplicating it across chunks.
+    """
+    preprocess_factory, bwd_factory, postprocess_factory = (
+        _load_miles_sparse_mla_bwd_factories()
+    )
+    batch, query_count, head_count, head_dim = q.shape
+    kv_count = int(kv.shape[1])
+    chunk_size = _MILES_CHUNKED_BWD_TOPK
+    preprocess_kernel = preprocess_factory(batch, query_count, head_count, head_dim)
+    bwd_kernel = bwd_factory(
+        batch,
+        query_count,
+        kv_count,
+        head_count,
+        head_dim,
+        chunk_size,
+        sm_scale=scale,
+        block_size=chunk_size,
+    )
+    postprocess_kernel = postprocess_factory(batch, kv_count, head_dim)
+    delta = preprocess_kernel(global_out, grad_out)
+    dq_accum = torch.zeros_like(q, dtype=torch.float32)
+    dkv_accum = torch.zeros_like(kv, dtype=torch.float32)
+
+    for start in range(0, int(topk.shape[-1]), chunk_size):
+        chunk = topk[..., start : start + chunk_size]
+        if int(chunk.shape[-1]) < chunk_size:
+            pad = torch.full(
+                (*chunk.shape[:-1], chunk_size - int(chunk.shape[-1])),
+                -1,
+                device=chunk.device,
+                dtype=chunk.dtype,
+            )
+            chunk = torch.cat((chunk, pad), dim=-1)
+        chunk = chunk.contiguous()
+        ignored_sink_grad = torch.zeros_like(attn_sink)
+        chunk_dq = bwd_kernel(
+            q,
+            kv,
+            grad_out,
+            attn_sink,
+            chunk,
+            global_lse_log2,
+            delta,
+            dkv_accum,
+            ignored_sink_grad,
+        )
+        dq_accum.add_(chunk_dq.float())
+
+    dkv = postprocess_kernel(dkv_accum)
+    return (
+        dq_accum.to(dtype=q.dtype),
+        dkv,
+        _analytic_attn_sink_grad(
+            attn_sink=attn_sink,
+            global_out=global_out,
+            grad_out=grad_out,
+            global_lse_log2=global_lse_log2,
+        ),
+    )
+
+
+def _analytic_attn_sink_grad(
+    *,
+    attn_sink: torch.Tensor,
+    global_out: torch.Tensor,
+    grad_out: torch.Tensor,
+    global_lse_log2: torch.Tensor,
+) -> torch.Tensor:
+    delta = (global_out.float() * grad_out.float()).sum(dim=-1)
+    global_lse = global_lse_log2.float() * _LN2
+    sink = attn_sink.float().reshape(1, 1, -1)
+    finite = torch.isfinite(global_lse) & torch.isfinite(sink)
+    p_sink = torch.where(
+        finite,
+        torch.exp(sink - global_lse),
+        torch.zeros_like(global_lse),
+    )
+    return -(delta * p_sink).sum(dim=(0, 1)).to(dtype=attn_sink.dtype)
+
+
 def _require_same_device(
     device: torch.device,
     **tensors: torch.Tensor,
@@ -237,3 +364,14 @@ def _load_miles_sparse_mla() -> tuple[_SparseFwd, _SparseBwd]:
         "miles_plugins.models.deepseek_v4.ops.kernel.tilelang_sparse_mla_bwd"
     )
     return fwd_module.sparse_mqa_fwd_interface, bwd_module.sparse_mqa_bwd_interface
+
+
+def _load_miles_sparse_mla_bwd_factories() -> tuple[
+    _SparseKernelFactory,
+    _SparseKernelFactory,
+    _SparseKernelFactory,
+]:
+    bwd_module = importlib.import_module(
+        "miles_plugins.models.deepseek_v4.ops.kernel.tilelang_sparse_mla_bwd"
+    )
+    return bwd_module.preprocess, bwd_module.bwd, bwd_module.postprocess

@@ -158,6 +158,98 @@ def test_sparse_bwd_casts_replay_tensors_to_q_dtype(
     }
 
 
+def test_sparse_bwd_chunks_long_topk_and_computes_sink_grad_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[torch.Tensor] = []
+
+    def fake_preprocess(
+        batch: int,
+        query_count: int,
+        head_count: int,
+        head_dim: int,
+    ):
+        del batch, query_count, head_count, head_dim
+
+        def kernel(o: torch.Tensor, do: torch.Tensor) -> torch.Tensor:
+            return (o.float() * do.float()).sum(dim=-1)
+
+        return kernel
+
+    def fake_bwd(
+        batch: int,
+        query_count: int,
+        kv_count: int,
+        head_count: int,
+        head_dim: int,
+        topk: int,
+        sm_scale: float | None = None,
+        block_size: int = 32,
+    ):
+        del batch, query_count, kv_count, head_count, head_dim, sm_scale
+        assert topk == 64
+        assert block_size == 64
+
+        def kernel(
+            q: torch.Tensor,
+            kv: torch.Tensor,
+            do: torch.Tensor,
+            attn_sink: torch.Tensor,
+            indices: torch.Tensor,
+            lse: torch.Tensor,
+            delta: torch.Tensor,
+            dkv: torch.Tensor,
+            d_attn_sink: torch.Tensor,
+        ) -> torch.Tensor:
+            del kv, do, attn_sink, lse, delta
+            calls.append(indices.detach().clone())
+            dkv.add_(1.0)
+            d_attn_sink.add_(999.0)
+            return torch.full_like(q, float(len(calls)))
+
+        return kernel
+
+    def fake_postprocess(batch: int, kv_count: int, head_dim: int):
+        del batch, kv_count, head_dim
+
+        def kernel(dkv: torch.Tensor) -> torch.Tensor:
+            return dkv
+
+        return kernel
+
+    monkeypatch.setattr(
+        sparse_kernel,
+        "_load_miles_sparse_mla_bwd_factories",
+        lambda: (fake_preprocess, fake_bwd, fake_postprocess),
+    )
+
+    q = torch.randn(1, 1, 2, 4)
+    kv = torch.randn(1, 3, 4)
+    global_out = torch.ones_like(q)
+    grad_out = torch.full_like(q, 2.0)
+    global_lse = torch.full(q.shape[:-1], math.log(4.0))
+    topk = torch.arange(96).reshape(1, 1, 96).remainder(3)
+
+    result = dsv4_sparse_bwd(
+        q=q,
+        kv=kv,
+        attn_sink=torch.tensor([0.0, float("-inf")]),
+        topk=topk,
+        global_out=global_out,
+        grad_out=grad_out,
+        global_lse=global_lse,
+        scale=0.25,
+    )
+
+    assert len(calls) == 2
+    assert calls[0].shape == (1, 1, 64)
+    assert calls[1].shape == (1, 1, 64)
+    assert calls[1][0, 0, 32:].tolist() == [-1] * 32
+    torch.testing.assert_close(result.dq, torch.full_like(q, 3.0))
+    torch.testing.assert_close(result.dkv, torch.full_like(kv, 2.0))
+    torch.testing.assert_close(result.d_attn_sink, torch.tensor([-2.0, 0.0]))
+
+
 def test_disabled_attn_sink_is_negative_infinity() -> None:
     sink = torch.randn(4)
     disabled = dsv4_disabled_attn_sink(sink)
