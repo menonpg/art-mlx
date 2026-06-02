@@ -95,6 +95,7 @@ def build_dsv4_stage_inputs(
     window_size: int = 128,
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
+    materialize_compressed_metadata: bool = True,
 ) -> Dsv4StageInputs:
     """Build DSV4 Miles-kernel stage metadata from ART CP stage ranges.
 
@@ -159,23 +160,49 @@ def build_dsv4_stage_inputs(
         )
         for query_id in query_ids
     )
-    compressed_by_query = _compressed_ids_by_query(
-        layout=layout,
-        query_token_ids=query_ids,
-        candidate_entry_ids=compressed_entry_ids,
-        compression_kind=compression_kind,
-        global_topk=topk,
-    )
-    local_topk = _build_stage_local_topk(
-        raw_by_query=raw_by_query,
-        compressed_by_query=compressed_by_query,
-        raw_local=raw_local,
-        compressed_local=compressed_local,
-        batch_size=batch_size,
-        raw_list_size=int(raw_list_size),
-        compressed_list_size=int(compressed_list_size),
-        device=topk.device if topk is not None else torch.device("cpu"),
-    )
+    if compression_kind == Dsv4CompressionKind.CSA:
+        if topk is None:
+            raise RuntimeError("DSV4 CSA stage remap requires global_topk")
+        local_topk = _build_csa_stage_local_topk_tensor(
+            layout=layout,
+            query_token_ids=query_ids,
+            raw_by_query=raw_by_query,
+            raw_local=raw_local,
+            raw_token_count=len(raw_token_ids),
+            candidate_entry_ids=compressed_entry_ids,
+            global_topk=topk,
+            raw_list_size=int(raw_list_size),
+            compressed_list_size=int(compressed_list_size),
+        )
+        compressed_by_query = (
+            _compressed_ids_by_query(
+                layout=layout,
+                query_token_ids=query_ids,
+                candidate_entry_ids=compressed_entry_ids,
+                compression_kind=compression_kind,
+                global_topk=topk,
+            )
+            if materialize_compressed_metadata
+            else ()
+        )
+    else:
+        compressed_by_query = _compressed_ids_by_query(
+            layout=layout,
+            query_token_ids=query_ids,
+            candidate_entry_ids=compressed_entry_ids,
+            compression_kind=compression_kind,
+            global_topk=topk,
+        )
+        local_topk = _build_stage_local_topk(
+            raw_by_query=raw_by_query,
+            compressed_by_query=compressed_by_query,
+            raw_local=raw_local,
+            compressed_local=compressed_local,
+            batch_size=batch_size,
+            raw_list_size=int(raw_list_size),
+            compressed_list_size=int(compressed_list_size),
+            device=topk.device if topk is not None else torch.device("cpu"),
+        )
 
     return Dsv4StageInputs(
         stage_index=int(stage_index),
@@ -204,6 +231,7 @@ def build_stage_local_topk_for_csa(
     window_size: int = 128,
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
+    materialize_compressed_metadata: bool = True,
 ) -> Dsv4StageInputs:
     return build_dsv4_stage_inputs(
         layout=layout,
@@ -215,6 +243,7 @@ def build_stage_local_topk_for_csa(
         window_size=window_size,
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
+        materialize_compressed_metadata=materialize_compressed_metadata,
     )
 
 
@@ -298,6 +327,7 @@ def build_dsv4_stage_inputs_from_stage_plan(
     window_size: int = 128,
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
+    materialize_compressed_metadata: bool = True,
 ) -> Dsv4StageInputs:
     """Build this rank's DSV4 stage inputs from one ART StagePlan."""
     query_ids = _token_ids_from_ranges(stage_plan.global_q_ranges)
@@ -323,6 +353,7 @@ def build_dsv4_stage_inputs_from_stage_plan(
         window_size=window_size,
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
+        materialize_compressed_metadata=materialize_compressed_metadata,
     )
 
 
@@ -384,6 +415,7 @@ def build_dsv4_stage_plan_group_from_stage_plans(
                 window_size=window_size,
                 raw_list_size=raw_list_size,
                 compressed_list_size=compressed_list_size,
+                materialize_compressed_metadata=True,
             )
         )
     return Dsv4StagePlanGroup(
@@ -1163,6 +1195,136 @@ def _compressed_ids_by_query(
             batch_rows.append(tuple(selected))
         rows_by_batch.append(tuple(batch_rows))
     return tuple(rows_by_batch)
+
+
+def _build_csa_stage_local_topk_tensor(
+    *,
+    layout: Dsv4CompressedLayout,
+    query_token_ids: tuple[int, ...],
+    raw_by_query: tuple[tuple[int, ...], ...],
+    raw_local: dict[int, int],
+    raw_token_count: int,
+    candidate_entry_ids: tuple[int, ...],
+    global_topk: torch.Tensor,
+    raw_list_size: int,
+    compressed_list_size: int,
+) -> torch.Tensor:
+    device = global_topk.device
+    batch_size, query_count, topk_size = global_topk.shape
+    local = torch.full(
+        (batch_size, query_count, raw_list_size + compressed_list_size),
+        _INVALID_INDEX,
+        device=device,
+        dtype=torch.int64,
+    )
+    _fill_raw_stage_local_topk(
+        local=local,
+        raw_by_query=raw_by_query,
+        raw_local=raw_local,
+        raw_list_size=raw_list_size,
+    )
+    if compressed_list_size == 0 or topk_size == 0 or not candidate_entry_ids:
+        return local
+
+    candidate_ids = torch.tensor(
+        candidate_entry_ids,
+        device=device,
+        dtype=torch.long,
+    )
+    candidate_local = torch.arange(
+        len(candidate_entry_ids), device=device, dtype=torch.long
+    ) + int(raw_token_count)
+    visible_mask = _compressed_visibility_mask(
+        layout=layout,
+        query_token_ids=query_token_ids,
+        candidate_entry_ids=candidate_entry_ids,
+        device=device,
+    )
+    topk_long = global_topk.to(dtype=torch.long)
+    matches = topk_long.unsqueeze(-1) == candidate_ids.view(1, 1, 1, -1)
+    visible_matches = matches & visible_mask.view(1, query_count, 1, -1)
+    valid = visible_matches.any(dim=-1)
+
+    local_values = torch.where(
+        visible_matches,
+        candidate_local.view(1, 1, 1, -1),
+        torch.zeros((), device=device, dtype=torch.long),
+    ).amax(dim=-1)
+    positions = torch.arange(topk_size, device=device, dtype=torch.long)
+    first_pos_by_candidate = torch.where(
+        matches,
+        positions.view(1, 1, topk_size, 1),
+        torch.full((), topk_size, device=device, dtype=torch.long),
+    ).amin(dim=2)
+    first_pos_for_topk = torch.where(
+        matches,
+        first_pos_by_candidate.unsqueeze(2),
+        torch.zeros((), device=device, dtype=torch.long),
+    ).amax(dim=-1)
+    valid = valid & (positions.view(1, 1, topk_size) == first_pos_for_topk)
+
+    invalid = torch.full_like(local_values, _INVALID_INDEX)
+    packed_values = torch.where(valid, local_values, invalid)
+    order = torch.where(
+        valid,
+        positions.view(1, 1, topk_size),
+        positions.view(1, 1, topk_size) + topk_size,
+    )
+    take = min(int(compressed_list_size), int(topk_size))
+    selected_positions = order.argsort(dim=-1)[..., :take]
+    selected = packed_values.gather(-1, selected_positions)
+    if take < int(compressed_list_size):
+        selected = torch.cat(
+            (
+                selected,
+                selected.new_full(
+                    (batch_size, query_count, int(compressed_list_size) - take),
+                    _INVALID_INDEX,
+                ),
+            ),
+            dim=-1,
+        )
+    local[:, :, raw_list_size : raw_list_size + compressed_list_size] = selected
+    return local
+
+
+def _fill_raw_stage_local_topk(
+    *,
+    local: torch.Tensor,
+    raw_by_query: tuple[tuple[int, ...], ...],
+    raw_local: dict[int, int],
+    raw_list_size: int,
+) -> None:
+    for query_idx, raw_ids in enumerate(raw_by_query):
+        selected_raw = raw_ids[-raw_list_size:] if raw_list_size > 0 else ()
+        for offset, token_id in enumerate(selected_raw):
+            local[:, query_idx, offset] = int(raw_local[int(token_id)])
+
+
+def _compressed_visibility_mask(
+    *,
+    layout: Dsv4CompressedLayout,
+    query_token_ids: tuple[int, ...],
+    candidate_entry_ids: tuple[int, ...],
+    device: torch.device,
+) -> torch.Tensor:
+    if not query_token_ids:
+        return torch.zeros(
+            (0, len(candidate_entry_ids)), device=device, dtype=torch.bool
+        )
+    rows = [
+        [
+            entry_id
+            in visible_entry_ids_for_query(
+                layout=layout,
+                query_token_id=query_id,
+                candidate_entry_ids=candidate_entry_ids,
+            )
+            for entry_id in candidate_entry_ids
+        ]
+        for query_id in query_token_ids
+    ]
+    return torch.tensor(rows, device=device, dtype=torch.bool)
 
 
 def _compressed_metadata_by_query(

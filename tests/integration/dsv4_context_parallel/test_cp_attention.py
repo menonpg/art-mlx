@@ -354,32 +354,43 @@ def test_csa_attention_forward_launcher_uses_local_topk_and_stage_slots(
         ),
     )
     attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    original_tolist = torch.Tensor.tolist
 
-    work = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
-        layout=layout,
-        rank=0,
-        stage_plan_slots=slots,
-        query=torch.zeros(2, 2, 3, dtype=torch.float64),
-        query_token_ids=(3, 7),
-        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
-        raw_token_ids=tuple(range(8)),
-        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
-        compressed_entry_ids=(0, 1),
-        indexer_q=torch.tensor(
-            [[[1.0, 0.0]], [[1.0, 0.0]]],
-            dtype=torch.float32,
-        ),
-        indexer_weights=torch.ones(2, 1, dtype=torch.float32),
-        indexer_kv=torch.tensor([[2.0, 0.0], [3.0, 0.0]], dtype=torch.float32),
-        indexer_kv_entry_ids=(0, 1),
-        indexer_topk=2,
-        attn_sink=attn_sink,
-        group=None,
-        async_op=True,
-        scale=0.25,
-        window_size=4,
-    )
-    result = work.wait_post_process()
+    def fail_tolist(tensor: torch.Tensor) -> list[object]:
+        raise AssertionError(f"unexpected Tensor.tolist on shape {tuple(tensor.shape)}")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", fail_tolist)
+    try:
+        work = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+            layout=layout,
+            rank=0,
+            stage_plan_slots=slots,
+            query=torch.zeros(2, 2, 3, dtype=torch.float64),
+            query_token_ids=(3, 7),
+            raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+            raw_token_ids=tuple(range(8)),
+            compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+            compressed_entry_ids=(0, 1),
+            indexer_q=torch.tensor(
+                [[[1.0, 0.0]], [[1.0, 0.0]]],
+                dtype=torch.float32,
+            ),
+            indexer_weights=torch.ones(2, 1, dtype=torch.float32),
+            indexer_kv=torch.tensor(
+                [[2.0, 0.0], [3.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            indexer_kv_entry_ids=(0, 1),
+            indexer_topk=2,
+            attn_sink=attn_sink,
+            group=None,
+            async_op=True,
+            scale=0.25,
+            window_size=4,
+        )
+        result = work.wait_post_process()
+    finally:
+        monkeypatch.setattr(torch.Tensor, "tolist", original_tolist)
 
     expected_out, expected_lse = merge_single_sink_branch(
         _stage_tensor(((1.0, 2.0),)),

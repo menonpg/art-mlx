@@ -812,6 +812,7 @@ def _launch_dsv4_stage_from_slot(
         window_size=window_size,
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
+        materialize_compressed_metadata=compression_kind != Dsv4CompressionKind.CSA,
     )
     return launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
         layout=layout,

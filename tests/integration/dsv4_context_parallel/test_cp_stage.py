@@ -126,6 +126,36 @@ def test_csa_stage_inputs_preserve_batch_specific_topk() -> None:
     assert stage.topk_stage_local[1, 0].tolist() == [0, 1, 2, 3, 10, -1]
 
 
+def test_csa_stage_inputs_tensorized_remap_filters_duplicates_without_metadata() -> (
+    None
+):
+    layout = _layout(Dsv4CompressionKind.CSA)
+    stage = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=4,
+        query_token_ids=(11,),
+        global_k_ranges=(_Range(start=8, end=13), _Range(start=13, end=18)),
+        global_topk=torch.tensor([[[2, 2, 3, 2, -1]]], dtype=torch.long),
+        window_size=4,
+        materialize_compressed_metadata=False,
+    )
+
+    assert stage.compressed_entry_ids == (2, 3)
+    assert stage.compressed_entry_ids_by_query == ((),)
+    assert stage.topk_stage_local.shape == (1, 1, 9)
+    assert stage.topk_stage_local[0, 0].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        10,
+        -1,
+        -1,
+        -1,
+        -1,
+    ]
+
+
 def test_hca_stage_inputs_include_all_visible_compressed_entries() -> None:
     layout = _layout(Dsv4CompressionKind.HCA)
     stage = build_stage_local_topk_for_hca(
