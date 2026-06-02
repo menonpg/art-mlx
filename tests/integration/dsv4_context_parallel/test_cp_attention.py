@@ -16,15 +16,19 @@ from art.megatron.dsv4 import (
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
+    Dsv4ContextParallelState,
     Dsv4ExchangedAttentionBackwardWork,
     Dsv4GradientOwnerBucket,
+    Dsv4IndexerStagePlan,
     Dsv4MaterializedStage,
+    Dsv4PreparedPlan,
     Dsv4SparseBackwardResult,
     Dsv4SparseForwardResult,
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
     Dsv4StagePlanGroup,
+    Dsv4StagePlanSlot,
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     build_dsv4_compressed_layout,
@@ -35,9 +39,12 @@ from art.megatron.dsv4 import (
     launch_dsv4_attention_backward_from_stage_plan_slots,
     launch_dsv4_attention_forward_from_stage_plan_groups,
     launch_dsv4_csa_attention_forward_from_stage_plan_slots,
+    launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
     launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
     launch_dsv4_hca_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_projected_attention_forward_from_context_parallel_state,
     launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_projected_attention_backward_from_context_parallel_state,
     launch_dsv4_projected_attention_backward_from_stage_plan_slots,
     launch_exchanged_dsv4_attention_backward,
     launch_exchanged_dsv4_attention_forward,
@@ -71,6 +78,19 @@ class _StagePlan(BaseModel):
     stage_index: int
     global_q_ranges: tuple[_Range, ...]
     global_k_ranges: tuple[_Range, ...]
+
+
+class _RankPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    rank: int
+
+
+class _CpState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    rank_plan: _RankPlan
+    cp_group: Any = None
 
 
 def _dense_attention_stats(
@@ -692,6 +712,162 @@ def test_hca_projected_attention_wraps_compression_and_backward(
     assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
 
 
+def test_csa_projected_attention_from_context_state_uses_prepared_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slots = _single_rank_slots()
+    indexer_stage_plans = _csa_indexer_stage_plans(layout=layout, slots=slots)
+    context_state = _context_state(
+        csa_layout=layout,
+        slots=slots,
+        csa_indexer_stage_plans=indexer_stage_plans,
+    )
+
+    def fail_indexer_stage_plan_build(**_kwargs: object) -> object:
+        raise AssertionError("unexpected CSA indexer StagePlan rebuild")
+
+    monkeypatch.setattr(
+        cp_attention,
+        "build_dsv4_indexer_stage_plan_from_stage_plans",
+        fail_indexer_stage_plan_build,
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    main_kv, main_gate, main_bias = _projected_inputs(width=6)
+    indexer_kv, indexer_gate, indexer_bias = _projected_inputs(width=4)
+
+    forward = launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
+        context_state=context_state,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        main_projected_kv=main_kv,
+        main_projected_gate=main_gate,
+        main_positional_bias=main_bias,
+        main_token_ids=tuple(range(8)),
+        indexer_projected_kv=indexer_kv,
+        indexer_projected_gate=indexer_gate,
+        indexer_positional_bias=indexer_bias,
+        indexer_token_ids=tuple(range(8)),
+        indexer_q=torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=torch.float64),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float64),
+        indexer_topk=2,
+        attn_sink=attn_sink,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+
+    assert forward.compression_kind == Dsv4CompressionKind.CSA
+    assert forward.main_compressed.compressed_entry_ids == (0, 1)
+    assert forward.indexer_compressed is not None
+    grad_out = torch.arange(
+        forward.attention.out.numel(),
+        dtype=forward.attention.out.dtype,
+    ).reshape_as(forward.attention.out)
+    backward = launch_dsv4_projected_attention_backward_from_context_parallel_state(
+        context_state=context_state,
+        forward_result=forward,
+        grad_out=grad_out,
+        async_op=True,
+    ).wait_post_process()
+
+    torch.testing.assert_close(
+        backward.attention.dcompressed_kv, _kv_rows((28.0, 29.0))
+    )
+    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+
+
+def test_hca_projected_attention_from_context_state_uses_prepared_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.HCA)
+    slots = _single_rank_slots()
+    context_state = _context_state(hca_layout=layout, slots=slots)
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    projected_kv, projected_gate, positional_bias = _projected_inputs(width=3)
+
+    forward = launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
+        context_state=context_state,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        token_ids=tuple(range(8)),
+        attn_sink=attn_sink,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+
+    assert forward.compression_kind == Dsv4CompressionKind.HCA
+    assert forward.indexer_compressed is None
+    grad_out = torch.arange(
+        forward.attention.out.numel(),
+        dtype=forward.attention.out.dtype,
+    ).reshape_as(forward.attention.out)
+    backward = launch_dsv4_projected_attention_backward_from_context_parallel_state(
+        context_state=context_state,
+        forward_result=forward,
+        grad_out=grad_out,
+        async_op=True,
+    ).wait_post_process()
+
+    torch.testing.assert_close(
+        backward.attention.dcompressed_kv, _kv_rows((28.0, 29.0))
+    )
+    assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
+
+
+def test_projected_attention_from_context_state_requires_prepared_layout() -> None:
+    context_state = _context_state(slots=_single_rank_slots())
+    with pytest.raises(RuntimeError, match="missing csa layout"):
+        launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
+            context_state=context_state,
+            query=torch.zeros(2, 2, 3, dtype=torch.float64),
+            query_token_ids=(3, 7),
+            raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+            raw_token_ids=tuple(range(8)),
+            main_projected_kv=torch.zeros(8, 6, dtype=torch.float64),
+            main_projected_gate=torch.zeros(8, 6, dtype=torch.float64),
+            main_positional_bias=torch.zeros(2, 3, dtype=torch.float64),
+            main_token_ids=tuple(range(8)),
+            indexer_projected_kv=torch.zeros(8, 4, dtype=torch.float64),
+            indexer_projected_gate=torch.zeros(8, 4, dtype=torch.float64),
+            indexer_positional_bias=torch.zeros(2, 2, dtype=torch.float64),
+            indexer_token_ids=tuple(range(8)),
+            indexer_q=torch.zeros(2, 1, 2, dtype=torch.float64),
+            indexer_weights=torch.ones(2, 1, dtype=torch.float64),
+            indexer_topk=2,
+            attn_sink=torch.zeros(2, dtype=torch.float64),
+            async_op=True,
+        )
+
+
 def test_exchanged_attention_forward_rejects_bad_stage_work() -> None:
     attn_sink = torch.zeros(2, dtype=torch.float64)
     with pytest.raises(ValueError, match="missing wait"):
@@ -1254,7 +1430,7 @@ def _single_rank_layout(
     )
 
 
-def _single_rank_slots() -> tuple[Any, ...]:
+def _single_rank_slots() -> tuple[Dsv4StagePlanSlot, ...]:
     return build_dsv4_stage_plan_slots(
         stage_plans_by_rank=(
             (
@@ -1265,6 +1441,39 @@ def _single_rank_slots() -> tuple[Any, ...]:
                 ),
             ),
         ),
+    )
+
+
+def _context_state(
+    *,
+    csa_layout: Dsv4CompressedLayout | None = None,
+    hca_layout: Dsv4CompressedLayout | None = None,
+    slots: tuple[Dsv4StagePlanSlot, ...] = (),
+    csa_indexer_stage_plans: tuple[Dsv4IndexerStagePlan, ...] = (),
+    rank: int = 0,
+) -> Dsv4ContextParallelState:
+    return Dsv4ContextParallelState(
+        cp_state=cast(Any, _CpState(rank_plan=_RankPlan(rank=rank))),
+        dsv4_plan=Dsv4PreparedPlan(
+            csa_layout=csa_layout,
+            hca_layout=hca_layout,
+            stage_plan_slots=slots,
+            csa_indexer_stage_plans=csa_indexer_stage_plans,
+        ),
+    )
+
+
+def _csa_indexer_stage_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    slots: tuple[Dsv4StagePlanSlot, ...],
+) -> tuple[Dsv4IndexerStagePlan, ...]:
+    return tuple(
+        cp_attention.build_dsv4_indexer_stage_plan_from_stage_plans(
+            layout=layout,
+            stage_plans_by_rank=slot.stage_plans_by_rank,
+        )
+        for slot in slots
     )
 
 
@@ -1280,7 +1489,7 @@ def _two_rank_layout() -> Dsv4CompressedLayout:
     )
 
 
-def _two_rank_slots() -> tuple[Any, ...]:
+def _two_rank_slots() -> tuple[Dsv4StagePlanSlot, ...]:
     return build_dsv4_stage_plan_slots(
         stage_plans_by_rank=(
             (

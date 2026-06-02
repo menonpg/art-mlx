@@ -31,6 +31,7 @@ from .types import (
     Dsv4CompressedKvForwardResult,
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
+    Dsv4ContextParallelState,
     Dsv4GradientOwnerBucket,
     Dsv4IndexerStagePlan,
     Dsv4MaterializedStage,
@@ -870,6 +871,82 @@ def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
 
 
 @torch.compiler.disable
+def launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
+    *,
+    context_state: Dsv4ContextParallelState,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    main_projected_kv: torch.Tensor,
+    main_projected_gate: torch.Tensor,
+    main_positional_bias: torch.Tensor,
+    main_token_ids: Sequence[int],
+    indexer_projected_kv: torch.Tensor,
+    indexer_projected_gate: torch.Tensor,
+    indexer_positional_bias: torch.Tensor,
+    indexer_token_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_topk: int,
+    attn_sink: torch.Tensor,
+    async_op: bool,
+    indexer_score_scale: float = 1.0,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ProjectedAttentionForwardWork:
+    """Launch projected-input CSA DSV4 CP from prepared DSV4 metadata.
+
+    This is the model-handler-facing adapter: it unpacks the host-ahead DSV4
+    plan from `Dsv4ContextParallelState` and delegates to the StagePlan-slot
+    launcher. It performs no activation-dependent planning and keeps custom
+    communication eager/outside compiled regions.
+    """
+    plan = context_state.dsv4_plan
+    layout = _require_prepared_layout(
+        context_state=context_state,
+        kind=Dsv4CompressionKind.CSA,
+    )
+    slots = _require_prepared_stage_slots(context_state)
+    indexer_stage_plans = tuple(plan.csa_indexer_stage_plans)
+    if not indexer_stage_plans:
+        raise RuntimeError(
+            "DSV4 prepared CSA context state is missing indexer StagePlans"
+        )
+    return launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=_prepared_rank(context_state),
+        stage_plan_slots=slots,
+        query=query,
+        query_token_ids=query_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        main_projected_kv=main_projected_kv,
+        main_projected_gate=main_projected_gate,
+        main_positional_bias=main_positional_bias,
+        main_token_ids=main_token_ids,
+        indexer_projected_kv=indexer_projected_kv,
+        indexer_projected_gate=indexer_projected_gate,
+        indexer_positional_bias=indexer_positional_bias,
+        indexer_token_ids=indexer_token_ids,
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_topk=indexer_topk,
+        attn_sink=attn_sink,
+        group=context_state.cp_state.cp_group,
+        async_op=async_op,
+        indexer_stage_plans=indexer_stage_plans,
+        indexer_score_scale=indexer_score_scale,
+        scale=scale,
+        window_size=window_size,
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
+    )
+
+
+@torch.compiler.disable
 def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
     *,
     layout: Dsv4CompressedLayout,
@@ -935,6 +1012,51 @@ def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
 
 
 @torch.compiler.disable
+def launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
+    *,
+    context_state: Dsv4ContextParallelState,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+    token_ids: Sequence[int],
+    attn_sink: torch.Tensor,
+    async_op: bool,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ProjectedAttentionForwardWork:
+    """Launch projected-input HCA DSV4 CP from prepared DSV4 metadata."""
+    return launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
+        layout=_require_prepared_layout(
+            context_state=context_state,
+            kind=Dsv4CompressionKind.HCA,
+        ),
+        rank=_prepared_rank(context_state),
+        stage_plan_slots=_require_prepared_stage_slots(context_state),
+        query=query,
+        query_token_ids=query_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        token_ids=token_ids,
+        attn_sink=attn_sink,
+        group=context_state.cp_state.cp_group,
+        async_op=async_op,
+        scale=scale,
+        window_size=window_size,
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
+    )
+
+
+@torch.compiler.disable
 def launch_dsv4_projected_attention_backward_from_stage_plan_slots(
     *,
     layout: Dsv4CompressedLayout,
@@ -977,6 +1099,35 @@ def launch_dsv4_projected_attention_backward_from_stage_plan_slots(
         forward_result=forward_result,
         group=group,
         async_op=async_op,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_projected_attention_backward_from_context_parallel_state(
+    *,
+    context_state: Dsv4ContextParallelState,
+    forward_result: Dsv4ProjectedAttentionForwardResult,
+    grad_out: torch.Tensor,
+    async_op: bool,
+    owned_query_token_ids: Sequence[int] | None = None,
+    owned_raw_token_ids: Sequence[int] | None = None,
+    owned_compressed_entry_ids: Sequence[int] | None = None,
+) -> Dsv4ProjectedAttentionBackwardWork:
+    """Replay projected-input DSV4 CP backward from prepared DSV4 metadata."""
+    return launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=_require_prepared_layout(
+            context_state=context_state,
+            kind=forward_result.compression_kind,
+        ),
+        rank=_prepared_rank(context_state),
+        stage_plan_slots=_require_prepared_stage_slots(context_state),
+        forward_result=forward_result,
+        grad_out=grad_out,
+        group=context_state.cp_state.cp_group,
+        async_op=async_op,
+        owned_query_token_ids=owned_query_token_ids,
+        owned_raw_token_ids=owned_raw_token_ids,
+        owned_compressed_entry_ids=owned_compressed_entry_ids,
     )
 
 
@@ -1434,6 +1585,37 @@ def _validate_stage_plan_slots(
             raise RuntimeError(f"DSV4 duplicate StagePlan slot {stage_index}")
         seen.add(stage_index)
     return slots
+
+
+def _require_prepared_layout(
+    *,
+    context_state: Dsv4ContextParallelState,
+    kind: Dsv4CompressionKind,
+) -> Dsv4CompressedLayout:
+    if kind == Dsv4CompressionKind.CSA:
+        layout = context_state.dsv4_plan.csa_layout
+    elif kind == Dsv4CompressionKind.HCA:
+        layout = context_state.dsv4_plan.hca_layout
+    else:
+        raise RuntimeError(f"Unsupported DSV4 compression kind {kind}")
+    if layout is None:
+        raise RuntimeError(
+            f"DSV4 prepared context state is missing {kind.value} layout"
+        )
+    return layout
+
+
+def _require_prepared_stage_slots(
+    context_state: Dsv4ContextParallelState,
+) -> tuple[Dsv4StagePlanSlot, ...]:
+    slots = tuple(context_state.dsv4_plan.stage_plan_slots)
+    if not slots:
+        raise RuntimeError("DSV4 prepared context state is missing StagePlan slots")
+    return slots
+
+
+def _prepared_rank(context_state: Dsv4ContextParallelState) -> int:
+    return int(context_state.cp_state.rank_plan.rank)
 
 
 def _stage_plan_slot_gradient_id_spaces(
