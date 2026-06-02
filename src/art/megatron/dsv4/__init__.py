@@ -16,9 +16,11 @@ from .compressor import (
     pack_dsv4_compression_halo_payloads,
 )
 from .cp_attention import (
+    Dsv4GradientOwnerExchangeWork,
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     compute_single_sink_grad,
+    launch_dsv4_gradient_owner_bucket_exchange,
     merge_materialized_stage_records,
     merge_single_sink_branch,
     merge_stage_outputs,
@@ -95,6 +97,7 @@ __all__ = [
     "Dsv4CompressionSpec",
     "Dsv4ContextParallelState",
     "Dsv4GradientOwnerBucket",
+    "Dsv4GradientOwnerExchangeWork",
     "Dsv4HaloTransfer",
     "Dsv4MaterializedStage",
     "Dsv4PreparedPlan",
@@ -133,6 +136,7 @@ __all__ = [
     "launch_dsv4_tensor_exchange",
     "launch_dsv4_compression_halo_exchange",
     "launch_dsv4_compression_halo_gradient_exchange",
+    "launch_dsv4_gradient_owner_bucket_exchange",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
     "merge_materialized_stage_records",

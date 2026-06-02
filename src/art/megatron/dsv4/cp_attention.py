@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
 from . import sparse_kernel
+from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
@@ -14,7 +17,97 @@ from .types import (
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
+    Dsv4TensorExchangePlan,
 )
+
+
+class Dsv4GradientOwnerExchangeWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    rank: int
+    rank_count: int
+    recv_query_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    query_head_count: int
+    query_head_dim: int
+    query_work: Dsv4TensorExchangeWork
+    raw_work: Dsv4TensorExchangeWork
+    compressed_work: Dsv4TensorExchangeWork
+
+    def wait(self) -> None:
+        self.query_work.wait()
+        self.raw_work.wait()
+        self.compressed_work.wait()
+
+    def wait_post_process(self) -> tuple[Dsv4GradientOwnerBucket, ...]:
+        query_result = self.query_work.wait_post_process()
+        raw_result = self.raw_work.wait_post_process()
+        compressed_result = self.compressed_work.wait_post_process()
+        _validate_owner_exchange_result_ids(
+            actual=query_result.ids,
+            expected=_wire_peer_ids_by_peer(
+                ids_by_peer=self.recv_query_token_ids_by_peer,
+                rank_count=int(self.rank_count),
+            ),
+            name="query",
+        )
+        _validate_owner_exchange_result_ids(
+            actual=raw_result.ids,
+            expected=_wire_peer_ids_by_peer(
+                ids_by_peer=self.recv_raw_token_ids_by_peer,
+                rank_count=int(self.rank_count),
+            ),
+            name="raw",
+        )
+        _validate_owner_exchange_result_ids(
+            actual=compressed_result.ids,
+            expected=_wire_peer_ids_by_peer(
+                ids_by_peer=self.recv_compressed_entry_ids_by_peer,
+                rank_count=int(self.rank_count),
+            ),
+            name="compressed",
+        )
+
+        query_tensor = query_result.tensor.reshape(
+            int(query_result.tensor.shape[0]),
+            int(query_result.tensor.shape[1]),
+            int(self.query_head_count),
+            int(self.query_head_dim),
+        )
+        buckets: list[Dsv4GradientOwnerBucket] = []
+        q_cursor = 0
+        raw_cursor = 0
+        compressed_cursor = 0
+        for peer in range(int(self.rank_count)):
+            query_ids = self.recv_query_token_ids_by_peer[peer]
+            raw_ids = self.recv_raw_token_ids_by_peer[peer]
+            compressed_ids = self.recv_compressed_entry_ids_by_peer[peer]
+            q_count = len(query_ids)
+            raw_count = len(raw_ids)
+            compressed_count = len(compressed_ids)
+            if q_count or raw_count or compressed_count:
+                buckets.append(
+                    Dsv4GradientOwnerBucket(
+                        owner_rank=int(self.rank),
+                        query_token_ids=query_ids,
+                        raw_token_ids=raw_ids,
+                        compressed_entry_ids=compressed_ids,
+                        dq=query_tensor[:, q_cursor : q_cursor + q_count],
+                        draw_kv=raw_result.tensor[
+                            :,
+                            raw_cursor : raw_cursor + raw_count,
+                        ],
+                        dcompressed_kv=compressed_result.tensor[
+                            :,
+                            compressed_cursor : compressed_cursor + compressed_count,
+                        ],
+                    )
+                )
+            q_cursor += q_count
+            raw_cursor += raw_count
+            compressed_cursor += compressed_count
+        return tuple(buckets)
 
 
 def _accum_output_dtype(input_dtype: torch.dtype) -> torch.dtype:
@@ -482,6 +575,158 @@ def pack_dsv4_gradient_owner_buckets(
     return tuple(buckets)
 
 
+@torch.compiler.disable
+def launch_dsv4_gradient_owner_bucket_exchange(
+    *,
+    gradients: Dsv4AttentionGradientResult,
+    query_owner_ranks: Sequence[int],
+    raw_owner_ranks: Sequence[int],
+    compressed_owner_ranks: Sequence[int],
+    recv_query_token_ids_by_peer: Sequence[Sequence[int]],
+    recv_raw_token_ids_by_peer: Sequence[Sequence[int]],
+    recv_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
+    rank: int,
+    rank_count: int,
+    group: Any,
+    async_op: bool,
+) -> Dsv4GradientOwnerExchangeWork:
+    """Launch distributed owner reduction payload exchange for DSV4 grads.
+
+    This is an eager DSV4 communication boundary. Actual ids may repeat across
+    source ranks, so the wire id includes the source rank; `wait_post_process`
+    converts received rows back to ordinary `Dsv4GradientOwnerBucket`s and
+    leaves summation to `accumulate_dsv4_gradient_owner_buckets`.
+    """
+    _validate_gradient_result_shapes(gradients)
+    rank = int(rank)
+    rank_count = int(rank_count)
+    _validate_exchange_rank(rank=rank, rank_count=rank_count)
+    recv_query = _normalize_peer_ids(
+        recv_query_token_ids_by_peer,
+        rank_count=rank_count,
+        name="recv_query_token_ids_by_peer",
+    )
+    recv_raw = _normalize_peer_ids(
+        recv_raw_token_ids_by_peer,
+        rank_count=rank_count,
+        name="recv_raw_token_ids_by_peer",
+    )
+    recv_compressed = _normalize_peer_ids(
+        recv_compressed_entry_ids_by_peer,
+        rank_count=rank_count,
+        name="recv_compressed_entry_ids_by_peer",
+    )
+    buckets = pack_dsv4_gradient_owner_buckets(
+        gradients=gradients,
+        query_owner_ranks=query_owner_ranks,
+        raw_owner_ranks=raw_owner_ranks,
+        compressed_owner_ranks=compressed_owner_ranks,
+    )
+    query_tensor, query_ids, query_send = _pack_owner_exchange_rows(
+        rows_by_owner=tuple(
+            (
+                bucket.owner_rank,
+                bucket.query_token_ids,
+                bucket.dq.flatten(2),
+            )
+            for bucket in buckets
+        ),
+        empty=gradients.dq.flatten(2).new_empty(
+            (
+                int(gradients.dq.shape[0]),
+                0,
+                int(gradients.dq.shape[2]) * int(gradients.dq.shape[3]),
+            )
+        ),
+        rank=rank,
+        rank_count=rank_count,
+        name="query owner gradients",
+    )
+    raw_tensor, raw_ids, raw_send = _pack_owner_exchange_rows(
+        rows_by_owner=tuple(
+            (bucket.owner_rank, bucket.raw_token_ids, bucket.draw_kv)
+            for bucket in buckets
+        ),
+        empty=gradients.draw_kv.new_empty(
+            (int(gradients.draw_kv.shape[0]), 0, int(gradients.draw_kv.shape[-1]))
+        ),
+        rank=rank,
+        rank_count=rank_count,
+        name="raw owner gradients",
+    )
+    compressed_tensor, compressed_ids, compressed_send = _pack_owner_exchange_rows(
+        rows_by_owner=tuple(
+            (
+                bucket.owner_rank,
+                bucket.compressed_entry_ids,
+                bucket.dcompressed_kv,
+            )
+            for bucket in buckets
+        ),
+        empty=gradients.dcompressed_kv.new_empty(
+            (
+                int(gradients.dcompressed_kv.shape[0]),
+                0,
+                int(gradients.dcompressed_kv.shape[-1]),
+            )
+        ),
+        rank=rank,
+        rank_count=rank_count,
+        name="compressed owner gradients",
+    )
+    return Dsv4GradientOwnerExchangeWork(
+        rank=rank,
+        rank_count=rank_count,
+        recv_query_token_ids_by_peer=recv_query,
+        recv_raw_token_ids_by_peer=recv_raw,
+        recv_compressed_entry_ids_by_peer=recv_compressed,
+        query_head_count=int(gradients.dq.shape[2]),
+        query_head_dim=int(gradients.dq.shape[3]),
+        query_work=launch_dsv4_tensor_exchange(
+            tensor=query_tensor,
+            tensor_ids=query_ids,
+            plan=Dsv4TensorExchangePlan(
+                send_ids_by_peer=query_send,
+                recv_ids_by_peer=_wire_peer_ids_by_peer(
+                    ids_by_peer=recv_query,
+                    rank_count=rank_count,
+                ),
+            ),
+            group=group,
+            async_op=async_op,
+            label="dsv4_gradient_owner_query_exchange",
+        ),
+        raw_work=launch_dsv4_tensor_exchange(
+            tensor=raw_tensor,
+            tensor_ids=raw_ids,
+            plan=Dsv4TensorExchangePlan(
+                send_ids_by_peer=raw_send,
+                recv_ids_by_peer=_wire_peer_ids_by_peer(
+                    ids_by_peer=recv_raw,
+                    rank_count=rank_count,
+                ),
+            ),
+            group=group,
+            async_op=async_op,
+            label="dsv4_gradient_owner_raw_exchange",
+        ),
+        compressed_work=launch_dsv4_tensor_exchange(
+            tensor=compressed_tensor,
+            tensor_ids=compressed_ids,
+            plan=Dsv4TensorExchangePlan(
+                send_ids_by_peer=compressed_send,
+                recv_ids_by_peer=_wire_peer_ids_by_peer(
+                    ids_by_peer=recv_compressed,
+                    rank_count=rank_count,
+                ),
+            ),
+            group=group,
+            async_op=async_op,
+            label="dsv4_gradient_owner_compressed_exchange",
+        ),
+    )
+
+
 def accumulate_dsv4_gradient_owner_buckets(
     *,
     buckets: Sequence[Dsv4GradientOwnerBucket],
@@ -620,6 +865,112 @@ def compute_single_sink_grad(
     p_sink = _safe_exp_diff(sink_lse, global_lse)
     reduce_dims = tuple(range(delta.ndim - 1))
     return -(delta * p_sink).sum(dim=reduce_dims)
+
+
+def _pack_owner_exchange_rows(
+    *,
+    rows_by_owner: Sequence[tuple[int, tuple[int, ...], torch.Tensor]],
+    empty: torch.Tensor,
+    rank: int,
+    rank_count: int,
+    name: str,
+) -> tuple[torch.Tensor, tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    send_ids_by_peer: list[tuple[int, ...]] = [() for _ in range(rank_count)]
+    tensor_ids: list[int] = []
+    pieces: list[torch.Tensor] = []
+    for owner_rank, row_ids, rows in rows_by_owner:
+        owner_rank = int(owner_rank)
+        _validate_exchange_rank(rank=owner_rank, rank_count=rank_count)
+        if rows.ndim != 3:
+            raise ValueError(f"DSV4 {name} rows must be [B,N,D], got {rows.shape}")
+        if int(rows.shape[1]) != len(row_ids):
+            raise ValueError(f"DSV4 {name} row count does not match ids")
+        wire_ids = _wire_ids_for_peer(
+            source_rank=rank,
+            rank_count=rank_count,
+            ids=row_ids,
+        )
+        if send_ids_by_peer[owner_rank]:
+            raise ValueError(f"DSV4 {name} has duplicate owner rank {owner_rank}")
+        send_ids_by_peer[owner_rank] = wire_ids
+        tensor_ids.extend(wire_ids)
+        if row_ids:
+            pieces.append(rows)
+    if not pieces:
+        return empty, (), tuple(send_ids_by_peer)
+    return torch.cat(pieces, dim=1), tuple(tensor_ids), tuple(send_ids_by_peer)
+
+
+def _normalize_peer_ids(
+    ids_by_peer: Sequence[Sequence[int]],
+    *,
+    rank_count: int,
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    if len(ids_by_peer) != int(rank_count):
+        raise ValueError(
+            f"DSV4 {name} peer count {len(ids_by_peer)} does not match {rank_count}"
+        )
+    normalized: list[tuple[int, ...]] = []
+    for peer, ids in enumerate(ids_by_peer):
+        peer_ids = tuple(int(id_) for id_ in ids)
+        _validate_nonnegative_ids(peer_ids, name=f"{name}[{peer}]")
+        _row_by_id(ids=peer_ids, name=f"{name}[{peer}]")
+        normalized.append(peer_ids)
+    return tuple(normalized)
+
+
+def _wire_peer_ids_by_peer(
+    *,
+    ids_by_peer: tuple[tuple[int, ...], ...],
+    rank_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    return tuple(
+        _wire_ids_for_peer(
+            source_rank=peer,
+            rank_count=rank_count,
+            ids=peer_ids,
+        )
+        for peer, peer_ids in enumerate(ids_by_peer)
+    )
+
+
+def _wire_ids_for_peer(
+    *,
+    source_rank: int,
+    rank_count: int,
+    ids: Sequence[int],
+) -> tuple[int, ...]:
+    _validate_exchange_rank(rank=source_rank, rank_count=rank_count)
+    ids = tuple(int(id_) for id_ in ids)
+    _validate_nonnegative_ids(ids, name="owner exchange ids")
+    return tuple(int(id_) * int(rank_count) + int(source_rank) for id_ in ids)
+
+
+def _validate_owner_exchange_result_ids(
+    *,
+    actual: tuple[int, ...],
+    expected: tuple[tuple[int, ...], ...],
+    name: str,
+) -> None:
+    flat_expected = tuple(id_ for peer_ids in expected for id_ in peer_ids)
+    if actual != flat_expected:
+        raise RuntimeError(
+            f"DSV4 {name} owner exchange received ids {actual} "
+            f"but expected {flat_expected}"
+        )
+
+
+def _validate_exchange_rank(*, rank: int, rank_count: int) -> None:
+    if int(rank) < 0 or int(rank) >= int(rank_count):
+        raise ValueError(
+            f"DSV4 exchange rank {rank} is outside rank count {rank_count}"
+        )
+
+
+def _validate_nonnegative_ids(ids: Sequence[int], *, name: str) -> None:
+    if any(int(id_) < 0 for id_ in ids):
+        raise ValueError(f"DSV4 {name} must be non-negative")
 
 
 def _validate_gradient_result_shapes(gradients: Dsv4AttentionGradientResult) -> None:
