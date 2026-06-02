@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .compressor import build_dsv4_compressed_layout_from_cp_state
+from .cp_attention import build_dsv4_attention_backward_plan_from_stage_plan_slots
 from .cp_stage import (
     build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
     build_dsv4_stage_plan_slots,
@@ -133,6 +134,22 @@ def prepare_dsv4_context_parallel_state(
         if hca_layout is not None
         else ()
     )
+    csa_attention_backward_plan = (
+        build_dsv4_attention_backward_plan_from_stage_plan_slots(
+            layout=csa_layout,
+            stage_plan_slots=stage_slots,
+        )
+        if csa_layout is not None
+        else None
+    )
+    hca_attention_backward_plan = (
+        build_dsv4_attention_backward_plan_from_stage_plan_slots(
+            layout=hca_layout,
+            stage_plan_slots=stage_slots,
+        )
+        if hca_layout is not None
+        else None
+    )
     return Dsv4ContextParallelState(
         cp_state=cp_state,
         dsv4_plan=Dsv4PreparedPlan(
@@ -143,6 +160,8 @@ def prepare_dsv4_context_parallel_state(
             csa_indexer_kv_peer_plans_by_stage=csa_indexer_kv_peer_plans_by_stage,
             csa_stage_kv_peer_plans_by_slot=csa_stage_kv_peer_plans_by_slot,
             hca_stage_kv_peer_plans_by_slot=hca_stage_kv_peer_plans_by_slot,
+            csa_attention_backward_plan=csa_attention_backward_plan,
+            hca_attention_backward_plan=hca_attention_backward_plan,
         ),
         extra=dict(extra or {}),
     )

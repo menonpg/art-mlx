@@ -297,6 +297,31 @@ class Dsv4AttentionGradientResult(BaseModel):
     d_attn_sink: torch.Tensor
 
 
+class Dsv4AttentionBackwardRankPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    query_token_ids: tuple[int, ...]
+    raw_token_ids: tuple[int, ...]
+    compressed_entry_ids: tuple[int, ...]
+    query_owner_ranks: tuple[int, ...]
+    raw_owner_ranks: tuple[int, ...]
+    compressed_owner_ranks: tuple[int, ...]
+    recv_query_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    owned_query_token_ids: tuple[int, ...]
+    owned_raw_token_ids: tuple[int, ...]
+    owned_compressed_entry_ids: tuple[int, ...]
+
+
+class Dsv4AttentionBackwardPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    compression_kind: Dsv4CompressionKind
+    stage_indices: tuple[int, ...]
+    rank_plans: tuple[Dsv4AttentionBackwardRankPlan, ...]
+
+
 class Dsv4ProjectedAttentionForwardResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -354,6 +379,8 @@ class Dsv4PreparedPlan(BaseModel):
     hca_stage_kv_peer_plans_by_slot: tuple[
         tuple[Dsv4StageKvExchangePeerPlan, ...], ...
     ] = ()
+    csa_attention_backward_plan: Dsv4AttentionBackwardPlan | None = None
+    hca_attention_backward_plan: Dsv4AttentionBackwardPlan | None = None
 
 
 class Dsv4ContextParallelState(BaseModel):
@@ -386,6 +413,8 @@ Dsv4AttentionForwardResult.model_rebuild()
 Dsv4StageBackwardRecord.model_rebuild()
 Dsv4AttentionBackwardReplayResult.model_rebuild()
 Dsv4AttentionGradientResult.model_rebuild()
+Dsv4AttentionBackwardRankPlan.model_rebuild()
+Dsv4AttentionBackwardPlan.model_rebuild()
 Dsv4ProjectedAttentionForwardResult.model_rebuild()
 Dsv4ProjectedAttentionGradientResult.model_rebuild()
 Dsv4GradientOwnerBucket.model_rebuild()

@@ -25,6 +25,8 @@ from .indexer import (
     stage_candidate_entry_ids,
 )
 from .types import (
+    Dsv4AttentionBackwardPlan,
+    Dsv4AttentionBackwardRankPlan,
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
     Dsv4AttentionGradientResult,
@@ -1128,6 +1130,7 @@ def launch_dsv4_projected_attention_backward_from_stage_plan_slots(
     owned_query_token_ids: Sequence[int] | None = None,
     owned_raw_token_ids: Sequence[int] | None = None,
     owned_compressed_entry_ids: Sequence[int] | None = None,
+    backward_plan: Dsv4AttentionBackwardPlan | None = None,
 ) -> Dsv4ProjectedAttentionBackwardWork:
     """Replay DSV4 projected-input CP attention backward.
 
@@ -1152,6 +1155,7 @@ def launch_dsv4_projected_attention_backward_from_stage_plan_slots(
         owned_query_token_ids=owned_query_token_ids,
         owned_raw_token_ids=owned_raw_token_ids,
         owned_compressed_entry_ids=owned_compressed_entry_ids,
+        backward_plan=backward_plan,
     )
     return Dsv4ProjectedAttentionBackwardWork(
         attention_work=attention_work,
@@ -1184,9 +1188,47 @@ def launch_dsv4_projected_attention_backward_from_context_parallel_state(
         grad_out=grad_out,
         group=context_state.cp_state.cp_group,
         async_op=async_op,
+        backward_plan=_prepared_attention_backward_plan(
+            context_state=context_state,
+            kind=forward_result.compression_kind,
+        ),
         owned_query_token_ids=owned_query_token_ids,
         owned_raw_token_ids=owned_raw_token_ids,
         owned_compressed_entry_ids=owned_compressed_entry_ids,
+    )
+
+
+@torch.compiler.disable
+def build_dsv4_attention_backward_plan_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+) -> Dsv4AttentionBackwardPlan:
+    """Precompute DSV4 backward owner-gradient metadata from StagePlan slots.
+
+    This is host-only DSV4 planning metadata. It must not inspect live
+    activation tensors or CUDA state; prepared plans built here are reusable by
+    every DSV4 layer in the microbatch and keep owner-gradient id-space
+    derivation out of per-layer backward execution.
+    """
+    slots = _validate_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=stage_plan_slots,
+    )
+    id_spaces = _stage_plan_slot_gradient_id_spaces(layout=layout, slots=slots)
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    return Dsv4AttentionBackwardPlan(
+        compression_kind=layout.spec.kind,
+        stage_indices=_slot_stage_indices(slots),
+        rank_plans=tuple(
+            _build_attention_backward_rank_plan(
+                layout=layout,
+                id_spaces=id_spaces,
+                rank=rank,
+                rank_count=rank_count,
+            )
+            for rank in range(rank_count)
+        ),
     )
 
 
@@ -1203,6 +1245,7 @@ def launch_dsv4_attention_backward_from_stage_plan_slots(
     owned_query_token_ids: Sequence[int] | None = None,
     owned_raw_token_ids: Sequence[int] | None = None,
     owned_compressed_entry_ids: Sequence[int] | None = None,
+    backward_plan: Dsv4AttentionBackwardPlan | None = None,
 ) -> Dsv4ExchangedAttentionBackwardWork:
     """Replay DSV4 backward and reduce owner grads from ART StagePlan slots.
 
@@ -1219,91 +1262,38 @@ def launch_dsv4_attention_backward_from_stage_plan_slots(
         layout=layout,
         stage_plan_slots=stage_plan_slots,
     )
-    id_spaces = _stage_plan_slot_gradient_id_spaces(layout=layout, slots=slots)
-    local_query_ids = id_spaces[0][rank_int]
-    if tuple(forward_result.query_token_ids) != local_query_ids:
+    plan = _attention_backward_plan_or_build(
+        layout=layout,
+        slots=slots,
+        backward_plan=backward_plan,
+    )
+    rank_plan = plan.rank_plans[rank_int]
+    if tuple(forward_result.query_token_ids) != rank_plan.query_token_ids:
         raise RuntimeError(
             "DSV4 forward_result query ids do not match StagePlan-slot query ids: "
-            f"{tuple(forward_result.query_token_ids)} vs {local_query_ids}"
+            f"{tuple(forward_result.query_token_ids)} vs {rank_plan.query_token_ids}"
         )
-    recv_query = _recv_gradient_ids_by_peer(
-        ids_by_rank=id_spaces[0],
-        rank=rank_int,
-        rank_count=rank_count,
-        owner_rank=lambda token_id: _layout_raw_owner_rank(
-            layout=layout,
-            token_id=token_id,
-        ),
-    )
-    recv_raw = _recv_gradient_ids_by_peer(
-        ids_by_rank=id_spaces[1],
-        rank=rank_int,
-        rank_count=rank_count,
-        owner_rank=lambda token_id: _layout_raw_owner_rank(
-            layout=layout,
-            token_id=token_id,
-        ),
-    )
-    recv_compressed = _recv_gradient_ids_by_peer(
-        ids_by_rank=id_spaces[2],
-        rank=rank_int,
-        rank_count=rank_count,
-        owner_rank=lambda entry_id: _layout_entry_owner_rank(
-            layout=layout,
-            entry_id=entry_id,
-        ),
-    )
     return launch_exchanged_dsv4_attention_backward(
         forward_result=forward_result,
         grad_out=grad_out,
-        query_token_ids=local_query_ids,
-        raw_token_ids=id_spaces[1][rank_int],
-        compressed_entry_ids=id_spaces[2][rank_int],
-        query_owner_ranks=tuple(
-            _layout_raw_owner_rank(layout=layout, token_id=token_id)
-            for token_id in local_query_ids
-        ),
-        raw_owner_ranks=tuple(
-            _layout_raw_owner_rank(layout=layout, token_id=token_id)
-            for token_id in id_spaces[1][rank_int]
-        ),
-        compressed_owner_ranks=tuple(
-            _layout_entry_owner_rank(layout=layout, entry_id=entry_id)
-            for entry_id in id_spaces[2][rank_int]
-        ),
-        recv_query_token_ids_by_peer=recv_query,
-        recv_raw_token_ids_by_peer=recv_raw,
-        recv_compressed_entry_ids_by_peer=recv_compressed,
+        query_token_ids=rank_plan.query_token_ids,
+        raw_token_ids=rank_plan.raw_token_ids,
+        compressed_entry_ids=rank_plan.compressed_entry_ids,
+        query_owner_ranks=rank_plan.query_owner_ranks,
+        raw_owner_ranks=rank_plan.raw_owner_ranks,
+        compressed_owner_ranks=rank_plan.compressed_owner_ranks,
+        recv_query_token_ids_by_peer=rank_plan.recv_query_token_ids_by_peer,
+        recv_raw_token_ids_by_peer=rank_plan.recv_raw_token_ids_by_peer,
+        recv_compressed_entry_ids_by_peer=rank_plan.recv_compressed_entry_ids_by_peer,
         owned_query_token_ids=owned_query_token_ids
         if owned_query_token_ids is not None
-        else _owned_gradient_ids(
-            ids_by_rank=id_spaces[0],
-            rank=rank_int,
-            owner_rank=lambda token_id: _layout_raw_owner_rank(
-                layout=layout,
-                token_id=token_id,
-            ),
-        ),
+        else rank_plan.owned_query_token_ids,
         owned_raw_token_ids=owned_raw_token_ids
         if owned_raw_token_ids is not None
-        else _owned_gradient_ids(
-            ids_by_rank=id_spaces[1],
-            rank=rank_int,
-            owner_rank=lambda token_id: _layout_raw_owner_rank(
-                layout=layout,
-                token_id=token_id,
-            ),
-        ),
+        else rank_plan.owned_raw_token_ids,
         owned_compressed_entry_ids=owned_compressed_entry_ids
         if owned_compressed_entry_ids is not None
-        else _owned_gradient_ids(
-            ids_by_rank=id_spaces[2],
-            rank=rank_int,
-            owner_rank=lambda entry_id: _layout_entry_owner_rank(
-                layout=layout,
-                entry_id=entry_id,
-            ),
-        ),
+        else rank_plan.owned_compressed_entry_ids,
         rank=rank_int,
         rank_count=rank_count,
         group=group,
@@ -1696,6 +1686,148 @@ def _require_prepared_stage_slots(
 
 def _prepared_rank(context_state: Dsv4ContextParallelState) -> int:
     return int(context_state.cp_state.rank_plan.rank)
+
+
+def _prepared_attention_backward_plan(
+    *,
+    context_state: Dsv4ContextParallelState,
+    kind: Dsv4CompressionKind,
+) -> Dsv4AttentionBackwardPlan | None:
+    if kind == Dsv4CompressionKind.CSA:
+        return context_state.dsv4_plan.csa_attention_backward_plan
+    if kind == Dsv4CompressionKind.HCA:
+        return context_state.dsv4_plan.hca_attention_backward_plan
+    raise RuntimeError(f"Unsupported DSV4 compression kind {kind}")
+
+
+def _attention_backward_plan_or_build(
+    *,
+    layout: Dsv4CompressedLayout,
+    slots: Sequence[Dsv4StagePlanSlot],
+    backward_plan: Dsv4AttentionBackwardPlan | None,
+) -> Dsv4AttentionBackwardPlan:
+    if backward_plan is None:
+        return build_dsv4_attention_backward_plan_from_stage_plan_slots(
+            layout=layout,
+            stage_plan_slots=slots,
+        )
+    return _validate_attention_backward_plan(
+        layout=layout,
+        slots=slots,
+        backward_plan=backward_plan,
+    )
+
+
+def _validate_attention_backward_plan(
+    *,
+    layout: Dsv4CompressedLayout,
+    slots: Sequence[Dsv4StagePlanSlot],
+    backward_plan: Dsv4AttentionBackwardPlan,
+) -> Dsv4AttentionBackwardPlan:
+    if backward_plan.compression_kind != layout.spec.kind:
+        raise RuntimeError(
+            "DSV4 prepared backward plan kind must match layout kind: "
+            f"{backward_plan.compression_kind} vs {layout.spec.kind}"
+        )
+    if backward_plan.stage_indices != _slot_stage_indices(slots):
+        raise RuntimeError(
+            "DSV4 prepared backward plan stage ids must match StagePlan slots"
+        )
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    if len(backward_plan.rank_plans) != rank_count:
+        raise RuntimeError(
+            "DSV4 prepared backward plan rank count must match layout rank count: "
+            f"{len(backward_plan.rank_plans)} vs {rank_count}"
+        )
+    return backward_plan
+
+
+def _build_attention_backward_rank_plan(
+    *,
+    layout: Dsv4CompressedLayout,
+    id_spaces: tuple[
+        tuple[tuple[int, ...], ...],
+        tuple[tuple[int, ...], ...],
+        tuple[tuple[int, ...], ...],
+    ],
+    rank: int,
+    rank_count: int,
+) -> Dsv4AttentionBackwardRankPlan:
+    query_ids = id_spaces[0][rank]
+    raw_ids = id_spaces[1][rank]
+    compressed_ids = id_spaces[2][rank]
+    return Dsv4AttentionBackwardRankPlan(
+        query_token_ids=query_ids,
+        raw_token_ids=raw_ids,
+        compressed_entry_ids=compressed_ids,
+        query_owner_ranks=tuple(
+            _layout_raw_owner_rank(layout=layout, token_id=token_id)
+            for token_id in query_ids
+        ),
+        raw_owner_ranks=tuple(
+            _layout_raw_owner_rank(layout=layout, token_id=token_id)
+            for token_id in raw_ids
+        ),
+        compressed_owner_ranks=tuple(
+            _layout_entry_owner_rank(layout=layout, entry_id=entry_id)
+            for entry_id in compressed_ids
+        ),
+        recv_query_token_ids_by_peer=_recv_gradient_ids_by_peer(
+            ids_by_rank=id_spaces[0],
+            rank=rank,
+            rank_count=rank_count,
+            owner_rank=lambda token_id: _layout_raw_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+        ),
+        recv_raw_token_ids_by_peer=_recv_gradient_ids_by_peer(
+            ids_by_rank=id_spaces[1],
+            rank=rank,
+            rank_count=rank_count,
+            owner_rank=lambda token_id: _layout_raw_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+        ),
+        recv_compressed_entry_ids_by_peer=_recv_gradient_ids_by_peer(
+            ids_by_rank=id_spaces[2],
+            rank=rank,
+            rank_count=rank_count,
+            owner_rank=lambda entry_id: _layout_entry_owner_rank(
+                layout=layout,
+                entry_id=entry_id,
+            ),
+        ),
+        owned_query_token_ids=_owned_gradient_ids(
+            ids_by_rank=id_spaces[0],
+            rank=rank,
+            owner_rank=lambda token_id: _layout_raw_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+        ),
+        owned_raw_token_ids=_owned_gradient_ids(
+            ids_by_rank=id_spaces[1],
+            rank=rank,
+            owner_rank=lambda token_id: _layout_raw_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+        ),
+        owned_compressed_entry_ids=_owned_gradient_ids(
+            ids_by_rank=id_spaces[2],
+            rank=rank,
+            owner_rank=lambda entry_id: _layout_entry_owner_rank(
+                layout=layout,
+                entry_id=entry_id,
+            ),
+        ),
+    )
+
+
+def _slot_stage_indices(slots: Sequence[Dsv4StagePlanSlot]) -> tuple[int, ...]:
+    return tuple(int(slot.stage_index) for slot in slots)
 
 
 def _stage_plan_slot_gradient_id_spaces(

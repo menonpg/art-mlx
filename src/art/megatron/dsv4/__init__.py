@@ -28,6 +28,7 @@ from .cp_attention import (
     Dsv4SinkGradientReduceWork,
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
+    build_dsv4_attention_backward_plan_from_stage_plan_slots,
     compute_single_sink_grad,
     launch_dsv4_attention_backward_from_stage_plan_slots,
     launch_dsv4_attention_forward_from_stage_plan_groups,
@@ -92,6 +93,8 @@ from .sparse_kernel import (
     dsv4_sparse_fwd,
 )
 from .types import (
+    Dsv4AttentionBackwardPlan,
+    Dsv4AttentionBackwardRankPlan,
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
     Dsv4AttentionGradientResult,
@@ -133,6 +136,8 @@ from .types import (
 
 __all__ = [
     "Dsv4AttentionBackwardReplayResult",
+    "Dsv4AttentionBackwardPlan",
+    "Dsv4AttentionBackwardRankPlan",
     "Dsv4AttentionForwardResult",
     "Dsv4AttentionGradientResult",
     "Dsv4BranchView",
@@ -188,6 +193,7 @@ __all__ = [
     "accumulate_dsv4_gradient_owner_buckets",
     "build_dsv4_compressed_layout",
     "build_dsv4_compressed_layout_from_cp_state",
+    "build_dsv4_attention_backward_plan_from_stage_plan_slots",
     "build_dsv4_indexer_kv_exchange_peer_plans",
     "build_dsv4_indexer_stage_plan_from_stage_plans",
     "build_dsv4_stage_inputs",

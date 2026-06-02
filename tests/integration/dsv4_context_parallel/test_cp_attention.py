@@ -31,6 +31,7 @@ from art.megatron.dsv4 import (
     Dsv4StagePlanSlot,
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
+    build_dsv4_attention_backward_plan_from_stage_plan_slots,
     build_dsv4_compressed_layout,
     build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
@@ -776,6 +777,15 @@ def test_csa_projected_attention_from_context_state_uses_prepared_plan(
         forward.attention.out.numel(),
         dtype=forward.attention.out.dtype,
     ).reshape_as(forward.attention.out)
+
+    def fail_backward_id_space_build(**_kwargs: object) -> object:
+        raise AssertionError("unexpected prepared backward metadata rebuild")
+
+    monkeypatch.setattr(
+        cp_attention,
+        "_stage_plan_slot_gradient_id_spaces",
+        fail_backward_id_space_build,
+    )
     backward = launch_dsv4_projected_attention_backward_from_context_parallel_state(
         context_state=context_state,
         forward_result=forward,
@@ -830,6 +840,15 @@ def test_hca_projected_attention_from_context_state_uses_prepared_plan(
         forward.attention.out.numel(),
         dtype=forward.attention.out.dtype,
     ).reshape_as(forward.attention.out)
+
+    def fail_backward_id_space_build(**_kwargs: object) -> object:
+        raise AssertionError("unexpected prepared backward metadata rebuild")
+
+    monkeypatch.setattr(
+        cp_attention,
+        "_stage_plan_slot_gradient_id_spaces",
+        fail_backward_id_space_build,
+    )
     backward = launch_dsv4_projected_attention_backward_from_context_parallel_state(
         context_state=context_state,
         forward_result=forward,
@@ -1117,6 +1136,74 @@ def test_attention_backward_launcher_uses_stage_plan_slots(
             attn_sink=attn_sink,
         ),
     )
+
+
+def test_attention_backward_launcher_uses_prepared_backward_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slots = _single_rank_slots()
+    backward_plan = build_dsv4_attention_backward_plan_from_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=slots,
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    forward = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+        compressed_entry_ids=(0, 1),
+        indexer_q=torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=torch.float32),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float32),
+        indexer_kv=torch.tensor([[2.0, 0.0], [3.0, 0.0]], dtype=torch.float32),
+        indexer_kv_entry_ids=(0, 1),
+        indexer_topk=2,
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+
+    def fail_id_space_build(**_kwargs: object) -> object:
+        raise AssertionError("backward id spaces should be prepared")
+
+    monkeypatch.setattr(
+        cp_attention,
+        "_stage_plan_slot_gradient_id_spaces",
+        fail_id_space_build,
+    )
+    grad_out = torch.arange(forward.out.numel(), dtype=forward.out.dtype).reshape_as(
+        forward.out
+    )
+    result = launch_dsv4_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        forward_result=forward,
+        grad_out=grad_out,
+        group=None,
+        async_op=True,
+        backward_plan=backward_plan,
+    ).wait_post_process()
+
+    torch.testing.assert_close(result.dq, _stage_tensor(((10.0, 10.0),)))
+    torch.testing.assert_close(result.dcompressed_kv, _kv_rows((28.0, 29.0)))
 
 
 def test_attention_backward_launcher_reduces_owner_grads_from_stage_plan_slots(
@@ -1459,6 +1546,18 @@ def _context_state(
             hca_layout=hca_layout,
             stage_plan_slots=slots,
             csa_indexer_stage_plans=csa_indexer_stage_plans,
+            csa_attention_backward_plan=build_dsv4_attention_backward_plan_from_stage_plan_slots(
+                layout=csa_layout,
+                stage_plan_slots=slots,
+            )
+            if csa_layout is not None and slots
+            else None,
+            hca_attention_backward_plan=build_dsv4_attention_backward_plan_from_stage_plan_slots(
+                layout=hca_layout,
+                stage_plan_slots=slots,
+            )
+            if hca_layout is not None and slots
+            else None,
         ),
     )
 

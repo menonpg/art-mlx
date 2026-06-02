@@ -56,6 +56,10 @@ def test_prepare_dsv4_context_parallel_state_wraps_real_cp_plan() -> None:
     assert all(
         len(peer_plans) == 2 for peer_plans in plan.hca_stage_kv_peer_plans_by_slot
     )
+    assert plan.csa_attention_backward_plan is not None
+    assert plan.hca_attention_backward_plan is not None
+    assert len(plan.csa_attention_backward_plan.rank_plans) == 2
+    assert len(plan.hca_attention_backward_plan.rank_plans) == 2
 
 
 def test_prepare_dsv4_context_parallel_state_allows_hca_only() -> None:
@@ -79,6 +83,8 @@ def test_prepare_dsv4_context_parallel_state_allows_hca_only() -> None:
     assert dsv4_state.dsv4_plan.csa_indexer_kv_peer_plans_by_stage == ()
     assert dsv4_state.dsv4_plan.csa_stage_kv_peer_plans_by_slot == ()
     assert dsv4_state.dsv4_plan.hca_stage_kv_peer_plans_by_slot
+    assert dsv4_state.dsv4_plan.csa_attention_backward_plan is None
+    assert dsv4_state.dsv4_plan.hca_attention_backward_plan is not None
     assert dsv4_state.dsv4_plan.stage_plan_slots
 
 
