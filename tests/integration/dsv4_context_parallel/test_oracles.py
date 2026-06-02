@@ -10,9 +10,13 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     Dsv4SparseBackwardResult,
     Dsv4SparseForwardResult,
+    Dsv4StagePlanSlot,
     accumulate_materialized_dsv4_attention_backward,
     build_dsv4_compressed_layout,
     build_stage_local_topk_for_csa,
+    compress_projected_kv,
+    launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_projected_attention_backward_from_stage_plan_slots,
     materialize_dsv4_stage_tensors,
     replay_materialized_dsv4_attention_backward,
     run_materialized_dsv4_attention_forward,
@@ -32,6 +36,14 @@ class _Range(BaseModel):
 
     start: int
     end: int
+
+
+class _StagePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage_index: int
+    global_q_ranges: tuple[_Range, ...]
+    global_k_ranges: tuple[_Range, ...]
 
 
 def test_dense_oracle_matches_unpacked_branch_views_and_shared_prefix() -> None:
@@ -246,6 +258,147 @@ def test_materialized_stage_path_matches_packed_oracle_forward_and_backward(
     assert not bool(actual_grad.dcompressed_kv.abs().sum().eq(0).item())
 
 
+def test_projected_hca_wrapper_matches_packed_oracle_forward_and_backward(
+    monkeypatch,
+) -> None:
+    layout = _layout(Dsv4CompressionKind.HCA, rank_count=1)
+    torch.manual_seed(109)
+    query = torch.randn(18, 2, 4, dtype=torch.float64)
+    raw_kv = torch.randn(18, 4, dtype=torch.float64)
+    projected_kv = torch.randn(18, 4, dtype=torch.float64)
+    projected_gate = torch.randn(18, 4, dtype=torch.float64)
+    positional_bias = torch.randn(4, 4, dtype=torch.float64)
+    attn_sink = torch.randn(2, dtype=torch.float64)
+    grad_out = torch.randn(1, 18, 2, 4, dtype=torch.float64)
+
+    monkeypatch.setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
+    monkeypatch.setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
+
+    forward_work = launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=_single_rank_slot(),
+        query=query,
+        query_token_ids=tuple(range(18)),
+        raw_kv=raw_kv,
+        raw_token_ids=tuple(range(18)),
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        token_ids=tuple(range(18)),
+        attn_sink=attn_sink,
+        group=None,
+        async_op=False,
+        scale=0.25,
+        window_size=128,
+        raw_list_size=18,
+    )
+    actual = forward_work.wait_post_process()
+    compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+    )
+    expected = dense_dsv4_packed_attention_oracle(
+        layout=layout,
+        query=query,
+        raw_kv=raw_kv,
+        compressed_kv=compressed,
+        attn_sink=attn_sink,
+        topk_by_query=None,
+        window_size=128,
+        scale=0.25,
+    )
+    torch.testing.assert_close(actual.attention.out, expected.out, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(
+        actual.attention.lse,
+        expected.lse,
+        rtol=1e-6,
+        atol=1e-6,
+        check_dtype=False,
+    )
+
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=_single_rank_slot(),
+        forward_result=actual,
+        grad_out=grad_out,
+        group=None,
+        async_op=False,
+    ).wait_post_process()
+
+    ref_query = query.detach().clone().requires_grad_()
+    ref_raw = raw_kv.detach().clone().requires_grad_()
+    ref_projected = projected_kv.detach().clone().requires_grad_()
+    ref_gate = projected_gate.detach().clone().requires_grad_()
+    ref_bias = positional_bias.detach().clone().requires_grad_()
+    ref_sink = attn_sink.detach().clone().requires_grad_()
+    ref_compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=ref_projected,
+        projected_gate=ref_gate,
+        positional_bias=ref_bias,
+    )
+    ref = dense_dsv4_packed_attention_oracle(
+        layout=layout,
+        query=ref_query,
+        raw_kv=ref_raw,
+        compressed_kv=ref_compressed,
+        attn_sink=ref_sink,
+        topk_by_query=None,
+        window_size=128,
+        scale=0.25,
+    )
+    (ref.out * grad_out).sum().backward()
+
+    assert ref_query.grad is not None
+    assert ref_raw.grad is not None
+    assert ref_projected.grad is not None
+    assert ref_gate.grad is not None
+    assert ref_bias.grad is not None
+    assert ref_sink.grad is not None
+    torch.testing.assert_close(
+        backward.attention.dq,
+        ref_query.grad.unsqueeze(0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.attention.draw_kv,
+        ref_raw.grad.unsqueeze(0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_kv,
+        ref_projected.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_gate,
+        ref_gate.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dpositional_bias,
+        ref_bias.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.attention.d_attn_sink,
+        ref_sink.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+    assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
+
+
 def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     max_visible = max(
         sum(
@@ -302,6 +455,21 @@ def _layout(kind: Dsv4CompressionKind, rank_count: int = 2) -> Dsv4CompressedLay
             token_counts_by_rank=token_counts_by_rank,
         ),
         spec=Dsv4CompressionSpec(kind=kind, ratio=4),
+    )
+
+
+def _single_rank_slot() -> tuple[Dsv4StagePlanSlot, ...]:
+    return (
+        Dsv4StagePlanSlot(
+            stage_index=0,
+            stage_plans_by_rank=(
+                _StagePlan(
+                    stage_index=0,
+                    global_q_ranges=(_Range(start=0, end=18),),
+                    global_k_ranges=(_Range(start=0, end=18),),
+                ),
+            ),
+        ),
     )
 
 
