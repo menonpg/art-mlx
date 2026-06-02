@@ -1516,9 +1516,7 @@ def run_training_step(
         reduced_loss=reduced_loss,
         probs_corr=probs_corr_sum / micro_count,
         kl_policy_ref=(
-            kl_policy_ref_sum / kl_policy_ref_count
-            if kl_policy_ref_count > 0
-            else None
+            kl_policy_ref_sum / kl_policy_ref_count if kl_policy_ref_count > 0 else None
         ),
         new_logprobs=new_logprobs_list,
         update_successful=update_successful,

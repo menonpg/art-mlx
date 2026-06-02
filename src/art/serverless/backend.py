@@ -421,9 +421,7 @@ class ServerlessBackend(Backend):
                 importance_sampling_level=dev_config.get("importance_sampling_level"),
                 kimi_k2_tau=dev_config.get("kimi_k2_tau"),
                 kl_penalty_coef=dev_config.get("kl_penalty_coef"),
-                kl_penalty_reference_step=dev_config.get(
-                    "kl_penalty_reference_step"
-                ),
+                kl_penalty_reference_step=dev_config.get("kl_penalty_reference_step"),
                 kl_penalty_source=dev_config.get("kl_penalty_source"),
                 kl_ref_adapter_path=dev_config.get("kl_ref_adapter_path"),
                 learning_rate=config.learning_rate,
