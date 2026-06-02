@@ -14,6 +14,7 @@ from art.megatron.dsv4 import (
     compute_indexer_scores,
     compute_indexer_stage_topk,
     compute_indexer_topk,
+    launch_exchanged_dsv4_indexer_topk,
     merge_indexer_topk_results,
     stable_topk_by_score_and_id,
     stage_candidate_entry_ids,
@@ -198,6 +199,45 @@ def test_indexer_stage_topks_merge_to_global_with_explicit_id_maps() -> None:
     assert not merged.scores.requires_grad
 
 
+def test_exchanged_indexer_topk_merges_stage_work_results() -> None:
+    stage_works = (
+        _FakeIndexerStageWork(
+            Dsv4TopkResult(
+                scores=torch.tensor([[[5.0, 1.0]]]),
+                indices=torch.tensor([[[10, 2]]]),
+            )
+        ),
+        _FakeIndexerStageWork(
+            Dsv4TopkResult(
+                scores=torch.tensor([[[5.0, 2.0]]]),
+                indices=torch.tensor([[[3, 4]]]),
+            )
+        ),
+    )
+
+    work = launch_exchanged_dsv4_indexer_topk(stage_works=stage_works, topk=3)
+    work.wait()
+    result = work.wait_post_process()
+
+    assert result.scores[0, 0].tolist() == [5.0, 5.0, 2.0]
+    assert result.indices[0, 0].tolist() == [3, 10, 4]
+    for stage_work in stage_works:
+        assert stage_work.wait_count == 1
+        assert stage_work.post_process_count == 1
+
+
+def test_exchanged_indexer_topk_rejects_bad_stage_work() -> None:
+    with pytest.raises(RuntimeError, match="missing wait"):
+        launch_exchanged_dsv4_indexer_topk(stage_works=(object(),), topk=1)
+
+    work = launch_exchanged_dsv4_indexer_topk(
+        stage_works=(_BadIndexerStageWork(),),
+        topk=1,
+    )
+    with pytest.raises(TypeError, match="expected Dsv4TopkResult"):
+        work.wait_post_process()
+
+
 def test_indexer_stage_topk_handles_empty_candidate_stage() -> None:
     layout = _layout()
     q = torch.randn(2, 3, 5)
@@ -312,3 +352,30 @@ def _layout() -> Dsv4CompressedLayout:
         ),
         spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
     )
+
+
+class _FakeIndexerStageWork:
+    def __init__(self, result: Dsv4TopkResult) -> None:
+        self.result = result
+        self.wait_count = 0
+        self.post_process_count = 0
+        self._wait_complete = False
+
+    def wait(self) -> None:
+        if self._wait_complete:
+            return
+        self.wait_count += 1
+        self._wait_complete = True
+
+    def wait_post_process(self) -> Dsv4TopkResult:
+        self.post_process_count += 1
+        self.wait()
+        return self.result
+
+
+class _BadIndexerStageWork:
+    def wait(self) -> None:
+        pass
+
+    def wait_post_process(self) -> object:
+        return object()

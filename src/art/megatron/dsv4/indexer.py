@@ -64,6 +64,24 @@ class Dsv4IndexerKvExchangeWork(BaseModel):
         )
 
 
+class Dsv4ExchangedIndexerTopkWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    stage_works: tuple[Any, ...]
+    topk: int
+
+    def wait(self) -> None:
+        for work in self.stage_works:
+            work.wait()
+
+    def wait_post_process(self) -> Dsv4TopkResult:
+        results = tuple(
+            _indexer_topk_result_from_work(work=work, position=position)
+            for position, work in enumerate(self.stage_works)
+        )
+        return merge_indexer_topk_results(results=results, topk=int(self.topk))
+
+
 def stage_candidate_entry_ids(
     *,
     layout: Dsv4CompressedLayout,
@@ -311,6 +329,28 @@ def launch_dsv4_indexer_kv_exchange(
     )
 
 
+@torch.compiler.disable
+def launch_exchanged_dsv4_indexer_topk(
+    *,
+    stage_works: Sequence[Any],
+    topk: int,
+) -> Dsv4ExchangedIndexerTopkWork:
+    """Create the eager bridge from exchanged indexer stages to global topk.
+
+    Each stage work owns custom DSV4 indexer KV communication plus stage-local
+    topk scoring. This wrapper keeps that wait/materialization boundary eager
+    and merges the stage results into one global compressed-id topk tensor.
+    """
+    works = tuple(stage_works)
+    if not works:
+        raise RuntimeError("DSV4 exchanged indexer topk requires at least one stage")
+    if int(topk) < 0:
+        raise RuntimeError(f"DSV4 exchanged indexer topk must be non-negative: {topk}")
+    for position, work in enumerate(works):
+        _validate_indexer_stage_work(work=work, position=position)
+    return Dsv4ExchangedIndexerTopkWork(stage_works=works, topk=int(topk))
+
+
 def merge_indexer_topk_results(
     *,
     results: Sequence[Dsv4TopkResult],
@@ -327,6 +367,25 @@ def merge_indexer_topk_results(
         topk=topk,
     )
     return Dsv4TopkResult(indices=merged_ids.to(torch.int64), scores=merged_scores)
+
+
+def _validate_indexer_stage_work(*, work: Any, position: int) -> None:
+    if not callable(getattr(work, "wait", None)):
+        raise RuntimeError(f"DSV4 indexer stage work {position} is missing wait()")
+    if not callable(getattr(work, "wait_post_process", None)):
+        raise RuntimeError(
+            f"DSV4 indexer stage work {position} is missing wait_post_process()"
+        )
+
+
+def _indexer_topk_result_from_work(*, work: Any, position: int) -> Dsv4TopkResult:
+    result = work.wait_post_process()
+    if not isinstance(result, Dsv4TopkResult):
+        raise TypeError(
+            f"DSV4 indexer stage work {position} returned {type(result)!r}, "
+            "expected Dsv4TopkResult"
+        )
+    return result
 
 
 def stable_topk_by_score_and_id(
