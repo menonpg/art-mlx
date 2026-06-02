@@ -15,6 +15,8 @@ from art.megatron.dsv4 import (
     build_dsv4_compressed_layout,
     build_stage_local_topk_for_csa,
     compress_projected_kv,
+    compute_indexer_topk,
+    launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
     launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
     launch_dsv4_projected_attention_backward_from_stage_plan_slots,
     materialize_dsv4_stage_tensors,
@@ -395,6 +397,176 @@ def test_projected_hca_wrapper_matches_packed_oracle_forward_and_backward(
         rtol=1e-6,
         atol=1e-6,
     )
+    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+    assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
+
+
+def test_projected_csa_wrapper_matches_packed_oracle_forward_and_backward(
+    monkeypatch,
+) -> None:
+    layout = _layout(Dsv4CompressionKind.CSA, rank_count=1)
+    torch.manual_seed(113)
+    query = torch.randn(18, 2, 4, dtype=torch.float64)
+    raw_kv = torch.randn(18, 4, dtype=torch.float64)
+    main_projected_kv = torch.randn(18, 8, dtype=torch.float64)
+    main_projected_gate = torch.randn(18, 8, dtype=torch.float64)
+    main_positional_bias = torch.randn(4, 8, dtype=torch.float64)
+    indexer_projected_kv = torch.randn(18, 6, dtype=torch.float64)
+    indexer_projected_gate = torch.randn(18, 6, dtype=torch.float64)
+    indexer_positional_bias = torch.randn(4, 6, dtype=torch.float64)
+    indexer_q = torch.randn(18, 2, 3, dtype=torch.float64)
+    indexer_weights = torch.randn(18, 2, dtype=torch.float64)
+    attn_sink = torch.randn(2, dtype=torch.float64)
+    grad_out = torch.randn(1, 18, 2, 4, dtype=torch.float64)
+
+    monkeypatch.setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
+    monkeypatch.setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
+
+    forward_work = launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=_single_rank_slot(),
+        query=query,
+        query_token_ids=tuple(range(18)),
+        raw_kv=raw_kv,
+        raw_token_ids=tuple(range(18)),
+        main_projected_kv=main_projected_kv,
+        main_projected_gate=main_projected_gate,
+        main_positional_bias=main_positional_bias,
+        main_token_ids=tuple(range(18)),
+        indexer_projected_kv=indexer_projected_kv,
+        indexer_projected_gate=indexer_projected_gate,
+        indexer_positional_bias=indexer_positional_bias,
+        indexer_token_ids=tuple(range(18)),
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_topk=2,
+        attn_sink=attn_sink,
+        group=None,
+        async_op=False,
+        scale=0.4,
+        window_size=128,
+        raw_list_size=18,
+        compressed_list_size=2,
+    )
+    actual = forward_work.wait_post_process()
+    main_compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=main_projected_kv,
+        projected_gate=main_projected_gate,
+        positional_bias=main_positional_bias,
+    )
+    indexer_compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=indexer_projected_kv,
+        projected_gate=indexer_projected_gate,
+        positional_bias=indexer_positional_bias,
+    )
+    topk = compute_indexer_topk(
+        layout=layout,
+        query_token_ids=tuple(range(18)),
+        indexer_q=indexer_q,
+        indexer_kv=indexer_compressed,
+        indexer_weights=indexer_weights,
+        candidate_entry_ids=tuple(range(len(layout.entries))),
+        topk=2,
+    ).indices[0]
+    expected = dense_dsv4_packed_attention_oracle(
+        layout=layout,
+        query=query,
+        raw_kv=raw_kv,
+        compressed_kv=main_compressed,
+        attn_sink=attn_sink,
+        topk_by_query=topk,
+        window_size=128,
+        scale=0.4,
+    )
+    torch.testing.assert_close(actual.attention.out, expected.out, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(
+        actual.attention.lse,
+        expected.lse,
+        rtol=1e-6,
+        atol=1e-6,
+        check_dtype=False,
+    )
+
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=_single_rank_slot(),
+        forward_result=actual,
+        grad_out=grad_out,
+        group=None,
+        async_op=False,
+    ).wait_post_process()
+
+    ref_query = query.detach().clone().requires_grad_()
+    ref_raw = raw_kv.detach().clone().requires_grad_()
+    ref_main_projected = main_projected_kv.detach().clone().requires_grad_()
+    ref_main_gate = main_projected_gate.detach().clone().requires_grad_()
+    ref_main_bias = main_positional_bias.detach().clone().requires_grad_()
+    ref_sink = attn_sink.detach().clone().requires_grad_()
+    ref_main_compressed = compress_projected_kv(
+        layout=layout,
+        projected_kv=ref_main_projected,
+        projected_gate=ref_main_gate,
+        positional_bias=ref_main_bias,
+    )
+    ref = dense_dsv4_packed_attention_oracle(
+        layout=layout,
+        query=ref_query,
+        raw_kv=ref_raw,
+        compressed_kv=ref_main_compressed,
+        attn_sink=ref_sink,
+        topk_by_query=topk,
+        window_size=128,
+        scale=0.4,
+    )
+    (ref.out * grad_out).sum().backward()
+
+    assert ref_query.grad is not None
+    assert ref_raw.grad is not None
+    assert ref_main_projected.grad is not None
+    assert ref_main_gate.grad is not None
+    assert ref_main_bias.grad is not None
+    assert ref_sink.grad is not None
+    torch.testing.assert_close(
+        backward.attention.dq,
+        ref_query.grad.unsqueeze(0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.attention.draw_kv,
+        ref_raw.grad.unsqueeze(0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_kv,
+        ref_main_projected.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dprojected_gate,
+        ref_main_gate.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.main_compressor.dpositional_bias,
+        ref_main_bias.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        backward.attention.d_attn_sink,
+        ref_sink.grad,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert actual.indexer_compressed is not None
     assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
     assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
 
