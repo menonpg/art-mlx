@@ -462,6 +462,76 @@ def launch_planned_dsv4_indexer_kv_exchange(
 
 
 @torch.compiler.disable
+def launch_dsv4_indexer_topk_from_stage_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan],
+    query_token_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    topk: int,
+    group: Any,
+    async_op: bool,
+    score_scale: float = 1.0,
+) -> Dsv4ExchangedIndexerTopkWork:
+    """Launch all CSA indexer stages for one rank and return global topk work.
+
+    This is the rank-level eager assembly point for DSV4 indexer CP. Stage
+    metadata is precomputed from ART StagePlans; this function gathers
+    rank-local indexer query rows, launches each custom KV exchange, and returns
+    the existing query-id-aware topk merge work.
+    """
+    rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
+    stage_plans = tuple(indexer_stage_plans)
+    if not stage_plans:
+        raise RuntimeError("DSV4 indexer topk launch requires at least one stage plan")
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    _row_by_id(query_ids, name="query_token_ids")
+
+    stage_works = []
+    for stage_plan in stage_plans:
+        _validate_indexer_stage_plan_rank_count(
+            stage_plan=stage_plan,
+            rank_count=len(layout.entry_ids_by_owner_rank),
+        )
+        stage_query_ids = stage_plan.query_token_ids_by_rank[rank_int]
+        stage_works.append(
+            launch_planned_dsv4_indexer_kv_exchange(
+                layout=layout,
+                rank=rank_int,
+                candidate_entry_ids_by_rank=stage_plan.candidate_entry_ids_by_rank,
+                query_token_ids=stage_query_ids,
+                indexer_q=_gather_indexer_query_rows(
+                    tensor=indexer_q,
+                    tensor_ids=query_ids,
+                    selected_ids=stage_query_ids,
+                    name="indexer_q",
+                ),
+                indexer_weights=_gather_indexer_query_rows(
+                    tensor=indexer_weights,
+                    tensor_ids=query_ids,
+                    selected_ids=stage_query_ids,
+                    name="indexer_weights",
+                ),
+                indexer_kv=indexer_kv,
+                indexer_kv_entry_ids=indexer_kv_entry_ids,
+                topk=topk,
+                group=group,
+                async_op=async_op,
+                score_scale=score_scale,
+            )
+        )
+    return launch_exchanged_dsv4_indexer_topk(
+        stage_works=stage_works,
+        query_token_ids=query_ids,
+        topk=topk,
+    )
+
+
+@torch.compiler.disable
 def launch_exchanged_dsv4_indexer_topk(
     *,
     stage_works: Sequence[Any],
@@ -583,6 +653,67 @@ def _validate_indexer_stage_work(*, work: Any, position: int) -> None:
         raise RuntimeError(
             f"DSV4 indexer stage work {position} is missing wait_post_process()"
         )
+
+
+def _validate_indexer_stage_plan_rank_count(
+    *,
+    stage_plan: Dsv4IndexerStagePlan,
+    rank_count: int,
+) -> None:
+    if len(stage_plan.query_token_ids_by_rank) != int(rank_count):
+        raise RuntimeError(
+            "DSV4 indexer stage plan query rank count mismatch: "
+            f"{len(stage_plan.query_token_ids_by_rank)} vs {rank_count}"
+        )
+    if len(stage_plan.candidate_entry_ids_by_rank) != int(rank_count):
+        raise RuntimeError(
+            "DSV4 indexer stage plan candidate rank count mismatch: "
+            f"{len(stage_plan.candidate_entry_ids_by_rank)} vs {rank_count}"
+        )
+
+
+def _gather_indexer_query_rows(
+    *,
+    tensor: torch.Tensor,
+    tensor_ids: Sequence[int],
+    selected_ids: Sequence[int],
+    name: str,
+) -> torch.Tensor:
+    token_dim = _indexer_query_token_dim(tensor=tensor, name=name)
+    ids = tuple(int(token_id) for token_id in tensor_ids)
+    if len(ids) != int(tensor.shape[token_dim]):
+        raise RuntimeError(
+            f"DSV4 {name} ids must match token rows, got "
+            f"{len(ids)} vs {int(tensor.shape[token_dim])}"
+        )
+    row_by_id = _row_by_id(ids, name=f"{name}_token_ids")
+    selected = tuple(int(token_id) for token_id in selected_ids)
+    missing = tuple(token_id for token_id in selected if token_id not in row_by_id)
+    if missing:
+        raise RuntimeError(f"DSV4 {name} is missing query ids: {missing}")
+    index = torch.tensor(
+        tuple(row_by_id[token_id] for token_id in selected),
+        device=tensor.device,
+        dtype=torch.long,
+    )
+    return tensor.index_select(token_dim, index)
+
+
+def _indexer_query_token_dim(*, tensor: torch.Tensor, name: str) -> int:
+    if name == "indexer_q":
+        if tensor.ndim == 3:
+            return 0
+        if tensor.ndim == 4:
+            return 1
+    if name == "indexer_weights":
+        if tensor.ndim == 2:
+            return 0
+        if tensor.ndim == 3:
+            return 1
+    raise RuntimeError(
+        f"DSV4 {name} must have token dimension in [Q,...] or [B,Q,...], got "
+        f"{tuple(tensor.shape)}"
+    )
 
 
 def _validate_stage_plan_count(

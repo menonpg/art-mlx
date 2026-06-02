@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from . import sparse_kernel
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
+from .cp_stage import launch_planned_dsv4_stage_kv_exchange
 from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
@@ -18,6 +19,7 @@ from .types import (
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
+    Dsv4StagePlanGroup,
     Dsv4TensorExchangePlan,
 )
 
@@ -361,6 +363,59 @@ def launch_exchanged_dsv4_attention_forward(
     return Dsv4ExchangedAttentionForwardWork(
         stage_works=works,
         query_token_ids=query_ids,
+        attn_sink=attn_sink,
+        scale=scale,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_attention_forward_from_stage_plan_groups(
+    *,
+    layout: Any,
+    rank: int,
+    stage_plan_groups: Sequence[Dsv4StagePlanGroup],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    scale: float | None = None,
+) -> Dsv4ExchangedAttentionForwardWork:
+    """Launch all DSV4 attention stage KV exchanges for one rank.
+
+    Stage groups are DSV4 metadata derived from ART StagePlans. The returned work
+    owns the eager wait/materialization boundary and then uses the existing
+    sparse stage forward plus global real-key/sink merge path.
+    """
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    rank_int = int(rank)
+    _validate_exchange_rank(rank=rank_int, rank_count=rank_count)
+    stage_groups = tuple(stage_plan_groups)
+    if not stage_groups:
+        raise ValueError("DSV4 attention forward launch requires stage_plan_groups")
+    stage_works = tuple(
+        launch_planned_dsv4_stage_kv_exchange(
+            layout=layout,
+            rank=rank_int,
+            stage_inputs_by_rank=stage_group.stage_inputs_by_rank,
+            query=query,
+            query_token_ids=query_token_ids,
+            raw_kv=raw_kv,
+            raw_token_ids=raw_token_ids,
+            compressed_kv=compressed_kv,
+            compressed_entry_ids=compressed_entry_ids,
+            group=group,
+            async_op=async_op,
+        )
+        for stage_group in stage_groups
+    )
+    return launch_exchanged_dsv4_attention_forward(
+        stage_works=stage_works,
+        query_token_ids=query_token_ids,
         attn_sink=attn_sink,
         scale=scale,
     )

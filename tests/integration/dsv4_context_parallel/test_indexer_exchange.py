@@ -13,9 +13,11 @@ from art.megatron.dsv4 import (
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
+    Dsv4IndexerStagePlan,
     build_dsv4_compressed_layout,
     build_dsv4_indexer_kv_exchange_peer_plans,
     compute_indexer_stage_topk,
+    launch_dsv4_indexer_topk_from_stage_plans,
     launch_planned_dsv4_indexer_kv_exchange,
 )
 
@@ -94,6 +96,33 @@ def _indexer_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> N
             assert actual.indices[0, 0].tolist() == [1, -1]
         else:
             assert actual.indices[0, 0].tolist() == [2, 1]
+
+        query_ids = (3, 7) if rank == 0 else (16, 11)
+        assembled = launch_dsv4_indexer_topk_from_stage_plans(
+            layout=layout,
+            rank=rank,
+            indexer_stage_plans=(
+                Dsv4IndexerStagePlan(
+                    stage_index=0,
+                    query_token_ids_by_rank=((7,), (11,)),
+                    candidate_entry_ids_by_rank=((1, 2), (1, 2)),
+                ),
+            ),
+            query_token_ids=query_ids,
+            indexer_q=indexer_q.expand(2, -1, -1).contiguous(),
+            indexer_weights=indexer_weights.expand(2, -1).contiguous(),
+            indexer_kv=_indexer_kv(local_entry_ids),
+            indexer_kv_entry_ids=local_entry_ids,
+            topk=2,
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        ).wait_post_process()
+        if rank == 0:
+            assert assembled.indices[0, 0].tolist() == [-1, -1]
+            assert assembled.indices[0, 1].tolist() == [1, -1]
+        else:
+            assert assembled.indices[0, 0].tolist() == [-1, -1]
+            assert assembled.indices[0, 1].tolist() == [2, 1]
     finally:
         destroy_process_group()
 

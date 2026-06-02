@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
 
 from art.megatron.dsv4 import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionGradientResult,
+    Dsv4CompressedLayout,
+    Dsv4CompressionKind,
+    Dsv4CompressionSpec,
     Dsv4ExchangedAttentionBackwardWork,
     Dsv4GradientOwnerBucket,
     Dsv4MaterializedStage,
@@ -14,9 +18,13 @@ from art.megatron.dsv4 import (
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
+    Dsv4StagePlanGroup,
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
+    build_dsv4_compressed_layout,
+    build_stage_local_topk_for_csa,
     compute_single_sink_grad,
+    launch_dsv4_attention_forward_from_stage_plan_groups,
     launch_exchanged_dsv4_attention_backward,
     launch_exchanged_dsv4_attention_forward,
     merge_materialized_stage_records,
@@ -27,6 +35,20 @@ from art.megatron.dsv4 import (
     run_materialized_dsv4_attention_forward,
 )
 import art.megatron.dsv4.cp_attention as cp_attention
+
+
+class _LayoutIndex(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    ownership_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...]
+    token_counts_by_rank: tuple[int, ...]
+
+
+class _Range(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    start: int
+    end: int
 
 
 def _dense_attention_stats(
@@ -239,6 +261,65 @@ def test_exchanged_attention_forward_materializes_stages_then_merges(
     for stage_work in stage_works:
         assert stage_work.wait_count == 1
         assert stage_work.post_process_count == 1
+
+
+def test_stage_plan_group_attention_forward_launcher_assembles_stage_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    layout = _single_rank_layout()
+    stage = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=0,
+        query_token_ids=(3, 7),
+        global_k_ranges=(_Range(start=0, end=8),),
+        global_topk=torch.tensor([[[0, 1], [1, 0]]], dtype=torch.long),
+        window_size=4,
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+
+    work = launch_dsv4_attention_forward_from_stage_plan_groups(
+        layout=layout,
+        rank=0,
+        stage_plan_groups=(
+            Dsv4StagePlanGroup(stage_index=0, stage_inputs_by_rank=(stage,)),
+        ),
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+        compressed_entry_ids=(0, 1),
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+    )
+    result = work.wait_post_process()
+
+    expected_out, expected_lse = merge_single_sink_branch(
+        _stage_tensor(((1.0, 2.0),)),
+        _stage_lse(((2.0, 4.0),)),
+        attn_sink,
+    )
+    torch.testing.assert_close(result.out, expected_out)
+    torch.testing.assert_close(result.lse, expected_lse)
+    assert result.stage_records[0].materialized_stage.key_global_ids == (
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        0,
+        1,
+    )
 
 
 def test_exchanged_attention_forward_rejects_bad_stage_work() -> None:
@@ -687,6 +768,18 @@ def _materialized_stage(
         compressed_count=1,
         key_kinds=(Dsv4StageKeyKind.RAW, Dsv4StageKeyKind.COMPRESSED),
         key_global_ids=(raw_id, compressed_id),
+    )
+
+
+def _single_rank_layout() -> Dsv4CompressedLayout:
+    return build_dsv4_compressed_layout(
+        group_ids=torch.tensor([[0] * 8]),
+        parent_ids=torch.tensor([[0] * 8]),
+        token_layout_index=_LayoutIndex(
+            ownership_ranges_by_rank=(((0, 8, 0),),),
+            token_counts_by_rank=(8,),
+        ),
+        spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
     )
 
 
