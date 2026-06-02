@@ -5,17 +5,21 @@ import torch
 
 from art.megatron.dsv4 import (
     Dsv4AttentionBackwardReplayResult,
+    Dsv4AttentionGradientResult,
+    Dsv4GradientOwnerBucket,
     Dsv4MaterializedStage,
     Dsv4SparseBackwardResult,
     Dsv4SparseForwardResult,
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
+    accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     compute_single_sink_grad,
     merge_materialized_stage_records,
     merge_single_sink_branch,
     merge_stage_outputs,
+    pack_dsv4_gradient_owner_buckets,
     replay_materialized_dsv4_attention_backward,
     run_materialized_dsv4_attention_forward,
 )
@@ -353,6 +357,142 @@ def test_accumulate_materialized_backward_rejects_bad_id_spaces() -> None:
         )
 
 
+def test_pack_gradient_owner_buckets_groups_by_owner_rank() -> None:
+    gradients = _gradient_result()
+
+    buckets = pack_dsv4_gradient_owner_buckets(
+        gradients=gradients,
+        query_owner_ranks=(1, 0, 1),
+        raw_owner_ranks=(0, 1),
+        compressed_owner_ranks=(1, 0),
+    )
+
+    assert tuple(bucket.owner_rank for bucket in buckets) == (0, 1)
+    bucket0, bucket1 = buckets
+    assert bucket0.query_token_ids == (11,)
+    assert bucket0.raw_token_ids == (20,)
+    assert bucket0.compressed_entry_ids == (101,)
+    assert bucket1.query_token_ids == (10, 12)
+    assert bucket1.raw_token_ids == (21,)
+    assert bucket1.compressed_entry_ids == (100,)
+    torch.testing.assert_close(bucket0.dq, gradients.dq[:, [1]])
+    torch.testing.assert_close(bucket1.draw_kv, gradients.draw_kv[:, [1]])
+    torch.testing.assert_close(bucket0.dcompressed_kv, gradients.dcompressed_kv[:, [1]])
+
+
+def test_gradient_owner_buckets_support_partial_empty_sections() -> None:
+    gradients = _gradient_result()
+
+    buckets = pack_dsv4_gradient_owner_buckets(
+        gradients=gradients,
+        query_owner_ranks=(0, 0, 0),
+        raw_owner_ranks=(1, 1),
+        compressed_owner_ranks=(2, 2),
+    )
+
+    assert tuple(bucket.owner_rank for bucket in buckets) == (0, 1, 2)
+    query_bucket, raw_bucket, compressed_bucket = buckets
+    assert raw_bucket.query_token_ids == ()
+    assert compressed_bucket.raw_token_ids == ()
+    assert query_bucket.compressed_entry_ids == ()
+    assert raw_bucket.dq.shape[1] == 0
+    assert compressed_bucket.draw_kv.shape[1] == 0
+    assert query_bucket.dcompressed_kv.shape[1] == 0
+
+    reduced = accumulate_dsv4_gradient_owner_buckets(
+        buckets=buckets,
+        query_token_ids=gradients.query_token_ids,
+        raw_token_ids=gradients.raw_token_ids,
+        compressed_entry_ids=gradients.compressed_entry_ids,
+        d_attn_sink=gradients.d_attn_sink,
+    )
+
+    torch.testing.assert_close(reduced.dq, gradients.dq)
+    torch.testing.assert_close(reduced.draw_kv, gradients.draw_kv)
+    torch.testing.assert_close(reduced.dcompressed_kv, gradients.dcompressed_kv)
+
+
+def test_accumulate_gradient_owner_buckets_sums_received_duplicates() -> None:
+    bucket0 = _owner_bucket(
+        owner_rank=0,
+        query_ids=(10, 11),
+        raw_ids=(20,),
+        compressed_ids=(100,),
+        value=1.0,
+    )
+    bucket1 = _owner_bucket(
+        owner_rank=2,
+        query_ids=(11, 12),
+        raw_ids=(20,),
+        compressed_ids=(101,),
+        value=2.0,
+    )
+
+    reduced = accumulate_dsv4_gradient_owner_buckets(
+        buckets=(bucket0, bucket1),
+        query_token_ids=(10, 11, 12),
+        raw_token_ids=(20,),
+        compressed_entry_ids=(100, 101),
+        d_attn_sink=torch.tensor([7.0, 8.0], dtype=torch.float64),
+    )
+
+    torch.testing.assert_close(reduced.dq, _stage_tensor(((1.0, 3.0, 2.0),)))
+    torch.testing.assert_close(
+        reduced.draw_kv,
+        torch.full((1, 1, 3), 3.0, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        reduced.dcompressed_kv,
+        torch.tensor([[[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        reduced.d_attn_sink, torch.tensor([7.0, 8.0], dtype=torch.float64)
+    )
+
+
+def test_gradient_owner_buckets_reject_bad_metadata() -> None:
+    gradients = _gradient_result()
+    with pytest.raises(ValueError, match="query_owner_ranks length"):
+        pack_dsv4_gradient_owner_buckets(
+            gradients=gradients,
+            query_owner_ranks=(0,),
+            raw_owner_ranks=(0, 1),
+            compressed_owner_ranks=(0, 1),
+        )
+    with pytest.raises(ValueError, match="missing from query_token_ids"):
+        accumulate_dsv4_gradient_owner_buckets(
+            buckets=(
+                _owner_bucket(
+                    owner_rank=0,
+                    query_ids=(13,),
+                    raw_ids=(),
+                    compressed_ids=(),
+                    value=1.0,
+                ),
+            ),
+            query_token_ids=(10,),
+            raw_token_ids=(),
+            compressed_entry_ids=(),
+            d_attn_sink=torch.zeros(2, dtype=torch.float64),
+        )
+    with pytest.raises(ValueError, match="bucket_query_token_ids contains duplicate"):
+        accumulate_dsv4_gradient_owner_buckets(
+            buckets=(
+                _owner_bucket(
+                    owner_rank=0,
+                    query_ids=(10, 10),
+                    raw_ids=(),
+                    compressed_ids=(),
+                    value=1.0,
+                ),
+            ),
+            query_token_ids=(10,),
+            raw_token_ids=(),
+            compressed_entry_ids=(),
+            d_attn_sink=torch.zeros(2, dtype=torch.float64),
+        )
+
+
 def _materialized_stage(
     stage_index: int,
     query_token_ids: tuple[int, ...],
@@ -437,5 +577,46 @@ def _stage_backward_record(
                 ]
             ],
             dtype=stage.kv_stage.dtype,
+        ),
+    )
+
+
+def _gradient_result() -> Dsv4AttentionGradientResult:
+    return Dsv4AttentionGradientResult(
+        query_token_ids=(10, 11, 12),
+        raw_token_ids=(20, 21),
+        compressed_entry_ids=(100, 101),
+        dq=_stage_tensor(((1.0, 2.0, 3.0),)),
+        draw_kv=torch.tensor(
+            [[[20.0, 20.0, 20.0], [21.0, 21.0, 21.0]]],
+            dtype=torch.float64,
+        ),
+        dcompressed_kv=torch.tensor(
+            [[[100.0, 100.0, 100.0], [101.0, 101.0, 101.0]]],
+            dtype=torch.float64,
+        ),
+        d_attn_sink=torch.tensor([3.0, 4.0], dtype=torch.float64),
+    )
+
+
+def _owner_bucket(
+    *,
+    owner_rank: int,
+    query_ids: tuple[int, ...],
+    raw_ids: tuple[int, ...],
+    compressed_ids: tuple[int, ...],
+    value: float,
+) -> Dsv4GradientOwnerBucket:
+    return Dsv4GradientOwnerBucket(
+        owner_rank=owner_rank,
+        query_token_ids=query_ids,
+        raw_token_ids=raw_ids,
+        compressed_entry_ids=compressed_ids,
+        dq=_stage_tensor((tuple(value for _ in query_ids),)),
+        draw_kv=torch.full((1, len(raw_ids), 3), value, dtype=torch.float64),
+        dcompressed_kv=torch.full(
+            (1, len(compressed_ids), 3),
+            value,
+            dtype=torch.float64,
         ),
     )

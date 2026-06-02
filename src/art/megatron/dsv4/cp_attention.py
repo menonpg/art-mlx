@@ -9,6 +9,7 @@ from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
     Dsv4AttentionGradientResult,
+    Dsv4GradientOwnerBucket,
     Dsv4MaterializedStage,
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
@@ -412,6 +413,181 @@ def accumulate_materialized_dsv4_attention_backward(
     )
 
 
+def pack_dsv4_gradient_owner_buckets(
+    *,
+    gradients: Dsv4AttentionGradientResult,
+    query_owner_ranks: Sequence[int],
+    raw_owner_ranks: Sequence[int],
+    compressed_owner_ranks: Sequence[int],
+) -> tuple[Dsv4GradientOwnerBucket, ...]:
+    """Pack local DSV4 grads into owner-ranked buckets for eager communication.
+
+    This helper only builds stable send payloads. The actual distributed send
+    path should keep custom communication eager and make stream/lifetime
+    ordering explicit.
+    """
+    query_owner_ranks = _validate_owner_ranks(
+        ranks=query_owner_ranks,
+        expected_count=len(gradients.query_token_ids),
+        name="query_owner_ranks",
+    )
+    raw_owner_ranks = _validate_owner_ranks(
+        ranks=raw_owner_ranks,
+        expected_count=len(gradients.raw_token_ids),
+        name="raw_owner_ranks",
+    )
+    compressed_owner_ranks = _validate_owner_ranks(
+        ranks=compressed_owner_ranks,
+        expected_count=len(gradients.compressed_entry_ids),
+        name="compressed_owner_ranks",
+    )
+    _validate_gradient_result_shapes(gradients)
+
+    owner_ranks = sorted(
+        set(query_owner_ranks) | set(raw_owner_ranks) | set(compressed_owner_ranks)
+    )
+    buckets: list[Dsv4GradientOwnerBucket] = []
+    for owner_rank in owner_ranks:
+        q_positions = _positions_for_owner(query_owner_ranks, owner_rank)
+        raw_positions = _positions_for_owner(raw_owner_ranks, owner_rank)
+        compressed_positions = _positions_for_owner(compressed_owner_ranks, owner_rank)
+        buckets.append(
+            Dsv4GradientOwnerBucket(
+                owner_rank=owner_rank,
+                query_token_ids=_ids_at_positions(
+                    gradients.query_token_ids, q_positions
+                ),
+                raw_token_ids=_ids_at_positions(gradients.raw_token_ids, raw_positions),
+                compressed_entry_ids=_ids_at_positions(
+                    gradients.compressed_entry_ids,
+                    compressed_positions,
+                ),
+                dq=_index_select_positions(
+                    gradients.dq,
+                    positions=q_positions,
+                    device=gradients.dq.device,
+                ),
+                draw_kv=_index_select_positions(
+                    gradients.draw_kv,
+                    positions=raw_positions,
+                    device=gradients.draw_kv.device,
+                ),
+                dcompressed_kv=_index_select_positions(
+                    gradients.dcompressed_kv,
+                    positions=compressed_positions,
+                    device=gradients.dcompressed_kv.device,
+                ),
+            )
+        )
+    return tuple(buckets)
+
+
+def accumulate_dsv4_gradient_owner_buckets(
+    *,
+    buckets: Sequence[Dsv4GradientOwnerBucket],
+    query_token_ids: Sequence[int],
+    raw_token_ids: Sequence[int],
+    compressed_entry_ids: Sequence[int],
+    d_attn_sink: torch.Tensor,
+) -> Dsv4AttentionGradientResult:
+    """Reduce received owner buckets into this rank's explicit id spaces."""
+    if len(buckets) == 0:
+        raise ValueError("at least one DSV4 gradient owner bucket is required")
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    raw_ids = tuple(int(token_id) for token_id in raw_token_ids)
+    compressed_ids = tuple(int(entry_id) for entry_id in compressed_entry_ids)
+    query_index = _row_by_id(ids=query_ids, name="query_token_ids")
+    raw_index = _row_by_id(ids=raw_ids, name="raw_token_ids")
+    compressed_index = _row_by_id(
+        ids=compressed_ids,
+        name="compressed_entry_ids",
+    )
+
+    first = buckets[0]
+    _validate_owner_bucket_shapes(first)
+    batch_size, _, head_count, dim = first.dq.shape
+    kv_dim = int(first.draw_kv.shape[-1])
+    target_dtype = _accum_output_dtype(first.dq.dtype)
+    dq = torch.zeros(
+        (batch_size, len(query_ids), head_count, dim),
+        device=first.dq.device,
+        dtype=target_dtype,
+    )
+    draw_kv = torch.zeros(
+        (batch_size, len(raw_ids), kv_dim),
+        device=first.draw_kv.device,
+        dtype=target_dtype,
+    )
+    dcompressed_kv = torch.zeros(
+        (batch_size, len(compressed_ids), kv_dim),
+        device=first.dcompressed_kv.device,
+        dtype=target_dtype,
+    )
+
+    for bucket in buckets:
+        _validate_owner_bucket_shapes(bucket)
+        if (
+            int(bucket.dq.shape[0]) != batch_size
+            or int(bucket.dq.shape[2]) != head_count
+            or int(bucket.dq.shape[-1]) != dim
+        ):
+            raise ValueError(
+                "all DSV4 gradient owner bucket dq tensors must share shape"
+            )
+        if (
+            int(bucket.draw_kv.shape[0]) != batch_size
+            or int(bucket.draw_kv.shape[-1]) != kv_dim
+            or int(bucket.dcompressed_kv.shape[0]) != batch_size
+            or int(bucket.dcompressed_kv.shape[-1]) != kv_dim
+        ):
+            raise ValueError(
+                "all DSV4 gradient owner bucket KV tensors must share shape"
+            )
+        if bucket.query_token_ids:
+            dq.index_add_(
+                1,
+                _indices_for_ids(
+                    ids=bucket.query_token_ids,
+                    id_index=query_index,
+                    name="query_token_ids",
+                    device=dq.device,
+                ),
+                bucket.dq.to(dtype=target_dtype),
+            )
+        if bucket.raw_token_ids:
+            draw_kv.index_add_(
+                1,
+                _indices_for_ids(
+                    ids=bucket.raw_token_ids,
+                    id_index=raw_index,
+                    name="raw_token_ids",
+                    device=draw_kv.device,
+                ),
+                bucket.draw_kv.to(dtype=target_dtype),
+            )
+        if bucket.compressed_entry_ids:
+            dcompressed_kv.index_add_(
+                1,
+                _indices_for_ids(
+                    ids=bucket.compressed_entry_ids,
+                    id_index=compressed_index,
+                    name="compressed_entry_ids",
+                    device=dcompressed_kv.device,
+                ),
+                bucket.dcompressed_kv.to(dtype=target_dtype),
+            )
+
+    return Dsv4AttentionGradientResult(
+        query_token_ids=query_ids,
+        raw_token_ids=raw_ids,
+        compressed_entry_ids=compressed_ids,
+        dq=dq,
+        draw_kv=draw_kv,
+        dcompressed_kv=dcompressed_kv,
+        d_attn_sink=d_attn_sink,
+    )
+
+
 def compute_single_sink_grad(
     grad_out: torch.Tensor,
     global_out: torch.Tensor,
@@ -444,6 +620,93 @@ def compute_single_sink_grad(
     p_sink = _safe_exp_diff(sink_lse, global_lse)
     reduce_dims = tuple(range(delta.ndim - 1))
     return -(delta * p_sink).sum(dim=reduce_dims)
+
+
+def _validate_gradient_result_shapes(gradients: Dsv4AttentionGradientResult) -> None:
+    if int(gradients.dq.shape[1]) != len(gradients.query_token_ids):
+        raise ValueError("DSV4 dq rows must match query_token_ids")
+    if int(gradients.draw_kv.shape[1]) != len(gradients.raw_token_ids):
+        raise ValueError("DSV4 draw_kv rows must match raw_token_ids")
+    if int(gradients.dcompressed_kv.shape[1]) != len(gradients.compressed_entry_ids):
+        raise ValueError("DSV4 dcompressed_kv rows must match compressed_entry_ids")
+    if gradients.dq.ndim != 4:
+        raise ValueError(f"DSV4 dq must have shape [B,Q,H,D], got {gradients.dq.shape}")
+    if gradients.draw_kv.ndim != 3 or gradients.dcompressed_kv.ndim != 3:
+        raise ValueError(
+            "DSV4 KV gradients must have shape [B,K,D], got "
+            f"raw={gradients.draw_kv.shape}, compressed={gradients.dcompressed_kv.shape}"
+        )
+    if int(gradients.draw_kv.shape[0]) != int(gradients.dq.shape[0]) or int(
+        gradients.dcompressed_kv.shape[0]
+    ) != int(gradients.dq.shape[0]):
+        raise ValueError("DSV4 gradient batch dimensions must match")
+    if int(gradients.draw_kv.shape[-1]) != int(gradients.dq.shape[-1]) or int(
+        gradients.dcompressed_kv.shape[-1]
+    ) != int(gradients.dq.shape[-1]):
+        raise ValueError("DSV4 gradient head/KV dims must match")
+
+
+def _validate_owner_bucket_shapes(bucket: Dsv4GradientOwnerBucket) -> None:
+    if bucket.dq.ndim != 4:
+        raise ValueError(
+            f"DSV4 owner bucket dq must be [B,Q,H,D], got {bucket.dq.shape}"
+        )
+    if bucket.draw_kv.ndim != 3 or bucket.dcompressed_kv.ndim != 3:
+        raise ValueError(
+            "DSV4 owner bucket KV gradients must be [B,K,D], got "
+            f"raw={bucket.draw_kv.shape}, compressed={bucket.dcompressed_kv.shape}"
+        )
+    if int(bucket.dq.shape[1]) != len(bucket.query_token_ids):
+        raise ValueError("DSV4 owner bucket dq rows must match query ids")
+    if int(bucket.draw_kv.shape[1]) != len(bucket.raw_token_ids):
+        raise ValueError("DSV4 owner bucket raw rows must match raw ids")
+    if int(bucket.dcompressed_kv.shape[1]) != len(bucket.compressed_entry_ids):
+        raise ValueError("DSV4 owner bucket compressed rows must match compressed ids")
+    _row_by_id(ids=bucket.query_token_ids, name="bucket_query_token_ids")
+    _row_by_id(ids=bucket.raw_token_ids, name="bucket_raw_token_ids")
+    _row_by_id(ids=bucket.compressed_entry_ids, name="bucket_compressed_entry_ids")
+
+
+def _validate_owner_ranks(
+    *,
+    ranks: Sequence[int],
+    expected_count: int,
+    name: str,
+) -> tuple[int, ...]:
+    ranks = tuple(int(rank) for rank in ranks)
+    if len(ranks) != int(expected_count):
+        raise ValueError(
+            f"DSV4 {name} length {len(ranks)} does not match expected {expected_count}"
+        )
+    if any(rank < 0 for rank in ranks):
+        raise ValueError(f"DSV4 {name} must be non-negative")
+    return ranks
+
+
+def _positions_for_owner(
+    owner_ranks: Sequence[int], owner_rank: int
+) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, candidate_rank in enumerate(owner_ranks)
+        if int(candidate_rank) == int(owner_rank)
+    )
+
+
+def _ids_at_positions(ids: Sequence[int], positions: Sequence[int]) -> tuple[int, ...]:
+    return tuple(int(ids[position]) for position in positions)
+
+
+def _index_select_positions(
+    tensor: torch.Tensor,
+    *,
+    positions: Sequence[int],
+    device: torch.device,
+) -> torch.Tensor:
+    indices = torch.tensor(
+        tuple(int(position) for position in positions), device=device, dtype=torch.long
+    )
+    return tensor.index_select(1, indices)
 
 
 def _validate_stage_backward_shapes(record: Dsv4StageBackwardRecord) -> None:

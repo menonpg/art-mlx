@@ -194,6 +194,18 @@ class Dsv4AttentionGradientResult(BaseModel):
     d_attn_sink: torch.Tensor
 
 
+class Dsv4GradientOwnerBucket(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    owner_rank: int
+    query_token_ids: tuple[int, ...]
+    raw_token_ids: tuple[int, ...]
+    compressed_entry_ids: tuple[int, ...]
+    dq: torch.Tensor
+    draw_kv: torch.Tensor
+    dcompressed_kv: torch.Tensor
+
+
 class Dsv4CompressedLayout(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -231,3 +243,4 @@ Dsv4AttentionForwardResult.model_rebuild()
 Dsv4StageBackwardRecord.model_rebuild()
 Dsv4AttentionBackwardReplayResult.model_rebuild()
 Dsv4AttentionGradientResult.model_rebuild()
+Dsv4GradientOwnerBucket.model_rebuild()
