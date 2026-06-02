@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Any, Protocol
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
+from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .indexer import stage_candidate_entry_ids, visible_entry_ids_for_query
 from .types import (
     Dsv4BranchView,
@@ -13,6 +15,7 @@ from .types import (
     Dsv4MaterializedStage,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
+    Dsv4TensorExchangePlan,
 )
 
 _INVALID_INDEX = -1
@@ -21,6 +24,53 @@ _INVALID_INDEX = -1
 class TokenRangeLike(Protocol):
     start: int
     end: int
+
+
+class Dsv4StageKvExchangeWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    stage_inputs: Dsv4StageInputs
+    query: torch.Tensor
+    query_token_ids: tuple[int, ...]
+    recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    tensor_work: Dsv4TensorExchangeWork
+
+    def wait(self) -> None:
+        self.tensor_work.wait()
+
+    def wait_post_process(self) -> Dsv4MaterializedStage:
+        result = self.tensor_work.wait_post_process()
+        expected_wire_ids = _stage_wire_peer_ids_by_peer(
+            raw_ids_by_peer=self.recv_raw_token_ids_by_peer,
+            compressed_ids_by_peer=self.recv_compressed_entry_ids_by_peer,
+        )
+        _validate_stage_exchange_ids(
+            actual=result.ids,
+            expected=expected_wire_ids,
+        )
+        raw_positions, raw_ids = _positions_for_stage_kind(
+            wire_ids=result.ids,
+            kind=Dsv4StageKeyKind.RAW,
+        )
+        compressed_positions, compressed_ids = _positions_for_stage_kind(
+            wire_ids=result.ids,
+            kind=Dsv4StageKeyKind.COMPRESSED,
+        )
+        raw_kv = _index_select_stage_token_dim(result.tensor, raw_positions)
+        compressed_kv = _index_select_stage_token_dim(
+            result.tensor,
+            compressed_positions,
+        )
+        return materialize_dsv4_stage_tensors(
+            stage_inputs=self.stage_inputs,
+            query=self.query,
+            query_token_ids=self.query_token_ids,
+            raw_kv=raw_kv,
+            raw_token_ids=raw_ids,
+            compressed_kv=compressed_kv,
+            compressed_entry_ids=compressed_ids,
+        )
 
 
 def build_dsv4_stage_inputs(
@@ -286,6 +336,95 @@ def materialize_dsv4_stage_tensors(
     )
 
 
+@torch.compiler.disable
+def launch_dsv4_stage_kv_exchange(
+    *,
+    stage_inputs: Dsv4StageInputs,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    send_raw_token_ids_by_peer: Sequence[Sequence[int]],
+    send_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
+    recv_raw_token_ids_by_peer: Sequence[Sequence[int]],
+    recv_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
+    group: Any,
+    async_op: bool,
+) -> Dsv4StageKvExchangeWork:
+    """Launch one fused raw+compressed KV exchange for a DSV4 attention stage.
+
+    Raw and compressed rows share the main attention KV dim, so the production
+    stage path exchanges one fused tensor per stage instead of separate raw and
+    compressed collectives. Wire ids encode key kind to keep raw token ids and
+    compressed entry ids in disjoint spaces.
+    """
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    _validate_stage_kv_pair(
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_entry_ids,
+    )
+    rank_count = _peer_count(
+        send_raw_token_ids_by_peer,
+        send_compressed_entry_ids_by_peer,
+        recv_raw_token_ids_by_peer,
+        recv_compressed_entry_ids_by_peer,
+    )
+    send_raw = _normalize_stage_peer_ids(
+        send_raw_token_ids_by_peer,
+        rank_count=rank_count,
+        name="send_raw_token_ids_by_peer",
+    )
+    send_compressed = _normalize_stage_peer_ids(
+        send_compressed_entry_ids_by_peer,
+        rank_count=rank_count,
+        name="send_compressed_entry_ids_by_peer",
+    )
+    recv_raw = _normalize_stage_peer_ids(
+        recv_raw_token_ids_by_peer,
+        rank_count=rank_count,
+        name="recv_raw_token_ids_by_peer",
+    )
+    recv_compressed = _normalize_stage_peer_ids(
+        recv_compressed_entry_ids_by_peer,
+        rank_count=rank_count,
+        name="recv_compressed_entry_ids_by_peer",
+    )
+    fused_kv, fused_ids = _fuse_local_stage_kv(
+        raw_kv=raw_kv,
+        raw_token_ids=tuple(int(token_id) for token_id in raw_token_ids),
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=tuple(int(entry_id) for entry_id in compressed_entry_ids),
+    )
+    return Dsv4StageKvExchangeWork(
+        stage_inputs=stage_inputs,
+        query=query,
+        query_token_ids=query_ids,
+        recv_raw_token_ids_by_peer=recv_raw,
+        recv_compressed_entry_ids_by_peer=recv_compressed,
+        tensor_work=launch_dsv4_tensor_exchange(
+            tensor=fused_kv,
+            tensor_ids=fused_ids,
+            plan=Dsv4TensorExchangePlan(
+                send_ids_by_peer=_stage_wire_peer_ids_by_peer(
+                    raw_ids_by_peer=send_raw,
+                    compressed_ids_by_peer=send_compressed,
+                ),
+                recv_ids_by_peer=_stage_wire_peer_ids_by_peer(
+                    raw_ids_by_peer=recv_raw,
+                    compressed_ids_by_peer=recv_compressed,
+                ),
+            ),
+            group=group,
+            async_op=async_op,
+            label="dsv4_stage_kv_exchange",
+        ),
+    )
+
+
 def _stage_raw_token_ids(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
     seen: set[int] = set()
     token_ids: list[int] = []
@@ -295,6 +434,158 @@ def _stage_raw_token_ids(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
                 seen.add(token_id)
                 token_ids.append(token_id)
     return tuple(token_ids)
+
+
+def _validate_stage_kv_pair(
+    *,
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+) -> None:
+    if raw_kv.ndim not in (2, 3) or compressed_kv.ndim not in (2, 3):
+        raise RuntimeError(
+            "DSV4 stage KV tensors must be [N,D] or [B,N,D], got "
+            f"raw={tuple(raw_kv.shape)}, compressed={tuple(compressed_kv.shape)}"
+        )
+    if raw_kv.ndim != compressed_kv.ndim:
+        raise RuntimeError(
+            "DSV4 raw and compressed stage KV ranks must match, got "
+            f"{raw_kv.ndim} vs {compressed_kv.ndim}"
+        )
+    if raw_kv.device != compressed_kv.device or raw_kv.dtype != compressed_kv.dtype:
+        raise RuntimeError("DSV4 raw and compressed stage KV device/dtype must match")
+    if int(raw_kv.shape[-1]) != int(compressed_kv.shape[-1]):
+        raise RuntimeError("DSV4 raw and compressed stage KV dims must match")
+    if raw_kv.ndim == 3 and int(raw_kv.shape[0]) != int(compressed_kv.shape[0]):
+        raise RuntimeError("DSV4 raw and compressed stage KV batch dims must match")
+    if len(raw_token_ids) != int(raw_kv.shape[_stage_token_dim(raw_kv)]):
+        raise RuntimeError("DSV4 raw_token_ids length must match raw_kv rows")
+    if len(compressed_entry_ids) != int(
+        compressed_kv.shape[_stage_token_dim(compressed_kv)]
+    ):
+        raise RuntimeError(
+            "DSV4 compressed_entry_ids length must match compressed_kv rows"
+        )
+    _row_by_id(tensor_ids=raw_token_ids, name="raw_token_ids")
+    _row_by_id(tensor_ids=compressed_entry_ids, name="compressed_entry_ids")
+
+
+def _peer_count(*peers: Sequence[Sequence[int]]) -> int:
+    counts = {len(peer_ids) for peer_ids in peers}
+    if len(counts) != 1:
+        raise RuntimeError("DSV4 stage exchange peer-list counts must match")
+    return counts.pop()
+
+
+def _normalize_stage_peer_ids(
+    ids_by_peer: Sequence[Sequence[int]],
+    *,
+    rank_count: int,
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    if len(ids_by_peer) != int(rank_count):
+        raise RuntimeError(
+            f"DSV4 {name} peer count {len(ids_by_peer)} does not match {rank_count}"
+        )
+    normalized: list[tuple[int, ...]] = []
+    for peer, ids in enumerate(ids_by_peer):
+        peer_ids = tuple(int(id_) for id_ in ids)
+        if any(id_ < 0 for id_ in peer_ids):
+            raise RuntimeError(f"DSV4 {name}[{peer}] ids must be non-negative")
+        _row_by_id(tensor_ids=peer_ids, name=f"{name}[{peer}]")
+        normalized.append(peer_ids)
+    return tuple(normalized)
+
+
+def _fuse_local_stage_kv(
+    *,
+    raw_kv: torch.Tensor,
+    raw_token_ids: tuple[int, ...],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: tuple[int, ...],
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    fused = torch.cat((raw_kv, compressed_kv), dim=_stage_token_dim(raw_kv))
+    return fused, tuple(
+        _stage_wire_id(Dsv4StageKeyKind.RAW, token_id) for token_id in raw_token_ids
+    ) + tuple(
+        _stage_wire_id(Dsv4StageKeyKind.COMPRESSED, entry_id)
+        for entry_id in compressed_entry_ids
+    )
+
+
+def _stage_wire_peer_ids_by_peer(
+    *,
+    raw_ids_by_peer: tuple[tuple[int, ...], ...],
+    compressed_ids_by_peer: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[int, ...], ...]:
+    if len(raw_ids_by_peer) != len(compressed_ids_by_peer):
+        raise RuntimeError("DSV4 stage wire peer counts must match")
+    return tuple(
+        tuple(_stage_wire_id(Dsv4StageKeyKind.RAW, id_) for id_ in raw_ids)
+        + tuple(
+            _stage_wire_id(Dsv4StageKeyKind.COMPRESSED, id_) for id_ in compressed_ids
+        )
+        for raw_ids, compressed_ids in zip(raw_ids_by_peer, compressed_ids_by_peer)
+    )
+
+
+def _stage_wire_id(kind: Dsv4StageKeyKind, id_: int) -> int:
+    id_int = int(id_)
+    if id_int < 0:
+        raise RuntimeError("DSV4 stage key ids must be non-negative")
+    return id_int * 2 + (1 if kind is Dsv4StageKeyKind.COMPRESSED else 0)
+
+
+def _stage_wire_kind_and_id(wire_id: int) -> tuple[Dsv4StageKeyKind, int]:
+    wire_int = int(wire_id)
+    if wire_int < 0:
+        raise RuntimeError("DSV4 stage wire ids must be non-negative")
+    kind = Dsv4StageKeyKind.COMPRESSED if wire_int % 2 else Dsv4StageKeyKind.RAW
+    return kind, wire_int // 2
+
+
+def _validate_stage_exchange_ids(
+    *,
+    actual: tuple[int, ...],
+    expected: tuple[tuple[int, ...], ...],
+) -> None:
+    flat_expected = tuple(id_ for peer_ids in expected for id_ in peer_ids)
+    if actual != flat_expected:
+        raise RuntimeError(
+            f"DSV4 stage exchange received ids {actual} but expected {flat_expected}"
+        )
+
+
+def _positions_for_stage_kind(
+    *,
+    wire_ids: Sequence[int],
+    kind: Dsv4StageKeyKind,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    positions: list[int] = []
+    ids: list[int] = []
+    for position, wire_id in enumerate(wire_ids):
+        row_kind, row_id = _stage_wire_kind_and_id(int(wire_id))
+        if row_kind is kind:
+            positions.append(position)
+            ids.append(row_id)
+    return tuple(positions), tuple(ids)
+
+
+def _index_select_stage_token_dim(
+    tensor: torch.Tensor,
+    positions: Sequence[int],
+) -> torch.Tensor:
+    indices = torch.tensor(
+        tuple(int(position) for position in positions),
+        device=tensor.device,
+        dtype=torch.long,
+    )
+    return tensor.index_select(_stage_token_dim(tensor), indices)
+
+
+def _stage_token_dim(tensor: torch.Tensor) -> int:
+    return 0 if tensor.ndim == 2 else 1
 
 
 def _visible_raw_swa_token_ids(

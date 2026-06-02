@@ -30,9 +30,11 @@ from .cp_attention import (
     run_materialized_dsv4_attention_forward,
 )
 from .cp_stage import (
+    Dsv4StageKvExchangeWork,
     build_dsv4_stage_inputs,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
+    launch_dsv4_stage_kv_exchange,
     materialize_dsv4_stage_tensors,
     raw_swa_token_ids_for_query,
 )
@@ -104,6 +106,7 @@ __all__ = [
     "Dsv4ProjectedTokenBuffer",
     "Dsv4StageInputs",
     "Dsv4StageKeyKind",
+    "Dsv4StageKvExchangeWork",
     "Dsv4StageBackwardRecord",
     "Dsv4StageForwardRecord",
     "Dsv4SparseBackwardResult",
@@ -137,6 +140,7 @@ __all__ = [
     "launch_dsv4_compression_halo_exchange",
     "launch_dsv4_compression_halo_gradient_exchange",
     "launch_dsv4_gradient_owner_bucket_exchange",
+    "launch_dsv4_stage_kv_exchange",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
     "merge_materialized_stage_records",
