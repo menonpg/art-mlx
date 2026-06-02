@@ -161,6 +161,44 @@ def compute_indexer_topk(
     return Dsv4TopkResult(indices=top_ids.to(torch.int64), scores=top_scores)
 
 
+@torch.no_grad()
+def compute_indexer_stage_topk(
+    *,
+    layout: Dsv4CompressedLayout,
+    query_token_ids: Sequence[int],
+    candidate_entry_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    topk: int,
+    score_scale: float = 1.0,
+) -> Dsv4TopkResult:
+    """Compute CSA indexer topk for one CP stage's compressed candidates.
+
+    The caller provides an explicit id space for the fetched indexer-compressed
+    KV rows. This keeps the stage path independent of how communication fetched
+    those rows, while still rejecting missing or duplicate compressed ids before
+    scoring.
+    """
+    candidate_ids = tuple(int(entry_id) for entry_id in candidate_entry_ids)
+    candidate_kv = _gather_indexer_kv_by_ids(
+        tensor=indexer_kv,
+        tensor_ids=indexer_kv_entry_ids,
+        selected_ids=candidate_ids,
+    )
+    return compute_indexer_topk(
+        indexer_q=indexer_q,
+        indexer_kv=candidate_kv,
+        indexer_weights=indexer_weights,
+        candidate_entry_ids=candidate_ids,
+        topk=topk,
+        query_token_ids=query_token_ids,
+        layout=layout,
+        score_scale=score_scale,
+    )
+
+
 def merge_indexer_topk_results(
     *,
     results: Sequence[Dsv4TopkResult],
@@ -345,6 +383,47 @@ def stable_select_from_scored_ids(
             dim=-1,
         ),
     )
+
+
+def _gather_indexer_kv_by_ids(
+    *,
+    tensor: torch.Tensor,
+    tensor_ids: Sequence[int],
+    selected_ids: Sequence[int],
+) -> torch.Tensor:
+    if tensor.ndim not in (2, 3):
+        raise RuntimeError(
+            "DSV4 indexer KV must have shape [C,D] or [B,C,D], got "
+            f"{tuple(tensor.shape)}"
+        )
+    tensor_ids = tuple(int(entry_id) for entry_id in tensor_ids)
+    selected_ids = tuple(int(entry_id) for entry_id in selected_ids)
+    if len(tensor_ids) != int(tensor.shape[-2]):
+        raise RuntimeError(
+            "DSV4 indexer KV id count must match tensor rows, got "
+            f"{len(tensor_ids)} vs {int(tensor.shape[-2])}"
+        )
+    row_by_id = _row_by_id(tensor_ids, name="indexer_kv_entry_ids")
+    _row_by_id(selected_ids, name="candidate_entry_ids")
+    missing = tuple(entry_id for entry_id in selected_ids if entry_id not in row_by_id)
+    if missing:
+        raise RuntimeError(f"DSV4 indexer KV tensor is missing ids: {missing}")
+    indices = torch.tensor(
+        tuple(row_by_id[entry_id] for entry_id in selected_ids),
+        device=tensor.device,
+        dtype=torch.long,
+    )
+    return tensor.index_select(0 if tensor.ndim == 2 else 1, indices)
+
+
+def _row_by_id(ids: Sequence[int], name: str) -> dict[int, int]:
+    row_by_id: dict[int, int] = {}
+    for row, id_ in enumerate(ids):
+        id_int = int(id_)
+        if id_int in row_by_id:
+            raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
+        row_by_id[id_int] = row
+    return row_by_id
 
 
 def _query_visibility(

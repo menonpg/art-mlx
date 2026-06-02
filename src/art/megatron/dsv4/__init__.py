@@ -32,6 +32,7 @@ from .cp_stage import (
 from .indexer import (
     build_indexer_visibility_mask,
     compute_indexer_scores,
+    compute_indexer_stage_topk,
     compute_indexer_topk,
     merge_indexer_topk_results,
     stable_topk_by_score_and_id,
@@ -110,6 +111,7 @@ __all__ = [
     "build_stage_local_topk_for_hca",
     "compute_single_sink_grad",
     "compute_indexer_scores",
+    "compute_indexer_stage_topk",
     "compute_indexer_topk",
     "compress_owned_projected_kv",
     "compress_projected_kv",

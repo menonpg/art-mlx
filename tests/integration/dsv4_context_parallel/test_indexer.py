@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
+import pytest
 import torch
 
 from art.megatron.dsv4 import (
@@ -11,6 +12,7 @@ from art.megatron.dsv4 import (
     build_dsv4_compressed_layout,
     build_indexer_visibility_mask,
     compute_indexer_scores,
+    compute_indexer_stage_topk,
     compute_indexer_topk,
     merge_indexer_topk_results,
     stable_topk_by_score_and_id,
@@ -138,6 +140,115 @@ def test_compute_indexer_topk_handles_no_visible_candidates() -> None:
 
     assert result.indices[0, 0].tolist() == [-1, -1, -1]
     assert torch.isneginf(result.scores[0, 0]).all()
+
+
+def test_indexer_stage_topks_merge_to_global_with_explicit_id_maps() -> None:
+    layout = _layout()
+    torch.manual_seed(17)
+    query_token_ids = (11, 16)
+    q = torch.randn(len(query_token_ids), 3, 5, requires_grad=True)
+    weights = torch.randn(len(query_token_ids), 3, requires_grad=True)
+    kv_by_entry = {
+        entry_id: torch.randn(5, requires_grad=True) for entry_id in (0, 1, 2, 3)
+    }
+    fetched_ids = (3, 1, 0, 2)
+    fetched_kv = torch.stack([kv_by_entry[entry_id] for entry_id in fetched_ids])
+    topk = 3
+
+    stage_prefix = compute_indexer_stage_topk(
+        layout=layout,
+        query_token_ids=query_token_ids,
+        candidate_entry_ids=(0, 1),
+        indexer_q=q,
+        indexer_weights=weights,
+        indexer_kv=fetched_kv,
+        indexer_kv_entry_ids=fetched_ids,
+        topk=topk,
+        score_scale=0.25,
+    )
+    stage_suffix = compute_indexer_stage_topk(
+        layout=layout,
+        query_token_ids=query_token_ids,
+        candidate_entry_ids=(2, 3),
+        indexer_q=q,
+        indexer_weights=weights,
+        indexer_kv=fetched_kv,
+        indexer_kv_entry_ids=fetched_ids,
+        topk=topk,
+        score_scale=0.25,
+    )
+    merged = merge_indexer_topk_results(
+        results=(stage_prefix, stage_suffix),
+        topk=topk,
+    )
+    expected = compute_indexer_topk(
+        indexer_q=q,
+        indexer_kv=torch.stack([kv_by_entry[entry_id] for entry_id in (0, 1, 2, 3)]),
+        indexer_weights=weights,
+        candidate_entry_ids=(0, 1, 2, 3),
+        topk=topk,
+        query_token_ids=query_token_ids,
+        layout=layout,
+        score_scale=0.25,
+    )
+
+    torch.testing.assert_close(merged.indices, expected.indices)
+    torch.testing.assert_close(merged.scores, expected.scores, rtol=1e-6, atol=1e-6)
+    assert not merged.indices.requires_grad
+    assert not merged.scores.requires_grad
+
+
+def test_indexer_stage_topk_handles_empty_candidate_stage() -> None:
+    layout = _layout()
+    q = torch.randn(2, 3, 5)
+    weights = torch.randn(2, 3)
+    kv = torch.randn(2, 5)
+
+    result = compute_indexer_stage_topk(
+        layout=layout,
+        query_token_ids=(11, 16),
+        candidate_entry_ids=(),
+        indexer_q=q,
+        indexer_weights=weights,
+        indexer_kv=kv,
+        indexer_kv_entry_ids=(0, 1),
+        topk=4,
+    )
+
+    assert result.indices.shape == (1, 2, 4)
+    assert result.scores.shape == (1, 2, 4)
+    assert result.indices.tolist() == [[[-1, -1, -1, -1], [-1, -1, -1, -1]]]
+    assert torch.isneginf(result.scores).all()
+
+
+def test_indexer_stage_topk_rejects_bad_entry_id_maps() -> None:
+    layout = _layout()
+    q = torch.randn(1, 2, 5)
+    weights = torch.randn(1, 2)
+    kv = torch.randn(2, 5)
+
+    with pytest.raises(RuntimeError, match="missing ids"):
+        compute_indexer_stage_topk(
+            layout=layout,
+            query_token_ids=(11,),
+            candidate_entry_ids=(2,),
+            indexer_q=q,
+            indexer_weights=weights,
+            indexer_kv=kv,
+            indexer_kv_entry_ids=(0, 1),
+            topk=1,
+        )
+    with pytest.raises(RuntimeError, match="duplicate id"):
+        compute_indexer_stage_topk(
+            layout=layout,
+            query_token_ids=(11,),
+            candidate_entry_ids=(1,),
+            indexer_q=q,
+            indexer_weights=weights,
+            indexer_kv=kv,
+            indexer_kv_entry_ids=(1, 1),
+            topk=1,
+        )
 
 
 def test_stable_topk_repairs_boundary_ties_by_global_id() -> None:
