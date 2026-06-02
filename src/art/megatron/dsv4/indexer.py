@@ -101,7 +101,7 @@ def stage_candidate_entry_ids(
     """Return compressed ids whose raw closure token is in a CP stage K range."""
     if not global_k_ranges:
         return ()
-    if layout.entries and (
+    if layout.entry_count() and (
         not layout.entry_ids_by_closure_token or not layout.closure_token_ids
     ):
         raise RuntimeError(
@@ -194,12 +194,13 @@ def visible_entry_ids_for_query(
     """Return candidate compressed ids visible to one packed query token."""
     query = _query_visibility(layout=layout, query_token_id=query_token_id)
     if candidate_entry_ids is None:
-        candidate_entry_ids = range(len(layout.entries))
+        candidate_entry_ids = range(layout.entry_count())
     return tuple(
         int(entry_id)
         for entry_id in candidate_entry_ids
-        if _entry_visible_to_query(
-            entry=layout.entries[int(entry_id)],
+        if _entry_id_visible_to_query(
+            layout=layout,
+            entry_id=int(entry_id),
             query_branch_stream_id=query[0],
             query_prefix_stream_id=query[1],
             query_view_pos=query[2],
@@ -1079,7 +1080,7 @@ def _compressed_entry_owner_rank(
     entry_id: int,
 ) -> int:
     entry_int = int(entry_id)
-    if entry_int < 0 or entry_int >= len(layout.entries):
+    if entry_int < 0 or entry_int >= layout.entry_count():
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
     if layout.compressed_entry_owner_ranks:
         return int(layout.compressed_entry_owner_ranks[entry_int])
@@ -1173,11 +1174,18 @@ def _entry_visibility_tensors(
     pos: list[int] = []
     shared: list[bool] = []
     for entry_id in candidate_entry_ids:
-        entry = layout.entries[int(entry_id)]
-        branch.append(int(entry.branch_stream_id))
-        prefix.append(int(entry.prefix_stream_id))
-        pos.append(int(entry.closure_view_pos))
-        shared.append(bool(entry.shared_prefix_entry))
+        entry_int = _validate_entry_id(layout=layout, entry_id=int(entry_id))
+        if layout.entry_branch_stream_ids:
+            branch.append(int(layout.entry_branch_stream_ids[entry_int]))
+            prefix.append(int(layout.entry_prefix_stream_ids[entry_int]))
+            pos.append(int(layout.entry_closure_view_positions[entry_int]))
+            shared.append(bool(layout.entry_shared_prefix_flags[entry_int]))
+        else:
+            entry = layout.entries[entry_int]
+            branch.append(int(entry.branch_stream_id))
+            prefix.append(int(entry.prefix_stream_id))
+            pos.append(int(entry.closure_view_pos))
+            shared.append(bool(entry.shared_prefix_entry))
     return (
         torch.tensor(branch, device=device, dtype=torch.long),
         torch.tensor(prefix, device=device, dtype=torch.long),
@@ -1200,6 +1208,40 @@ def _entry_visible_to_query(
     return (same_branch or shared_prefix) and int(entry.closure_view_pos) <= int(
         query_view_pos
     )
+
+
+def _entry_id_visible_to_query(
+    *,
+    layout: Dsv4CompressedLayout,
+    entry_id: int,
+    query_branch_stream_id: int,
+    query_prefix_stream_id: int,
+    query_view_pos: int,
+) -> bool:
+    entry_int = _validate_entry_id(layout=layout, entry_id=entry_id)
+    if layout.entry_branch_stream_ids:
+        same_branch = int(layout.entry_branch_stream_ids[entry_int]) == int(
+            query_branch_stream_id
+        )
+        shared_prefix = bool(layout.entry_shared_prefix_flags[entry_int]) and int(
+            layout.entry_prefix_stream_ids[entry_int]
+        ) == int(query_prefix_stream_id)
+        return (same_branch or shared_prefix) and int(
+            layout.entry_closure_view_positions[entry_int]
+        ) <= int(query_view_pos)
+    return _entry_visible_to_query(
+        entry=layout.entries[entry_int],
+        query_branch_stream_id=query_branch_stream_id,
+        query_prefix_stream_id=query_prefix_stream_id,
+        query_view_pos=query_view_pos,
+    )
+
+
+def _validate_entry_id(*, layout: Dsv4CompressedLayout, entry_id: int) -> int:
+    entry_int = int(entry_id)
+    if entry_int < 0 or entry_int >= layout.entry_count():
+        raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
+    return entry_int
 
 
 def _stream_for_token(*, layout: Dsv4CompressedLayout, token_id: int):

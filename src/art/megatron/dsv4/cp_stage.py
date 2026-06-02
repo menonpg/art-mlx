@@ -1289,7 +1289,7 @@ def _compressed_entry_owner_rank(
     entry_id: int,
 ) -> int:
     entry_int = int(entry_id)
-    if entry_int < 0 or entry_int >= len(layout.entries):
+    if entry_int < 0 or entry_int >= layout.entry_count():
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
     if layout.compressed_entry_owner_ranks:
         return int(layout.compressed_entry_owner_ranks[entry_int])

@@ -428,13 +428,23 @@ class Dsv4CompressedLayout(BaseModel):
     streams: tuple[Dsv4StreamSpec, ...]
     branch_views: tuple[Dsv4BranchView, ...]
     entries: tuple[Dsv4CompressedEntry, ...]
+    compressed_entry_count: int = 0
     halo_transfers: tuple[Dsv4HaloTransfer, ...]
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
     raw_token_owner_ranks: tuple[int, ...]
     compressed_entry_owner_ranks: tuple[int, ...] = ()
+    entry_branch_stream_ids: tuple[int, ...] = ()
+    entry_prefix_stream_ids: tuple[int, ...] = ()
+    entry_closure_view_positions: tuple[int, ...] = ()
+    entry_shared_prefix_flags: tuple[bool, ...] = ()
+    entry_dependency_start_view_positions: tuple[int, ...] = ()
+    dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...] = ()
     entry_ids_by_branch_stream: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     entry_ids_by_closure_token: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     closure_token_ids: tuple[int, ...] = ()
+
+    def entry_count(self) -> int:
+        return int(self.compressed_entry_count or len(self.entries))
 
 
 class Dsv4PreparedPlan(BaseModel):

@@ -1242,13 +1242,9 @@ def build_dsv4_attention_backward_plans_from_stage_plan_slots(
                 f"{len(layout.entry_ids_by_owner_rank)} vs {rank_count}"
             )
 
-    query_raw_ids = _stage_plan_slot_query_raw_id_spaces(
+    query_raw_ids, query_raw_owners = _stage_plan_slot_query_raw_id_and_owner_spaces(
         layout=layout_tuple[0],
         slots=slots,
-    )
-    query_raw_owners = _query_raw_owner_spaces(
-        layout=layout_tuple[0],
-        id_spaces=query_raw_ids,
     )
     common_rank_parts = _common_backward_rank_parts(
         id_spaces=query_raw_ids,
@@ -1870,30 +1866,158 @@ def _stage_plan_slot_query_raw_id_spaces(
     tuple[tuple[int, ...], ...],
     tuple[tuple[int, ...], ...],
 ]:
+    return _stage_plan_slot_query_raw_id_and_owner_spaces(layout=layout, slots=slots)[0]
+
+
+def _stage_plan_slot_query_raw_id_and_owner_spaces(
+    *,
+    layout: Dsv4CompressedLayout,
+    slots: Sequence[Dsv4StagePlanSlot],
+) -> tuple[
+    tuple[
+        tuple[tuple[int, ...], ...],
+        tuple[tuple[int, ...], ...],
+    ],
+    tuple[
+        tuple[tuple[int, ...], ...],
+        tuple[tuple[int, ...], ...],
+    ],
+]:
     rank_count = len(layout.entry_ids_by_owner_rank)
-    query_by_rank: list[list[int]] = [[] for _ in range(rank_count)]
-    raw_by_rank: list[list[int]] = [[] for _ in range(rank_count)]
-    query_seen_by_rank: list[set[int]] = [set() for _ in range(rank_count)]
-    raw_seen_by_rank: list[set[int]] = [set() for _ in range(rank_count)]
+    raw_owner_ranks = tuple(int(owner) for owner in layout.raw_token_owner_ranks)
+    valid_ranges = _layout_stream_ranges(layout)
+    query_ranges_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(rank_count)]
+    raw_ranges_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(rank_count)]
     for slot in slots:
         for rank, stage_plan in enumerate(slot.stage_plans_by_rank):
-            _append_unique_seen(
-                query_by_rank[rank],
-                query_seen_by_rank[rank],
-                _token_ids_from_ranges(stage_plan.global_q_ranges),
+            _append_stage_ranges(
+                query_ranges_by_rank[rank],
+                stage_plan.global_q_ranges,
             )
-            _append_unique_seen(
-                raw_by_rank[rank],
-                raw_seen_by_rank[rank],
-                _raw_token_ids_from_ranges(
-                    layout=layout,
-                    ranges=stage_plan.global_k_ranges,
-                ),
+            _append_intersected_stage_ranges(
+                raw_ranges_by_rank[rank],
+                ranges=stage_plan.global_k_ranges,
+                valid_ranges=valid_ranges,
             )
+    query_ids_by_rank: list[tuple[int, ...]] = []
+    query_owners_by_rank: list[tuple[int, ...]] = []
+    raw_ids_by_rank: list[tuple[int, ...]] = []
+    raw_owners_by_rank: list[tuple[int, ...]] = []
+    for rank in range(rank_count):
+        query_ids = _token_ids_from_merged_ranges(query_ranges_by_rank[rank])
+        query_ids_by_rank.append(query_ids)
+        query_owners_by_rank.append((int(rank),) * len(query_ids))
+        raw_ids, raw_owners = _token_ids_and_owners_from_merged_ranges(
+            ranges=raw_ranges_by_rank[rank],
+            raw_owner_ranks=raw_owner_ranks,
+            require_owned=False,
+        )
+        raw_ids_by_rank.append(raw_ids)
+        raw_owners_by_rank.append(raw_owners)
     return (
-        tuple(tuple(ids) for ids in query_by_rank),
-        tuple(tuple(ids) for ids in raw_by_rank),
+        (
+            tuple(query_ids_by_rank),
+            tuple(raw_ids_by_rank),
+        ),
+        (
+            tuple(query_owners_by_rank),
+            tuple(raw_owners_by_rank),
+        ),
     )
+
+
+def _append_stage_ranges(
+    target: list[tuple[int, int]],
+    ranges: Sequence[Any],
+) -> None:
+    for range_ in ranges:
+        start = int(range_.start)
+        end = int(range_.end)
+        if start < end:
+            target.append((start, end))
+
+
+def _append_intersected_stage_ranges(
+    target: list[tuple[int, int]],
+    *,
+    ranges: Sequence[Any],
+    valid_ranges: tuple[tuple[int, int], ...],
+) -> None:
+    valid_count = len(valid_ranges)
+    valid_index = 0
+    for range_ in ranges:
+        range_start = int(range_.start)
+        range_end = int(range_.end)
+        if range_start >= range_end:
+            continue
+        while valid_index < valid_count and valid_ranges[valid_index][1] <= range_start:
+            valid_index += 1
+        scan_index = valid_index
+        while scan_index < valid_count:
+            stream_start, stream_end = valid_ranges[scan_index]
+            if stream_start >= range_end:
+                break
+            start = max(range_start, stream_start)
+            end = min(range_end, stream_end)
+            if start < end:
+                target.append((start, end))
+            scan_index += 1
+
+
+def _token_ids_from_merged_ranges(ranges: Sequence[tuple[int, int]]) -> tuple[int, ...]:
+    ids: list[int] = []
+    for start, end in _merge_token_ranges(ranges):
+        if int(start) < 0:
+            raise RuntimeError(f"DSV4 query token range {start}:{end} has no CP owner")
+        ids.extend(range(int(start), int(end)))
+    return tuple(ids)
+
+
+def _token_ids_and_owners_from_merged_ranges(
+    *,
+    ranges: Sequence[tuple[int, int]],
+    raw_owner_ranks: Sequence[int],
+    require_owned: bool,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    ids: list[int] = []
+    owners: list[int] = []
+    owner_count = len(raw_owner_ranks)
+    for start, end in _merge_token_ranges(ranges):
+        for token_id in range(int(start), int(end)):
+            if token_id < 0 or token_id >= owner_count:
+                if require_owned:
+                    raise RuntimeError(
+                        f"DSV4 raw/query token {token_id} has no CP owner"
+                    )
+                continue
+            owner = int(raw_owner_ranks[token_id])
+            if owner < 0:
+                if require_owned:
+                    raise RuntimeError(
+                        f"DSV4 raw/query token {token_id} has no CP owner"
+                    )
+                continue
+            ids.append(token_id)
+            owners.append(owner)
+    return tuple(ids), tuple(owners)
+
+
+def _merge_token_ranges(
+    ranges: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    sorted_ranges = sorted(
+        (int(start), int(end)) for start, end in ranges if int(start) < int(end)
+    )
+    if not sorted_ranges:
+        return ()
+    merged: list[list[int]] = [[sorted_ranges[0][0], sorted_ranges[0][1]]]
+    for start, end in sorted_ranges[1:]:
+        current = merged[-1]
+        if int(start) <= int(current[1]):
+            current[1] = max(int(current[1]), int(end))
+        else:
+            merged.append([int(start), int(end)])
+    return tuple((start, end) for start, end in merged)
 
 
 def _stage_plan_slot_compressed_id_spaces(
@@ -2013,9 +2137,8 @@ def _common_backward_rank_parts(
     ],
     rank_count: int,
 ) -> tuple[dict[str, Any], ...]:
-    query_recv_by_rank, query_owned_by_rank = _gradient_recv_and_owned_by_rank(
-        ids_by_rank=id_spaces[0],
-        owners_by_rank=owner_spaces[0],
+    query_recv_by_rank, query_owned_by_rank = _identity_query_recv_and_owned_by_rank(
+        query_ids_by_rank=id_spaces[0],
         rank_count=rank_count,
     )
     raw_recv_by_rank, raw_owned_by_rank = _gradient_recv_and_owned_by_rank(
@@ -2036,6 +2159,29 @@ def _common_backward_rank_parts(
         }
         for rank in range(rank_count)
     )
+
+
+def _identity_query_recv_and_owned_by_rank(
+    *,
+    query_ids_by_rank: tuple[tuple[int, ...], ...],
+    rank_count: int,
+) -> tuple[
+    tuple[tuple[tuple[int, ...], ...], ...],
+    tuple[tuple[int, ...], ...],
+]:
+    if len(query_ids_by_rank) != int(rank_count):
+        raise RuntimeError(
+            "DSV4 query id space rank count mismatch: "
+            f"{len(query_ids_by_rank)} vs {rank_count}"
+        )
+    recv = tuple(
+        tuple(
+            query_ids_by_rank[rank] if peer == rank else ()
+            for peer in range(int(rank_count))
+        )
+        for rank in range(int(rank_count))
+    )
+    return recv, query_ids_by_rank
 
 
 def _gradient_recv_and_owned_by_rank(
@@ -2143,6 +2289,12 @@ def _raw_token_ids_from_ranges(
                     ids.append(token_id)
                     seen.add(token_id)
     return tuple(ids)
+
+
+def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted((int(stream.start), int(stream.end)) for stream in layout.streams)
+    )
 
 
 def _token_ids_from_ranges(ranges: Sequence[Any]) -> tuple[int, ...]:
