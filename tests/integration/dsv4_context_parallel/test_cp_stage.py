@@ -11,7 +11,9 @@ from art.megatron.dsv4 import (
     Dsv4StageKeyKind,
     build_dsv4_compressed_layout,
     build_dsv4_stage_kv_exchange_peer_plans,
+    build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
     build_dsv4_stage_plan_group_from_stage_plans,
+    build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
     materialize_dsv4_stage_tensors,
@@ -237,6 +239,58 @@ def test_stage_plan_group_derives_stage_inputs_from_art_stage_plans() -> None:
     assert rank1.compressed_entry_ids == (2, 3)
     assert rank1.topk_stage_local[0, 0].tolist() == [0, 1, 2, 3, 10, -1]
     assert rank1.topk_stage_local[0, 1].tolist() == [5, 6, 7, 8, 11, -1]
+
+
+def test_stage_plan_slots_group_stage_indices_in_rank0_order() -> None:
+    slots = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (
+                _stage_plan(stage_index=9, q_ranges=((0, 1),), k_ranges=((0, 4),)),
+                _stage_plan(stage_index=3, q_ranges=((1, 2),), k_ranges=((0, 8),)),
+            ),
+            (
+                _stage_plan(stage_index=3, q_ranges=((8, 9),), k_ranges=((8, 12),)),
+                _stage_plan(stage_index=9, q_ranges=((9, 10),), k_ranges=((4, 12),)),
+            ),
+        ),
+    )
+
+    assert tuple(slot.stage_index for slot in slots) == (9, 3)
+    assert tuple(slot.stage_plans_by_rank[1].stage_index for slot in slots) == (9, 3)
+
+
+def test_stage_kv_exchange_plan_from_stage_plans_does_not_need_topk() -> None:
+    layout = _layout(Dsv4CompressionKind.CSA)
+    stage_plans = (
+        _stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),
+        _stage_plan(
+            stage_index=5,
+            q_ranges=((11, 12), (16, 17)),
+            k_ranges=((8, 18),),
+        ),
+    )
+    topk_dependent_group = build_dsv4_stage_plan_group_from_stage_plans(
+        layout=layout,
+        stage_plans_by_rank=stage_plans,
+        compression_kind=Dsv4CompressionKind.CSA,
+        global_topk_indices_by_rank=(
+            torch.tensor([[[1, 2]]], dtype=torch.long),
+            torch.tensor([[[3, 2], [0, 1]]], dtype=torch.long),
+        ),
+        topk_query_token_ids_by_rank=((7,), (11, 16)),
+        window_size=4,
+    )
+
+    from_stage_inputs = build_dsv4_stage_kv_exchange_peer_plans(
+        layout=layout,
+        stage_inputs_by_rank=topk_dependent_group.stage_inputs_by_rank,
+    )
+    from_stage_plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
+        layout=layout,
+        stage_plans_by_rank=stage_plans,
+    )
+
+    assert from_stage_plans == from_stage_inputs
 
 
 def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:

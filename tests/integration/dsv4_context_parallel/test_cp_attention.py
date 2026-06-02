@@ -22,9 +22,12 @@ from art.megatron.dsv4 import (
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
     compute_single_sink_grad,
     launch_dsv4_attention_forward_from_stage_plan_groups,
+    launch_dsv4_csa_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_attention_forward_from_stage_plan_slots,
     launch_exchanged_dsv4_attention_backward,
     launch_exchanged_dsv4_attention_forward,
     merge_materialized_stage_records,
@@ -49,6 +52,14 @@ class _Range(BaseModel):
 
     start: int
     end: int
+
+
+class _StagePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage_index: int
+    global_q_ranges: tuple[_Range, ...]
+    global_k_ranges: tuple[_Range, ...]
 
 
 def _dense_attention_stats(
@@ -320,6 +331,121 @@ def test_stage_plan_group_attention_forward_launcher_assembles_stage_work(
         0,
         1,
     )
+
+
+def test_csa_attention_forward_launcher_uses_local_topk_and_stage_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slots = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (
+                _stage_plan(
+                    stage_index=0,
+                    q_ranges=((3, 4), (7, 8)),
+                    k_ranges=((0, 8),),
+                ),
+            ),
+        ),
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+
+    work = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+        compressed_entry_ids=(0, 1),
+        indexer_q=torch.tensor(
+            [[[1.0, 0.0]], [[1.0, 0.0]]],
+            dtype=torch.float32,
+        ),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float32),
+        indexer_kv=torch.tensor([[2.0, 0.0], [3.0, 0.0]], dtype=torch.float32),
+        indexer_kv_entry_ids=(0, 1),
+        indexer_topk=2,
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    )
+    result = work.wait_post_process()
+
+    expected_out, expected_lse = merge_single_sink_branch(
+        _stage_tensor(((1.0, 2.0),)),
+        _stage_lse(((2.0, 4.0),)),
+        attn_sink,
+    )
+    torch.testing.assert_close(result.out, expected_out)
+    torch.testing.assert_close(result.lse, expected_lse)
+    stage = result.stage_records[0].materialized_stage
+    assert stage.query_token_ids == (3, 7)
+    assert stage.raw_count == 8
+    assert stage.compressed_count == 2
+    assert stage.key_global_ids == (0, 1, 2, 3, 4, 5, 6, 7, 0, 1)
+
+
+def test_hca_attention_forward_launcher_uses_stage_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.HCA)
+    slots = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (
+                _stage_plan(
+                    stage_index=0,
+                    q_ranges=((3, 4), (7, 8)),
+                    k_ranges=((0, 8),),
+                ),
+            ),
+        ),
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+
+    work = launch_dsv4_hca_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+        compressed_entry_ids=(0, 1),
+        attn_sink=attn_sink,
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    )
+    result = work.wait_post_process()
+
+    expected_out, expected_lse = merge_single_sink_branch(
+        _stage_tensor(((1.0, 2.0),)),
+        _stage_lse(((2.0, 4.0),)),
+        attn_sink,
+    )
+    torch.testing.assert_close(result.out, expected_out)
+    torch.testing.assert_close(result.lse, expected_lse)
+    stage = result.stage_records[0].materialized_stage
+    assert stage.query_token_ids == (3, 7)
+    assert stage.raw_count == 8
+    assert stage.compressed_count == 2
 
 
 def test_exchanged_attention_forward_rejects_bad_stage_work() -> None:
@@ -771,7 +897,9 @@ def _materialized_stage(
     )
 
 
-def _single_rank_layout() -> Dsv4CompressedLayout:
+def _single_rank_layout(
+    kind: Dsv4CompressionKind = Dsv4CompressionKind.CSA,
+) -> Dsv4CompressedLayout:
     return build_dsv4_compressed_layout(
         group_ids=torch.tensor([[0] * 8]),
         parent_ids=torch.tensor([[0] * 8]),
@@ -779,7 +907,20 @@ def _single_rank_layout() -> Dsv4CompressedLayout:
             ownership_ranges_by_rank=(((0, 8, 0),),),
             token_counts_by_rank=(8,),
         ),
-        spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
+        spec=Dsv4CompressionSpec(kind=kind, ratio=4),
+    )
+
+
+def _stage_plan(
+    *,
+    stage_index: int,
+    q_ranges: tuple[tuple[int, int], ...],
+    k_ranges: tuple[tuple[int, int], ...],
+) -> _StagePlan:
+    return _StagePlan(
+        stage_index=stage_index,
+        global_q_ranges=tuple(_Range(start=start, end=end) for start, end in q_ranges),
+        global_k_ranges=tuple(_Range(start=start, end=end) for start, end in k_ranges),
     )
 
 

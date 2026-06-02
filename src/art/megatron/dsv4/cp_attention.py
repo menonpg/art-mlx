@@ -9,17 +9,28 @@ import torch.distributed as dist
 
 from . import sparse_kernel
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
-from .cp_stage import launch_planned_dsv4_stage_kv_exchange
+from .cp_stage import (
+    build_dsv4_stage_inputs_from_stage_plan,
+    launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
+    launch_planned_dsv4_stage_kv_exchange,
+)
+from .indexer import (
+    build_dsv4_indexer_stage_plan_from_stage_plans,
+    launch_dsv4_indexer_topk_from_stage_plans,
+)
 from .types import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionForwardResult,
     Dsv4AttentionGradientResult,
+    Dsv4CompressedLayout,
+    Dsv4CompressionKind,
     Dsv4GradientOwnerBucket,
     Dsv4MaterializedStage,
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
     Dsv4StagePlanGroup,
+    Dsv4StagePlanSlot,
     Dsv4TensorExchangePlan,
 )
 
@@ -422,6 +433,158 @@ def launch_dsv4_attention_forward_from_stage_plan_groups(
 
 
 @torch.compiler.disable
+def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    indexer_topk: int,
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    indexer_score_scale: float = 1.0,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ExchangedAttentionForwardWork:
+    """Launch DSV4 CSA CP forward from ART StagePlan slots.
+
+    The indexer topk is local to this rank's query rows. Stage KV exchange
+    planning remains topk-independent and uses all ranks' StagePlan K ranges, so
+    this path does not require gathering live topk ids from peer ranks.
+    """
+    rank_int = int(rank)
+    _validate_exchange_rank(
+        rank=rank_int, rank_count=len(layout.entry_ids_by_owner_rank)
+    )
+    slots = _validate_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=stage_plan_slots,
+    )
+    query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
+    indexer_stage_plans = tuple(
+        build_dsv4_indexer_stage_plan_from_stage_plans(
+            layout=layout,
+            stage_plans_by_rank=slot.stage_plans_by_rank,
+        )
+        for slot in slots
+    )
+    topk_result = launch_dsv4_indexer_topk_from_stage_plans(
+        layout=layout,
+        rank=rank_int,
+        indexer_stage_plans=indexer_stage_plans,
+        query_token_ids=query_ids,
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_kv=indexer_kv,
+        indexer_kv_entry_ids=indexer_kv_entry_ids,
+        topk=indexer_topk,
+        group=group,
+        async_op=async_op,
+        score_scale=indexer_score_scale,
+    ).wait_post_process()
+    stage_works = tuple(
+        _launch_dsv4_stage_from_slot(
+            layout=layout,
+            rank=rank_int,
+            slot=slot,
+            compression_kind=Dsv4CompressionKind.CSA,
+            query=query,
+            query_token_ids=query_ids,
+            raw_kv=raw_kv,
+            raw_token_ids=raw_token_ids,
+            compressed_kv=compressed_kv,
+            compressed_entry_ids=compressed_entry_ids,
+            group=group,
+            async_op=async_op,
+            global_topk=topk_result.indices,
+            topk_query_token_ids=query_ids,
+            window_size=window_size,
+            raw_list_size=raw_list_size,
+            compressed_list_size=compressed_list_size,
+        )
+        for slot in slots
+    )
+    return launch_exchanged_dsv4_attention_forward(
+        stage_works=stage_works,
+        query_token_ids=query_ids,
+        attn_sink=attn_sink,
+        scale=scale,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ExchangedAttentionForwardWork:
+    """Launch DSV4 HCA CP forward from ART StagePlan slots."""
+    rank_int = int(rank)
+    _validate_exchange_rank(
+        rank=rank_int, rank_count=len(layout.entry_ids_by_owner_rank)
+    )
+    slots = _validate_stage_plan_slots(
+        layout=layout,
+        stage_plan_slots=stage_plan_slots,
+    )
+    query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
+    stage_works = tuple(
+        _launch_dsv4_stage_from_slot(
+            layout=layout,
+            rank=rank_int,
+            slot=slot,
+            compression_kind=Dsv4CompressionKind.HCA,
+            query=query,
+            query_token_ids=query_ids,
+            raw_kv=raw_kv,
+            raw_token_ids=raw_token_ids,
+            compressed_kv=compressed_kv,
+            compressed_entry_ids=compressed_entry_ids,
+            group=group,
+            async_op=async_op,
+            global_topk=None,
+            topk_query_token_ids=None,
+            window_size=window_size,
+            raw_list_size=raw_list_size,
+            compressed_list_size=compressed_list_size,
+        )
+        for slot in slots
+    )
+    return launch_exchanged_dsv4_attention_forward(
+        stage_works=stage_works,
+        query_token_ids=query_ids,
+        attn_sink=attn_sink,
+        scale=scale,
+    )
+
+
+@torch.compiler.disable
 def launch_exchanged_dsv4_attention_backward(
     *,
     forward_result: Dsv4AttentionForwardResult,
@@ -618,6 +781,75 @@ def _empty_owned_gradient_result(
         ),
         d_attn_sink=d_attn_sink,
     )
+
+
+def _launch_dsv4_stage_from_slot(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    slot: Dsv4StagePlanSlot,
+    compression_kind: Dsv4CompressionKind,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    group: Any,
+    async_op: bool,
+    global_topk: torch.Tensor | None,
+    topk_query_token_ids: Sequence[int] | None,
+    window_size: int,
+    raw_list_size: int | None,
+    compressed_list_size: int | None,
+) -> Any:
+    local_stage_inputs = build_dsv4_stage_inputs_from_stage_plan(
+        layout=layout,
+        stage_plan=slot.stage_plans_by_rank[int(rank)],
+        compression_kind=compression_kind,
+        global_topk=global_topk,
+        topk_query_token_ids=topk_query_token_ids,
+        window_size=window_size,
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
+    )
+    return launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
+        layout=layout,
+        rank=rank,
+        stage_plan_slot=slot,
+        local_stage_inputs=local_stage_inputs,
+        query=query,
+        query_token_ids=query_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_entry_ids,
+        group=group,
+        async_op=async_op,
+    )
+
+
+def _validate_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+) -> tuple[Dsv4StagePlanSlot, ...]:
+    slots = tuple(stage_plan_slots)
+    if not slots:
+        raise ValueError("DSV4 attention forward requires stage_plan_slots")
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    seen: set[int] = set()
+    for slot in slots:
+        if len(slot.stage_plans_by_rank) != rank_count:
+            raise RuntimeError(
+                "DSV4 StagePlan slot rank count mismatch: "
+                f"{len(slot.stage_plans_by_rank)} vs {rank_count}"
+            )
+        stage_index = int(slot.stage_index)
+        if stage_index in seen:
+            raise RuntimeError(f"DSV4 duplicate StagePlan slot {stage_index}")
+        seen.add(stage_index)
+    return slots
 
 
 def _normalize_output_ids(ids: Sequence[int], *, name: str) -> tuple[int, ...]:

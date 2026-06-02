@@ -16,6 +16,7 @@ from .types import (
     Dsv4StageInputs,
     Dsv4StageKeyKind,
     Dsv4StagePlanGroup,
+    Dsv4StagePlanSlot,
     Dsv4TensorExchangePlan,
 )
 
@@ -239,6 +240,92 @@ def build_stage_local_topk_for_hca(
     )
 
 
+def build_dsv4_stage_plan_slots(
+    *,
+    stage_plans_by_rank: Sequence[Sequence[Any]],
+) -> tuple[Dsv4StagePlanSlot, ...]:
+    """Group ART StagePlans by stage index across all CP ranks.
+
+    This is host-only DSV4 planning metadata. It preserves rank 0's stage order
+    and validates that every rank has exactly one StagePlan for each stage id,
+    so later DSV4 launchers can derive compatible all-rank exchange requests.
+    """
+    plans_by_rank = tuple(tuple(rank_plans) for rank_plans in stage_plans_by_rank)
+    if not plans_by_rank:
+        raise RuntimeError("DSV4 StagePlan slot grouping requires at least one rank")
+
+    maps_by_rank: list[dict[int, Any]] = []
+    stage_order: list[int] = []
+    for rank, rank_plans in enumerate(plans_by_rank):
+        rank_map: dict[int, Any] = {}
+        for stage_plan in rank_plans:
+            stage_index = int(stage_plan.stage_index)
+            if stage_index in rank_map:
+                raise RuntimeError(
+                    f"DSV4 rank {rank} has duplicate StagePlan {stage_index}"
+                )
+            rank_map[stage_index] = stage_plan
+            if rank == 0:
+                stage_order.append(stage_index)
+        maps_by_rank.append(rank_map)
+
+    expected = set(stage_order)
+    for rank, rank_map in enumerate(maps_by_rank):
+        actual = set(rank_map)
+        if actual != expected:
+            raise RuntimeError(
+                "DSV4 StagePlan slots require identical stage ids on all ranks: "
+                f"rank0={tuple(stage_order)}, rank{rank}={tuple(rank_map)}"
+            )
+    return tuple(
+        Dsv4StagePlanSlot(
+            stage_index=stage_index,
+            stage_plans_by_rank=tuple(
+                rank_map[stage_index] for rank_map in maps_by_rank
+            ),
+        )
+        for stage_index in stage_order
+    )
+
+
+def build_dsv4_stage_inputs_from_stage_plan(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plan: Any,
+    compression_kind: Dsv4CompressionKind,
+    global_topk: torch.Tensor | None = None,
+    topk_query_token_ids: Sequence[int] | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4StageInputs:
+    """Build this rank's DSV4 stage inputs from one ART StagePlan."""
+    query_ids = _token_ids_from_ranges(stage_plan.global_q_ranges)
+    stage_topk = None
+    if compression_kind == Dsv4CompressionKind.CSA:
+        if global_topk is None or topk_query_token_ids is None:
+            raise RuntimeError("DSV4 CSA stage inputs require local topk metadata")
+        stage_topk = _select_topk_for_query_ids(
+            global_topk=global_topk,
+            global_query_token_ids=topk_query_token_ids,
+            selected_query_token_ids=query_ids,
+        )
+    elif global_topk is not None or topk_query_token_ids is not None:
+        raise RuntimeError("DSV4 HCA stage inputs do not consume topk metadata")
+
+    return build_dsv4_stage_inputs(
+        layout=layout,
+        stage_index=int(stage_plan.stage_index),
+        query_token_ids=query_ids,
+        global_k_ranges=stage_plan.global_k_ranges,
+        compression_kind=compression_kind,
+        global_topk=stage_topk,
+        window_size=window_size,
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
+    )
+
+
 def build_dsv4_stage_plan_group_from_stage_plans(
     *,
     layout: Dsv4CompressedLayout,
@@ -271,24 +358,29 @@ def build_dsv4_stage_plan_group_from_stage_plans(
     ):
         raise RuntimeError("DSV4 HCA StagePlan conversion does not consume topk")
 
+    csa_topk_by_rank = (
+        tuple(global_topk_indices_by_rank)
+        if global_topk_indices_by_rank is not None
+        else None
+    )
+    csa_topk_ids_by_rank = (
+        tuple(topk_query_token_ids_by_rank)
+        if topk_query_token_ids_by_rank is not None
+        else None
+    )
     stage_inputs = []
     for rank, stage_plan in enumerate(stage_plans):
-        query_ids = _token_ids_from_ranges(stage_plan.global_q_ranges)
-        topk = None
-        if compression_kind == Dsv4CompressionKind.CSA:
-            topk = _select_topk_for_query_ids(
-                global_topk=global_topk_indices_by_rank[rank],  # type: ignore[index]
-                global_query_token_ids=topk_query_token_ids_by_rank[rank],  # type: ignore[index]
-                selected_query_token_ids=query_ids,
-            )
         stage_inputs.append(
-            build_dsv4_stage_inputs(
+            build_dsv4_stage_inputs_from_stage_plan(
                 layout=layout,
-                stage_index=stage_index,
-                query_token_ids=query_ids,
-                global_k_ranges=stage_plan.global_k_ranges,
                 compression_kind=compression_kind,
-                global_topk=topk,
+                stage_plan=stage_plan,
+                global_topk=csa_topk_by_rank[rank]
+                if csa_topk_by_rank is not None
+                else None,
+                topk_query_token_ids=csa_topk_ids_by_rank[rank]
+                if csa_topk_ids_by_rank is not None
+                else None,
                 window_size=window_size,
                 raw_list_size=raw_list_size,
                 compressed_list_size=compressed_list_size,
@@ -318,9 +410,37 @@ def build_dsv4_stage_kv_exchange_peer_plans(
             "DSV4 stage exchange planning requires one stage input per rank, got "
             f"{len(stage_inputs_by_rank)} vs {rank_count}"
         )
+    return _build_stage_kv_exchange_peer_plans_from_ids(
+        layout=layout,
+        raw_token_ids_by_rank=tuple(
+            stage.raw_token_ids for stage in stage_inputs_by_rank
+        ),
+        compressed_entry_ids_by_rank=tuple(
+            stage.compressed_entry_ids for stage in stage_inputs_by_rank
+        ),
+    )
+
+
+def _build_stage_kv_exchange_peer_plans_from_ids(
+    *,
+    layout: Dsv4CompressedLayout,
+    raw_token_ids_by_rank: Sequence[Sequence[int]],
+    compressed_entry_ids_by_rank: Sequence[Sequence[int]],
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    if len(raw_token_ids_by_rank) != rank_count:
+        raise RuntimeError(
+            "DSV4 stage raw exchange planning requires one id list per rank, got "
+            f"{len(raw_token_ids_by_rank)} vs {rank_count}"
+        )
+    if len(compressed_entry_ids_by_rank) != rank_count:
+        raise RuntimeError(
+            "DSV4 stage compressed exchange planning requires one id list per rank, "
+            f"got {len(compressed_entry_ids_by_rank)} vs {rank_count}"
+        )
     recv_raw = tuple(
         _ids_by_owner_rank(
-            ids=stage.raw_token_ids,
+            ids=raw_token_ids,
             rank_count=rank_count,
             owner_rank=lambda token_id: _raw_token_owner_rank(
                 layout=layout,
@@ -328,11 +448,11 @@ def build_dsv4_stage_kv_exchange_peer_plans(
             ),
             name=f"rank{rank}_raw_token_ids",
         )
-        for rank, stage in enumerate(stage_inputs_by_rank)
+        for rank, raw_token_ids in enumerate(raw_token_ids_by_rank)
     )
     recv_compressed = tuple(
         _ids_by_owner_rank(
-            ids=stage.compressed_entry_ids,
+            ids=compressed_entry_ids,
             rank_count=rank_count,
             owner_rank=lambda entry_id: _compressed_entry_owner_rank(
                 layout=layout,
@@ -340,7 +460,7 @@ def build_dsv4_stage_kv_exchange_peer_plans(
             ),
             name=f"rank{rank}_compressed_entry_ids",
         )
-        for rank, stage in enumerate(stage_inputs_by_rank)
+        for rank, compressed_entry_ids in enumerate(compressed_entry_ids_by_rank)
     )
     send_raw = _transpose_peer_ids(recv_raw)
     send_compressed = _transpose_peer_ids(recv_compressed)
@@ -352,6 +472,40 @@ def build_dsv4_stage_kv_exchange_peer_plans(
             recv_compressed_entry_ids_by_peer=recv_compressed[rank],
         )
         for rank in range(rank_count)
+    )
+
+
+def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plans_by_rank: Sequence[Any],
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    """Plan fused stage KV exchange from ART StagePlans without topk metadata.
+
+    The KV exchange fetches every raw token and compressed candidate whose
+    closure lies in the stage K ranges. CSA topk only affects the local sparse
+    kernel list tensor, not which compressed candidate rows are fetched for the
+    stage. This avoids requiring an all-rank topk tensor gather before planning
+    compatible all-to-all sends.
+    """
+    stage_plans = tuple(stage_plans_by_rank)
+    _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
+    _shared_stage_index(stage_plans)
+    raw_by_rank = tuple(
+        _stage_raw_token_ids(layout=layout, ranges=stage_plan.global_k_ranges)
+        for stage_plan in stage_plans
+    )
+    compressed_by_rank = tuple(
+        stage_candidate_entry_ids(
+            layout=layout,
+            global_k_ranges=stage_plan.global_k_ranges,
+        )
+        for stage_plan in stage_plans
+    )
+    return _build_stage_kv_exchange_peer_plans_from_ids(
+        layout=layout,
+        raw_token_ids_by_rank=raw_by_rank,
+        compressed_entry_ids_by_rank=compressed_by_rank,
     )
 
 
@@ -580,6 +734,58 @@ def launch_planned_dsv4_stage_kv_exchange(
     plan = peer_plans[rank_int]
     return launch_dsv4_stage_kv_exchange(
         stage_inputs=stage_inputs_by_rank[rank_int],
+        query=query,
+        query_token_ids=query_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_entry_ids,
+        send_raw_token_ids_by_peer=plan.send_raw_token_ids_by_peer,
+        send_compressed_entry_ids_by_peer=plan.send_compressed_entry_ids_by_peer,
+        recv_raw_token_ids_by_peer=plan.recv_raw_token_ids_by_peer,
+        recv_compressed_entry_ids_by_peer=plan.recv_compressed_entry_ids_by_peer,
+        group=group,
+        async_op=async_op,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slot: Dsv4StagePlanSlot,
+    local_stage_inputs: Dsv4StageInputs,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    group: Any,
+    async_op: bool,
+) -> Dsv4StageKvExchangeWork:
+    """Launch one rank's fused stage KV exchange from an ART StagePlan slot.
+
+    `local_stage_inputs` contains this rank's real sparse-kernel topk list.
+    Peer send/recv lists are derived from all ranks' StagePlan K ranges and are
+    deliberately independent of CSA topk, because every compressed candidate in
+    a stage K range may be fetched while the local topk list selects the rows
+    the Miles kernel actually scores.
+    """
+    rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
+    if int(stage_plan_slot.stage_index) != int(local_stage_inputs.stage_index):
+        raise RuntimeError(
+            "DSV4 stage slot and local inputs stage_index mismatch: "
+            f"{stage_plan_slot.stage_index} vs {local_stage_inputs.stage_index}"
+        )
+    peer_plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
+        layout=layout,
+        stage_plans_by_rank=stage_plan_slot.stage_plans_by_rank,
+    )
+    plan = peer_plans[rank_int]
+    return launch_dsv4_stage_kv_exchange(
+        stage_inputs=local_stage_inputs,
         query=query,
         query_token_ids=query_token_ids,
         raw_kv=raw_kv,

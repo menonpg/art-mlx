@@ -176,6 +176,13 @@ class Dsv4StagePlanGroup(BaseModel):
     stage_inputs_by_rank: tuple[Dsv4StageInputs, ...]
 
 
+class Dsv4StagePlanSlot(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    stage_index: int
+    stage_plans_by_rank: tuple[Any, ...]
+
+
 class Dsv4MaterializedStage(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -302,6 +309,7 @@ Dsv4CompressionHaloGradientPayload.model_rebuild()
 Dsv4StageInputs.model_rebuild()
 Dsv4IndexerStagePlan.model_rebuild()
 Dsv4StagePlanGroup.model_rebuild()
+Dsv4StagePlanSlot.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
 Dsv4SparseForwardResult.model_rebuild()
 Dsv4SparseBackwardResult.model_rebuild()
