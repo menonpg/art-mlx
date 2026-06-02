@@ -364,6 +364,22 @@ def test_csa_attention_forward_launcher_uses_local_topk_and_stage_slots(
             ),
         ),
     )
+    indexer_stage_plans = tuple(
+        cp_attention.build_dsv4_indexer_stage_plan_from_stage_plans(
+            layout=layout,
+            stage_plans_by_rank=slot.stage_plans_by_rank,
+        )
+        for slot in slots
+    )
+
+    def fail_indexer_stage_plan_build(**_kwargs: object) -> object:
+        raise AssertionError("unexpected CSA indexer StagePlan rebuild")
+
+    monkeypatch.setattr(
+        cp_attention,
+        "build_dsv4_indexer_stage_plan_from_stage_plans",
+        fail_indexer_stage_plan_build,
+    )
     attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
     original_tolist = torch.Tensor.tolist
 
@@ -396,6 +412,7 @@ def test_csa_attention_forward_launcher_uses_local_topk_and_stage_slots(
             attn_sink=attn_sink,
             group=None,
             async_op=True,
+            indexer_stage_plans=indexer_stage_plans,
             scale=0.25,
             window_size=4,
         )

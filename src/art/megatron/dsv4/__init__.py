@@ -84,6 +84,7 @@ from .indexer import (
     stage_candidate_entry_ids,
     visible_entry_ids_for_query,
 )
+from .planning import prepare_dsv4_context_parallel_state
 from .sparse_kernel import (
     dsv4_disabled_attn_sink,
     dsv4_sparse_bwd,
@@ -237,6 +238,7 @@ __all__ = [
     "pack_dsv4_compression_halo_gradient_payloads",
     "pack_dsv4_compression_halo_payloads",
     "pack_dsv4_gradient_owner_buckets",
+    "prepare_dsv4_context_parallel_state",
     "raw_swa_token_ids_for_query",
     "replay_materialized_dsv4_attention_backward",
     "run_materialized_dsv4_attention_forward",

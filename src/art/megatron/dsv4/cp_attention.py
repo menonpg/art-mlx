@@ -32,6 +32,7 @@ from .types import (
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
     Dsv4GradientOwnerBucket,
+    Dsv4IndexerStagePlan,
     Dsv4MaterializedStage,
     Dsv4ProjectedAttentionForwardResult,
     Dsv4ProjectedAttentionGradientResult,
@@ -233,6 +234,7 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
     indexer_q: torch.Tensor | None = None
     indexer_weights: torch.Tensor | None = None
     indexer_topk: int | None = None
+    indexer_stage_plans: tuple[Dsv4IndexerStagePlan, ...] | None = None
     indexer_score_scale: float = 1.0
     attn_sink: torch.Tensor
     group: Any
@@ -298,6 +300,7 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
                     indexer_kv=self._indexer_compressed.compressed_kv,
                     indexer_kv_entry_ids=self._indexer_compressed.compressed_entry_ids,
                     indexer_topk=int(self.indexer_topk),
+                    indexer_stage_plans=self.indexer_stage_plans,
                     attn_sink=self.attn_sink,
                     group=self.group,
                     async_op=bool(self.async_op),
@@ -616,6 +619,7 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
     attn_sink: torch.Tensor,
     group: Any,
     async_op: bool,
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
     indexer_score_scale: float = 1.0,
     scale: float | None = None,
     window_size: int = 128,
@@ -637,13 +641,30 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
         stage_plan_slots=stage_plan_slots,
     )
     query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
-    indexer_stage_plans = tuple(
-        build_dsv4_indexer_stage_plan_from_stage_plans(
-            layout=layout,
-            stage_plans_by_rank=slot.stage_plans_by_rank,
+    prepared_indexer_stage_plans = tuple(indexer_stage_plans or ())
+    if prepared_indexer_stage_plans:
+        if len(prepared_indexer_stage_plans) != len(slots):
+            raise RuntimeError(
+                "DSV4 prepared CSA indexer stage plan count must match slots: "
+                f"{len(prepared_indexer_stage_plans)} vs {len(slots)}"
+            )
+        prepared_stage_ids = tuple(
+            int(plan.stage_index) for plan in prepared_indexer_stage_plans
         )
-        for slot in slots
-    )
+        slot_stage_ids = tuple(int(slot.stage_index) for slot in slots)
+        if prepared_stage_ids != slot_stage_ids:
+            raise RuntimeError(
+                "DSV4 prepared CSA indexer stage ids must match StagePlan slots"
+            )
+    else:
+        prepared_indexer_stage_plans = tuple(
+            build_dsv4_indexer_stage_plan_from_stage_plans(
+                layout=layout,
+                stage_plans_by_rank=slot.stage_plans_by_rank,
+            )
+            for slot in slots
+        )
+    indexer_stage_plans = prepared_indexer_stage_plans
     topk_result = launch_dsv4_indexer_topk_from_stage_plans(
         layout=layout,
         rank=rank_int,
@@ -772,6 +793,7 @@ def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
     attn_sink: torch.Tensor,
     group: Any,
     async_op: bool,
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
     indexer_score_scale: float = 1.0,
     scale: float | None = None,
     window_size: int = 128,
@@ -833,6 +855,9 @@ def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
         indexer_q=indexer_q,
         indexer_weights=indexer_weights,
         indexer_topk=int(indexer_topk),
+        indexer_stage_plans=tuple(indexer_stage_plans)
+        if indexer_stage_plans is not None
+        else None,
         indexer_score_scale=float(indexer_score_scale),
         attn_sink=attn_sink,
         group=group,

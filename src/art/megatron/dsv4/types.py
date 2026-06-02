@@ -327,6 +327,8 @@ class Dsv4PreparedPlan(BaseModel):
 
     csa_layout: Dsv4CompressedLayout | None = None
     hca_layout: Dsv4CompressedLayout | None = None
+    stage_plan_slots: tuple[Dsv4StagePlanSlot, ...] = ()
+    csa_indexer_stage_plans: tuple[Dsv4IndexerStagePlan, ...] = ()
 
 
 class Dsv4ContextParallelState(BaseModel):
@@ -360,3 +362,5 @@ Dsv4AttentionGradientResult.model_rebuild()
 Dsv4ProjectedAttentionForwardResult.model_rebuild()
 Dsv4ProjectedAttentionGradientResult.model_rebuild()
 Dsv4GradientOwnerBucket.model_rebuild()
+Dsv4PreparedPlan.model_rebuild()
+Dsv4ContextParallelState.model_rebuild()

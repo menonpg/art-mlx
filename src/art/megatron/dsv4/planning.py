@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from .compressor import build_dsv4_compressed_layout_from_cp_state
+from .cp_stage import build_dsv4_stage_plan_slots
+from .indexer import build_dsv4_indexer_stage_plan_from_stage_plans
+from .types import (
+    Dsv4CompressionKind,
+    Dsv4CompressionSpec,
+    Dsv4ContextParallelState,
+    Dsv4PreparedPlan,
+)
+
+if TYPE_CHECKING:
+    from art.megatron.context_parallel.types import ArtContextParallelState
+else:
+    ArtContextParallelState = Any
+
+
+@torch.compiler.disable
+def prepare_dsv4_context_parallel_state(
+    *,
+    cp_state: ArtContextParallelState,
+    csa_ratio: int = 4,
+    hca_ratio: int = 128,
+    include_csa: bool = True,
+    include_hca: bool = True,
+    extra: dict[str, Any] | None = None,
+) -> Dsv4ContextParallelState:
+    """Wrap a normal ART CP state with host-only DSV4 planning metadata.
+
+    This function is part of the host-ahead planning path. It must not inspect
+    activation tensors, read CUDA metadata, or branch on CUDA tensor values; if
+    that invariant is broken, the CPU can block on device work and destroy the
+    intended overlap between previous-micro GPU execution and next-micro
+    planning. The returned metadata is reusable by every DSV4 layer in the
+    microbatch.
+    """
+    if not include_csa and not include_hca:
+        raise RuntimeError("DSV4 planning requires CSA, HCA, or both")
+    if (
+        cp_state.group_ids.device.type != "cpu"
+        or cp_state.parent_ids.device.type != "cpu"
+    ):
+        raise RuntimeError(
+            "DSV4 CP planning expects CPU shared-prefix metadata. Passing CUDA "
+            "group_ids or parent_ids would synchronize and break host-ahead planning."
+        )
+    if cp_state.group_ids.ndim != 1 or cp_state.parent_ids.ndim != 1:
+        raise RuntimeError(
+            "DSV4 CP planning expects rank-1 ART CP metadata, got "
+            f"{tuple(cp_state.group_ids.shape)} and {tuple(cp_state.parent_ids.shape)}"
+        )
+
+    runtime_plan = _runtime_plan_from_cp_state(cp_state)
+    stage_slots = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=tuple(
+            rank_plan.stage_plans for rank_plan in runtime_plan.rank_plans
+        ),
+    )
+    csa_layout = (
+        build_dsv4_compressed_layout_from_cp_state(
+            state=cp_state,
+            spec=Dsv4CompressionSpec(
+                kind=Dsv4CompressionKind.CSA,
+                ratio=int(csa_ratio),
+            ),
+        )
+        if include_csa
+        else None
+    )
+    hca_layout = (
+        build_dsv4_compressed_layout_from_cp_state(
+            state=cp_state,
+            spec=Dsv4CompressionSpec(
+                kind=Dsv4CompressionKind.HCA,
+                ratio=int(hca_ratio),
+            ),
+        )
+        if include_hca
+        else None
+    )
+    csa_indexer_stage_plans = (
+        tuple(
+            build_dsv4_indexer_stage_plan_from_stage_plans(
+                layout=csa_layout,
+                stage_plans_by_rank=slot.stage_plans_by_rank,
+            )
+            for slot in stage_slots
+        )
+        if csa_layout is not None
+        else ()
+    )
+    return Dsv4ContextParallelState(
+        cp_state=cp_state,
+        dsv4_plan=Dsv4PreparedPlan(
+            csa_layout=csa_layout,
+            hca_layout=hca_layout,
+            stage_plan_slots=stage_slots,
+            csa_indexer_stage_plans=csa_indexer_stage_plans,
+        ),
+        extra=dict(extra or {}),
+    )
+
+
+def _runtime_plan_from_cp_state(cp_state: ArtContextParallelState):
+    from art.megatron.context_parallel.builder import build_shared_prefix_attention_spec
+    from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
+
+    spec = build_shared_prefix_attention_spec(
+        group_ids=cp_state.group_ids.unsqueeze(0),
+        parent_ids=cp_state.parent_ids.unsqueeze(0),
+    )
+    runtime_plan = get_or_build_runtime_plan(
+        spec,
+        topology=cp_state.runtime_key.topology,
+        config=cp_state.config,
+        runtime_key=cp_state.runtime_key,
+        original_seq_len=int(cp_state.rank_plan.original_seq_len),
+    )
+    local_rank = int(cp_state.rank_plan.rank)
+    if local_rank >= len(runtime_plan.rank_plans):
+        raise RuntimeError(
+            "DSV4 CP planning local rank is outside runtime plan: "
+            f"{local_rank} >= {len(runtime_plan.rank_plans)}"
+        )
+    local_stage_ids = tuple(
+        int(stage.stage_index) for stage in cp_state.rank_plan.stage_plans
+    )
+    planned_stage_ids = tuple(
+        int(stage.stage_index)
+        for stage in runtime_plan.rank_plans[local_rank].stage_plans
+    )
+    if local_stage_ids != planned_stage_ids:
+        raise RuntimeError(
+            "DSV4 CP planning reconstructed a runtime plan inconsistent with "
+            f"the provided rank plan: {planned_stage_ids} vs {local_stage_ids}"
+        )
+    return runtime_plan
