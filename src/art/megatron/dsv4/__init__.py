@@ -8,9 +8,12 @@ from .compressor import (
 )
 from .cp_attention import (
     compute_single_sink_grad,
+    merge_materialized_stage_records,
     merge_single_sink_branch,
     merge_stage_outputs,
     merge_two_stage_outputs,
+    replay_materialized_dsv4_attention_backward,
+    run_materialized_dsv4_attention_forward,
 )
 from .cp_stage import (
     build_dsv4_stage_inputs,
@@ -34,6 +37,8 @@ from .sparse_kernel import (
     dsv4_sparse_fwd,
 )
 from .types import (
+    Dsv4AttentionBackwardReplayResult,
+    Dsv4AttentionForwardResult,
     Dsv4BranchView,
     Dsv4CompressedEntry,
     Dsv4CompressedLayout,
@@ -45,6 +50,8 @@ from .types import (
     Dsv4PreparedPlan,
     Dsv4SparseBackwardResult,
     Dsv4SparseForwardResult,
+    Dsv4StageBackwardRecord,
+    Dsv4StageForwardRecord,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
     Dsv4StreamKind,
@@ -54,6 +61,8 @@ from .types import (
 )
 
 __all__ = [
+    "Dsv4AttentionBackwardReplayResult",
+    "Dsv4AttentionForwardResult",
     "Dsv4BranchView",
     "Dsv4CompressedEntry",
     "Dsv4CompressedLayout",
@@ -65,6 +74,8 @@ __all__ = [
     "Dsv4PreparedPlan",
     "Dsv4StageInputs",
     "Dsv4StageKeyKind",
+    "Dsv4StageBackwardRecord",
+    "Dsv4StageForwardRecord",
     "Dsv4SparseBackwardResult",
     "Dsv4SparseForwardResult",
     "Dsv4StreamKind",
@@ -87,10 +98,13 @@ __all__ = [
     "dsv4_sparse_fwd",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
+    "merge_materialized_stage_records",
     "merge_stage_outputs",
     "merge_two_stage_outputs",
     "materialize_dsv4_stage_tensors",
     "raw_swa_token_ids_for_query",
+    "replay_materialized_dsv4_attention_backward",
+    "run_materialized_dsv4_attention_forward",
     "stable_topk_by_score_and_id",
     "stage_candidate_entry_ids",
     "visible_entry_ids_for_query",

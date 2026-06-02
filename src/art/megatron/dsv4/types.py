@@ -120,6 +120,8 @@ class Dsv4StageInputs(BaseModel):
 class Dsv4MaterializedStage(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
+    stage_index: int
+    query_token_ids: tuple[int, ...]
     q_stage: torch.Tensor
     kv_stage: torch.Tensor
     topk_stage_local: torch.Tensor
@@ -141,6 +143,42 @@ class Dsv4SparseBackwardResult(BaseModel):
 
     dq: torch.Tensor
     dkv: torch.Tensor
+    d_attn_sink: torch.Tensor
+
+
+class Dsv4StageForwardRecord(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    materialized_stage: Dsv4MaterializedStage
+    out: torch.Tensor
+    lse: torch.Tensor
+
+
+class Dsv4AttentionForwardResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    out: torch.Tensor
+    lse: torch.Tensor
+    real_out: torch.Tensor
+    real_lse: torch.Tensor
+    query_token_ids: tuple[int, ...]
+    attn_sink: torch.Tensor
+    scale: float | None
+    stage_records: tuple[Dsv4StageForwardRecord, ...]
+
+
+class Dsv4StageBackwardRecord(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    materialized_stage: Dsv4MaterializedStage
+    dq_stage: torch.Tensor
+    dkv_stage: torch.Tensor
+
+
+class Dsv4AttentionBackwardReplayResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    stage_records: tuple[Dsv4StageBackwardRecord, ...]
     d_attn_sink: torch.Tensor
 
 
@@ -176,3 +214,7 @@ Dsv4StageInputs.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
 Dsv4SparseForwardResult.model_rebuild()
 Dsv4SparseBackwardResult.model_rebuild()
+Dsv4StageForwardRecord.model_rebuild()
+Dsv4AttentionForwardResult.model_rebuild()
+Dsv4StageBackwardRecord.model_rebuild()
+Dsv4AttentionBackwardReplayResult.model_rebuild()

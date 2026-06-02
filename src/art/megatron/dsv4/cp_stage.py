@@ -274,6 +274,8 @@ def materialize_dsv4_stage_tensors(
     kv_stage = torch.cat((raw_stage, compressed_stage), dim=1).contiguous()
 
     return Dsv4MaterializedStage(
+        stage_index=stage_inputs.stage_index,
+        query_token_ids=stage_inputs.query_token_ids,
         q_stage=q_stage.contiguous(),
         kv_stage=kv_stage,
         topk_stage_local=topk.contiguous(),

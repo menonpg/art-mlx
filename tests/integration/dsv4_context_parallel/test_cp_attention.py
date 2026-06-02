@@ -4,10 +4,19 @@ import pytest
 import torch
 
 from art.megatron.dsv4 import (
+    Dsv4MaterializedStage,
+    Dsv4SparseBackwardResult,
+    Dsv4SparseForwardResult,
+    Dsv4StageForwardRecord,
+    Dsv4StageKeyKind,
     compute_single_sink_grad,
+    merge_materialized_stage_records,
     merge_single_sink_branch,
     merge_stage_outputs,
+    replay_materialized_dsv4_attention_backward,
+    run_materialized_dsv4_attention_forward,
 )
+import art.megatron.dsv4.cp_attention as cp_attention
 
 
 def _dense_attention_stats(
@@ -126,3 +135,209 @@ def test_compute_single_sink_grad_matches_autograd_reference() -> None:
     )
 
     torch.testing.assert_close(sink_grad, attn_sink.grad)
+
+
+def test_materialized_attention_forward_merges_partial_stages_and_sink_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages = (_materialized_stage(0, (10, 11)), _materialized_stage(1, (11, 12)))
+    stage_outputs = (
+        _stage_tensor(((1.0, 2.0),)),
+        _stage_tensor(((3.0, 4.0),)),
+    )
+    stage_lses = (
+        _stage_lse(((2.0, 4.0),)),
+        _stage_lse(((6.0, 8.0),)),
+    )
+    calls: list[tuple[torch.Tensor, float | None]] = []
+
+    def fake_fwd(
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk: torch.Tensor,
+        scale: float | None = None,
+    ) -> Dsv4SparseForwardResult:
+        del kv, topk
+        calls.append((attn_sink, scale))
+        index = len(calls) - 1
+        assert q.shape == stages[index].q_stage.shape
+        return Dsv4SparseForwardResult(out=stage_outputs[index], lse=stage_lses[index])
+
+    monkeypatch.setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", fake_fwd)
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+
+    result = run_materialized_dsv4_attention_forward(
+        stages=stages,
+        query_token_ids=(10, 11, 12),
+        attn_sink=attn_sink,
+        scale=0.5,
+    )
+
+    expected_real = _stage_tensor(((1.0, 2.6, 4.0),))
+    expected_real_lse = _stage_lse(((2.0, 10.0, 8.0),))
+    expected_out, expected_lse = merge_single_sink_branch(
+        expected_real,
+        expected_real_lse,
+        attn_sink,
+    )
+
+    torch.testing.assert_close(result.real_out, expected_real)
+    torch.testing.assert_close(result.real_lse, expected_real_lse)
+    torch.testing.assert_close(result.out, expected_out)
+    torch.testing.assert_close(result.lse, expected_lse)
+    assert len(calls) == 2
+    for disabled_sink, scale in calls:
+        assert torch.isneginf(disabled_sink).all()
+        assert scale == 0.5
+
+
+def test_materialized_attention_backward_replays_global_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages = (_materialized_stage(0, (10, 11)), _materialized_stage(1, (11, 12)))
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    forward = run_materialized_dsv4_attention_forward(
+        stages=stages,
+        query_token_ids=(10, 11, 12),
+        attn_sink=attn_sink,
+        scale=0.25,
+    )
+    grad_out = torch.arange(
+        forward.out.numel(),
+        dtype=forward.out.dtype,
+    ).reshape_as(forward.out)
+    bwd_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def fake_bwd(
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk: torch.Tensor,
+        global_out: torch.Tensor,
+        grad_out: torch.Tensor,
+        global_lse: torch.Tensor,
+        scale: float | None = None,
+    ) -> Dsv4SparseBackwardResult:
+        del topk
+        bwd_calls.append((attn_sink, global_out, grad_out, global_lse))
+        stage_value = float(q[0, 0, 0, 0].item())
+        assert scale == 0.25
+        return Dsv4SparseBackwardResult(
+            dq=torch.full_like(q, stage_value + 10.0),
+            dkv=torch.full_like(kv, stage_value + 20.0),
+            d_attn_sink=torch.full_like(attn_sink, 999.0),
+        )
+
+    monkeypatch.setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", fake_bwd)
+
+    replay = replay_materialized_dsv4_attention_backward(
+        forward_result=forward,
+        grad_out=grad_out,
+    )
+
+    assert len(replay.stage_records) == 2
+    assert len(bwd_calls) == 2
+    torch.testing.assert_close(bwd_calls[0][1], forward.out[:, [0, 1]])
+    torch.testing.assert_close(bwd_calls[1][1], forward.out[:, [1, 2]])
+    torch.testing.assert_close(bwd_calls[0][2], grad_out[:, [0, 1]])
+    torch.testing.assert_close(bwd_calls[1][2], grad_out[:, [1, 2]])
+    torch.testing.assert_close(bwd_calls[0][3], forward.lse[:, [0, 1]])
+    torch.testing.assert_close(bwd_calls[1][3], forward.lse[:, [1, 2]])
+    assert torch.isneginf(bwd_calls[0][0]).all()
+    assert torch.isneginf(bwd_calls[1][0]).all()
+    torch.testing.assert_close(
+        replay.d_attn_sink,
+        compute_single_sink_grad(
+            grad_out=grad_out,
+            global_out=forward.out,
+            global_lse=forward.lse,
+            attn_sink=attn_sink,
+        ),
+    )
+    torch.testing.assert_close(
+        replay.stage_records[0].dq_stage,
+        torch.full_like(stages[0].q_stage, 10.0),
+    )
+    torch.testing.assert_close(
+        replay.stage_records[1].dkv_stage,
+        torch.full_like(stages[1].kv_stage, 21.0),
+    )
+
+
+def test_materialized_stage_merge_rejects_unknown_query_id() -> None:
+    stage = _materialized_stage(0, (13,))
+    record = Dsv4StageForwardRecord(
+        materialized_stage=stage,
+        out=torch.zeros_like(stage.q_stage),
+        lse=torch.zeros(stage.q_stage.shape[:-1], dtype=stage.q_stage.dtype),
+    )
+
+    with pytest.raises(ValueError, match="missing from global query ids"):
+        merge_materialized_stage_records(records=(record,), query_token_ids=(10, 11))
+
+
+def _materialized_stage(
+    stage_index: int, query_token_ids: tuple[int, ...]
+) -> Dsv4MaterializedStage:
+    q_stage = torch.full(
+        (1, len(query_token_ids), 2, 3),
+        float(stage_index),
+        dtype=torch.float64,
+    )
+    kv_stage = torch.full((1, 2, 3), float(stage_index), dtype=torch.float64)
+    return Dsv4MaterializedStage(
+        stage_index=stage_index,
+        query_token_ids=query_token_ids,
+        q_stage=q_stage,
+        kv_stage=kv_stage,
+        topk_stage_local=torch.zeros(1, len(query_token_ids), 2, dtype=torch.long),
+        raw_count=1,
+        compressed_count=1,
+        key_kinds=(Dsv4StageKeyKind.RAW, Dsv4StageKeyKind.COMPRESSED),
+        key_global_ids=(stage_index, stage_index + 100),
+    )
+
+
+def _stage_tensor(values_by_batch: tuple[tuple[float, ...], ...]) -> torch.Tensor:
+    rows = []
+    for values in values_by_batch:
+        rows.append(torch.tensor(values, dtype=torch.float64).view(len(values), 1, 1))
+    return torch.stack(rows, dim=0).expand(-1, -1, 2, 3).contiguous()
+
+
+def _stage_lse(values_by_batch: tuple[tuple[float, ...], ...]) -> torch.Tensor:
+    rows = []
+    for values in values_by_batch:
+        rows.append(
+            torch.log(torch.tensor(values, dtype=torch.float64)).view(len(values), 1)
+        )
+    return torch.stack(rows, dim=0).expand(-1, -1, 2).contiguous()
+
+
+def _fake_forward_for_replay(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk: torch.Tensor,
+    scale: float | None = None,
+) -> Dsv4SparseForwardResult:
+    del kv, attn_sink, topk, scale
+    stage_index = int(q[0, 0, 0, 0].item())
+    if stage_index == 0:
+        return Dsv4SparseForwardResult(
+            out=_stage_tensor(((1.0, 2.0),)),
+            lse=_stage_lse(((2.0, 4.0),)),
+        )
+    return Dsv4SparseForwardResult(
+        out=_stage_tensor(((3.0, 4.0),)),
+        lse=_stage_lse(((6.0, 8.0),)),
+    )
