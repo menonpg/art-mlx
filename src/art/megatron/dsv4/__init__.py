@@ -6,6 +6,12 @@ from .compressor import (
     compress_owned_projected_kv,
     compress_projected_kv,
 )
+from .cp_attention import (
+    compute_single_sink_grad,
+    merge_single_sink_branch,
+    merge_stage_outputs,
+    merge_two_stage_outputs,
+)
 from .cp_stage import (
     build_dsv4_stage_inputs,
     build_stage_local_topk_for_csa,
@@ -59,11 +65,15 @@ __all__ = [
     "build_indexer_visibility_mask",
     "build_stage_local_topk_for_csa",
     "build_stage_local_topk_for_hca",
+    "compute_single_sink_grad",
     "compute_indexer_scores",
     "compute_indexer_topk",
     "compress_owned_projected_kv",
     "compress_projected_kv",
+    "merge_single_sink_branch",
     "merge_indexer_topk_results",
+    "merge_stage_outputs",
+    "merge_two_stage_outputs",
     "raw_swa_token_ids_for_query",
     "stable_topk_by_score_and_id",
     "stage_candidate_entry_ids",
