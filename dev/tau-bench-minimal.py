@@ -63,7 +63,9 @@ async def train(
             pbar_desc=f"gather({step:03d})",
         )
         await model.delete_checkpoints()
-        await backend.train(model, train_groups)
+        result = await backend.train(model, train_groups)
+        await model.log(train_groups, split="train", step=result.step)
+        await model.log(split="train", step=result.step, metrics=result.metrics)
         if step + 1 == steps:
             await val()
 
