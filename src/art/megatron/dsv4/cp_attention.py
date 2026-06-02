@@ -135,6 +135,36 @@ class Dsv4ExchangedAttentionForwardWork(BaseModel):
         )
 
 
+class Dsv4ExchangedAttentionBackwardWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    local_gradients: Dsv4AttentionGradientResult
+    owner_work: Any
+    owned_query_token_ids: tuple[int, ...]
+    owned_raw_token_ids: tuple[int, ...]
+    owned_compressed_entry_ids: tuple[int, ...]
+
+    def wait(self) -> None:
+        self.owner_work.wait()
+
+    def wait_post_process(self) -> Dsv4AttentionGradientResult:
+        buckets = _owner_buckets_from_work(self.owner_work)
+        if buckets:
+            return accumulate_dsv4_gradient_owner_buckets(
+                buckets=buckets,
+                query_token_ids=self.owned_query_token_ids,
+                raw_token_ids=self.owned_raw_token_ids,
+                compressed_entry_ids=self.owned_compressed_entry_ids,
+                d_attn_sink=self.local_gradients.d_attn_sink,
+            )
+        return _empty_owned_gradient_result(
+            template=self.local_gradients,
+            query_token_ids=self.owned_query_token_ids,
+            raw_token_ids=self.owned_raw_token_ids,
+            compressed_entry_ids=self.owned_compressed_entry_ids,
+        )
+
+
 def _accum_output_dtype(input_dtype: torch.dtype) -> torch.dtype:
     if input_dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
@@ -306,6 +336,78 @@ def launch_exchanged_dsv4_attention_forward(
     )
 
 
+@torch.compiler.disable
+def launch_exchanged_dsv4_attention_backward(
+    *,
+    forward_result: Dsv4AttentionForwardResult,
+    grad_out: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_token_ids: Sequence[int],
+    compressed_entry_ids: Sequence[int],
+    query_owner_ranks: Sequence[int],
+    raw_owner_ranks: Sequence[int],
+    compressed_owner_ranks: Sequence[int],
+    recv_query_token_ids_by_peer: Sequence[Sequence[int]],
+    recv_raw_token_ids_by_peer: Sequence[Sequence[int]],
+    recv_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
+    owned_query_token_ids: Sequence[int],
+    owned_raw_token_ids: Sequence[int],
+    owned_compressed_entry_ids: Sequence[int],
+    rank: int,
+    rank_count: int,
+    group: Any,
+    async_op: bool,
+) -> Dsv4ExchangedAttentionBackwardWork:
+    """Replay DSV4 stage backward and launch owner-gradient exchange.
+
+    This is an eager bridge around custom communication. It composes the
+    materialized global-LSE replay path with the DSV4 explicit-id owner exchange
+    without adding DSV4 behavior to the generic CP executor.
+    """
+    owned_query_ids = _normalize_output_ids(
+        owned_query_token_ids,
+        name="owned_query_token_ids",
+    )
+    owned_raw_ids = _normalize_output_ids(
+        owned_raw_token_ids,
+        name="owned_raw_token_ids",
+    )
+    owned_compressed_ids = _normalize_output_ids(
+        owned_compressed_entry_ids,
+        name="owned_compressed_entry_ids",
+    )
+    replay_result = replay_materialized_dsv4_attention_backward(
+        forward_result=forward_result,
+        grad_out=grad_out,
+    )
+    local_gradients = accumulate_materialized_dsv4_attention_backward(
+        replay_result=replay_result,
+        query_token_ids=query_token_ids,
+        raw_token_ids=raw_token_ids,
+        compressed_entry_ids=compressed_entry_ids,
+    )
+    owner_work = launch_dsv4_gradient_owner_bucket_exchange(
+        gradients=local_gradients,
+        query_owner_ranks=query_owner_ranks,
+        raw_owner_ranks=raw_owner_ranks,
+        compressed_owner_ranks=compressed_owner_ranks,
+        recv_query_token_ids_by_peer=recv_query_token_ids_by_peer,
+        recv_raw_token_ids_by_peer=recv_raw_token_ids_by_peer,
+        recv_compressed_entry_ids_by_peer=recv_compressed_entry_ids_by_peer,
+        rank=rank,
+        rank_count=rank_count,
+        group=group,
+        async_op=async_op,
+    )
+    return Dsv4ExchangedAttentionBackwardWork(
+        local_gradients=local_gradients,
+        owner_work=owner_work,
+        owned_query_token_ids=owned_query_ids,
+        owned_raw_token_ids=owned_raw_ids,
+        owned_compressed_entry_ids=owned_compressed_ids,
+    )
+
+
 def _validate_stage_exchange_work(*, work: Any, position: int) -> None:
     if not callable(getattr(work, "wait", None)):
         raise ValueError(f"DSV4 stage exchange work {position} is missing wait()")
@@ -323,6 +425,57 @@ def _materialized_stage_from_work(*, work: Any, position: int) -> Dsv4Materializ
             "expected Dsv4MaterializedStage"
         )
     return stage
+
+
+def _owner_buckets_from_work(work: Any) -> tuple[Dsv4GradientOwnerBucket, ...]:
+    if not callable(getattr(work, "wait", None)):
+        raise ValueError("DSV4 owner-gradient exchange work is missing wait()")
+    if not callable(getattr(work, "wait_post_process", None)):
+        raise ValueError(
+            "DSV4 owner-gradient exchange work is missing wait_post_process()"
+        )
+    buckets = tuple(work.wait_post_process())
+    for position, bucket in enumerate(buckets):
+        if not isinstance(bucket, Dsv4GradientOwnerBucket):
+            raise TypeError(
+                f"DSV4 owner-gradient exchange returned {type(bucket)!r} "
+                f"at position {position}, expected Dsv4GradientOwnerBucket"
+            )
+    return buckets
+
+
+def _empty_owned_gradient_result(
+    *,
+    template: Dsv4AttentionGradientResult,
+    query_token_ids: tuple[int, ...],
+    raw_token_ids: tuple[int, ...],
+    compressed_entry_ids: tuple[int, ...],
+) -> Dsv4AttentionGradientResult:
+    _validate_gradient_result_shapes(template)
+    batch_size = int(template.dq.shape[0])
+    head_count = int(template.dq.shape[2])
+    head_dim = int(template.dq.shape[3])
+    kv_dim = int(template.draw_kv.shape[-1])
+    return Dsv4AttentionGradientResult(
+        query_token_ids=query_token_ids,
+        raw_token_ids=raw_token_ids,
+        compressed_entry_ids=compressed_entry_ids,
+        dq=template.dq.new_zeros(
+            (batch_size, len(query_token_ids), head_count, head_dim)
+        ),
+        draw_kv=template.draw_kv.new_zeros((batch_size, len(raw_token_ids), kv_dim)),
+        dcompressed_kv=template.dcompressed_kv.new_zeros(
+            (batch_size, len(compressed_entry_ids), kv_dim)
+        ),
+        d_attn_sink=template.d_attn_sink,
+    )
+
+
+def _normalize_output_ids(ids: Sequence[int], *, name: str) -> tuple[int, ...]:
+    ids = tuple(int(id_) for id_ in ids)
+    _validate_nonnegative_ids(ids, name=name)
+    _row_by_id(ids=ids, name=name)
+    return ids
 
 
 def merge_materialized_stage_records(

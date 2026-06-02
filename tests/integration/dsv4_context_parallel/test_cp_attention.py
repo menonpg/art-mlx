@@ -6,6 +6,7 @@ import torch
 from art.megatron.dsv4 import (
     Dsv4AttentionBackwardReplayResult,
     Dsv4AttentionGradientResult,
+    Dsv4ExchangedAttentionBackwardWork,
     Dsv4GradientOwnerBucket,
     Dsv4MaterializedStage,
     Dsv4SparseBackwardResult,
@@ -16,6 +17,7 @@ from art.megatron.dsv4 import (
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     compute_single_sink_grad,
+    launch_exchanged_dsv4_attention_backward,
     launch_exchanged_dsv4_attention_forward,
     merge_materialized_stage_records,
     merge_single_sink_branch,
@@ -336,6 +338,115 @@ def test_materialized_attention_backward_replays_global_rows(
     )
 
 
+def test_exchanged_attention_backward_replays_and_reduces_owner_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages = (
+        _materialized_stage(0, (10, 11), raw_id=20, compressed_id=100),
+        _materialized_stage(1, (11, 12), raw_id=20, compressed_id=101),
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+    forward = run_materialized_dsv4_attention_forward(
+        stages=stages,
+        query_token_ids=(10, 11, 12),
+        attn_sink=attn_sink,
+        scale=0.25,
+    )
+    grad_out = torch.arange(forward.out.numel(), dtype=forward.out.dtype).reshape_as(
+        forward.out
+    )
+
+    work = launch_exchanged_dsv4_attention_backward(
+        forward_result=forward,
+        grad_out=grad_out,
+        query_token_ids=(10, 11, 12),
+        raw_token_ids=(20,),
+        compressed_entry_ids=(100, 101),
+        query_owner_ranks=(0, 0, 0),
+        raw_owner_ranks=(0,),
+        compressed_owner_ranks=(0, 0),
+        recv_query_token_ids_by_peer=((10, 11, 12),),
+        recv_raw_token_ids_by_peer=((20,),),
+        recv_compressed_entry_ids_by_peer=((100, 101),),
+        owned_query_token_ids=(10, 11, 12),
+        owned_raw_token_ids=(20,),
+        owned_compressed_entry_ids=(100, 101),
+        rank=0,
+        rank_count=1,
+        group=None,
+        async_op=True,
+    )
+    result = work.wait_post_process()
+
+    torch.testing.assert_close(result.dq, _stage_tensor(((10.0, 21.0, 11.0),)))
+    torch.testing.assert_close(
+        result.draw_kv,
+        torch.full((1, 1, 3), 140.0, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        result.dcompressed_kv,
+        torch.tensor(
+            [[[21.0, 21.0, 21.0], [121.0, 121.0, 121.0]]], dtype=torch.float64
+        ),
+    )
+    torch.testing.assert_close(
+        result.d_attn_sink,
+        compute_single_sink_grad(
+            grad_out=grad_out,
+            global_out=forward.out,
+            global_lse=forward.lse,
+            attn_sink=attn_sink,
+        ),
+    )
+
+
+def test_exchanged_attention_backward_handles_empty_owner_receives() -> None:
+    template = Dsv4AttentionGradientResult(
+        query_token_ids=(),
+        raw_token_ids=(),
+        compressed_entry_ids=(),
+        dq=torch.empty(1, 0, 2, 3, dtype=torch.float64),
+        draw_kv=torch.empty(1, 0, 3, dtype=torch.float64),
+        dcompressed_kv=torch.empty(1, 0, 3, dtype=torch.float64),
+        d_attn_sink=torch.tensor([3.0, 4.0], dtype=torch.float64),
+    )
+    owner_work = _EmptyOwnerExchangeWork()
+    work = Dsv4ExchangedAttentionBackwardWork(
+        local_gradients=template,
+        owner_work=owner_work,
+        owned_query_token_ids=(10, 11),
+        owned_raw_token_ids=(20,),
+        owned_compressed_entry_ids=(100,),
+    )
+
+    work.wait()
+    result = work.wait_post_process()
+
+    assert owner_work.wait_count == 1
+    assert owner_work.post_process_count == 1
+    assert result.query_token_ids == (10, 11)
+    assert result.raw_token_ids == (20,)
+    assert result.compressed_entry_ids == (100,)
+    torch.testing.assert_close(result.dq, torch.zeros(1, 2, 2, 3, dtype=torch.float64))
+    torch.testing.assert_close(
+        result.draw_kv, torch.zeros(1, 1, 3, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        result.dcompressed_kv, torch.zeros(1, 1, 3, dtype=torch.float64)
+    )
+    torch.testing.assert_close(result.d_attn_sink, template.d_attn_sink)
+
+
 def test_materialized_stage_merge_rejects_unknown_query_id() -> None:
     stage = _materialized_stage(0, (13,))
     record = Dsv4StageForwardRecord(
@@ -616,6 +727,30 @@ def _fake_forward_for_replay(
     )
 
 
+def _fake_backward_for_bridge(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk: torch.Tensor,
+    global_out: torch.Tensor,
+    grad_out: torch.Tensor,
+    global_lse: torch.Tensor,
+    scale: float | None = None,
+) -> Dsv4SparseBackwardResult:
+    del topk, global_out, grad_out, global_lse
+    assert scale == 0.25
+    stage_index = int(q[0, 0, 0, 0].item())
+    dkv = torch.empty_like(kv)
+    for row in range(int(kv.shape[1])):
+        dkv[:, row].fill_(stage_index * 100.0 + row + 20.0)
+    return Dsv4SparseBackwardResult(
+        dq=torch.full_like(q, stage_index + 10.0),
+        dkv=dkv,
+        d_attn_sink=torch.full_like(attn_sink, 999.0),
+    )
+
+
 def _stage_backward_record(
     stage: Dsv4MaterializedStage,
     *,
@@ -704,3 +839,21 @@ class _BadStageExchangeWork:
 
     def wait_post_process(self) -> object:
         return object()
+
+
+class _EmptyOwnerExchangeWork:
+    def __init__(self) -> None:
+        self.wait_count = 0
+        self.post_process_count = 0
+        self._wait_complete = False
+
+    def wait(self) -> None:
+        if self._wait_complete:
+            return
+        self.wait_count += 1
+        self._wait_complete = True
+
+    def wait_post_process(self) -> tuple[Dsv4GradientOwnerBucket, ...]:
+        self.post_process_count += 1
+        self.wait()
+        return ()
