@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
@@ -94,6 +95,116 @@ def position_in_query_view(
         if int(token.packed_token_id) == int(candidate_token_id):
             return int(token.view_pos)
     return None
+
+
+def compress_projected_kv(
+    *,
+    layout: Dsv4CompressedLayout,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+    entry_ids: Sequence[int] | None = None,
+    token_ids: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Compress projected DSV4 KV/gate tensors according to a branch layout.
+
+    `projected_kv` and `projected_gate` are the outputs of the DSV4 compressor
+    projections, before RMSNorm/RoPE. For HCA their last dim is `D`; for CSA it
+    is `2 * D` and the A/B halves are selected according to the Miles overlap
+    transform. `token_ids` maps rows in the projected tensors to packed token ids
+    when the rank owns a compact local+halo buffer; if omitted, tensor row `t`
+    is packed token `t`.
+    """
+    if projected_kv.shape != projected_gate.shape:
+        raise RuntimeError(
+            "DSV4 projected KV and gate tensors must share shape, got "
+            f"{tuple(projected_kv.shape)} vs {tuple(projected_gate.shape)}"
+        )
+    if projected_kv.device != projected_gate.device:
+        raise RuntimeError(
+            "DSV4 projected KV and gate tensors must share device, got "
+            f"{projected_kv.device} vs {projected_gate.device}"
+        )
+    if projected_kv.ndim not in (2, 3):
+        raise RuntimeError(
+            "DSV4 projected tensors must have shape [T, C] or [B, T, C], got "
+            f"{tuple(projected_kv.shape)}"
+        )
+    if positional_bias.ndim != 2:
+        raise RuntimeError(
+            "DSV4 compressor positional bias must have shape [ratio, C], got "
+            f"{tuple(positional_bias.shape)}"
+        )
+    if int(positional_bias.shape[0]) != int(layout.spec.ratio):
+        raise RuntimeError(
+            "DSV4 positional-bias ratio mismatch: "
+            f"layout={layout.spec.ratio}, bias={int(positional_bias.shape[0])}"
+        )
+
+    selected_entries = _select_entries(layout=layout, entry_ids=entry_ids)
+    head_dim = _compressed_head_dim(
+        layout=layout,
+        projected_dim=int(projected_kv.shape[-1]),
+        positional_bias=positional_bias,
+    )
+    if not selected_entries:
+        return _empty_compressed_output(projected_kv, head_dim)
+
+    gather = _build_projected_compression_gather(
+        entries=selected_entries,
+        layout=layout,
+        token_ids=token_ids,
+        tensor_token_count=int(projected_kv.shape[-2]),
+    )
+    token_index = gather["token_index"].to(projected_kv.device)
+    valid = gather["valid"].to(projected_kv.device)
+    ape_row = gather["ape_row"].to(projected_kv.device)
+    half = gather["half"].to(projected_kv.device)
+    positional_bias = positional_bias.to(device=projected_gate.device)
+
+    gathered_kv = _gather_tokens(projected_kv, token_index)
+    gathered_gate = _gather_tokens(projected_gate, token_index)
+    if layout.spec.kind == Dsv4CompressionKind.CSA:
+        gathered_kv = _select_csa_halves(gathered_kv, half, head_dim)
+        gathered_gate = _select_csa_halves(gathered_gate, half, head_dim)
+        bias = _select_csa_positional_bias(positional_bias, ape_row, half, head_dim)
+    elif layout.spec.kind == Dsv4CompressionKind.HCA:
+        bias = positional_bias.index_select(0, ape_row.reshape(-1)).reshape(
+            *ape_row.shape,
+            head_dim,
+        )
+    else:
+        raise RuntimeError(f"Unsupported DSV4 compression kind: {layout.spec.kind}")
+
+    bias = bias.to(device=projected_gate.device, dtype=torch.float32)
+    score = gathered_gate.float() + bias
+    score = score.masked_fill(~valid.to(score.device).unsqueeze(-1), float("-inf"))
+    weights = torch.softmax(score, dim=-2)
+    weights = torch.where(
+        valid.to(weights.device).unsqueeze(-1),
+        weights,
+        torch.zeros((), dtype=weights.dtype, device=weights.device),
+    )
+    return (gathered_kv * weights).sum(dim=-2)
+
+
+def compress_owned_projected_kv(
+    *,
+    layout: Dsv4CompressedLayout,
+    owner_rank: int,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+    token_ids: Sequence[int] | None = None,
+) -> torch.Tensor:
+    return compress_projected_kv(
+        layout=layout,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        entry_ids=layout.entry_ids_by_owner_rank[int(owner_rank)],
+        token_ids=token_ids,
+    )
 
 
 def _validate_metadata(
@@ -277,6 +388,204 @@ def _build_token_ownership(
             for token_id in range(int(start), int(end)):
                 owners[token_id] = (rank, int(local_start) + token_id - int(start))
     return owners
+
+
+def _select_entries(
+    *,
+    layout: Dsv4CompressedLayout,
+    entry_ids: Sequence[int] | None,
+) -> tuple[Dsv4CompressedEntry, ...]:
+    if entry_ids is None:
+        return layout.entries
+    return tuple(layout.entries[int(entry_id)] for entry_id in entry_ids)
+
+
+def _compressed_head_dim(
+    *,
+    layout: Dsv4CompressedLayout,
+    projected_dim: int,
+    positional_bias: torch.Tensor,
+) -> int:
+    if int(positional_bias.shape[-1]) != int(projected_dim):
+        raise RuntimeError(
+            "DSV4 projected tensor and positional-bias dims must match, got "
+            f"{projected_dim} vs {int(positional_bias.shape[-1])}"
+        )
+    if layout.spec.kind == Dsv4CompressionKind.HCA:
+        return projected_dim
+    if layout.spec.kind == Dsv4CompressionKind.CSA:
+        if projected_dim % 2 != 0:
+            raise RuntimeError(
+                f"DSV4 CSA projected dim must be even, got {projected_dim}"
+            )
+        return projected_dim // 2
+    raise RuntimeError(f"Unsupported DSV4 compression kind: {layout.spec.kind}")
+
+
+def _empty_compressed_output(projected_kv: torch.Tensor, head_dim: int) -> torch.Tensor:
+    if projected_kv.ndim == 2:
+        return projected_kv.new_empty((0, head_dim))
+    return projected_kv.new_empty((int(projected_kv.shape[0]), 0, head_dim))
+
+
+def _build_projected_compression_gather(
+    *,
+    entries: tuple[Dsv4CompressedEntry, ...],
+    layout: Dsv4CompressedLayout,
+    token_ids: Sequence[int] | None,
+    tensor_token_count: int,
+) -> dict[str, torch.Tensor]:
+    max_rows = _max_compression_rows(layout.spec)
+    token_to_row = _token_to_row_map(token_ids, tensor_token_count)
+    token_index = torch.zeros((len(entries), max_rows), dtype=torch.long)
+    valid = torch.zeros((len(entries), max_rows), dtype=torch.bool)
+    ape_row = torch.zeros((len(entries), max_rows), dtype=torch.long)
+    half = torch.zeros((len(entries), max_rows), dtype=torch.long)
+    ratio = int(layout.spec.ratio)
+
+    for row, entry in enumerate(entries):
+        deps = tuple(int(token_id) for token_id in entry.dependency_token_ids)
+        if layout.spec.kind == Dsv4CompressionKind.HCA:
+            slots = range(len(deps))
+            dep_halves = (0,) * len(deps)
+        elif layout.spec.kind == Dsv4CompressionKind.CSA:
+            if len(deps) == ratio:
+                slots = range(ratio, 2 * ratio)
+                dep_halves = (1,) * len(deps)
+            elif len(deps) == 2 * ratio:
+                slots = range(2 * ratio)
+                dep_halves = (0,) * ratio + (1,) * ratio
+            else:
+                raise RuntimeError(
+                    "DSV4 CSA entries must contain ratio or 2*ratio dependencies, got "
+                    f"{len(deps)} for entry_id={entry.entry_id}"
+                )
+        else:
+            raise RuntimeError(f"Unsupported DSV4 compression kind: {layout.spec.kind}")
+
+        for dep_offset, slot in enumerate(slots):
+            token_index[row, slot] = _token_row(
+                token_to_row=token_to_row,
+                token_id=deps[dep_offset],
+                tensor_token_count=tensor_token_count,
+            )
+            valid[row, slot] = True
+            ape_row[row, slot] = dep_offset % ratio
+            half[row, slot] = dep_halves[dep_offset]
+
+    return {
+        "token_index": token_index,
+        "valid": valid,
+        "ape_row": ape_row,
+        "half": half,
+    }
+
+
+def _max_compression_rows(spec: Dsv4CompressionSpec) -> int:
+    if spec.kind == Dsv4CompressionKind.CSA:
+        return 2 * int(spec.ratio)
+    if spec.kind == Dsv4CompressionKind.HCA:
+        return int(spec.ratio)
+    raise RuntimeError(f"Unsupported DSV4 compression kind: {spec.kind}")
+
+
+def _token_to_row_map(
+    token_ids: Sequence[int] | None,
+    tensor_token_count: int,
+) -> dict[int, int] | None:
+    if token_ids is None:
+        return None
+    if len(token_ids) != tensor_token_count:
+        raise RuntimeError(
+            "DSV4 token_ids length must match projected tensor token count, got "
+            f"{len(token_ids)} vs {tensor_token_count}"
+        )
+    token_to_row: dict[int, int] = {}
+    for row, token_id in enumerate(token_ids):
+        token = int(token_id)
+        if token in token_to_row:
+            raise RuntimeError(f"DSV4 token id {token} appears more than once")
+        token_to_row[token] = row
+    return token_to_row
+
+
+def _token_row(
+    *,
+    token_to_row: dict[int, int] | None,
+    token_id: int,
+    tensor_token_count: int,
+) -> int:
+    if token_to_row is not None:
+        row = token_to_row.get(int(token_id))
+        if row is None:
+            raise RuntimeError(
+                f"DSV4 projected token buffer is missing packed token {token_id}"
+            )
+        return int(row)
+    if int(token_id) < 0 or int(token_id) >= int(tensor_token_count):
+        raise RuntimeError(
+            f"DSV4 packed token {token_id} is outside projected tensor length "
+            f"{tensor_token_count}"
+        )
+    return int(token_id)
+
+
+def _gather_tokens(projected: torch.Tensor, token_index: torch.Tensor) -> torch.Tensor:
+    if projected.ndim == 2:
+        return projected.index_select(0, token_index.reshape(-1)).reshape(
+            *token_index.shape,
+            int(projected.shape[-1]),
+        )
+    return projected[:, token_index.reshape(-1), :].reshape(
+        int(projected.shape[0]),
+        *token_index.shape,
+        int(projected.shape[-1]),
+    )
+
+
+def _select_csa_halves(
+    tensor: torch.Tensor,
+    half: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    split = tensor.reshape(*tensor.shape[:-1], 2, head_dim)
+    half_index = half.to(tensor.device)
+    if tensor.ndim == 3:
+        gather_index = (
+            half_index.unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand(
+                *half_index.shape,
+                1,
+                head_dim,
+            )
+        )
+    elif tensor.ndim == 4:
+        gather_index = (
+            half_index.unsqueeze(0)
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand(
+                int(tensor.shape[0]),
+                *half_index.shape,
+                1,
+                head_dim,
+            )
+        )
+    else:
+        raise RuntimeError(f"Unexpected DSV4 CSA tensor rank: {tensor.ndim}")
+    return split.gather(-2, gather_index).squeeze(-2)
+
+
+def _select_csa_positional_bias(
+    positional_bias: torch.Tensor,
+    ape_row: torch.Tensor,
+    half: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    split = positional_bias.reshape(int(positional_bias.shape[0]), 2, head_dim)
+    flat = split[ape_row.reshape(-1), half.reshape(-1)]
+    return flat.reshape(*ape_row.shape, head_dim)
 
 
 def _build_entries(

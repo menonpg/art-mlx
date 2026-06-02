@@ -3,6 +3,8 @@
 from .compressor import (
     build_dsv4_compressed_layout,
     build_dsv4_compressed_layout_from_cp_state,
+    compress_owned_projected_kv,
+    compress_projected_kv,
 )
 from .types import (
     Dsv4BranchView,
@@ -32,4 +34,6 @@ __all__ = [
     "Dsv4TokenInView",
     "build_dsv4_compressed_layout",
     "build_dsv4_compressed_layout_from_cp_state",
+    "compress_owned_projected_kv",
+    "compress_projected_kv",
 ]
