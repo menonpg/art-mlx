@@ -21,6 +21,7 @@ class Dsv4TensorExchangeWork(BaseModel):
     stream: torch.cuda.Stream | None = None
     output_ndim: int
     label: str = "dsv4_tensor_exchange"
+    allow_duplicate_recv_ids: bool = False
     _wait_complete: bool = PrivateAttr(default=False)
 
     def wait(self) -> None:
@@ -34,7 +35,11 @@ class Dsv4TensorExchangeWork(BaseModel):
 
     def wait_post_process(self) -> Dsv4TensorIdBuffer:
         self.wait()
-        ids = _flatten_peer_ids(self.recv_ids_by_peer, name="recv_ids_by_peer")
+        ids = _flatten_peer_ids(
+            self.recv_ids_by_peer,
+            name="recv_ids_by_peer",
+            allow_duplicates=bool(self.allow_duplicate_recv_ids),
+        )
         tensor = _unpack_wire_rows(
             packed=self.recv_buffer,
             output_ndim=int(self.output_ndim),
@@ -52,6 +57,7 @@ def launch_dsv4_tensor_exchange(
     group: Any,
     async_op: bool,
     label: str = "dsv4_tensor_exchange",
+    allow_duplicate_recv_ids: bool = False,
 ) -> Dsv4TensorExchangeWork:
     """Exchange DSV4 KV-like tensor rows by explicit ids.
 
@@ -63,7 +69,11 @@ def launch_dsv4_tensor_exchange(
     """
     _validate_exchange_tensor(tensor)
     world_size = _world_size(group)
-    _validate_plan(plan=plan, world_size=world_size)
+    _validate_plan(
+        plan=plan,
+        world_size=world_size,
+        allow_duplicate_recv_ids=bool(allow_duplicate_recv_ids),
+    )
     tensor_ids = _normalize_ids(
         ids=tensor_ids,
         expected_count=int(tensor.shape[_row_dim(tensor)]),
@@ -103,6 +113,7 @@ def launch_dsv4_tensor_exchange(
             stream=None,
             output_ndim=tensor.ndim,
             label=label,
+            allow_duplicate_recv_ids=bool(allow_duplicate_recv_ids),
         )
 
     input_split_sizes = [len(peer_ids) for peer_ids in plan.send_ids_by_peer]
@@ -139,6 +150,7 @@ def launch_dsv4_tensor_exchange(
         stream=stream,
         output_ndim=tensor.ndim,
         label=label,
+        allow_duplicate_recv_ids=bool(allow_duplicate_recv_ids),
     )
 
 
@@ -189,7 +201,12 @@ def _validate_exchange_tensor(tensor: torch.Tensor) -> None:
         )
 
 
-def _validate_plan(*, plan: Dsv4TensorExchangePlan, world_size: int) -> None:
+def _validate_plan(
+    *,
+    plan: Dsv4TensorExchangePlan,
+    world_size: int,
+    allow_duplicate_recv_ids: bool,
+) -> None:
     if len(plan.send_ids_by_peer) != int(world_size):
         raise RuntimeError(
             "DSV4 exchange send peer count must match world size, got "
@@ -202,7 +219,11 @@ def _validate_plan(*, plan: Dsv4TensorExchangePlan, world_size: int) -> None:
         )
     for peer, ids in enumerate(plan.send_ids_by_peer):
         _row_by_id(ids, name=f"send_ids_by_peer[{peer}]")
-    _flatten_peer_ids(plan.recv_ids_by_peer, name="recv_ids_by_peer")
+    _flatten_peer_ids(
+        plan.recv_ids_by_peer,
+        name="recv_ids_by_peer",
+        allow_duplicates=allow_duplicate_recv_ids,
+    )
 
 
 def _normalize_ids(
@@ -298,9 +319,13 @@ def _flatten_peer_ids(
     ids_by_peer: tuple[tuple[int, ...], ...],
     *,
     name: str,
+    allow_duplicates: bool = False,
 ) -> tuple[int, ...]:
     ids = tuple(int(id_) for peer_ids in ids_by_peer for id_ in peer_ids)
-    _row_by_id(ids, name=name)
+    if any(id_ < 0 for id_ in ids):
+        raise RuntimeError(f"DSV4 {name} ids must be non-negative")
+    if not allow_duplicates:
+        _row_by_id(ids, name=name)
     return ids
 
 

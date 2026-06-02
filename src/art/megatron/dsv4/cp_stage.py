@@ -107,11 +107,12 @@ def build_dsv4_stage_inputs(
         )
 
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
-    raw_token_ids = _stage_raw_token_ids(layout=layout, ranges=global_k_ranges)
+    stage_k_ranges = tuple(global_k_ranges) if query_ids else ()
+    raw_token_ids = _stage_raw_token_ids(layout=layout, ranges=stage_k_ranges)
     raw_local = {token_id: offset for offset, token_id in enumerate(raw_token_ids)}
     compressed_entry_ids = stage_candidate_entry_ids(
         layout=layout,
-        global_k_ranges=global_k_ranges,
+        global_k_ranges=stage_k_ranges,
     )
     compressed_local = {
         entry_id: len(raw_token_ids) + offset
@@ -516,13 +517,20 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
     _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
     _shared_stage_index(stage_plans)
     raw_by_rank = tuple(
-        _stage_raw_token_ids(layout=layout, ranges=stage_plan.global_k_ranges)
+        _stage_raw_token_ids(
+            layout=layout,
+            ranges=stage_plan.global_k_ranges
+            if _token_ids_from_ranges(stage_plan.global_q_ranges)
+            else (),
+        )
         for stage_plan in stage_plans
     )
     compressed_by_rank = tuple(
         stage_candidate_entry_ids(
             layout=layout,
-            global_k_ranges=stage_plan.global_k_ranges,
+            global_k_ranges=stage_plan.global_k_ranges
+            if _token_ids_from_ranges(stage_plan.global_q_ranges)
+            else (),
         )
         for stage_plan in stage_plans
     )

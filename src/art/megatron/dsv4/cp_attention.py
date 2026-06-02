@@ -488,8 +488,6 @@ def run_materialized_dsv4_attention_forward(
     if len(stages) == 0:
         raise ValueError("at least one materialized DSV4 stage is required")
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
-    if not query_ids:
-        raise ValueError("DSV4 materialized attention requires query_token_ids")
 
     records: list[Dsv4StageForwardRecord] = []
     disabled_sink = sparse_kernel.dsv4_disabled_attn_sink(attn_sink)
@@ -550,8 +548,6 @@ def launch_exchanged_dsv4_attention_forward(
     for position, work in enumerate(works):
         _validate_stage_exchange_work(work=work, position=position)
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
-    if not query_ids:
-        raise ValueError("DSV4 exchanged attention requires query_token_ids")
     return Dsv4ExchangedAttentionForwardWork(
         stage_works=works,
         query_token_ids=query_ids,

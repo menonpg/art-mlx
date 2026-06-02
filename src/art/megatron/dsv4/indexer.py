@@ -160,18 +160,20 @@ def build_dsv4_indexer_stage_plan_from_stage_plans(
     stage_plans = tuple(stage_plans_by_rank)
     _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
     stage_index = _shared_stage_index(stage_plans)
+    query_ids_by_rank = tuple(
+        _token_ids_from_ranges(stage_plan.global_q_ranges) for stage_plan in stage_plans
+    )
     return Dsv4IndexerStagePlan(
         stage_index=stage_index,
-        query_token_ids_by_rank=tuple(
-            _token_ids_from_ranges(stage_plan.global_q_ranges)
-            for stage_plan in stage_plans
-        ),
+        query_token_ids_by_rank=query_ids_by_rank,
         candidate_entry_ids_by_rank=tuple(
             stage_candidate_entry_ids(
                 layout=layout,
-                global_k_ranges=stage_plan.global_k_ranges,
+                global_k_ranges=stage_plan.global_k_ranges
+                if query_ids_by_rank[rank]
+                else (),
             )
-            for stage_plan in stage_plans
+            for rank, stage_plan in enumerate(stage_plans)
         ),
     )
 
@@ -555,8 +557,6 @@ def launch_exchanged_dsv4_indexer_topk(
     if not works:
         raise RuntimeError("DSV4 exchanged indexer topk requires at least one stage")
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
-    if not query_ids:
-        raise RuntimeError("DSV4 exchanged indexer topk requires query_token_ids")
     _row_by_id(query_ids, name="query_token_ids")
     if int(topk) < 0:
         raise RuntimeError(f"DSV4 exchanged indexer topk must be non-negative: {topk}")

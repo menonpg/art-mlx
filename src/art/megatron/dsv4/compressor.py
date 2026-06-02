@@ -776,6 +776,7 @@ def launch_dsv4_compression_halo_gradient_exchange(
             group=group,
             async_op=async_op,
             label="dsv4_compression_halo_gradient_exchange",
+            allow_duplicate_recv_ids=True,
         ),
     )
 
