@@ -686,6 +686,40 @@ def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle(
         init_path.unlink()
 
 
+def test_distributed_projected_hca_ratio128_cp4_empty_rank_matches_packed_oracle(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_projected_hca_ratio128_cp4_empty_rank_oracle_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_hca_ratio128_empty_rank_oracle_worker,
+        args=(4, str(init_path), "29634"),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
+def test_distributed_projected_hca_ratio128_cp8_empty_rank_matches_packed_oracle(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_projected_hca_ratio128_cp8_empty_rank_oracle_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_hca_ratio128_empty_rank_oracle_worker,
+        args=(8, str(init_path), "29635"),
+        nprocs=8,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.device_count() < 2
@@ -1584,6 +1618,120 @@ def _hca_ratio128_boundary_layout() -> Dsv4CompressedLayout:
     )
 
 
+def _hca_ratio128_empty_rank_layout(*, rank_count: int) -> Dsv4CompressedLayout:
+    if int(rank_count) < 3:
+        raise RuntimeError(
+            f"HCA ratio-128 empty-rank layout requires at least 3 ranks: {rank_count}"
+        )
+    return build_dsv4_compressed_layout(
+        group_ids=torch.tensor([[0] * 96 + [1] * 160 + [2] * 160]),
+        parent_ids=torch.tensor([[0] * 96 + [0] * 160 + [0] * 160]),
+        token_layout_index=_LayoutIndex(
+            ownership_ranges_by_rank=(
+                ((0, 96, 0),),
+                ((96, 256, 0),),
+                ((256, 416, 0),),
+                *(((),) * (int(rank_count) - 3)),
+            ),
+            token_counts_by_rank=(96, 160, 160) + ((0,) * (int(rank_count) - 3)),
+        ),
+        spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.HCA, ratio=128),
+    )
+
+
+def _hca_ratio128_empty_token_ids_by_rank(
+    *,
+    rank_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    if int(rank_count) < 3:
+        raise RuntimeError(
+            f"HCA ratio-128 empty-token layout requires at least 3 ranks: {rank_count}"
+        )
+    return (
+        tuple(range(0, 96)),
+        tuple(range(96, 256)),
+        tuple(range(256, 416)),
+        *(((),) * (int(rank_count) - 3)),
+    )
+
+
+def _hca_ratio128_empty_stage_slots(
+    *,
+    rank_count: int,
+) -> tuple[Dsv4StagePlanSlot, ...]:
+    if int(rank_count) < 3:
+        raise RuntimeError(
+            f"HCA ratio-128 empty-rank slot requires at least 3 ranks: {rank_count}"
+        )
+    stage_plans = [
+        _StagePlan(
+            stage_index=0,
+            global_q_ranges=(_Range(start=0, end=96),),
+            global_k_ranges=(_Range(start=0, end=416),),
+        ),
+        _StagePlan(
+            stage_index=0,
+            global_q_ranges=(_Range(start=96, end=256),),
+            global_k_ranges=(_Range(start=0, end=416),),
+        ),
+        _StagePlan(
+            stage_index=0,
+            global_q_ranges=(_Range(start=256, end=416),),
+            global_k_ranges=(_Range(start=0, end=416),),
+        ),
+    ]
+    for _ in range(int(rank_count) - 3):
+        stage_plans.append(
+            _StagePlan(
+                stage_index=0,
+                global_q_ranges=(),
+                global_k_ranges=(_Range(start=0, end=416),),
+            )
+        )
+    return (
+        Dsv4StagePlanSlot(
+            stage_index=0,
+            stage_plans_by_rank=tuple(stage_plans),
+        ),
+    )
+
+
+def _distributed_projected_hca_ratio128_empty_rank_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+    master_port: str,
+) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = master_port
+    init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
+        layout = _hca_ratio128_empty_rank_layout(rank_count=world_size)
+        local_token_ids_by_rank = _hca_ratio128_empty_token_ids_by_rank(
+            rank_count=world_size
+        )
+        _run_distributed_projected_hca_oracle_case(
+            rank=rank,
+            layout=layout,
+            stage_plan_slots=_hca_ratio128_empty_stage_slots(rank_count=world_size),
+            local_token_ids=local_token_ids_by_rank[rank],
+            token_count=416,
+            seed=143 + world_size,
+            expect_rank0_halo_grad=True,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+    finally:
+        destroy_process_group()
+
+
 def _run_distributed_projected_hca_oracle_case(
     *,
     rank: int,
@@ -1748,8 +1896,16 @@ def _run_distributed_projected_hca_oracle_case(
         rtol=rtol,
         atol=atol,
     )
-    assert not bool(backward.attention.dq.abs().sum().eq(0).item())
-    assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
+    if local_token_ids:
+        assert not bool(backward.attention.dq.abs().sum().eq(0).item())
+        assert not bool(
+            backward.main_compressor.dprojected_gate.abs().sum().eq(0).item()
+        )
+    else:
+        assert backward.attention.dq.numel() == 0
+        assert backward.attention.draw_kv.numel() == 0
+        assert backward.main_compressor.dprojected_kv.numel() == 0
+        assert backward.main_compressor.dprojected_gate.numel() == 0
     if expect_rank0_halo_grad and rank == 0:
         assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
         assert not bool(
