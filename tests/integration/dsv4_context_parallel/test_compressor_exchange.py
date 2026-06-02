@@ -16,6 +16,9 @@ from art.megatron.dsv4 import (
     accumulate_dsv4_compression_halo_gradient_payloads,
     build_dsv4_compressed_layout,
     compress_owned_projected_kv,
+    compress_projected_kv,
+    launch_dsv4_compressed_kv_backward,
+    launch_dsv4_compressed_kv_forward,
     launch_dsv4_compression_halo_exchange,
     launch_dsv4_compression_halo_gradient_exchange,
     materialize_dsv4_compression_token_buffer,
@@ -37,6 +40,23 @@ def test_compression_halo_exchange_feeds_owner_rank_compression(
         init_path.unlink()
     mp.start_processes(
         _halo_exchange_worker,
+        args=(2, str(init_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
+def test_compressed_kv_work_matches_global_oracle_and_reduces_bias_grad(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_compressed_kv_work_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _compressed_kv_work_worker,
         args=(2, str(init_path)),
         nprocs=2,
         join=True,
@@ -197,6 +217,102 @@ def _halo_exchange_worker(rank: int, world_size: int, init_path: str) -> None:
             rtol=1e-6,
             atol=1e-6,
         )
+    finally:
+        destroy_process_group()
+
+
+def _compressed_kv_work_worker(rank: int, world_size: int, init_path: str) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29625")
+    init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        layout = _layout()
+        full_kv = _global_projected(18, 10) / 50
+        full_gate = (full_kv + 0.25).sin()
+        positional_bias = torch.linspace(-0.5, 0.5, steps=40).reshape(4, 10)
+        local_ids_by_rank = (tuple(range(8)), tuple(range(8, 18)))
+        local_ids = local_ids_by_rank[rank]
+        local_index = torch.tensor(local_ids, dtype=torch.long)
+
+        forward_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=rank,
+            projected_kv=full_kv.index_select(0, local_index),
+            projected_gate=full_gate.index_select(0, local_index),
+            positional_bias=positional_bias,
+            token_ids=local_ids,
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        )
+        forward_result = forward_work.wait_post_process()
+        expected_owned = compress_owned_projected_kv(
+            layout=layout,
+            owner_rank=rank,
+            projected_kv=full_kv,
+            projected_gate=full_gate,
+            positional_bias=positional_bias,
+        )
+        assert forward_result.owner_rank == rank
+        assert forward_result.local_token_ids == local_ids
+        assert (
+            forward_result.compressed_entry_ids == layout.entry_ids_by_owner_rank[rank]
+        )
+        torch.testing.assert_close(
+            forward_result.compressed_kv,
+            expected_owned,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+        backward_work = launch_dsv4_compressed_kv_backward(
+            forward_result=forward_result,
+            dcompressed_kv=2 * forward_result.compressed_kv.detach(),
+            group=cast(Any, torch.distributed).group.WORLD,
+            async_op=True,
+        )
+        grad_result = backward_work.wait_post_process()
+
+        ref_kv = full_kv.detach().clone().requires_grad_()
+        ref_gate = full_gate.detach().clone().requires_grad_()
+        ref_bias = positional_bias.detach().clone().requires_grad_()
+        ref_compressed = compress_projected_kv(
+            layout=layout,
+            projected_kv=ref_kv,
+            projected_gate=ref_gate,
+            positional_bias=ref_bias,
+        )
+        ref_compressed.square().sum().backward()
+        assert ref_kv.grad is not None
+        assert ref_gate.grad is not None
+        assert ref_bias.grad is not None
+
+        assert grad_result.token_ids == local_ids
+        torch.testing.assert_close(
+            grad_result.dprojected_kv,
+            ref_kv.grad.index_select(0, local_index),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            grad_result.dprojected_gate,
+            ref_gate.grad.index_select(0, local_index),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            grad_result.dpositional_bias,
+            ref_bias.grad,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        assert not bool(grad_result.dprojected_kv.abs().sum().eq(0).item())
+        assert not bool(grad_result.dprojected_gate.abs().sum().eq(0).item())
+        assert not bool(grad_result.dpositional_bias.abs().sum().eq(0).item())
     finally:
         destroy_process_group()
 

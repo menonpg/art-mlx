@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 import torch
+import torch.distributed as dist
 
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
+    Dsv4CompressedKvForwardResult,
+    Dsv4CompressedKvGradientResult,
     Dsv4CompressedLayout,
     Dsv4CompressionHaloGradientPayload,
     Dsv4CompressionHaloPayload,
@@ -23,6 +26,8 @@ from .types import (
     Dsv4TensorExchangePlan,
     Dsv4TokenInView,
 )
+
+_DIST = cast(Any, dist)
 
 if TYPE_CHECKING:
     from art.megatron.context_parallel.types import ArtContextParallelState
@@ -141,6 +146,86 @@ class Dsv4CompressionHaloGradientExchangeWork(BaseModel):
             )
             cursor += count
         return tuple(payloads)
+
+
+class Dsv4CompressedKvForwardWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    layout: Dsv4CompressedLayout
+    rank: int
+    projected_kv: torch.Tensor
+    projected_gate: torch.Tensor
+    token_ids: tuple[int, ...]
+    positional_bias: torch.Tensor
+    halo_work: Dsv4CompressionHaloExchangeWork
+
+    def wait(self) -> None:
+        self.halo_work.wait()
+
+    def wait_post_process(self) -> Dsv4CompressedKvForwardResult:
+        halo_payloads = self.halo_work.wait_post_process()
+        buffer = materialize_dsv4_compression_token_buffer(
+            layout=self.layout,
+            owner_rank=int(self.rank),
+            projected_kv=self.projected_kv,
+            projected_gate=self.projected_gate,
+            token_ids=self.token_ids,
+            halo_payloads=halo_payloads,
+        )
+        compressed_entry_ids = self.layout.entry_ids_by_owner_rank[int(self.rank)]
+        compressed = compress_owned_projected_kv(
+            layout=self.layout,
+            owner_rank=int(self.rank),
+            projected_kv=buffer.projected_kv,
+            projected_gate=buffer.projected_gate,
+            positional_bias=self.positional_bias,
+            token_ids=buffer.token_ids,
+        )
+        return Dsv4CompressedKvForwardResult(
+            layout=self.layout,
+            owner_rank=int(self.rank),
+            local_token_ids=self.token_ids,
+            compressed_entry_ids=compressed_entry_ids,
+            token_buffer=buffer,
+            positional_bias=self.positional_bias,
+            compressed_kv=compressed,
+        )
+
+
+class Dsv4CompressedKvBackwardWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    rank: int
+    local_gradient: Dsv4ProjectedTokenBuffer
+    dpositional_bias: torch.Tensor
+    halo_gradient_work: Dsv4CompressionHaloGradientExchangeWork
+    bias_handle: Any | None = None
+    _wait_complete: bool = PrivateAttr(default=False)
+
+    def wait(self) -> None:
+        if self._wait_complete:
+            return
+        self.halo_gradient_work.wait()
+        if self.bias_handle is not None:
+            self.bias_handle.wait()
+        self._wait_complete = True
+
+    def wait_post_process(self) -> Dsv4CompressedKvGradientResult:
+        self.wait()
+        halo_payloads = self.halo_gradient_work.wait_post_process()
+        accumulated = accumulate_dsv4_compression_halo_gradient_payloads(
+            target_rank=int(self.rank),
+            token_ids=self.local_gradient.token_ids,
+            dprojected_kv=self.local_gradient.projected_kv,
+            dprojected_gate=self.local_gradient.projected_gate,
+            halo_gradient_payloads=halo_payloads,
+        )
+        return Dsv4CompressedKvGradientResult(
+            token_ids=accumulated.token_ids,
+            dprojected_kv=accumulated.projected_kv,
+            dprojected_gate=accumulated.projected_gate,
+            dpositional_bias=self.dpositional_bias,
+        )
 
 
 def build_dsv4_compressed_layout(
@@ -317,6 +402,130 @@ def compress_owned_projected_kv(
         positional_bias=positional_bias,
         entry_ids=layout.entry_ids_by_owner_rank[int(owner_rank)],
         token_ids=token_ids,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_compressed_kv_forward(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    projected_kv: torch.Tensor,
+    projected_gate: torch.Tensor,
+    positional_bias: torch.Tensor,
+    token_ids: Sequence[int],
+    group: Any,
+    async_op: bool,
+) -> Dsv4CompressedKvForwardWork:
+    """Launch DSV4 compressed-KV production with projected-token halo exchange.
+
+    This is the production compression boundary the model handler can call after
+    local compressor projections. It starts the fused projected KV/gate halo
+    exchange immediately; `wait_post_process()` materializes the local+halo
+    token buffer and computes this rank's owned compressed entries.
+    """
+    _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
+    rank_int = _validate_layout_rank_value(
+        rank=rank,
+        rank_count=len(layout.entry_ids_by_owner_rank),
+    )
+    token_ids = _normalize_token_ids(
+        token_ids=token_ids,
+        tensor_token_count=int(projected_kv.shape[-2]),
+        name="token_ids",
+    )
+    _validate_positional_bias(
+        layout=layout,
+        projected_kv=projected_kv,
+        positional_bias=positional_bias,
+    )
+    halo_work = launch_dsv4_compression_halo_exchange(
+        layout=layout,
+        rank=rank_int,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        token_ids=token_ids,
+        group=group,
+        async_op=async_op,
+    )
+    return Dsv4CompressedKvForwardWork(
+        layout=layout,
+        rank=rank_int,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        token_ids=token_ids,
+        positional_bias=positional_bias,
+        halo_work=halo_work,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_compressed_kv_backward(
+    *,
+    forward_result: Dsv4CompressedKvForwardResult,
+    dcompressed_kv: torch.Tensor,
+    group: Any,
+    async_op: bool,
+) -> Dsv4CompressedKvBackwardWork:
+    """Replay compressor backward and launch reverse halo-gradient exchange.
+
+    The compressed-KV forward path can be used outside normal autograd because
+    DSV4 sparse attention backward is replay-based. This function recomputes the
+    small compression operation over the saved local+halo token buffer, scatters
+    owner-local projected-token gradients, returns remote halo gradients, and
+    CP-reduces the positional-bias gradient.
+    """
+    _validate_dcompressed_kv(
+        forward_result=forward_result,
+        dcompressed_kv=dcompressed_kv,
+    )
+    buffer = forward_result.token_buffer
+    if len(forward_result.compressed_entry_ids) == 0:
+        d_buffer_kv = torch.zeros_like(buffer.projected_kv)
+        d_buffer_gate = torch.zeros_like(buffer.projected_gate)
+        dpositional_bias = torch.zeros_like(forward_result.positional_bias)
+    else:
+        replay_kv = buffer.projected_kv.detach().requires_grad_(True)
+        replay_gate = buffer.projected_gate.detach().requires_grad_(True)
+        replay_bias = forward_result.positional_bias.detach().requires_grad_(True)
+        replay_compressed = compress_owned_projected_kv(
+            layout=forward_result.layout,
+            owner_rank=int(forward_result.owner_rank),
+            projected_kv=replay_kv,
+            projected_gate=replay_gate,
+            positional_bias=replay_bias,
+            token_ids=buffer.token_ids,
+        )
+        d_buffer_kv, d_buffer_gate, dpositional_bias = torch.autograd.grad(
+            replay_compressed,
+            (replay_kv, replay_gate, replay_bias),
+            grad_outputs=dcompressed_kv,
+        )
+    local_gradient = _scatter_buffer_gradient_to_local_tokens(
+        local_token_ids=forward_result.local_token_ids,
+        buffer_token_ids=buffer.token_ids,
+        dprojected_kv=d_buffer_kv,
+        dprojected_gate=d_buffer_gate,
+    )
+    halo_gradient_work = launch_dsv4_compression_halo_gradient_exchange(
+        layout=forward_result.layout,
+        rank=int(forward_result.owner_rank),
+        token_ids=buffer.token_ids,
+        dprojected_kv=d_buffer_kv,
+        dprojected_gate=d_buffer_gate,
+        group=group,
+        async_op=async_op,
+    )
+    reduced_bias = dpositional_bias.contiguous().clone()
+    bias_handle = None
+    if len(forward_result.layout.entry_ids_by_owner_rank) > 1:
+        bias_handle = _DIST.all_reduce(reduced_bias, group=group, async_op=async_op)
+    return Dsv4CompressedKvBackwardWork(
+        rank=int(forward_result.owner_rank),
+        local_gradient=local_gradient,
+        dpositional_bias=reduced_bias,
+        halo_gradient_work=halo_gradient_work,
+        bias_handle=bias_handle,
     )
 
 
@@ -646,6 +855,97 @@ def _validate_projected_pair(
         )
 
 
+def _validate_positional_bias(
+    *,
+    layout: Dsv4CompressedLayout,
+    projected_kv: torch.Tensor,
+    positional_bias: torch.Tensor,
+) -> None:
+    if positional_bias.ndim != 2:
+        raise RuntimeError(
+            "DSV4 compressor positional bias must have shape [ratio, C], got "
+            f"{tuple(positional_bias.shape)}"
+        )
+    if int(positional_bias.shape[0]) != int(layout.spec.ratio):
+        raise RuntimeError(
+            "DSV4 positional-bias ratio mismatch: "
+            f"layout={layout.spec.ratio}, bias={int(positional_bias.shape[0])}"
+        )
+    _compressed_head_dim(
+        layout=layout,
+        projected_dim=int(projected_kv.shape[-1]),
+        positional_bias=positional_bias,
+    )
+
+
+def _validate_dcompressed_kv(
+    *,
+    forward_result: Dsv4CompressedKvForwardResult,
+    dcompressed_kv: torch.Tensor,
+) -> None:
+    if tuple(dcompressed_kv.shape) != tuple(forward_result.compressed_kv.shape):
+        raise RuntimeError(
+            "DSV4 compressed-KV grad shape mismatch: "
+            f"{tuple(dcompressed_kv.shape)} vs "
+            f"{tuple(forward_result.compressed_kv.shape)}"
+        )
+    if dcompressed_kv.device != forward_result.compressed_kv.device:
+        raise RuntimeError(
+            "DSV4 compressed-KV grad device mismatch: "
+            f"{dcompressed_kv.device} vs {forward_result.compressed_kv.device}"
+        )
+
+
+def _scatter_buffer_gradient_to_local_tokens(
+    *,
+    local_token_ids: Sequence[int],
+    buffer_token_ids: Sequence[int],
+    dprojected_kv: torch.Tensor,
+    dprojected_gate: torch.Tensor,
+) -> Dsv4ProjectedTokenBuffer:
+    _validate_projected_pair(
+        projected_kv=dprojected_kv,
+        projected_gate=dprojected_gate,
+    )
+    buffer_token_ids = _normalize_token_ids(
+        token_ids=buffer_token_ids,
+        tensor_token_count=int(dprojected_kv.shape[-2]),
+        name="compression buffer token_ids",
+    )
+    local_token_ids = tuple(int(token_id) for token_id in local_token_ids)
+    local_index = _row_by_token_id(local_token_ids, name="local token_ids")
+
+    local_shape = list(dprojected_kv.shape)
+    local_shape[_token_dim(dprojected_kv)] = len(local_token_ids)
+    local_kv = dprojected_kv.new_zeros(tuple(local_shape))
+    local_gate = dprojected_gate.new_zeros(tuple(local_shape))
+
+    source_positions: list[int] = []
+    target_positions: list[int] = []
+    for source_position, token_id in enumerate(buffer_token_ids):
+        target_position = local_index.get(int(token_id))
+        if target_position is None:
+            continue
+        source_positions.append(source_position)
+        target_positions.append(target_position)
+    if source_positions:
+        _index_add_token_dim(
+            local_kv,
+            target_positions,
+            _index_select_token_dim(dprojected_kv, source_positions),
+        )
+        _index_add_token_dim(
+            local_gate,
+            target_positions,
+            _index_select_token_dim(dprojected_gate, source_positions),
+        )
+    return Dsv4ProjectedTokenBuffer(
+        token_ids=local_token_ids,
+        projected_kv=local_kv,
+        projected_gate=local_gate,
+    )
+
+
 def _normalize_token_ids(
     *,
     token_ids: Sequence[int],
@@ -811,6 +1111,11 @@ def _validate_layout_rank(*, rank: int, rank_count: int) -> None:
         raise RuntimeError(
             f"DSV4 compression halo rank {rank} is outside rank count {rank_count}"
         )
+
+
+def _validate_layout_rank_value(*, rank: int, rank_count: int) -> int:
+    _validate_layout_rank(rank=int(rank), rank_count=int(rank_count))
+    return int(rank)
 
 
 def _validate_halo_payload_tensors(payload: Dsv4CompressionHaloPayload) -> None:

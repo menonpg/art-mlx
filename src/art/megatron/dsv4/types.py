@@ -140,6 +140,27 @@ class Dsv4CompressionHaloGradientPayload(BaseModel):
     dprojected_gate: torch.Tensor
 
 
+class Dsv4CompressedKvForwardResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    layout: Dsv4CompressedLayout
+    owner_rank: int
+    local_token_ids: tuple[int, ...]
+    compressed_entry_ids: tuple[int, ...]
+    token_buffer: Dsv4ProjectedTokenBuffer
+    positional_bias: torch.Tensor
+    compressed_kv: torch.Tensor
+
+
+class Dsv4CompressedKvGradientResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    token_ids: tuple[int, ...]
+    dprojected_kv: torch.Tensor
+    dprojected_gate: torch.Tensor
+    dpositional_bias: torch.Tensor
+
+
 class Dsv4TopkResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -306,6 +327,8 @@ Dsv4TensorExchangePlan.model_rebuild()
 Dsv4TensorIdBuffer.model_rebuild()
 Dsv4CompressionHaloPayload.model_rebuild()
 Dsv4CompressionHaloGradientPayload.model_rebuild()
+Dsv4CompressedKvForwardResult.model_rebuild()
+Dsv4CompressedKvGradientResult.model_rebuild()
 Dsv4StageInputs.model_rebuild()
 Dsv4IndexerStagePlan.model_rebuild()
 Dsv4StagePlanGroup.model_rebuild()
