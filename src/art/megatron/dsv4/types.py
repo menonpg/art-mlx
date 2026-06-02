@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from art.megatron.context_parallel.types import ArtContextParallelState
+else:
+    ArtContextParallelState = Any
+
+
+class Dsv4CompressionKind(str, Enum):
+    CSA = "csa"
+    HCA = "hca"
+
+
+class Dsv4StreamKind(str, Enum):
+    PREFIX = "prefix"
+    COMPLETION = "completion"
+
+
+class Dsv4CompressionSpec(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    kind: Dsv4CompressionKind
+    ratio: int
+
+
+class Dsv4StreamSpec(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stream_id: int
+    kind: Dsv4StreamKind
+    parent_stream_id: int | None
+    start: int
+    end: int
+
+    def size(self) -> int:
+        return int(self.end) - int(self.start)
+
+
+class Dsv4TokenInView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    packed_token_id: int
+    stream_id: int
+    view_pos: int
+    stream_pos: int
+
+
+class Dsv4BranchView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    branch_stream_id: int
+    prefix_stream_id: int
+    suffix_stream_id: int | None
+    tokens: tuple[Dsv4TokenInView, ...]
+    prefix_token_count: int
+
+    def size(self) -> int:
+        return len(self.tokens)
+
+
+class Dsv4CompressedEntry(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    entry_id: int
+    kind: Dsv4CompressionKind
+    ratio: int
+    branch_stream_id: int
+    prefix_stream_id: int
+    closure_token_id: int
+    closure_view_pos: int
+    owner_rank: int
+    owner_local_offset: int
+    dependency_token_ids: tuple[int, ...]
+    remote_dependency_token_ids: tuple[int, ...]
+    shared_prefix_entry: bool
+    branch_entry_index: int
+
+
+class Dsv4HaloTransfer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_rank: int
+    target_rank: int
+    token_ids: tuple[int, ...]
+    entry_ids: tuple[int, ...]
+
+
+class Dsv4CompressedLayout(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    spec: Dsv4CompressionSpec
+    streams: tuple[Dsv4StreamSpec, ...]
+    branch_views: tuple[Dsv4BranchView, ...]
+    entries: tuple[Dsv4CompressedEntry, ...]
+    halo_transfers: tuple[Dsv4HaloTransfer, ...]
+    entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
+    entry_ids_by_branch_stream: dict[int, tuple[int, ...]] = Field(default_factory=dict)
+
+
+class Dsv4PreparedPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    csa_layout: Dsv4CompressedLayout | None = None
+    hca_layout: Dsv4CompressedLayout | None = None
+
+
+class Dsv4ContextParallelState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    cp_state: ArtContextParallelState
+    dsv4_plan: Dsv4PreparedPlan
+    extra: dict[str, Any] = Field(default_factory=dict)
