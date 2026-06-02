@@ -6,6 +6,15 @@ from .compressor import (
     compress_owned_projected_kv,
     compress_projected_kv,
 )
+from .indexer import (
+    build_indexer_visibility_mask,
+    compute_indexer_scores,
+    compute_indexer_topk,
+    merge_indexer_topk_results,
+    stable_topk_by_score_and_id,
+    stage_candidate_entry_ids,
+    visible_entry_ids_for_query,
+)
 from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
@@ -18,6 +27,7 @@ from .types import (
     Dsv4StreamKind,
     Dsv4StreamSpec,
     Dsv4TokenInView,
+    Dsv4TopkResult,
 )
 
 __all__ = [
@@ -32,8 +42,16 @@ __all__ = [
     "Dsv4StreamKind",
     "Dsv4StreamSpec",
     "Dsv4TokenInView",
+    "Dsv4TopkResult",
     "build_dsv4_compressed_layout",
     "build_dsv4_compressed_layout_from_cp_state",
+    "build_indexer_visibility_mask",
+    "compute_indexer_scores",
+    "compute_indexer_topk",
     "compress_owned_projected_kv",
     "compress_projected_kv",
+    "merge_indexer_topk_results",
+    "stable_topk_by_score_and_id",
+    "stage_candidate_entry_ids",
+    "visible_entry_ids_for_query",
 ]

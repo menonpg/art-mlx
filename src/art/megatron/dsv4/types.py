@@ -4,6 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
+import torch
 
 if TYPE_CHECKING:
     from art.megatron.context_parallel.types import ArtContextParallelState
@@ -90,6 +91,13 @@ class Dsv4HaloTransfer(BaseModel):
     entry_ids: tuple[int, ...]
 
 
+class Dsv4TopkResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    indices: torch.Tensor
+    scores: torch.Tensor
+
+
 class Dsv4CompressedLayout(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -115,3 +123,6 @@ class Dsv4ContextParallelState(BaseModel):
     cp_state: ArtContextParallelState
     dsv4_plan: Dsv4PreparedPlan
     extra: dict[str, Any] = Field(default_factory=dict)
+
+
+Dsv4TopkResult.model_rebuild()
