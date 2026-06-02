@@ -10,6 +10,7 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     Dsv4TopkResult,
     build_dsv4_compressed_layout,
+    build_dsv4_indexer_kv_exchange_peer_plans,
     build_indexer_visibility_mask,
     compute_indexer_scores,
     compute_indexer_stage_topk,
@@ -197,6 +198,30 @@ def test_indexer_stage_topks_merge_to_global_with_explicit_id_maps() -> None:
     torch.testing.assert_close(merged.scores, expected.scores, rtol=1e-6, atol=1e-6)
     assert not merged.indices.requires_grad
     assert not merged.scores.requires_grad
+
+
+def test_indexer_kv_exchange_peer_plan_uses_compressed_ownership() -> None:
+    layout = _layout()
+    plans = build_dsv4_indexer_kv_exchange_peer_plans(
+        layout=layout,
+        candidate_entry_ids_by_rank=((0, 1, 2), (1, 3)),
+    )
+
+    assert plans[0].recv_entry_ids_by_peer == ((0, 1), (2,))
+    assert plans[1].recv_entry_ids_by_peer == ((1,), (3,))
+    assert plans[0].send_entry_ids_by_peer == ((0, 1), (1,))
+    assert plans[1].send_entry_ids_by_peer == ((2,), (3,))
+
+    with pytest.raises(RuntimeError, match="duplicate id"):
+        build_dsv4_indexer_kv_exchange_peer_plans(
+            layout=layout,
+            candidate_entry_ids_by_rank=((0, 0), (1,)),
+        )
+    with pytest.raises(RuntimeError, match="outside layout"):
+        build_dsv4_indexer_kv_exchange_peer_plans(
+            layout=layout,
+            candidate_entry_ids_by_rank=((9,), (1,)),
+        )
 
 
 def test_exchanged_indexer_topk_merges_stage_work_results() -> None:

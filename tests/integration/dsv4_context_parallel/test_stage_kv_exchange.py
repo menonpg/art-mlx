@@ -14,6 +14,7 @@ from art.megatron.dsv4 import (
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_kv_exchange_peer_plans,
     build_stage_local_topk_for_csa,
     launch_dsv4_stage_kv_exchange,
 )
@@ -61,17 +62,38 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
     )
     try:
         layout = _layout()
-        query_ids = (7,) if rank == 0 else (11,)
-        stage = build_stage_local_topk_for_csa(
-            layout=layout,
-            stage_index=9,
-            query_token_ids=query_ids,
-            global_k_ranges=(_Range(start=4, end=13),),
-            global_topk=torch.tensor([[1, 2]], dtype=torch.long),
-            window_size=4,
+        stages = tuple(
+            build_stage_local_topk_for_csa(
+                layout=layout,
+                stage_index=9,
+                query_token_ids=query_ids,
+                global_k_ranges=(_Range(start=4, end=13),),
+                global_topk=torch.tensor([[1, 2]], dtype=torch.long),
+                window_size=4,
+            )
+            for query_ids in ((7,), (11,))
         )
+        stage = stages[rank]
+        query_ids = stage.query_token_ids
+        peer_plan = build_dsv4_stage_kv_exchange_peer_plans(
+            layout=layout,
+            stage_inputs_by_rank=stages,
+        )[rank]
+        assert peer_plan.recv_raw_token_ids_by_peer == (
+            (4, 5, 6, 7),
+            (8, 9, 10, 11, 12),
+        )
+        assert peer_plan.recv_compressed_entry_ids_by_peer == ((1,), (2,))
         local_raw_ids = (4, 5, 6, 7) if rank == 0 else (8, 9, 10, 11, 12)
         local_compressed_ids = (1,) if rank == 0 else (2,)
+        assert peer_plan.send_raw_token_ids_by_peer == (
+            local_raw_ids,
+            local_raw_ids,
+        )
+        assert peer_plan.send_compressed_entry_ids_by_peer == (
+            local_compressed_ids,
+            local_compressed_ids,
+        )
         work = launch_dsv4_stage_kv_exchange(
             stage_inputs=stage,
             query=_query_rows(query_ids),
@@ -80,19 +102,14 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
             raw_token_ids=local_raw_ids,
             compressed_kv=_compressed_rows(local_compressed_ids),
             compressed_entry_ids=local_compressed_ids,
-            send_raw_token_ids_by_peer=(
-                local_raw_ids,
-                local_raw_ids,
-            ),
+            send_raw_token_ids_by_peer=peer_plan.send_raw_token_ids_by_peer,
             send_compressed_entry_ids_by_peer=(
-                local_compressed_ids,
-                local_compressed_ids,
+                peer_plan.send_compressed_entry_ids_by_peer
             ),
-            recv_raw_token_ids_by_peer=(
-                (4, 5, 6, 7),
-                (8, 9, 10, 11, 12),
+            recv_raw_token_ids_by_peer=peer_plan.recv_raw_token_ids_by_peer,
+            recv_compressed_entry_ids_by_peer=(
+                peer_plan.recv_compressed_entry_ids_by_peer
             ),
-            recv_compressed_entry_ids_by_peer=((1,), (2,)),
             group=cast(Any, torch.distributed).group.WORLD,
             async_op=True,
         )

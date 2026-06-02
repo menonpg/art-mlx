@@ -10,6 +10,7 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     Dsv4StageKeyKind,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_kv_exchange_peer_plans,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
     materialize_dsv4_stage_tensors,
@@ -132,6 +133,65 @@ def test_hca_stage_inputs_include_all_visible_compressed_entries() -> None:
     assert stage.topk_stage_local[0, 0].tolist() == [0, -1, -1, -1, -1]
     assert stage.topk_stage_local[0, 1].tolist() == [0, 1, 2, 3, 5]
     assert stage.topk_stage_local[0, 2].tolist() == [-1, -1, -1, -1, -1]
+
+
+def test_stage_inputs_filter_padding_tokens_from_cp_k_ranges() -> None:
+    layout = _layout(Dsv4CompressionKind.CSA)
+    stage = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=6,
+        query_token_ids=(16,),
+        global_k_ranges=(_Range(start=16, end=20),),
+        global_topk=torch.tensor([[3, -1]], dtype=torch.long),
+        window_size=4,
+    )
+
+    assert stage.raw_token_ids == (16, 17)
+    assert stage.compressed_entry_ids == (3,)
+    assert stage.key_global_ids == (16, 17, 3)
+    assert stage.topk_stage_local[0, 0].tolist() == [0, -1, -1, -1, 2, -1]
+
+
+def test_stage_kv_exchange_peer_plan_uses_layout_ownership() -> None:
+    layout = _layout(Dsv4CompressionKind.CSA)
+    stages = (
+        build_stage_local_topk_for_csa(
+            layout=layout,
+            stage_index=0,
+            query_token_ids=(7,),
+            global_k_ranges=(_Range(start=4, end=13),),
+            global_topk=torch.tensor([[1, 2]], dtype=torch.long),
+            window_size=4,
+        ),
+        build_stage_local_topk_for_csa(
+            layout=layout,
+            stage_index=0,
+            query_token_ids=(16,),
+            global_k_ranges=(_Range(start=8, end=20),),
+            global_topk=torch.tensor([[3, 2]], dtype=torch.long),
+            window_size=4,
+        ),
+    )
+
+    plans = build_dsv4_stage_kv_exchange_peer_plans(
+        layout=layout,
+        stage_inputs_by_rank=stages,
+    )
+
+    assert plans[0].recv_raw_token_ids_by_peer == (
+        (4, 5, 6, 7),
+        (8, 9, 10, 11, 12),
+    )
+    assert plans[0].recv_compressed_entry_ids_by_peer == ((1,), (2,))
+    assert plans[1].recv_raw_token_ids_by_peer == ((), tuple(range(8, 18)))
+    assert plans[1].recv_compressed_entry_ids_by_peer == ((), (2, 3))
+    assert plans[0].send_raw_token_ids_by_peer == ((4, 5, 6, 7), ())
+    assert plans[0].send_compressed_entry_ids_by_peer == ((1,), ())
+    assert plans[1].send_raw_token_ids_by_peer == (
+        (8, 9, 10, 11, 12),
+        tuple(range(8, 18)),
+    )
+    assert plans[1].send_compressed_entry_ids_by_peer == ((2,), (2, 3))
 
 
 def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:

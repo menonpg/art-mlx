@@ -177,6 +177,7 @@ def build_dsv4_compressed_layout(
         entries=entries,
         halo_transfers=_build_halo_transfers(entries, token_owner),
         entry_ids_by_owner_rank=_entry_ids_by_owner(entries, token_layout_index),
+        raw_token_owner_ranks=_raw_token_owner_ranks(token_owner),
         entry_ids_by_branch_stream=entry_ids_by_branch_stream,
     )
 
@@ -1515,3 +1516,14 @@ def _entry_ids_by_owner(
     for entry in entries:
         by_rank[int(entry.owner_rank)].append(int(entry.entry_id))
     return tuple(tuple(entry_ids) for entry_ids in by_rank)
+
+
+def _raw_token_owner_ranks(
+    token_owner: dict[int, tuple[int, int]],
+) -> tuple[int, ...]:
+    if not token_owner:
+        return ()
+    ranks = [-1] * (max(token_owner) + 1)
+    for token_id, owner in token_owner.items():
+        ranks[int(token_id)] = int(owner[0])
+    return tuple(ranks)

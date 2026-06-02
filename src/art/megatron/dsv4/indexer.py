@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -82,6 +82,13 @@ class Dsv4ExchangedIndexerTopkWork(BaseModel):
         return merge_indexer_topk_results(results=results, topk=int(self.topk))
 
 
+class Dsv4IndexerKvExchangePeerPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    send_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+
+
 def stage_candidate_entry_ids(
     *,
     layout: Dsv4CompressedLayout,
@@ -94,6 +101,45 @@ def stage_candidate_entry_ids(
         int(entry.entry_id)
         for entry in layout.entries
         if _token_in_ranges(int(entry.closure_token_id), global_k_ranges)
+    )
+
+
+def build_dsv4_indexer_kv_exchange_peer_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    candidate_entry_ids_by_rank: Sequence[Sequence[int]],
+) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
+    """Plan indexer-compressed KV exchange peer ids for CSA stage scoring.
+
+    This is host metadata work only. It derives each receiver's candidate
+    compressed entries from layout ownership and transposes those requests into
+    send lists, without touching live activation tensors or CUDA state.
+    """
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    if len(candidate_entry_ids_by_rank) != rank_count:
+        raise RuntimeError(
+            "DSV4 indexer exchange planning requires one candidate list per rank, "
+            f"got {len(candidate_entry_ids_by_rank)} vs {rank_count}"
+        )
+    recv_by_rank = tuple(
+        _ids_by_owner_rank(
+            ids=candidate_ids,
+            rank_count=rank_count,
+            owner_rank=lambda entry_id: _compressed_entry_owner_rank(
+                layout=layout,
+                entry_id=entry_id,
+            ),
+            name=f"rank{rank}_candidate_entry_ids",
+        )
+        for rank, candidate_ids in enumerate(candidate_entry_ids_by_rank)
+    )
+    send_by_rank = _transpose_peer_ids(recv_by_rank)
+    return tuple(
+        Dsv4IndexerKvExchangePeerPlan(
+            send_entry_ids_by_peer=send_by_rank[rank],
+            recv_entry_ids_by_peer=recv_by_rank[rank],
+        )
+        for rank in range(rank_count)
     )
 
 
@@ -592,6 +638,48 @@ def _indexer_peer_count(*peers: Sequence[Sequence[int]]) -> int:
     if len(counts) != 1:
         raise RuntimeError("DSV4 indexer exchange peer-list counts must match")
     return counts.pop()
+
+
+def _ids_by_owner_rank(
+    *,
+    ids: Sequence[int],
+    rank_count: int,
+    owner_rank: Callable[[int], int],
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    seen: set[int] = set()
+    for id_ in ids:
+        id_int = int(id_)
+        if id_int in seen:
+            raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
+        seen.add(id_int)
+        rank = int(owner_rank(id_int))
+        if rank < 0 or rank >= int(rank_count):
+            raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
+        by_rank[rank].append(id_int)
+    return tuple(tuple(peer_ids) for peer_ids in by_rank)
+
+
+def _transpose_peer_ids(
+    recv_by_rank: tuple[tuple[tuple[int, ...], ...], ...],
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    rank_count = len(recv_by_rank)
+    return tuple(
+        tuple(recv_by_rank[peer][rank] for peer in range(rank_count))
+        for rank in range(rank_count)
+    )
+
+
+def _compressed_entry_owner_rank(
+    *,
+    layout: Dsv4CompressedLayout,
+    entry_id: int,
+) -> int:
+    entry_int = int(entry_id)
+    if entry_int < 0 or entry_int >= len(layout.entries):
+        raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
+    return int(layout.entries[entry_int].owner_rank)
 
 
 def _normalize_indexer_peer_ids(

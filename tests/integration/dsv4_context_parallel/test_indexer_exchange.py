@@ -14,6 +14,7 @@ from art.megatron.dsv4 import (
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
     build_dsv4_compressed_layout,
+    build_dsv4_indexer_kv_exchange_peer_plans,
     compute_indexer_stage_topk,
     launch_dsv4_indexer_kv_exchange,
 )
@@ -56,6 +57,12 @@ def _indexer_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> N
         query_token_ids = (7,) if rank == 0 else (11,)
         indexer_q = torch.tensor([[[1.0, 0.0]]], dtype=torch.float32)
         indexer_weights = torch.ones(1, 1, dtype=torch.float32)
+        peer_plan = build_dsv4_indexer_kv_exchange_peer_plans(
+            layout=layout,
+            candidate_entry_ids_by_rank=((1, 2), (1, 2)),
+        )[rank]
+        assert peer_plan.recv_entry_ids_by_peer == ((1,), (2,))
+        assert peer_plan.send_entry_ids_by_peer == (local_entry_ids, local_entry_ids)
         work = launch_dsv4_indexer_kv_exchange(
             layout=layout,
             query_token_ids=query_token_ids,
@@ -64,8 +71,8 @@ def _indexer_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> N
             indexer_weights=indexer_weights,
             indexer_kv=_indexer_kv(local_entry_ids),
             indexer_kv_entry_ids=local_entry_ids,
-            send_entry_ids_by_peer=(local_entry_ids, local_entry_ids),
-            recv_entry_ids_by_peer=((1,), (2,)),
+            send_entry_ids_by_peer=peer_plan.send_entry_ids_by_peer,
+            recv_entry_ids_by_peer=peer_plan.recv_entry_ids_by_peer,
             topk=2,
             group=cast(Any, torch.distributed).group.WORLD,
             async_op=True,

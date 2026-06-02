@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -73,6 +73,15 @@ class Dsv4StageKvExchangeWork(BaseModel):
         )
 
 
+class Dsv4StageKvExchangePeerPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    send_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    send_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+
+
 def build_dsv4_stage_inputs(
     *,
     layout: Dsv4CompressedLayout,
@@ -103,7 +112,7 @@ def build_dsv4_stage_inputs(
         )
 
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
-    raw_token_ids = _stage_raw_token_ids(global_k_ranges)
+    raw_token_ids = _stage_raw_token_ids(layout=layout, ranges=global_k_ranges)
     raw_local = {token_id: offset for offset, token_id in enumerate(raw_token_ids)}
     compressed_entry_ids = stage_candidate_entry_ids(
         layout=layout,
@@ -226,6 +235,61 @@ def build_stage_local_topk_for_hca(
         window_size=window_size,
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
+    )
+
+
+def build_dsv4_stage_kv_exchange_peer_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_inputs_by_rank: Sequence[Dsv4StageInputs],
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    """Plan fused raw+compressed KV exchange peer ids for DSV4 stages.
+
+    This is host metadata work: it must not inspect live activation tensors or
+    synchronize CUDA. Each rank receives the raw/compressed ids needed by its
+    stage, grouped by owner rank; send lists are the transpose of those receive
+    requests.
+    """
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    if len(stage_inputs_by_rank) != rank_count:
+        raise RuntimeError(
+            "DSV4 stage exchange planning requires one stage input per rank, got "
+            f"{len(stage_inputs_by_rank)} vs {rank_count}"
+        )
+    recv_raw = tuple(
+        _ids_by_owner_rank(
+            ids=stage.raw_token_ids,
+            rank_count=rank_count,
+            owner_rank=lambda token_id: _raw_token_owner_rank(
+                layout=layout,
+                token_id=token_id,
+            ),
+            name=f"rank{rank}_raw_token_ids",
+        )
+        for rank, stage in enumerate(stage_inputs_by_rank)
+    )
+    recv_compressed = tuple(
+        _ids_by_owner_rank(
+            ids=stage.compressed_entry_ids,
+            rank_count=rank_count,
+            owner_rank=lambda entry_id: _compressed_entry_owner_rank(
+                layout=layout,
+                entry_id=entry_id,
+            ),
+            name=f"rank{rank}_compressed_entry_ids",
+        )
+        for rank, stage in enumerate(stage_inputs_by_rank)
+    )
+    send_raw = _transpose_peer_ids(recv_raw)
+    send_compressed = _transpose_peer_ids(recv_compressed)
+    return tuple(
+        Dsv4StageKvExchangePeerPlan(
+            send_raw_token_ids_by_peer=send_raw[rank],
+            send_compressed_entry_ids_by_peer=send_compressed[rank],
+            recv_raw_token_ids_by_peer=recv_raw[rank],
+            recv_compressed_entry_ids_by_peer=recv_compressed[rank],
+        )
+        for rank in range(rank_count)
     )
 
 
@@ -425,15 +489,52 @@ def launch_dsv4_stage_kv_exchange(
     )
 
 
-def _stage_raw_token_ids(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
+def _stage_raw_token_ids(
+    *,
+    layout: Dsv4CompressedLayout,
+    ranges: Sequence[TokenRangeLike],
+) -> tuple[int, ...]:
     seen: set[int] = set()
     token_ids: list[int] = []
     for range_ in ranges:
         for token_id in range(int(range_.start), int(range_.end)):
-            if token_id not in seen:
+            if token_id not in seen and _token_in_layout(
+                layout=layout, token_id=token_id
+            ):
                 seen.add(token_id)
                 token_ids.append(token_id)
     return tuple(token_ids)
+
+
+def _ids_by_owner_rank(
+    *,
+    ids: Sequence[int],
+    rank_count: int,
+    owner_rank: Callable[[int], int],
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    seen: set[int] = set()
+    for id_ in ids:
+        id_int = int(id_)
+        if id_int in seen:
+            raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
+        seen.add(id_int)
+        rank = int(owner_rank(id_int))
+        if rank < 0 or rank >= int(rank_count):
+            raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
+        by_rank[rank].append(id_int)
+    return tuple(tuple(peer_ids) for peer_ids in by_rank)
+
+
+def _transpose_peer_ids(
+    recv_by_rank: tuple[tuple[tuple[int, ...], ...], ...],
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    rank_count = len(recv_by_rank)
+    return tuple(
+        tuple(recv_by_rank[peer][rank] for peer in range(rank_count))
+        for rank in range(rank_count)
+    )
 
 
 def _validate_stage_kv_pair(
@@ -586,6 +687,34 @@ def _index_select_stage_token_dim(
 
 def _stage_token_dim(tensor: torch.Tensor) -> int:
     return 0 if tensor.ndim == 2 else 1
+
+
+def _token_in_layout(*, layout: Dsv4CompressedLayout, token_id: int) -> bool:
+    return any(
+        int(stream.start) <= int(token_id) < int(stream.end)
+        for stream in layout.streams
+    )
+
+
+def _raw_token_owner_rank(*, layout: Dsv4CompressedLayout, token_id: int) -> int:
+    token_int = int(token_id)
+    if token_int < 0 or token_int >= len(layout.raw_token_owner_ranks):
+        raise RuntimeError(f"DSV4 raw token {token_int} has no CP owner")
+    rank = int(layout.raw_token_owner_ranks[token_int])
+    if rank < 0:
+        raise RuntimeError(f"DSV4 raw token {token_int} has no CP owner")
+    return rank
+
+
+def _compressed_entry_owner_rank(
+    *,
+    layout: Dsv4CompressedLayout,
+    entry_id: int,
+) -> int:
+    entry_int = int(entry_id)
+    if entry_int < 0 or entry_int >= len(layout.entries):
+        raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
+    return int(layout.entries[entry_int].owner_rank)
 
 
 def _visible_raw_swa_token_ids(
