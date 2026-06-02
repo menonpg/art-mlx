@@ -906,6 +906,43 @@ def test_distributed_projected_hca_ratio128_real_miles_boundary_matches_packed_o
         init_path.unlink()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not cast(Any, torch.distributed).is_nccl_available(),
+    reason="DSV4 HCA ratio-128 real-Miles CUDA/NCCL empty-rank oracle requires CUDA devices and NCCL",
+)
+@pytest.mark.parametrize(
+    ("world_size", "master_port"),
+    (
+        (4, "29650"),
+        (8, "29651"),
+    ),
+)
+def test_distributed_projected_hca_ratio128_real_miles_empty_rank_matches_packed_oracle_cuda_nccl(
+    tmp_path: Path,
+    world_size: int,
+    master_port: str,
+) -> None:
+    _ensure_miles_sparse_available()
+    if torch.cuda.device_count() < int(world_size):
+        pytest.skip(f"requires {world_size} CUDA devices")
+    init_path = (
+        tmp_path
+        / f"dsv4_projected_hca_ratio128_real_miles_cp{world_size}_empty_rank_oracle_nccl"
+    )
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_hca_ratio128_empty_rank_real_miles_nccl_oracle_worker,
+        args=(int(world_size), str(init_path), master_port),
+        nprocs=int(world_size),
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     max_visible = max(
         sum(
@@ -2923,6 +2960,49 @@ def _distributed_projected_hca_ratio128_empty_rank_oracle_worker(
             rtol=1e-4,
             atol=1e-4,
         )
+    finally:
+        destroy_process_group()
+
+
+def _distributed_projected_hca_ratio128_empty_rank_real_miles_nccl_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+    master_port: str,
+) -> None:
+    _add_miles_path_to_sys_path()
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = master_port
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        layout = _hca_ratio128_empty_rank_layout(rank_count=world_size)
+        local_token_ids_by_rank = _hca_ratio128_empty_token_ids_by_rank(
+            rank_count=world_size
+        )
+        _run_distributed_projected_hca_oracle_case(
+            rank=rank,
+            layout=layout,
+            stage_plan_slots=_hca_ratio128_empty_stage_slots(rank_count=world_size),
+            local_token_ids=local_token_ids_by_rank[rank],
+            token_count=416,
+            seed=159 + int(world_size),
+            expect_rank0_halo_grad=True,
+            device=device,
+            dtype=torch.bfloat16,
+            head_count=64,
+            head_dim=512,
+            scale=1.0 / (512**0.5),
+            mean_abs_pct_threshold=3.0,
+            grad_mean_abs_pct_threshold=5.0,
+        )
+        torch.cuda.synchronize(device)
     finally:
         destroy_process_group()
 
