@@ -110,6 +110,31 @@ class Dsv4GradientOwnerExchangeWork(BaseModel):
         return tuple(buckets)
 
 
+class Dsv4ExchangedAttentionForwardWork(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    stage_works: tuple[Any, ...]
+    query_token_ids: tuple[int, ...]
+    attn_sink: torch.Tensor
+    scale: float | None = None
+
+    def wait(self) -> None:
+        for work in self.stage_works:
+            work.wait()
+
+    def wait_post_process(self) -> Dsv4AttentionForwardResult:
+        stages = tuple(
+            _materialized_stage_from_work(work=work, position=position)
+            for position, work in enumerate(self.stage_works)
+        )
+        return run_materialized_dsv4_attention_forward(
+            stages=stages,
+            query_token_ids=self.query_token_ids,
+            attn_sink=self.attn_sink,
+            scale=self.scale,
+        )
+
+
 def _accum_output_dtype(input_dtype: torch.dtype) -> torch.dtype:
     if input_dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
@@ -248,6 +273,56 @@ def run_materialized_dsv4_attention_forward(
         scale=scale,
         stage_records=tuple(records),
     )
+
+
+@torch.compiler.disable
+def launch_exchanged_dsv4_attention_forward(
+    *,
+    stage_works: Sequence[Any],
+    query_token_ids: Sequence[int],
+    attn_sink: torch.Tensor,
+    scale: float | None = None,
+) -> Dsv4ExchangedAttentionForwardWork:
+    """Create the eager bridge from exchanged DSV4 stages to sparse attention.
+
+    Stage KV exchanges are custom eager communication. This wrapper deliberately
+    keeps their wait/materialization boundary out of compiled regions, then uses
+    the materialized-stage forward path for sparse kernel execution and global
+    real-key plus sink merge.
+    """
+    works = tuple(stage_works)
+    if not works:
+        raise ValueError("at least one DSV4 exchanged attention stage is required")
+    for position, work in enumerate(works):
+        _validate_stage_exchange_work(work=work, position=position)
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    if not query_ids:
+        raise ValueError("DSV4 exchanged attention requires query_token_ids")
+    return Dsv4ExchangedAttentionForwardWork(
+        stage_works=works,
+        query_token_ids=query_ids,
+        attn_sink=attn_sink,
+        scale=scale,
+    )
+
+
+def _validate_stage_exchange_work(*, work: Any, position: int) -> None:
+    if not callable(getattr(work, "wait", None)):
+        raise ValueError(f"DSV4 stage exchange work {position} is missing wait()")
+    if not callable(getattr(work, "wait_post_process", None)):
+        raise ValueError(
+            f"DSV4 stage exchange work {position} is missing wait_post_process()"
+        )
+
+
+def _materialized_stage_from_work(*, work: Any, position: int) -> Dsv4MaterializedStage:
+    stage = work.wait_post_process()
+    if not isinstance(stage, Dsv4MaterializedStage):
+        raise TypeError(
+            f"DSV4 stage exchange work {position} returned {type(stage)!r}, "
+            "expected Dsv4MaterializedStage"
+        )
+    return stage
 
 
 def merge_materialized_stage_records(

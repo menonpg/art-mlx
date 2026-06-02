@@ -16,6 +16,7 @@ from art.megatron.dsv4 import (
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     compute_single_sink_grad,
+    launch_exchanged_dsv4_attention_forward,
     merge_materialized_stage_records,
     merge_single_sink_branch,
     merge_stage_outputs,
@@ -198,6 +199,62 @@ def test_materialized_attention_forward_merges_partial_stages_and_sink_once(
     for disabled_sink, scale in calls:
         assert torch.isneginf(disabled_sink).all()
         assert scale == 0.5
+
+
+def test_exchanged_attention_forward_materializes_stages_then_merges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages = (_materialized_stage(0, (10, 11)), _materialized_stage(1, (11, 12)))
+    stage_works = tuple(_FakeStageExchangeWork(stage) for stage in stages)
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
+
+    work = launch_exchanged_dsv4_attention_forward(
+        stage_works=stage_works,
+        query_token_ids=(10, 11, 12),
+        attn_sink=attn_sink,
+        scale=0.25,
+    )
+    work.wait()
+    result = work.wait_post_process()
+
+    expected_real = _stage_tensor(((1.0, 2.6, 4.0),))
+    expected_real_lse = _stage_lse(((2.0, 10.0, 8.0),))
+    expected_out, expected_lse = merge_single_sink_branch(
+        expected_real,
+        expected_real_lse,
+        attn_sink,
+    )
+
+    torch.testing.assert_close(result.real_out, expected_real)
+    torch.testing.assert_close(result.real_lse, expected_real_lse)
+    torch.testing.assert_close(result.out, expected_out)
+    torch.testing.assert_close(result.lse, expected_lse)
+    for stage_work in stage_works:
+        assert stage_work.wait_count == 1
+        assert stage_work.post_process_count == 1
+
+
+def test_exchanged_attention_forward_rejects_bad_stage_work() -> None:
+    attn_sink = torch.zeros(2, dtype=torch.float64)
+    with pytest.raises(ValueError, match="missing wait"):
+        launch_exchanged_dsv4_attention_forward(
+            stage_works=(object(),),
+            query_token_ids=(10,),
+            attn_sink=attn_sink,
+        )
+
+    work = launch_exchanged_dsv4_attention_forward(
+        stage_works=(_BadStageExchangeWork(),),
+        query_token_ids=(10,),
+        attn_sink=attn_sink,
+    )
+    with pytest.raises(TypeError, match="expected Dsv4MaterializedStage"):
+        work.wait_post_process()
 
 
 def test_materialized_attention_backward_replays_global_rows(
@@ -620,3 +677,30 @@ def _owner_bucket(
             dtype=torch.float64,
         ),
     )
+
+
+class _FakeStageExchangeWork:
+    def __init__(self, stage: Dsv4MaterializedStage) -> None:
+        self.stage = stage
+        self.wait_count = 0
+        self.post_process_count = 0
+        self._wait_complete = False
+
+    def wait(self) -> None:
+        if self._wait_complete:
+            return
+        self.wait_count += 1
+        self._wait_complete = True
+
+    def wait_post_process(self) -> Dsv4MaterializedStage:
+        self.post_process_count += 1
+        self.wait()
+        return self.stage
+
+
+class _BadStageExchangeWork:
+    def wait(self) -> None:
+        pass
+
+    def wait_post_process(self) -> object:
+        return object()
