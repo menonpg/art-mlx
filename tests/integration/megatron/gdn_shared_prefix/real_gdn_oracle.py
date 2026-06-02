@@ -5,21 +5,26 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.gdn.gdn_shared_prefix import FLA_CHUNK_SIZE
-from art.megatron.gdn.layout import (
-    build_gdn_cp_layout_plan,
-    simulate_all_to_all_single,
-    split_gdn_families_by_rank,
-)
 from art.megatron.gdn.operator import (
-    _run_gdn_segment,
+    _apply_gated_rms_norm,
+    _chunk_gated_delta_rule,
+    _disable_reentrant_te_linear_transpose_cache,
+    _in_proj,
+    _l2norm,
+    _local_key_heads,
+    _local_value_dim,
+    _local_value_heads,
+    _out_proj,
     _zero_conv_state,
     _zero_recurrent_state,
     gdn_shared_prefix_forward,
 )
 
+from .layout_reference import build_test_gdn_cp_layout_plan
 from .metrics import (
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
@@ -172,6 +177,117 @@ def zero_parameter_grads(module: torch.nn.Module) -> None:
             main_grad.zero_()
 
 
+def _run_gdn_segment(
+    gdn: Any,
+    hidden_states: Tensor,
+    *,
+    conv_initial: Tensor,
+    recurrent_initial: Tensor,
+    output_final_state: bool = True,
+) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
+    _disable_reentrant_te_linear_transpose_cache(gdn)
+    seq_len, batch_size, _ = hidden_states.shape
+    if int(conv_initial.shape[0]) != batch_size:
+        raise ValueError(
+            "conv_initial batch must match hidden_states batch, got "
+            f"{tuple(conv_initial.shape)} for hidden {tuple(hidden_states.shape)}"
+        )
+    if int(recurrent_initial.shape[0]) != batch_size:
+        raise ValueError(
+            "recurrent_initial batch must match hidden_states batch, got "
+            f"{tuple(recurrent_initial.shape)} for hidden {tuple(hidden_states.shape)}"
+        )
+
+    qkvzba, _ = _in_proj(gdn, hidden_states)
+    qkvzba = qkvzba.transpose(0, 1)
+    qkv, gate, beta, alpha = torch.split(
+        qkvzba,
+        [
+            (gdn.qk_dim * 2 + gdn.v_dim) // gdn.tp_size,
+            gdn.v_dim // gdn.tp_size,
+            gdn.num_value_heads // gdn.tp_size,
+            gdn.num_value_heads // gdn.tp_size,
+        ],
+        dim=-1,
+    )
+    key_heads = _local_key_heads(gdn)
+    value_heads = _local_value_heads(gdn)
+    gate = gate.reshape(batch_size, seq_len, value_heads, gdn.value_head_dim)
+    beta = beta.reshape(batch_size, seq_len, value_heads)
+    alpha = alpha.reshape(batch_size, seq_len, value_heads)
+
+    qkv = qkv.transpose(1, 2)
+    qkv, conv_final = _dense_causal_conv1d_with_state(
+        gdn,
+        qkv,
+        conv_initial,
+        output_final_state=output_final_state,
+    )
+    qkv = qkv.transpose(1, 2)
+
+    query, key, value = torch.split(
+        qkv,
+        [
+            gdn.qk_dim // gdn.tp_size,
+            gdn.qk_dim // gdn.tp_size,
+            gdn.v_dim // gdn.tp_size,
+        ],
+        dim=-1,
+    )
+    query = query.reshape(batch_size, seq_len, key_heads, gdn.key_head_dim)
+    key = key.reshape(batch_size, seq_len, key_heads, gdn.key_head_dim)
+    value = value.reshape(batch_size, seq_len, value_heads, gdn.value_head_dim)
+    if gdn.use_qk_l2norm:
+        query = _l2norm(query.contiguous())
+        key = _l2norm(key.contiguous())
+    if gdn.num_value_heads // gdn.num_key_heads > 1:
+        repeat = gdn.num_value_heads // gdn.num_key_heads
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+
+    g = -gdn.A_log.exp() * F.softplus(alpha.float() + gdn.dt_bias)
+    beta = beta.sigmoid()
+    recurrent_out, recurrent_final = _chunk_gated_delta_rule(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        g=g.contiguous(),
+        beta=beta.contiguous(),
+        initial_state=recurrent_initial,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=False,
+    )
+    norm_out = _apply_gated_rms_norm(gdn, recurrent_out, gate.contiguous())
+    norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
+    norm_out = norm_out.transpose(0, 1).contiguous()
+    out, out_bias = _out_proj(gdn, norm_out)
+    return out, out_bias, conv_final, recurrent_final
+
+
+def _dense_causal_conv1d_with_state(
+    gdn: Any,
+    qkv: Tensor,
+    conv_initial: Tensor,
+    *,
+    output_final_state: bool,
+) -> tuple[Tensor, Tensor | None]:
+    weight = gdn.conv1d.weight.squeeze(1)
+    bias = gdn.conv1d.bias
+    dtype = qkv.dtype
+    extended = torch.cat([conv_initial, qkv], dim=-1)
+    out = F.conv1d(
+        extended, weight.unsqueeze(1), bias, padding=0, groups=extended.shape[1]
+    )
+    out = gdn.act_fn(out[..., : qkv.shape[-1]]).to(dtype=dtype)
+    tail_width = int(weight.shape[1]) - 1
+    final = (
+        extended[..., -tail_width:].to(dtype=dtype)
+        if tail_width
+        else extended[..., :0].to(dtype=dtype)
+    )
+    return out, final if output_final_state else None
+
+
 def run_real_gdn_flattened_reference(
     gdn: Any,
     hidden_states: Tensor,
@@ -246,11 +362,11 @@ def run_real_gdn_local_fork_reference(
     spec = parse_gdn_shared_prefix_segments(
         group_ids, parent_ids, min_completions_per_family=0
     )
-    gdn_token_indices_by_rank = split_gdn_families_by_rank(spec, cp_size=cp_size)
+    gdn_token_indices_by_rank = _split_gdn_families_by_rank(spec, cp_size=cp_size)
     gdn_token_ranges_by_rank = _rank_ranges_from_tokens_by_rank(
         gdn_token_indices_by_rank
     )
-    plan = build_gdn_cp_layout_plan(
+    plan = build_test_gdn_cp_layout_plan(
         group_ids=group_ids,
         parent_ids=parent_ids,
         cp_size=cp_size,
@@ -261,7 +377,7 @@ def run_real_gdn_local_fork_reference(
     attention_inputs = _rank_tensors_from_flat(
         flat_hidden, _tokens_by_rank_from_ranges(plan.attention_token_ranges_by_rank)
     )
-    gdn_inputs = simulate_all_to_all_single(attention_inputs, plan.attention_to_gdn)
+    gdn_inputs = _simulate_all_to_all_single(attention_inputs, plan.attention_to_gdn)
     gdn_outputs = tuple(
         _run_local_fork_rank(gdn, rank_hidden, spec, local_token_indices)
         for rank_hidden, local_token_indices in zip(
@@ -270,7 +386,7 @@ def run_real_gdn_local_fork_reference(
             strict=True,
         )
     )
-    attention_outputs = simulate_all_to_all_single(gdn_outputs, plan.gdn_to_attention)
+    attention_outputs = _simulate_all_to_all_single(gdn_outputs, plan.gdn_to_attention)
     flat_output = flat_hidden.new_zeros(flat_hidden.shape)
     for rank_output, token_indices in zip(
         attention_outputs,
@@ -287,6 +403,78 @@ def run_real_gdn_local_fork_reference(
         .transpose(0, 1)
         .contiguous()
     )
+
+
+def _split_gdn_families_by_rank(
+    spec: Any,
+    *,
+    cp_size: int,
+) -> tuple[tuple[int, ...], ...]:
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}")
+    ranks: list[list[int]] = [[] for _ in range(cp_size)]
+    loads = [0] * cp_size
+    for family in spec.families:
+        rank = min(range(cp_size), key=lambda index: (loads[index], index))
+        family_tokens = tuple(
+            token
+            for segment in (family.prefix, *family.completions)
+            for token in segment.linear_indices(spec.sequence_length)
+        )
+        ranks[rank].extend(family_tokens)
+        loads[rank] += len(family_tokens)
+    return tuple(tuple(rank_tokens) for rank_tokens in ranks)
+
+
+def _simulate_all_to_all_single(
+    tensors_by_rank: tuple[Tensor, ...],
+    plan: Any,
+) -> tuple[Tensor, ...]:
+    if len(tensors_by_rank) != int(plan.cp_size):
+        raise ValueError(
+            f"expected {plan.cp_size} rank tensors, got {len(tensors_by_rank)}"
+        )
+    sample = next((tensor for tensor in tensors_by_rank if tensor.numel()), None)
+    if sample is None:
+        sample = tensors_by_rank[0]
+    outputs = []
+    for dest_rank in range(int(plan.cp_size)):
+        pieces: list[Tensor | None] = [
+            None for _ in range(int(plan.dest_token_counts_by_rank[dest_rank]))
+        ]
+        for transfer in plan.transfers:
+            if int(transfer.dest_rank) != dest_rank:
+                continue
+            source_tensor = tensors_by_rank[int(transfer.source_rank)]
+            source_positions = _transfer_positions(
+                transfer.source_positions_tensor,
+                count=int(transfer.token_count),
+            )
+            dest_positions = _transfer_positions(
+                transfer.dest_positions_tensor,
+                count=int(transfer.token_count),
+            )
+            for source_position, dest_position in zip(
+                source_positions,
+                dest_positions,
+                strict=True,
+            ):
+                pieces[dest_position] = source_tensor[source_position]
+        if not pieces:
+            outputs.append(sample.new_empty((0, *sample.shape[1:])))
+            continue
+        if any(piece is None for piece in pieces):
+            raise RuntimeError(
+                f"exchange plan left holes for destination rank {dest_rank}"
+            )
+        outputs.append(torch.stack([piece for piece in pieces if piece is not None]))
+    return tuple(outputs)
+
+
+def _transfer_positions(tensor: Tensor | None, *, count: int) -> tuple[int, ...]:
+    if tensor is None:
+        return tuple(range(count))
+    return tuple(int(value) for value in tensor.cpu().tolist())
 
 
 def _rank_ranges_from_tokens_by_rank(

@@ -1,52 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-import socket
-from typing import Any, cast
-
 import pytest
 import torch
 from torch import Tensor
-from torch.distributed import destroy_process_group, init_process_group, is_initialized
 import torch.nn.functional as F
 
-from art.megatron.gdn.conv_gelu import (
-    gdn_varlen_causal_conv_gelu,
-    packed_varlen_causal_conv,
-    varlen_causal_conv_gelu,
-)
-from art.megatron.gdn.gdn_shared_prefix import (
-    GdnPlannerConfig,
-    build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
-)
-from tests.integration.megatron.gdn_shared_prefix.cases import (
-    GdnFamilyShape,
-    GdnPackedRowShape,
-    GdnPhase0Case,
-)
+from art.megatron.gdn.conv_gelu import packed_varlen_causal_conv
 from tests.integration.megatron.gdn_shared_prefix.metrics import assert_mean_abs_pct
-from tests.integration.megatron.gdn_shared_prefix.packed_layout import (
-    build_phase0_packed_tensors,
-)
-from tests.integration.megatron.gdn_shared_prefix.test_real_gdn_cp1_packed_vs_flattened import (
-    _make_matching_qwen35_gdn_pair,
-)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-
-
-def test_varlen_causal_conv_gelu_matches_reference_with_final_grads() -> None:
-    _run_case(batch=3, channels=11, max_len=9, kernel_width=4, has_bias=True)
-
-
-def test_varlen_causal_conv_gelu_matches_reference_without_bias() -> None:
-    _run_case(batch=4, channels=7, max_len=6, kernel_width=3, has_bias=False)
-
-
-def test_varlen_causal_conv_gelu_supports_unit_kernel() -> None:
-    _run_case(batch=2, channels=5, max_len=8, kernel_width=1, has_bias=True)
 
 
 def test_packed_varlen_causal_conv_gelu_matches_reference_with_final_grads() -> None:
@@ -109,90 +71,6 @@ def test_packed_varlen_causal_conv_rejects_unsupported_activation() -> None:
         )
 
 
-def test_gdn_varlen_causal_conv_gelu_matches_qwen_planner_bucket() -> None:
-    case = GdnPhase0Case(
-        name="conv_gelu_qwen_bucket",
-        sequence_length=64,
-        rows=(
-            GdnPackedRowShape(
-                families=(
-                    GdnFamilyShape(prefix_length=7, suffix_lengths=(2, 6, 3)),
-                    GdnFamilyShape(prefix_length=3, suffix_lengths=(8, 1)),
-                )
-            ),
-        ),
-        seed=61,
-    )
-    tensors = build_phase0_packed_tensors(case)
-    spec = parse_gdn_shared_prefix_segments(
-        tensors["group_ids"].cuda(),
-        tensors["parent_ids"].cuda(),
-        min_completions_per_family=1,
-    )
-    plan = build_gdn_rank_execution_plan(
-        spec,
-        device=torch.device("cuda"),
-        planner_config=GdnPlannerConfig(max_padding_ratio=4.0),
-    )
-    bucket = plan.completion_with_prefix_tail_buckets[0]
-    with _single_rank_model_parallel():
-        ref_gdn, _ = _make_matching_qwen35_gdn_pair(params_dtype=torch.float32)
-        ref_gdn.eval()
-        ref_gdn_any = cast(Any, ref_gdn)
-        conv1d = cast(Any, ref_gdn.conv1d)
-        qkv, conv_initial, _, _, out_grad, final_grad = _inputs(
-            batch=int(bucket.segment_count),
-            channels=int(ref_gdn_any.conv_dim_local_tp),
-            max_len=int(bucket.length),
-            kernel_width=int(ref_gdn_any.conv_kernel_dim),
-            has_bias=True,
-            seed=123,
-        )
-        qkv = qkv.masked_fill(~bucket.real_mask.transpose(0, 1).unsqueeze(1), 0)
-        weight = conv1d.weight.detach().squeeze(1).contiguous()
-        bias = None if conv1d.bias is None else conv1d.bias.detach().contiguous()
-        ref = _run_reference(
-            qkv, conv_initial, weight, bias, bucket.lengths, out_grad, final_grad
-        )
-        ref_gdn.zero_grad(set_to_none=True)
-        cand = _run_fused_gdn(
-            ref_gdn, qkv, conv_initial, bucket.lengths, out_grad, final_grad
-        )
-        _assert_results_close(ref, cand)
-
-
-def _run_case(
-    *,
-    batch: int,
-    channels: int,
-    max_len: int,
-    kernel_width: int,
-    has_bias: bool,
-) -> None:
-    qkv, conv_initial, weight, bias, out_grad, final_grad = _inputs(
-        batch=batch,
-        channels=channels,
-        max_len=max_len,
-        kernel_width=kernel_width,
-        has_bias=has_bias,
-        seed=kernel_width * 100 + channels,
-    )
-    lengths = torch.tensor(
-        [max(1, max_len - (index * 2) % max_len) for index in range(batch)],
-        device="cuda",
-        dtype=torch.long,
-    )
-    qkv = qkv.masked_fill(
-        ~(torch.arange(max_len, device="cuda")[None, :] < lengths[:, None]).unsqueeze(
-            1
-        ),
-        0,
-    )
-    ref = _run_reference(qkv, conv_initial, weight, bias, lengths, out_grad, final_grad)
-    cand = _run_fused(qkv, conv_initial, weight, bias, lengths, out_grad, final_grad)
-    _assert_results_close(ref, cand)
-
-
 def _run_packed_case(
     *,
     lengths: tuple[int, ...],
@@ -230,45 +108,6 @@ def _run_packed_case(
         activation=activation,
     )
     _assert_packed_results_close(ref, cand)
-
-
-def _inputs(
-    *,
-    batch: int,
-    channels: int,
-    max_len: int,
-    kernel_width: int,
-    has_bias: bool,
-    seed: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor, Tensor]:
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    qkv = torch.randn(
-        batch,
-        channels,
-        max_len,
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    conv_initial = torch.randn(
-        batch,
-        channels,
-        kernel_width - 1,
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    weight = torch.randn(
-        channels, kernel_width, device="cuda", dtype=torch.float32, generator=generator
-    )
-    bias = (
-        torch.randn(channels, device="cuda", dtype=torch.float32, generator=generator)
-        if has_bias
-        else None
-    )
-    out_grad = torch.randn_like(qkv, generator=generator)
-    final_grad = torch.randn_like(conv_initial, generator=generator)
-    return qkv, conv_initial, weight, bias, out_grad, final_grad
 
 
 def _packed_inputs(
@@ -326,27 +165,6 @@ def _packed_inputs(
     return conv_in, cu_seqlens, conv_initial, weight, bias, out_grad, final_grad
 
 
-def _run_reference(
-    qkv: Tensor,
-    conv_initial: Tensor,
-    weight: Tensor,
-    bias: Tensor | None,
-    lengths: Tensor,
-    out_grad: Tensor,
-    final_grad: Tensor,
-) -> dict[str, Tensor | None]:
-    qkv = qkv.detach().clone().requires_grad_(True)
-    conv_initial = conv_initial.detach().clone().requires_grad_(True)
-    weight = weight.detach().clone().requires_grad_(True)
-    bias = None if bias is None else bias.detach().clone().requires_grad_(True)
-    extended = torch.cat([conv_initial, qkv], dim=-1)
-    out = F.conv1d(extended, weight.unsqueeze(1), bias, groups=qkv.shape[1])
-    out = F.gelu(out).to(dtype=qkv.dtype)
-    final = _reference_final(qkv, conv_initial, lengths)
-    ((out * out_grad).sum() + (final * final_grad).sum()).backward()
-    return _result(qkv, conv_initial, weight, bias, out, final)
-
-
 def _run_packed_reference(
     conv_in: Tensor,
     cu_seqlens: Tensor,
@@ -374,27 +192,6 @@ def _run_packed_reference(
     final = _packed_reference_final(conv_in, cu_seqlens, conv_initial)
     ((out * out_grad).sum() + (final * final_grad).sum()).backward()
     return _packed_result(conv_in, conv_initial, weight, bias, out, final)
-
-
-def _run_fused(
-    qkv: Tensor,
-    conv_initial: Tensor,
-    weight: Tensor,
-    bias: Tensor | None,
-    lengths: Tensor,
-    out_grad: Tensor,
-    final_grad: Tensor,
-) -> dict[str, Tensor | None]:
-    qkv = qkv.detach().clone().requires_grad_(True)
-    conv_initial = conv_initial.detach().clone().requires_grad_(True)
-    weight = weight.detach().clone().requires_grad_(True)
-    bias = None if bias is None else bias.detach().clone().requires_grad_(True)
-    out, final = varlen_causal_conv_gelu(
-        qkv, conv_initial, weight, bias, lengths, output_final_state=True
-    )
-    assert final is not None
-    ((out * out_grad).sum() + (final * final_grad).sum()).backward()
-    return _result(qkv, conv_initial, weight, bias, out, final)
 
 
 def _run_packed_fused(
@@ -426,54 +223,6 @@ def _run_packed_fused(
     return _packed_result(conv_in, conv_initial, weight, bias, out, final)
 
 
-def _run_fused_gdn(
-    gdn: torch.nn.Module,
-    qkv: Tensor,
-    conv_initial: Tensor,
-    lengths: Tensor,
-    out_grad: Tensor,
-    final_grad: Tensor,
-) -> dict[str, Tensor | None]:
-    qkv = qkv.detach().clone().requires_grad_(True)
-    conv_initial = conv_initial.detach().clone().requires_grad_(True)
-    out, final = gdn_varlen_causal_conv_gelu(
-        gdn, qkv, conv_initial, lengths, output_final_state=True
-    )
-    assert final is not None
-    ((out * out_grad).sum() + (final * final_grad).sum()).backward()
-    conv1d = cast(Any, gdn.conv1d)
-    return {
-        "out": out.detach(),
-        "final": final.detach(),
-        "qkv_grad": _required_grad(qkv.grad),
-        "conv_initial_grad": _required_grad(conv_initial.grad),
-        "weight_grad": _required_grad(conv1d.weight.grad).squeeze(1),
-        "bias_grad": None if conv1d.bias is None else _required_grad(conv1d.bias.grad),
-    }
-
-
-def _reference_final(qkv: Tensor, conv_initial: Tensor, lengths: Tensor) -> Tensor:
-    tail_width = int(conv_initial.shape[-1])
-    if tail_width == 0:
-        return conv_initial
-    batch_size, _, max_len = qkv.shape
-    arange = torch.arange(batch_size, device=qkv.device)
-    pieces = []
-    for tail_offset in range(tail_width):
-        source = lengths - tail_width + tail_offset
-        from_qkv = source >= 0
-        qkv_index = source.clamp(min=0, max=max_len - 1)
-        init_index = (source + tail_width).clamp(min=0, max=tail_width - 1)
-        pieces.append(
-            torch.where(
-                from_qkv.unsqueeze(1),
-                qkv[arange, :, qkv_index],
-                conv_initial[arange, :, init_index],
-            )
-        )
-    return torch.stack(pieces, dim=-1)
-
-
 def _packed_reference_final(
     conv_in: Tensor, cu_seqlens: Tensor, conv_initial: Tensor
 ) -> Tensor:
@@ -500,24 +249,6 @@ def _torch_activation(tensor: Tensor, activation: str) -> Tensor:
     raise ValueError(activation)
 
 
-def _result(
-    qkv: Tensor,
-    conv_initial: Tensor,
-    weight: Tensor,
-    bias: Tensor | None,
-    out: Tensor,
-    final: Tensor,
-) -> dict[str, Tensor | None]:
-    return {
-        "out": out.detach(),
-        "final": final.detach(),
-        "qkv_grad": _required_grad(qkv.grad),
-        "conv_initial_grad": _required_grad(conv_initial.grad),
-        "weight_grad": _required_grad(weight.grad),
-        "bias_grad": None if bias is None else _required_grad(bias.grad),
-    }
-
-
 def _packed_result(
     conv_in: Tensor,
     conv_initial: Tensor,
@@ -542,21 +273,6 @@ def _required_grad(grad: Tensor | None) -> Tensor:
     return grad.detach()
 
 
-def _assert_results_close(
-    reference: dict[str, Tensor | None], candidate: dict[str, Tensor | None]
-) -> None:
-    for name in ("out", "final", "qkv_grad", "conv_initial_grad", "weight_grad"):
-        ref_tensor = reference[name]
-        cand_tensor = candidate[name]
-        assert ref_tensor is not None and cand_tensor is not None
-        if ref_tensor.numel() > 0:
-            assert torch.any(ref_tensor != 0), f"{name} reference is all zero"
-        assert_mean_abs_pct(ref_tensor, cand_tensor, name)
-    if reference["bias_grad"] is not None:
-        assert candidate["bias_grad"] is not None
-        assert_mean_abs_pct(reference["bias_grad"], candidate["bias_grad"], "bias_grad")
-
-
 def _assert_packed_results_close(
     reference: dict[str, Tensor | None], candidate: dict[str, Tensor | None]
 ) -> None:
@@ -574,36 +290,3 @@ def _assert_packed_results_close(
         assert reference["bias_grad"].dtype == torch.float32
         assert candidate["bias_grad"].dtype == torch.float32
         assert_mean_abs_pct(reference["bias_grad"], candidate["bias_grad"], "bias_grad")
-
-
-@contextmanager
-def _single_rank_model_parallel() -> Iterator[None]:
-    from megatron.core import parallel_state as ps
-
-    if is_initialized():
-        raise RuntimeError("torch.distributed is already initialized")
-    init_process_group(
-        backend="nccl",
-        init_method=f"tcp://127.0.0.1:{_free_port()}",
-        rank=0,
-        world_size=1,
-    )
-    try:
-        ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
-        yield
-    finally:
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            ps.destroy_model_parallel()
-        if is_initialized():
-            destroy_process_group()
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

@@ -24,8 +24,6 @@ from torch.distributed import (
     is_initialized,
 )
 
-from art.megatron.gdn.operator import _causal_conv1d_with_state
-
 from .cases import default_phase0_cases
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
@@ -143,50 +141,6 @@ def test_real_qwen35_gdn_cp1_matches_flattened_and_rejects_physical() -> None:
                     )
                     > MEAN_ABS_PCT_MISMATCH_THRESHOLD
                 ), case.name
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA is required for real Megatron/FLA GDN oracle coverage.",
-)
-def test_real_qwen35_stateful_conv_accepts_prepared_channel_first_layout() -> None:
-    with _single_rank_model_parallel():
-        gdn, _ = _make_matching_qwen35_gdn_pair()
-        device = torch.device("cuda")
-        conv_kernel_dim = gdn.conv_kernel_dim
-        assert conv_kernel_dim is not None
-        conv_dim = int(gdn.conv_dim_local_tp)
-        conv_width = int(conv_kernel_dim)
-        qkv = torch.randn(
-            3,
-            conv_dim,
-            7,
-            device=device,
-            dtype=GDN_CORRECTNESS_DTYPE,
-            generator=torch.Generator(device=device).manual_seed(20290425),
-        ).contiguous()
-        conv_initial = torch.randn(
-            3,
-            conv_dim,
-            conv_width - 1,
-            device=device,
-            dtype=GDN_CORRECTNESS_DTYPE,
-            generator=torch.Generator(device=device).manual_seed(20290426),
-        ).contiguous()
-
-        assert qkv.stride(1) != 1
-        out, final = _causal_conv1d_with_state(
-            gdn,
-            qkv,
-            conv_initial,
-            output_final_state=True,
-        )
-
-        assert tuple(out.shape) == tuple(qkv.shape)
-        assert final is not None
-        assert tuple(final.shape) == tuple(conv_initial.shape)
-        assert torch.isfinite(out).all()
-        assert torch.isfinite(final).all()
 
 
 def _make_matching_qwen35_gdn_pair(

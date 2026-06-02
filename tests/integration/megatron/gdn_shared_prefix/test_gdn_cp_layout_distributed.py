@@ -10,8 +10,7 @@ import torch.multiprocessing as mp
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.gdn.layout import (
-    build_cp_exchange_plan_from_rank_ranges,
-    build_gdn_cp_layout_plan,
+    build_local_rank_cp_exchange_plan_from_dest_ranges,
     exchange_rank_tensor_all_to_all,
 )
 
@@ -21,6 +20,7 @@ from .cases import (
     GdnPhase0Case,
     default_phase0_cases,
 )
+from .layout_reference import build_test_gdn_cp_layout_plan
 from .metrics import GDN_CORRECTNESS_DTYPE
 from .packed_layout import build_phase0_packed_tensors
 
@@ -103,7 +103,7 @@ def _distributed_layout_worker(
         attention_order = (
             tuple(reversed(real_indices)) if reverse_attention else real_indices
         )
-        plan = build_gdn_cp_layout_plan(
+        plan = build_test_gdn_cp_layout_plan(
             group_ids=tensors["group_ids"],
             parent_ids=tensors["parent_ids"],
             cp_size=world_size,
@@ -177,19 +177,19 @@ def _distributed_zero_source_nccl_worker(
         dest_tokens = ((), (), (), tuple(range(16)))
         source_ranges = _rank_ranges_from_tokens_by_rank(source_tokens)
         dest_ranges = _rank_ranges_from_tokens_by_rank(dest_tokens)
-        forward_plan = build_cp_exchange_plan_from_rank_ranges(
-            source_ranges_by_rank=source_ranges,
+        forward_plan = build_local_rank_cp_exchange_plan_from_dest_ranges(
+            source_layout=_layout_from_rank_ranges(source_ranges),
             dest_ranges_by_rank=dest_ranges,
             device="cuda",
-            validate=False,
             local_rank=rank,
+            cross_rank_token_count=16,
         )
-        backward_plan = build_cp_exchange_plan_from_rank_ranges(
-            source_ranges_by_rank=dest_ranges,
+        backward_plan = build_local_rank_cp_exchange_plan_from_dest_ranges(
+            source_layout=_layout_from_rank_ranges(dest_ranges),
             dest_ranges_by_rank=source_ranges,
             device="cuda",
-            validate=False,
             local_rank=rank,
+            cross_rank_token_count=16,
         )
         flat = torch.arange(16 * 6, device="cuda", dtype=torch.float32).reshape(
             16, 2, 3
@@ -265,9 +265,17 @@ def _striped_rank_indices(
 def _layout_from_tokens_by_rank(
     tokens_by_rank: tuple[tuple[int, ...], ...],
 ) -> TokenLayoutIndex:
+    return _layout_from_rank_ranges(_rank_ranges_from_tokens_by_rank(tokens_by_rank))
+
+
+def _layout_from_rank_ranges(
+    ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...],
+) -> TokenLayoutIndex:
     return TokenLayoutIndex(
-        ownership_ranges_by_rank=_rank_ranges_from_tokens_by_rank(tokens_by_rank),
-        token_counts_by_rank=tuple(len(tokens) for tokens in tokens_by_rank),
+        ownership_ranges_by_rank=ranges_by_rank,
+        token_counts_by_rank=tuple(
+            sum(end - start for start, end, _ in ranges) for ranges in ranges_by_rank
+        ),
     )
 
 
