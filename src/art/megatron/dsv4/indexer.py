@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -135,13 +135,10 @@ def build_dsv4_indexer_kv_exchange_peer_plans(
             f"got {len(candidate_entry_ids_by_rank)} vs {rank_count}"
         )
     recv_by_rank = tuple(
-        _ids_by_owner_rank(
+        _ids_by_owner_rank_from_table(
             ids=candidate_ids,
             rank_count=rank_count,
-            owner_rank=lambda entry_id: _compressed_entry_owner_rank(
-                layout=layout,
-                entry_id=entry_id,
-            ),
+            owner_ranks=_compressed_owner_rank_table(layout),
             name=f"rank{rank}_candidate_entry_ids",
         )
         for rank, candidate_ids in enumerate(candidate_entry_ids_by_rank)
@@ -1036,11 +1033,11 @@ def _indexer_peer_count(*peers: Sequence[Sequence[int]]) -> int:
     return counts.pop()
 
 
-def _ids_by_owner_rank(
+def _ids_by_owner_rank_from_table(
     *,
     ids: Sequence[int],
     rank_count: int,
-    owner_rank: Callable[[int], int],
+    owner_ranks: Sequence[int],
     name: str,
 ) -> tuple[tuple[int, ...], ...]:
     by_rank: list[list[int]] = [[] for _ in range(rank_count)]
@@ -1050,7 +1047,9 @@ def _ids_by_owner_rank(
         if id_int in seen:
             raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
         seen.add(id_int)
-        rank = int(owner_rank(id_int))
+        if id_int < 0 or id_int >= len(owner_ranks):
+            raise RuntimeError(f"DSV4 {name} id {id_int} is outside layout owner table")
+        rank = int(owner_ranks[id_int])
         if rank < 0 or rank >= int(rank_count):
             raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
         by_rank[rank].append(id_int)
@@ -1082,7 +1081,15 @@ def _compressed_entry_owner_rank(
     entry_int = int(entry_id)
     if entry_int < 0 or entry_int >= len(layout.entries):
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
+    if layout.compressed_entry_owner_ranks:
+        return int(layout.compressed_entry_owner_ranks[entry_int])
     return int(layout.entries[entry_int].owner_rank)
+
+
+def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
+    if layout.compressed_entry_owner_ranks:
+        return layout.compressed_entry_owner_ranks
+    return tuple(int(entry.owner_rank) for entry in layout.entries)
 
 
 def _normalize_indexer_peer_ids(

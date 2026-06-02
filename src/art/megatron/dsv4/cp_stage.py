@@ -513,31 +513,104 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
     stage. This avoids requiring an all-rank topk tensor gather before planning
     compatible all-to-all sends.
     """
+    return build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
+        layouts=(layout,),
+        stage_plans_by_rank=stage_plans_by_rank,
+    )[0]
+
+
+def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
+    *,
+    layouts: Sequence[Dsv4CompressedLayout],
+    stage_plans_by_rank: Sequence[Any],
+) -> tuple[tuple[Dsv4StageKvExchangePeerPlan, ...], ...]:
+    """Plan fused stage KV exchange metadata for multiple DSV4 layouts.
+
+    CSA and HCA share the raw SWA token requests for one ART StagePlan slot.
+    Building them together avoids expanding raw K ranges and bucketing raw
+    owners separately for each compression family.
+    """
+    layout_tuple = tuple(layouts)
+    if not layout_tuple:
+        return ()
     stage_plans = tuple(stage_plans_by_rank)
-    _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
+    _validate_stage_plan_count(layout=layout_tuple[0], stage_plans_by_rank=stage_plans)
     _shared_stage_index(stage_plans)
+    rank_count = len(layout_tuple[0].entry_ids_by_owner_rank)
+    for layout in layout_tuple[1:]:
+        _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
+        if len(layout.entry_ids_by_owner_rank) != rank_count:
+            raise RuntimeError(
+                "DSV4 stage KV exchange layouts must share rank count, got "
+                f"{len(layout.entry_ids_by_owner_rank)} vs {rank_count}"
+            )
+    has_queries = tuple(
+        _ranges_have_tokens(stage_plan.global_q_ranges) for stage_plan in stage_plans
+    )
     raw_by_rank = tuple(
         _stage_raw_token_ids(
-            layout=layout,
-            ranges=stage_plan.global_k_ranges
-            if _token_ids_from_ranges(stage_plan.global_q_ranges)
-            else (),
+            layout=layout_tuple[0],
+            ranges=stage_plan.global_k_ranges if has_queries[rank] else (),
         )
-        for stage_plan in stage_plans
+        for rank, stage_plan in enumerate(stage_plans)
     )
+    recv_raw = tuple(
+        _ids_by_owner_rank_from_table(
+            ids=raw_token_ids,
+            rank_count=rank_count,
+            owner_ranks=layout_tuple[0].raw_token_owner_ranks,
+            name=f"rank{rank}_raw_token_ids",
+        )
+        for rank, raw_token_ids in enumerate(raw_by_rank)
+    )
+    send_raw = _transpose_peer_ids(recv_raw)
+    return tuple(
+        _build_stage_kv_exchange_peer_plans_for_layout(
+            layout=layout,
+            stage_plans=stage_plans,
+            has_queries=has_queries,
+            send_raw=send_raw,
+            recv_raw=recv_raw,
+            rank_count=rank_count,
+        )
+        for layout in layout_tuple
+    )
+
+
+def _build_stage_kv_exchange_peer_plans_for_layout(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plans: tuple[Any, ...],
+    has_queries: tuple[bool, ...],
+    send_raw: tuple[tuple[tuple[int, ...], ...], ...],
+    recv_raw: tuple[tuple[tuple[int, ...], ...], ...],
+    rank_count: int,
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
     compressed_by_rank = tuple(
         stage_candidate_entry_ids(
             layout=layout,
-            global_k_ranges=stage_plan.global_k_ranges
-            if _token_ids_from_ranges(stage_plan.global_q_ranges)
-            else (),
+            global_k_ranges=stage_plan.global_k_ranges if has_queries[rank] else (),
         )
-        for stage_plan in stage_plans
+        for rank, stage_plan in enumerate(stage_plans)
     )
-    return _build_stage_kv_exchange_peer_plans_from_ids(
-        layout=layout,
-        raw_token_ids_by_rank=raw_by_rank,
-        compressed_entry_ids_by_rank=compressed_by_rank,
+    recv_compressed = tuple(
+        _ids_by_owner_rank_from_table(
+            ids=compressed_entry_ids,
+            rank_count=rank_count,
+            owner_ranks=_compressed_owner_rank_table(layout),
+            name=f"rank{rank}_compressed_entry_ids",
+        )
+        for rank, compressed_entry_ids in enumerate(compressed_by_rank)
+    )
+    send_compressed = _transpose_peer_ids(recv_compressed)
+    return tuple(
+        Dsv4StageKvExchangePeerPlan.model_construct(
+            send_raw_token_ids_by_peer=send_raw[rank],
+            send_compressed_entry_ids_by_peer=send_compressed[rank],
+            recv_raw_token_ids_by_peer=recv_raw[rank],
+            recv_compressed_entry_ids_by_peer=recv_compressed[rank],
+        )
+        for rank in range(rank_count)
     )
 
 
@@ -938,6 +1011,10 @@ def _token_ids_from_ranges(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
     return tuple(token_ids)
 
 
+def _ranges_have_tokens(ranges: Sequence[TokenRangeLike]) -> bool:
+    return any(int(range_.start) < int(range_.end) for range_ in ranges)
+
+
 def _select_topk_for_query_ids(
     *,
     global_topk: torch.Tensor,
@@ -985,6 +1062,29 @@ def _ids_by_owner_rank(
             raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
         seen.add(id_int)
         rank = int(owner_rank(id_int))
+        if rank < 0 or rank >= int(rank_count):
+            raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
+        by_rank[rank].append(id_int)
+    return tuple(tuple(peer_ids) for peer_ids in by_rank)
+
+
+def _ids_by_owner_rank_from_table(
+    *,
+    ids: Sequence[int],
+    rank_count: int,
+    owner_ranks: Sequence[int],
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    seen: set[int] = set()
+    for id_ in ids:
+        id_int = int(id_)
+        if id_int in seen:
+            raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
+        seen.add(id_int)
+        if id_int < 0 or id_int >= len(owner_ranks):
+            raise RuntimeError(f"DSV4 {name} id {id_int} is outside layout owner table")
+        rank = int(owner_ranks[id_int])
         if rank < 0 or rank >= int(rank_count):
             raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
         by_rank[rank].append(id_int)
@@ -1191,7 +1291,15 @@ def _compressed_entry_owner_rank(
     entry_int = int(entry_id)
     if entry_int < 0 or entry_int >= len(layout.entries):
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
+    if layout.compressed_entry_owner_ranks:
+        return int(layout.compressed_entry_owner_ranks[entry_int])
     return int(layout.entries[entry_int].owner_rank)
+
+
+def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
+    if layout.compressed_entry_owner_ranks:
+        return layout.compressed_entry_owner_ranks
+    return tuple(int(entry.owner_rank) for entry in layout.entries)
 
 
 def _visible_raw_swa_token_ids(

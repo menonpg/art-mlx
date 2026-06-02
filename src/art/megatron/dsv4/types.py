@@ -431,6 +431,7 @@ class Dsv4CompressedLayout(BaseModel):
     halo_transfers: tuple[Dsv4HaloTransfer, ...]
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
     raw_token_owner_ranks: tuple[int, ...]
+    compressed_entry_owner_ranks: tuple[int, ...] = ()
     entry_ids_by_branch_stream: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     entry_ids_by_closure_token: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     closure_token_ids: tuple[int, ...] = ()

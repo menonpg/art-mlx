@@ -5,9 +5,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .compressor import build_dsv4_compressed_layouts_from_cp_state
-from .cp_attention import build_dsv4_attention_backward_plan_from_stage_plan_slots
+from .cp_attention import build_dsv4_attention_backward_plans_from_stage_plan_slots
 from .cp_stage import (
-    build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
+    build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts,
     build_dsv4_stage_plan_slots,
 )
 from .indexer import (
@@ -120,44 +120,48 @@ def prepare_dsv4_context_parallel_state(
         if csa_layout is not None
         else ()
     )
-    csa_stage_kv_peer_plans_by_slot = (
-        tuple(
-            build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
-                layout=csa_layout,
+    stage_kv_layout_names: list[str] = []
+    stage_kv_layouts: list[Any] = []
+    if csa_layout is not None:
+        stage_kv_layout_names.append("csa")
+        stage_kv_layouts.append(csa_layout)
+    if hca_layout is not None:
+        stage_kv_layout_names.append("hca")
+        stage_kv_layouts.append(hca_layout)
+    stage_kv_plans_by_name: dict[str, list[Any]] = {
+        name: [] for name in stage_kv_layout_names
+    }
+    for slot in stage_slots:
+        plans_for_slot = (
+            build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
+                layouts=tuple(stage_kv_layouts),
                 stage_plans_by_rank=slot.stage_plans_by_rank,
             )
-            for slot in stage_slots
         )
-        if csa_layout is not None
-        else ()
-    )
-    hca_stage_kv_peer_plans_by_slot = (
-        tuple(
-            build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
-                layout=hca_layout,
-                stage_plans_by_rank=slot.stage_plans_by_rank,
-            )
-            for slot in stage_slots
+        for name, plans in zip(stage_kv_layout_names, plans_for_slot, strict=True):
+            stage_kv_plans_by_name[name].append(plans)
+    csa_stage_kv_peer_plans_by_slot = tuple(stage_kv_plans_by_name.get("csa", ()))
+    hca_stage_kv_peer_plans_by_slot = tuple(stage_kv_plans_by_name.get("hca", ()))
+    backward_layout_names: list[str] = []
+    backward_layouts: list[Any] = []
+    if csa_layout is not None:
+        backward_layout_names.append("csa")
+        backward_layouts.append(csa_layout)
+    if hca_layout is not None:
+        backward_layout_names.append("hca")
+        backward_layouts.append(hca_layout)
+    backward_plans = dict(
+        zip(
+            backward_layout_names,
+            build_dsv4_attention_backward_plans_from_stage_plan_slots(
+                layouts=tuple(backward_layouts),
+                stage_plan_slots=stage_slots,
+            ),
+            strict=True,
         )
-        if hca_layout is not None
-        else ()
     )
-    csa_attention_backward_plan = (
-        build_dsv4_attention_backward_plan_from_stage_plan_slots(
-            layout=csa_layout,
-            stage_plan_slots=stage_slots,
-        )
-        if csa_layout is not None
-        else None
-    )
-    hca_attention_backward_plan = (
-        build_dsv4_attention_backward_plan_from_stage_plan_slots(
-            layout=hca_layout,
-            stage_plan_slots=stage_slots,
-        )
-        if hca_layout is not None
-        else None
-    )
+    csa_attention_backward_plan = backward_plans.get("csa")
+    hca_attention_backward_plan = backward_plans.get("hca")
     return Dsv4ContextParallelState(
         cp_state=cp_state,
         dsv4_plan=Dsv4PreparedPlan(
