@@ -33,6 +33,7 @@ from .types import (
     Dsv4CompressionKind,
     Dsv4ContextParallelState,
     Dsv4GradientOwnerBucket,
+    Dsv4IndexerKvExchangePeerPlan,
     Dsv4IndexerStagePlan,
     Dsv4MaterializedStage,
     Dsv4ProjectedAttentionForwardResult,
@@ -40,6 +41,7 @@ from .types import (
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
+    Dsv4StageKvExchangePeerPlan,
     Dsv4StagePlanGroup,
     Dsv4StagePlanSlot,
     Dsv4TensorExchangePlan,
@@ -236,6 +238,12 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
     indexer_weights: torch.Tensor | None = None
     indexer_topk: int | None = None
     indexer_stage_plans: tuple[Dsv4IndexerStagePlan, ...] | None = None
+    indexer_kv_peer_plans_by_stage: (
+        tuple[tuple[Dsv4IndexerKvExchangePeerPlan, ...], ...] | None
+    ) = None
+    stage_kv_peer_plans_by_slot: (
+        tuple[tuple[Dsv4StageKvExchangePeerPlan, ...], ...] | None
+    ) = None
     indexer_score_scale: float = 1.0
     attn_sink: torch.Tensor
     group: Any
@@ -302,6 +310,8 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
                     indexer_kv_entry_ids=self._indexer_compressed.compressed_entry_ids,
                     indexer_topk=int(self.indexer_topk),
                     indexer_stage_plans=self.indexer_stage_plans,
+                    indexer_kv_peer_plans_by_stage=self.indexer_kv_peer_plans_by_stage,
+                    stage_kv_peer_plans_by_slot=self.stage_kv_peer_plans_by_slot,
                     attn_sink=self.attn_sink,
                     group=self.group,
                     async_op=bool(self.async_op),
@@ -324,6 +334,7 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
                     raw_token_ids=self.raw_token_ids,
                     compressed_kv=self._main_compressed.compressed_kv,
                     compressed_entry_ids=self._main_compressed.compressed_entry_ids,
+                    stage_kv_peer_plans_by_slot=self.stage_kv_peer_plans_by_slot,
                     attn_sink=self.attn_sink,
                     group=self.group,
                     async_op=bool(self.async_op),
@@ -621,6 +632,10 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
     group: Any,
     async_op: bool,
     indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
+    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
+    | None = None,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    | None = None,
     indexer_score_scale: float = 1.0,
     scale: float | None = None,
     window_size: int = 128,
@@ -642,6 +657,11 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
         stage_plan_slots=stage_plan_slots,
     )
     query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
+    prepared_stage_kv_peer_plans = _optional_stage_kv_peer_plans_by_slot(
+        slots=slots,
+        stage_kv_peer_plans_by_slot=stage_kv_peer_plans_by_slot,
+        name="CSA stage KV",
+    )
     prepared_indexer_stage_plans = tuple(indexer_stage_plans or ())
     if prepared_indexer_stage_plans:
         if len(prepared_indexer_stage_plans) != len(slots):
@@ -679,9 +699,13 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
         group=group,
         async_op=async_op,
         score_scale=indexer_score_scale,
+        indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
     ).wait_post_process()
     stage_works = tuple(
         _launch_dsv4_stage_from_slot(
+            stage_kv_peer_plans=prepared_stage_kv_peer_plans[stage_position]
+            if prepared_stage_kv_peer_plans is not None
+            else None,
             layout=layout,
             rank=rank_int,
             slot=slot,
@@ -700,7 +724,7 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
             raw_list_size=raw_list_size,
             compressed_list_size=compressed_list_size,
         )
-        for slot in slots
+        for stage_position, slot in enumerate(slots)
     )
     return launch_exchanged_dsv4_attention_forward(
         stage_works=stage_works,
@@ -725,6 +749,8 @@ def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
     attn_sink: torch.Tensor,
     group: Any,
     async_op: bool,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    | None = None,
     scale: float | None = None,
     window_size: int = 128,
     raw_list_size: int | None = None,
@@ -740,8 +766,16 @@ def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
         stage_plan_slots=stage_plan_slots,
     )
     query_ids = _normalize_output_ids(query_token_ids, name="query_token_ids")
+    prepared_stage_kv_peer_plans = _optional_stage_kv_peer_plans_by_slot(
+        slots=slots,
+        stage_kv_peer_plans_by_slot=stage_kv_peer_plans_by_slot,
+        name="HCA stage KV",
+    )
     stage_works = tuple(
         _launch_dsv4_stage_from_slot(
+            stage_kv_peer_plans=prepared_stage_kv_peer_plans[stage_position]
+            if prepared_stage_kv_peer_plans is not None
+            else None,
             layout=layout,
             rank=rank_int,
             slot=slot,
@@ -760,7 +794,7 @@ def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
             raw_list_size=raw_list_size,
             compressed_list_size=compressed_list_size,
         )
-        for slot in slots
+        for stage_position, slot in enumerate(slots)
     )
     return launch_exchanged_dsv4_attention_forward(
         stage_works=stage_works,
@@ -795,6 +829,10 @@ def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
     group: Any,
     async_op: bool,
     indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
+    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
+    | None = None,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    | None = None,
     indexer_score_scale: float = 1.0,
     scale: float | None = None,
     window_size: int = 128,
@@ -858,6 +896,16 @@ def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
         indexer_topk=int(indexer_topk),
         indexer_stage_plans=tuple(indexer_stage_plans)
         if indexer_stage_plans is not None
+        else None,
+        indexer_kv_peer_plans_by_stage=tuple(
+            tuple(peer_plans) for peer_plans in indexer_kv_peer_plans_by_stage
+        )
+        if indexer_kv_peer_plans_by_stage is not None
+        else None,
+        stage_kv_peer_plans_by_slot=tuple(
+            tuple(peer_plans) for peer_plans in stage_kv_peer_plans_by_slot
+        )
+        if stage_kv_peer_plans_by_slot is not None
         else None,
         indexer_score_scale=float(indexer_score_scale),
         attn_sink=attn_sink,
@@ -938,6 +986,8 @@ def launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
         group=context_state.cp_state.cp_group,
         async_op=async_op,
         indexer_stage_plans=indexer_stage_plans,
+        indexer_kv_peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage or None,
+        stage_kv_peer_plans_by_slot=plan.csa_stage_kv_peer_plans_by_slot or None,
         indexer_score_scale=indexer_score_scale,
         scale=scale,
         window_size=window_size,
@@ -963,6 +1013,8 @@ def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
     attn_sink: torch.Tensor,
     group: Any,
     async_op: bool,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    | None = None,
     scale: float | None = None,
     window_size: int = 128,
     raw_list_size: int | None = None,
@@ -1001,6 +1053,11 @@ def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
         raw_kv=raw_kv,
         raw_token_ids=raw_ids,
         main_compression_work=compressed_work,
+        stage_kv_peer_plans_by_slot=tuple(
+            tuple(peer_plans) for peer_plans in stage_kv_peer_plans_by_slot
+        )
+        if stage_kv_peer_plans_by_slot is not None
+        else None,
         attn_sink=attn_sink,
         group=group,
         async_op=async_op,
@@ -1049,6 +1106,8 @@ def launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
         attn_sink=attn_sink,
         group=context_state.cp_state.cp_group,
         async_op=async_op,
+        stage_kv_peer_plans_by_slot=context_state.dsv4_plan.hca_stage_kv_peer_plans_by_slot
+        or None,
         scale=scale,
         window_size=window_size,
         raw_list_size=raw_list_size,
@@ -1517,8 +1576,28 @@ def _empty_owned_gradient_result(
     )
 
 
+def _optional_stage_kv_peer_plans_by_slot(
+    *,
+    slots: Sequence[Dsv4StagePlanSlot],
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]] | None,
+    name: str,
+) -> tuple[tuple[Dsv4StageKvExchangePeerPlan, ...], ...] | None:
+    if stage_kv_peer_plans_by_slot is None:
+        return None
+    peer_plans_by_slot = tuple(
+        tuple(peer_plans) for peer_plans in stage_kv_peer_plans_by_slot
+    )
+    if len(peer_plans_by_slot) != len(slots):
+        raise RuntimeError(
+            f"DSV4 prepared {name} peer plan slot count must match StagePlan "
+            f"slots: {len(peer_plans_by_slot)} vs {len(slots)}"
+        )
+    return peer_plans_by_slot
+
+
 def _launch_dsv4_stage_from_slot(
     *,
+    stage_kv_peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None,
     layout: Dsv4CompressedLayout,
     rank: int,
     slot: Dsv4StagePlanSlot,
@@ -1561,6 +1640,7 @@ def _launch_dsv4_stage_from_slot(
         compressed_entry_ids=compressed_entry_ids,
         group=group,
         async_op=async_op,
+        peer_plans=stage_kv_peer_plans,
     )
 
 

@@ -45,6 +45,17 @@ def test_prepare_dsv4_context_parallel_state_wraps_real_cp_plan() -> None:
     for stage_plan in plan.csa_indexer_stage_plans:
         assert len(stage_plan.query_token_ids_by_rank) == 2
         assert len(stage_plan.candidate_entry_ids_by_rank) == 2
+    assert len(plan.csa_indexer_kv_peer_plans_by_stage) == len(
+        plan.csa_indexer_stage_plans
+    )
+    assert len(plan.csa_stage_kv_peer_plans_by_slot) == len(plan.stage_plan_slots)
+    assert len(plan.hca_stage_kv_peer_plans_by_slot) == len(plan.stage_plan_slots)
+    assert all(
+        len(peer_plans) == 2 for peer_plans in plan.csa_stage_kv_peer_plans_by_slot
+    )
+    assert all(
+        len(peer_plans) == 2 for peer_plans in plan.hca_stage_kv_peer_plans_by_slot
+    )
 
 
 def test_prepare_dsv4_context_parallel_state_allows_hca_only() -> None:
@@ -65,6 +76,9 @@ def test_prepare_dsv4_context_parallel_state_allows_hca_only() -> None:
     assert dsv4_state.dsv4_plan.csa_layout is None
     assert dsv4_state.dsv4_plan.hca_layout is not None
     assert dsv4_state.dsv4_plan.csa_indexer_stage_plans == ()
+    assert dsv4_state.dsv4_plan.csa_indexer_kv_peer_plans_by_stage == ()
+    assert dsv4_state.dsv4_plan.csa_stage_kv_peer_plans_by_slot == ()
+    assert dsv4_state.dsv4_plan.hca_stage_kv_peer_plans_by_slot
     assert dsv4_state.dsv4_plan.stage_plan_slots
 
 

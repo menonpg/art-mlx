@@ -52,7 +52,6 @@ from .cp_attention import (
     run_materialized_dsv4_attention_forward,
 )
 from .cp_stage import (
-    Dsv4StageKvExchangePeerPlan,
     Dsv4StageKvExchangeWork,
     build_dsv4_stage_inputs,
     build_dsv4_stage_inputs_from_stage_plan,
@@ -70,7 +69,6 @@ from .cp_stage import (
 )
 from .indexer import (
     Dsv4ExchangedIndexerTopkWork,
-    Dsv4IndexerKvExchangePeerPlan,
     Dsv4IndexerKvExchangeWork,
     build_dsv4_indexer_kv_exchange_peer_plans,
     build_dsv4_indexer_stage_plan_from_stage_plans,
@@ -109,6 +107,7 @@ from .types import (
     Dsv4ContextParallelState,
     Dsv4GradientOwnerBucket,
     Dsv4HaloTransfer,
+    Dsv4IndexerKvExchangePeerPlan,
     Dsv4IndexerStagePlan,
     Dsv4MaterializedStage,
     Dsv4PreparedPlan,
@@ -121,6 +120,7 @@ from .types import (
     Dsv4StageForwardRecord,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
+    Dsv4StageKvExchangePeerPlan,
     Dsv4StagePlanGroup,
     Dsv4StagePlanSlot,
     Dsv4StreamKind,

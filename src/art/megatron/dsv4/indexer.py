@@ -11,6 +11,7 @@ from .types import (
     Dsv4BranchView,
     Dsv4CompressedEntry,
     Dsv4CompressedLayout,
+    Dsv4IndexerKvExchangePeerPlan,
     Dsv4IndexerStagePlan,
     Dsv4TensorExchangePlan,
     Dsv4TopkResult,
@@ -89,13 +90,6 @@ class Dsv4ExchangedIndexerTopkWork(BaseModel):
             query_token_ids=self.query_token_ids,
             topk=int(self.topk),
         )
-
-
-class Dsv4IndexerKvExchangePeerPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    send_entry_ids_by_peer: tuple[tuple[int, ...], ...]
-    recv_entry_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
 def stage_candidate_entry_ids(
@@ -429,6 +423,7 @@ def launch_planned_dsv4_indexer_kv_exchange(
     group: Any,
     async_op: bool,
     score_scale: float = 1.0,
+    peer_plans: Sequence[Dsv4IndexerKvExchangePeerPlan] | None = None,
 ) -> Dsv4IndexerKvExchangeWork:
     """Launch one rank's indexer KV exchange from DSV4 host metadata.
 
@@ -437,9 +432,10 @@ def launch_planned_dsv4_indexer_kv_exchange(
     outside compiled regions.
     """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
-    plans = build_dsv4_indexer_kv_exchange_peer_plans(
+    plans = _indexer_kv_peer_plans_or_build(
         layout=layout,
         candidate_entry_ids_by_rank=candidate_entry_ids_by_rank,
+        peer_plans=peer_plans,
     )
     plan = plans[rank_int]
     return launch_dsv4_indexer_kv_exchange(
@@ -476,6 +472,8 @@ def launch_dsv4_indexer_topk_from_stage_plans(
     group: Any,
     async_op: bool,
     score_scale: float = 1.0,
+    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
+    | None = None,
 ) -> Dsv4ExchangedIndexerTopkWork:
     """Launch all CSA indexer stages for one rank and return global topk work.
 
@@ -490,9 +488,14 @@ def launch_dsv4_indexer_topk_from_stage_plans(
         raise RuntimeError("DSV4 indexer topk launch requires at least one stage plan")
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
     _row_by_id(query_ids, name="query_token_ids")
+    prepared_peer_plans = _validate_indexer_stage_peer_plans(
+        layout=layout,
+        indexer_stage_plans=stage_plans,
+        indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
+    )
 
     stage_works = []
-    for stage_plan in stage_plans:
+    for stage_position, stage_plan in enumerate(stage_plans):
         _validate_indexer_stage_plan_rank_count(
             stage_plan=stage_plan,
             rank_count=len(layout.entry_ids_by_owner_rank),
@@ -522,6 +525,9 @@ def launch_dsv4_indexer_topk_from_stage_plans(
                 group=group,
                 async_op=async_op,
                 score_scale=score_scale,
+                peer_plans=prepared_peer_plans[stage_position]
+                if prepared_peer_plans is not None
+                else None,
             )
         )
     return launch_exchanged_dsv4_indexer_topk(
@@ -561,6 +567,56 @@ def launch_exchanged_dsv4_indexer_topk(
         query_token_ids=query_ids,
         topk=int(topk),
     )
+
+
+def _indexer_kv_peer_plans_or_build(
+    *,
+    layout: Dsv4CompressedLayout,
+    candidate_entry_ids_by_rank: Sequence[Sequence[int]],
+    peer_plans: Sequence[Dsv4IndexerKvExchangePeerPlan] | None,
+) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
+    if peer_plans is None:
+        return build_dsv4_indexer_kv_exchange_peer_plans(
+            layout=layout,
+            candidate_entry_ids_by_rank=candidate_entry_ids_by_rank,
+        )
+    return _validate_indexer_kv_peer_plan_count(layout=layout, peer_plans=peer_plans)
+
+
+def _validate_indexer_stage_peer_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan],
+    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
+    | None,
+) -> tuple[tuple[Dsv4IndexerKvExchangePeerPlan, ...], ...] | None:
+    if indexer_kv_peer_plans_by_stage is None:
+        return None
+    stage_peer_plans = tuple(
+        _validate_indexer_kv_peer_plan_count(layout=layout, peer_plans=peer_plans)
+        for peer_plans in indexer_kv_peer_plans_by_stage
+    )
+    if len(stage_peer_plans) != len(indexer_stage_plans):
+        raise RuntimeError(
+            "DSV4 prepared indexer KV peer plan stage count must match indexer "
+            f"StagePlans: {len(stage_peer_plans)} vs {len(indexer_stage_plans)}"
+        )
+    return stage_peer_plans
+
+
+def _validate_indexer_kv_peer_plan_count(
+    *,
+    layout: Dsv4CompressedLayout,
+    peer_plans: Sequence[Dsv4IndexerKvExchangePeerPlan],
+) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
+    plans = tuple(peer_plans)
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    if len(plans) != rank_count:
+        raise RuntimeError(
+            "DSV4 prepared indexer KV peer plan count must match rank count: "
+            f"{len(plans)} vs {rank_count}"
+        )
+    return plans
 
 
 def merge_indexer_topk_results(

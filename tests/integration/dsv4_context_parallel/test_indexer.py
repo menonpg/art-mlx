@@ -17,11 +17,13 @@ from art.megatron.dsv4 import (
     compute_indexer_stage_topk,
     compute_indexer_topk,
     launch_exchanged_dsv4_indexer_topk,
+    launch_planned_dsv4_indexer_kv_exchange,
     merge_indexer_topk_results,
     stable_topk_by_score_and_id,
     stage_candidate_entry_ids,
     visible_entry_ids_for_query,
 )
+import art.megatron.dsv4.indexer as indexer_module
 
 
 class _LayoutIndex(BaseModel):
@@ -231,6 +233,51 @@ def test_indexer_kv_exchange_peer_plan_uses_compressed_ownership() -> None:
             layout=layout,
             candidate_entry_ids_by_rank=((9,), (1,)),
         )
+
+
+def test_planned_indexer_exchange_uses_prepared_peer_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = _layout()
+    candidates_by_rank = ((0, 1, 2), (1, 3))
+    prepared = build_dsv4_indexer_kv_exchange_peer_plans(
+        layout=layout,
+        candidate_entry_ids_by_rank=candidates_by_rank,
+    )
+    captured: dict[str, object] = {}
+
+    def fail_rebuild(**_kwargs: object) -> object:
+        raise AssertionError("indexer peer plan should be prepared")
+
+    def fake_launch(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        indexer_module,
+        "build_dsv4_indexer_kv_exchange_peer_plans",
+        fail_rebuild,
+    )
+    monkeypatch.setattr(indexer_module, "launch_dsv4_indexer_kv_exchange", fake_launch)
+
+    result = launch_planned_dsv4_indexer_kv_exchange(
+        layout=layout,
+        rank=1,
+        candidate_entry_ids_by_rank=candidates_by_rank,
+        query_token_ids=(11,),
+        indexer_q=torch.empty(1, 2, 4),
+        indexer_weights=torch.empty(1, 2),
+        indexer_kv=torch.empty(0, 4),
+        indexer_kv_entry_ids=(),
+        topk=2,
+        group=None,
+        async_op=False,
+        peer_plans=prepared,
+    )
+
+    assert result is not None
+    assert captured["send_entry_ids_by_peer"] == prepared[1].send_entry_ids_by_peer
+    assert captured["recv_entry_ids_by_peer"] == prepared[1].recv_entry_ids_by_peer
 
 
 def test_indexer_stage_plan_derives_queries_and_candidates_from_art_stage_plan() -> (

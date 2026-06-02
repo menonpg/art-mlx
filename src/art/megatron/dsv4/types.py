@@ -190,6 +190,13 @@ class Dsv4IndexerStagePlan(BaseModel):
     candidate_entry_ids_by_rank: tuple[tuple[int, ...], ...]
 
 
+class Dsv4IndexerKvExchangePeerPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    send_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+
+
 class Dsv4StagePlanGroup(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -202,6 +209,15 @@ class Dsv4StagePlanSlot(BaseModel):
 
     stage_index: int
     stage_plans_by_rank: tuple[Any, ...]
+
+
+class Dsv4StageKvExchangePeerPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    send_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    send_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
 class Dsv4MaterializedStage(BaseModel):
@@ -329,6 +345,15 @@ class Dsv4PreparedPlan(BaseModel):
     hca_layout: Dsv4CompressedLayout | None = None
     stage_plan_slots: tuple[Dsv4StagePlanSlot, ...] = ()
     csa_indexer_stage_plans: tuple[Dsv4IndexerStagePlan, ...] = ()
+    csa_indexer_kv_peer_plans_by_stage: tuple[
+        tuple[Dsv4IndexerKvExchangePeerPlan, ...], ...
+    ] = ()
+    csa_stage_kv_peer_plans_by_slot: tuple[
+        tuple[Dsv4StageKvExchangePeerPlan, ...], ...
+    ] = ()
+    hca_stage_kv_peer_plans_by_slot: tuple[
+        tuple[Dsv4StageKvExchangePeerPlan, ...], ...
+    ] = ()
 
 
 class Dsv4ContextParallelState(BaseModel):
@@ -349,8 +374,10 @@ Dsv4CompressedKvForwardResult.model_rebuild()
 Dsv4CompressedKvGradientResult.model_rebuild()
 Dsv4StageInputs.model_rebuild()
 Dsv4IndexerStagePlan.model_rebuild()
+Dsv4IndexerKvExchangePeerPlan.model_rebuild()
 Dsv4StagePlanGroup.model_rebuild()
 Dsv4StagePlanSlot.model_rebuild()
+Dsv4StageKvExchangePeerPlan.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
 Dsv4SparseForwardResult.model_rebuild()
 Dsv4SparseBackwardResult.model_rebuild()

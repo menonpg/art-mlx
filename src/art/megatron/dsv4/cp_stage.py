@@ -15,6 +15,7 @@ from .types import (
     Dsv4MaterializedStage,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
+    Dsv4StageKvExchangePeerPlan,
     Dsv4StagePlanGroup,
     Dsv4StagePlanSlot,
     Dsv4TensorExchangePlan,
@@ -73,15 +74,6 @@ class Dsv4StageKvExchangeWork(BaseModel):
             compressed_kv=compressed_kv,
             compressed_entry_ids=compressed_ids,
         )
-
-
-class Dsv4StageKvExchangePeerPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    send_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
-    send_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
-    recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
-    recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
 def build_dsv4_stage_inputs(
@@ -751,6 +743,7 @@ def launch_planned_dsv4_stage_kv_exchange(
     compressed_entry_ids: Sequence[int],
     group: Any,
     async_op: bool,
+    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
 ) -> Dsv4StageKvExchangeWork:
     """Launch one rank's fused stage KV exchange from DSV4 host metadata.
 
@@ -759,11 +752,12 @@ def launch_planned_dsv4_stage_kv_exchange(
     DSV4-specific planning outside the generic Flex CP executor.
     """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
-    peer_plans = build_dsv4_stage_kv_exchange_peer_plans(
+    plans = _stage_kv_peer_plans_or_build(
         layout=layout,
         stage_inputs_by_rank=stage_inputs_by_rank,
+        peer_plans=peer_plans,
     )
-    plan = peer_plans[rank_int]
+    plan = plans[rank_int]
     return launch_dsv4_stage_kv_exchange(
         stage_inputs=stage_inputs_by_rank[rank_int],
         query=query,
@@ -796,6 +790,7 @@ def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
     compressed_entry_ids: Sequence[int],
     group: Any,
     async_op: bool,
+    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
 ) -> Dsv4StageKvExchangeWork:
     """Launch one rank's fused stage KV exchange from an ART StagePlan slot.
 
@@ -811,11 +806,12 @@ def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
             "DSV4 stage slot and local inputs stage_index mismatch: "
             f"{stage_plan_slot.stage_index} vs {local_stage_inputs.stage_index}"
         )
-    peer_plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
+    plans = _stage_kv_peer_plans_or_build_from_slot(
         layout=layout,
-        stage_plans_by_rank=stage_plan_slot.stage_plans_by_rank,
+        stage_plan_slot=stage_plan_slot,
+        peer_plans=peer_plans,
     )
-    plan = peer_plans[rank_int]
+    plan = plans[rank_int]
     return launch_dsv4_stage_kv_exchange(
         stage_inputs=local_stage_inputs,
         query=query,
@@ -831,6 +827,55 @@ def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
         group=group,
         async_op=async_op,
     )
+
+
+def _stage_kv_peer_plans_or_build(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_inputs_by_rank: Sequence[Dsv4StageInputs],
+    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None,
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    if peer_plans is None:
+        return build_dsv4_stage_kv_exchange_peer_plans(
+            layout=layout,
+            stage_inputs_by_rank=stage_inputs_by_rank,
+        )
+    return _validate_stage_kv_peer_plan_count(
+        layout=layout,
+        peer_plans=peer_plans,
+    )
+
+
+def _stage_kv_peer_plans_or_build_from_slot(
+    *,
+    layout: Dsv4CompressedLayout,
+    stage_plan_slot: Dsv4StagePlanSlot,
+    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None,
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    if peer_plans is None:
+        return build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
+            layout=layout,
+            stage_plans_by_rank=stage_plan_slot.stage_plans_by_rank,
+        )
+    return _validate_stage_kv_peer_plan_count(
+        layout=layout,
+        peer_plans=peer_plans,
+    )
+
+
+def _validate_stage_kv_peer_plan_count(
+    *,
+    layout: Dsv4CompressedLayout,
+    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan],
+) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    plans = tuple(peer_plans)
+    rank_count = len(layout.entry_ids_by_owner_rank)
+    if len(plans) != rank_count:
+        raise RuntimeError(
+            "DSV4 prepared stage KV peer plan count must match rank count: "
+            f"{len(plans)} vs {rank_count}"
+        )
+    return plans
 
 
 def _stage_raw_token_ids(

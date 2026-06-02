@@ -16,9 +16,11 @@ from art.megatron.dsv4 import (
     build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
+    launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
     materialize_dsv4_stage_tensors,
     raw_swa_token_ids_for_query,
 )
+import art.megatron.dsv4.cp_stage as cp_stage
 
 
 class _LayoutIndex(BaseModel):
@@ -321,6 +323,79 @@ def test_stage_kv_exchange_plan_from_stage_plans_does_not_need_topk() -> None:
     )
 
     assert from_stage_plans == from_stage_inputs
+
+
+def test_stage_slot_exchange_uses_prepared_peer_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = _layout(Dsv4CompressionKind.CSA)
+    slot = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (_stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),),
+            (
+                _stage_plan(
+                    stage_index=5,
+                    q_ranges=((11, 12),),
+                    k_ranges=((8, 18),),
+                ),
+            ),
+        )
+    )[0]
+    local_stage_inputs = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=5,
+        query_token_ids=(7,),
+        global_k_ranges=(_Range(start=4, end=13),),
+        global_topk=torch.tensor([[[1, 2]]], dtype=torch.long),
+        window_size=4,
+    )
+    prepared = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
+        layout=layout,
+        stage_plans_by_rank=slot.stage_plans_by_rank,
+    )
+    captured: dict[str, object] = {}
+
+    def fail_rebuild(**_kwargs: object) -> object:
+        raise AssertionError("stage peer plan should be prepared")
+
+    def fake_launch(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        cp_stage,
+        "build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans",
+        fail_rebuild,
+    )
+    monkeypatch.setattr(cp_stage, "launch_dsv4_stage_kv_exchange", fake_launch)
+
+    result = launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
+        layout=layout,
+        rank=1,
+        stage_plan_slot=slot,
+        local_stage_inputs=local_stage_inputs,
+        query=torch.empty(1, 0, 1, 4),
+        query_token_ids=(),
+        raw_kv=torch.empty(0, 4),
+        raw_token_ids=(),
+        compressed_kv=torch.empty(0, 4),
+        compressed_entry_ids=(),
+        group=None,
+        async_op=False,
+        peer_plans=prepared,
+    )
+
+    assert result is not None
+    assert (
+        captured["send_raw_token_ids_by_peer"] == prepared[1].send_raw_token_ids_by_peer
+    )
+    assert (
+        captured["recv_raw_token_ids_by_peer"] == prepared[1].recv_raw_token_ids_by_peer
+    )
+    assert (
+        captured["send_compressed_entry_ids_by_peer"]
+        == prepared[1].send_compressed_entry_ids_by_peer
+    )
 
 
 def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:
