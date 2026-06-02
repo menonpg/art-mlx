@@ -1,5 +1,6 @@
 """DeepSeek-V4 context-parallel attention support."""
 
+from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .compressor import (
     accumulate_dsv4_compression_halo_gradient_payloads,
     build_dsv4_compressed_layout,
@@ -69,6 +70,8 @@ from .types import (
     Dsv4StageKeyKind,
     Dsv4StreamKind,
     Dsv4StreamSpec,
+    Dsv4TensorExchangePlan,
+    Dsv4TensorIdBuffer,
     Dsv4TokenInView,
     Dsv4TopkResult,
 )
@@ -98,6 +101,9 @@ __all__ = [
     "Dsv4SparseForwardResult",
     "Dsv4StreamKind",
     "Dsv4StreamSpec",
+    "Dsv4TensorExchangePlan",
+    "Dsv4TensorExchangeWork",
+    "Dsv4TensorIdBuffer",
     "Dsv4TokenInView",
     "Dsv4TopkResult",
     "accumulate_dsv4_compression_halo_gradient_payloads",
@@ -118,6 +124,7 @@ __all__ = [
     "dsv4_disabled_attn_sink",
     "dsv4_sparse_bwd",
     "dsv4_sparse_fwd",
+    "launch_dsv4_tensor_exchange",
     "merge_single_sink_branch",
     "merge_indexer_topk_results",
     "merge_materialized_stage_records",

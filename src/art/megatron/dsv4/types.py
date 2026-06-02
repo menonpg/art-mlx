@@ -104,6 +104,20 @@ class Dsv4ProjectedTokenBuffer(BaseModel):
     projected_gate: torch.Tensor
 
 
+class Dsv4TensorExchangePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    send_ids_by_peer: tuple[tuple[int, ...], ...]
+    recv_ids_by_peer: tuple[tuple[int, ...], ...]
+
+
+class Dsv4TensorIdBuffer(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    ids: tuple[int, ...]
+    tensor: torch.Tensor
+
+
 class Dsv4CompressionHaloPayload(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -265,6 +279,8 @@ class Dsv4ContextParallelState(BaseModel):
 
 Dsv4TopkResult.model_rebuild()
 Dsv4ProjectedTokenBuffer.model_rebuild()
+Dsv4TensorExchangePlan.model_rebuild()
+Dsv4TensorIdBuffer.model_rebuild()
 Dsv4CompressionHaloPayload.model_rebuild()
 Dsv4CompressionHaloGradientPayload.model_rebuild()
 Dsv4StageInputs.model_rebuild()
