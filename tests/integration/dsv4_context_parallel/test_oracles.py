@@ -652,6 +652,29 @@ def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle(
         init_path.unlink()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or not cast(Any, torch.distributed).is_nccl_available(),
+    reason="DSV4 CUDA/NCCL oracle requires at least two CUDA devices and NCCL",
+)
+def test_distributed_projected_hca_ratio128_boundary_matches_packed_oracle_cuda_nccl(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_projected_hca_ratio128_oracle_nccl"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_hca_ratio128_nccl_oracle_worker,
+        args=(2, str(init_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     max_visible = max(
         sum(
@@ -1198,7 +1221,49 @@ def _distributed_projected_hca_ratio128_oracle_worker(
             token_count=416,
             seed=137,
             expect_rank0_halo_grad=True,
+            rtol=1e-4,
+            atol=1e-4,
         )
+    finally:
+        destroy_process_group()
+
+
+def _distributed_projected_hca_ratio128_nccl_oracle_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29632")
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_fwd", _dense_fake_fwd)
+        setattr(cp_attention.sparse_kernel, "dsv4_sparse_bwd", _dense_fake_bwd)
+        layout = _hca_ratio128_boundary_layout()
+        _run_distributed_projected_hca_oracle_case(
+            rank=rank,
+            layout=layout,
+            stage_plan_slots=_two_rank_full_stage_slot(
+                first_rank_end=96,
+                token_count=416,
+            ),
+            local_token_ids=tuple(range(0, 96)) if rank == 0 else tuple(range(96, 416)),
+            token_count=416,
+            seed=139,
+            expect_rank0_halo_grad=True,
+            device=device,
+            dtype=torch.float32,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        torch.cuda.synchronize(device)
     finally:
         destroy_process_group()
 
@@ -1227,17 +1292,28 @@ def _run_distributed_projected_hca_oracle_case(
     token_count: int,
     seed: int,
     expect_rank0_halo_grad: bool,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
+    rtol: float = 1e-6,
+    atol: float = 1e-6,
 ) -> None:
     if expect_rank0_halo_grad:
         assert layout.halo_transfers
+    if device is None:
+        device = torch.device("cpu")
     torch.manual_seed(seed)
-    query = torch.randn(token_count, 2, 4, dtype=torch.float64)
-    raw_kv = torch.randn(token_count, 4, dtype=torch.float64)
-    projected_kv = torch.randn(token_count, 4, dtype=torch.float64)
-    projected_gate = torch.randn(token_count, 4, dtype=torch.float64)
-    positional_bias = torch.randn(int(layout.spec.ratio), 4, dtype=torch.float64)
-    attn_sink = torch.randn(2, dtype=torch.float64)
-    grad_out = torch.randn(1, token_count, 2, 4, dtype=torch.float64)
+    query = torch.randn(token_count, 2, 4, device=device, dtype=dtype)
+    raw_kv = torch.randn(token_count, 4, device=device, dtype=dtype)
+    projected_kv = torch.randn(token_count, 4, device=device, dtype=dtype)
+    projected_gate = torch.randn(token_count, 4, device=device, dtype=dtype)
+    positional_bias = torch.randn(
+        int(layout.spec.ratio),
+        4,
+        device=device,
+        dtype=dtype,
+    )
+    attn_sink = torch.randn(2, device=device, dtype=dtype)
+    grad_out = torch.randn(1, token_count, 2, 4, device=device, dtype=dtype)
 
     forward = launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
         layout=layout,
@@ -1276,18 +1352,18 @@ def _run_distributed_projected_hca_oracle_case(
         window_size=128,
         scale=0.25,
     )
-    local_positions = torch.tensor(local_token_ids, dtype=torch.long)
+    local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
     torch.testing.assert_close(
         forward.attention.out,
         expected.out.index_select(1, local_positions),
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=rtol,
+        atol=atol,
     )
     torch.testing.assert_close(
         forward.attention.lse,
         expected.lse.index_select(1, local_positions),
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=rtol,
+        atol=atol,
         check_dtype=False,
     )
 
@@ -1335,33 +1411,41 @@ def _run_distributed_projected_hca_oracle_case(
         actual=backward.attention.dq,
         actual_ids=backward.attention.query_token_ids,
         expected=ref_query.grad.unsqueeze(0),
+        rtol=rtol,
+        atol=atol,
     )
     _assert_id_aligned_rows_close(
         actual=backward.attention.draw_kv,
         actual_ids=backward.attention.raw_token_ids,
         expected=ref_raw.grad.unsqueeze(0),
+        rtol=rtol,
+        atol=atol,
     )
     _assert_id_aligned_rows_close(
         actual=backward.main_compressor.dprojected_kv,
         actual_ids=backward.main_compressor.token_ids,
         expected=ref_projected.grad,
+        rtol=rtol,
+        atol=atol,
     )
     _assert_id_aligned_rows_close(
         actual=backward.main_compressor.dprojected_gate,
         actual_ids=backward.main_compressor.token_ids,
         expected=ref_gate.grad,
+        rtol=rtol,
+        atol=atol,
     )
     torch.testing.assert_close(
         backward.main_compressor.dpositional_bias,
         ref_bias.grad,
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=rtol,
+        atol=atol,
     )
     torch.testing.assert_close(
         backward.attention.d_attn_sink,
         ref_sink.grad,
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=rtol,
+        atol=atol,
     )
     assert not bool(backward.attention.dq.abs().sum().eq(0).item())
     assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
@@ -1440,23 +1524,24 @@ def _dense_fake_bwd(
     )
     dselected = value_grad + dselected_from_key
     dkv = torch.zeros_like(kv)
-    safe_topk = topk.clamp_min(0).to(device=kv.device)
-    for batch in range(int(kv.shape[0])):
-        for query_index in range(int(q.shape[1])):
-            for list_index in range(int(topk.shape[-1])):
-                if not bool(valid[batch, query_index, list_index].item()):
-                    continue
-                key_index = int(safe_topk[batch, query_index, list_index].item())
-                dkv[batch, key_index] += (
-                    dselected[
-                        batch,
-                        query_index,
-                        :,
-                        list_index,
-                    ]
-                    .sum(dim=0)
-                    .to(dtype=dkv.dtype)
-                )
+    if int(kv.shape[1]) > 0 and int(topk.shape[-1]) > 0:
+        safe_topk = topk.to(device=kv.device, dtype=torch.long)
+        if safe_topk.shape[0] == 1 and int(kv.shape[0]) != 1:
+            safe_topk = safe_topk.expand(int(kv.shape[0]), *safe_topk.shape[1:])
+        safe_topk = safe_topk.clamp_min(0)
+        dselected_by_key = dselected.sum(dim=2).to(dtype=dkv.dtype)
+        dselected_by_key = torch.where(
+            valid.unsqueeze(-1),
+            dselected_by_key,
+            torch.zeros_like(dselected_by_key),
+        )
+        flat_index = safe_topk.reshape(int(kv.shape[0]), -1, 1).expand(
+            -1,
+            -1,
+            int(kv.shape[-1]),
+        )
+        flat_source = dselected_by_key.reshape(int(kv.shape[0]), -1, int(kv.shape[-1]))
+        dkv.scatter_add_(dim=1, index=flat_index, src=flat_source)
     return Dsv4SparseBackwardResult(
         dq=dq.to(dtype=q.dtype),
         dkv=dkv,
