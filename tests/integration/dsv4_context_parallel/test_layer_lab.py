@@ -127,13 +127,44 @@ def test_layer_lab_runtime_metrics_aggregate_rank_max(tmp_path) -> None:
     )
     assert (
         metrics[
+            "single_family_two_branches_cp2_csa_exposed_forward_comm_wait_median"
+        ].value
+        == 4.5
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_compression_halo_wait_median"].value
+        == 1.5
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_indexer_kv_wait_median"].value
+        == 1.0
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_stage_kv_wait_median"].value == 2.0
+    )
+    assert (
+        metrics[
             "single_family_two_branches_cp2_csa_stage_materialization_forward_median"
         ].value
         == 2.5
     )
     assert (
-        metrics["single_family_two_branches_cp2_csa_sparse_merge_forward_median"].value
+        metrics["single_family_two_branches_cp2_csa_sparse_kernel_forward_median"].value
         == 4.5
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_stage_merge_forward_median"].value
+        == 0.5
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_sink_merge_forward_median"].value
+        == 0.25
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_exposed_backward_comm_wait_median"
+        ].value
+        == 0.75
     )
     assert (
         metrics[
@@ -227,10 +258,17 @@ def _runtime_timing(
         compression_forward_ms=(3.0, 4.0),
         attention_forward_ms=(6.0, 7.0),
         indexer_forward_ms=(1.0, 2.0),
+        exposed_forward_comm_wait_ms=(4.0, 5.0),
+        compression_halo_wait_ms=(1.0, 2.0),
+        indexer_kv_wait_ms=(0.5, 1.5),
+        stage_kv_wait_ms=(1.5, 2.5),
         stage_materialization_forward_ms=(2.0, 3.0),
-        sparse_merge_forward_ms=(4.0, 5.0),
+        sparse_kernel_forward_ms=(4.0, 5.0),
+        stage_merge_forward_ms=(0.25, 0.75),
+        sink_merge_forward_ms=(0.125, 0.375),
         backward_launch_ms=(1.0, 1.0),
         backward_wait_ms=(1.0, 1.0),
+        exposed_backward_comm_wait_ms=(0.5, 1.0),
         backward_total_ms=backward_total_ms,
         e2e_ms=e2e_ms,
         peak_allocated_bytes=1024,

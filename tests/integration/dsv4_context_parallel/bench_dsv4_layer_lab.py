@@ -112,10 +112,17 @@ class RankRuntimeTiming(BaseModel):
     compression_forward_ms: tuple[float, ...]
     attention_forward_ms: tuple[float, ...]
     indexer_forward_ms: tuple[float, ...]
+    exposed_forward_comm_wait_ms: tuple[float, ...]
+    compression_halo_wait_ms: tuple[float, ...]
+    indexer_kv_wait_ms: tuple[float, ...]
+    stage_kv_wait_ms: tuple[float, ...]
     stage_materialization_forward_ms: tuple[float, ...]
-    sparse_merge_forward_ms: tuple[float, ...]
+    sparse_kernel_forward_ms: tuple[float, ...]
+    stage_merge_forward_ms: tuple[float, ...]
+    sink_merge_forward_ms: tuple[float, ...]
     backward_launch_ms: tuple[float, ...]
     backward_wait_ms: tuple[float, ...]
+    exposed_backward_comm_wait_ms: tuple[float, ...]
     backward_total_ms: tuple[float, ...]
     e2e_ms: tuple[float, ...]
     peak_allocated_bytes: int
@@ -146,11 +153,24 @@ class RuntimeTiming(BaseModel):
         compression_forward = _iteration_rank_max(self.ranks, "compression_forward_ms")
         attention_forward = _iteration_rank_max(self.ranks, "attention_forward_ms")
         indexer_forward = _iteration_rank_max(self.ranks, "indexer_forward_ms")
+        exposed_forward_comm_wait = _iteration_rank_max(
+            self.ranks, "exposed_forward_comm_wait_ms"
+        )
+        compression_halo_wait = _iteration_rank_max(
+            self.ranks, "compression_halo_wait_ms"
+        )
+        indexer_kv_wait = _iteration_rank_max(self.ranks, "indexer_kv_wait_ms")
+        stage_kv_wait = _iteration_rank_max(self.ranks, "stage_kv_wait_ms")
         stage_materialization_forward = _iteration_rank_max(
             self.ranks, "stage_materialization_forward_ms"
         )
-        sparse_merge_forward = _iteration_rank_max(
-            self.ranks, "sparse_merge_forward_ms"
+        sparse_kernel_forward = _iteration_rank_max(
+            self.ranks, "sparse_kernel_forward_ms"
+        )
+        stage_merge_forward = _iteration_rank_max(self.ranks, "stage_merge_forward_ms")
+        sink_merge_forward = _iteration_rank_max(self.ranks, "sink_merge_forward_ms")
+        exposed_backward_comm_wait = _iteration_rank_max(
+            self.ranks, "exposed_backward_comm_wait_ms"
         )
         backward_total = _iteration_rank_max(self.ranks, "backward_total_ms")
         e2e = _iteration_rank_max(self.ranks, "e2e_ms")
@@ -230,6 +250,46 @@ class RuntimeTiming(BaseModel):
                 unit="ms",
             ),
             Dsv4Metric(
+                name=f"{prefix}_exposed_forward_comm_wait_median",
+                value=_median(exposed_forward_comm_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_exposed_forward_comm_wait_p90",
+                value=_percentile(exposed_forward_comm_wait, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_compression_halo_wait_median",
+                value=_median(compression_halo_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_compression_halo_wait_p90",
+                value=_percentile(compression_halo_wait, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_indexer_kv_wait_median",
+                value=_median(indexer_kv_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_indexer_kv_wait_p90",
+                value=_percentile(indexer_kv_wait, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_stage_kv_wait_median",
+                value=_median(stage_kv_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_stage_kv_wait_p90",
+                value=_percentile(stage_kv_wait, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
                 name=f"{prefix}_stage_materialization_forward_median",
                 value=_median(stage_materialization_forward),
                 unit="ms",
@@ -240,13 +300,33 @@ class RuntimeTiming(BaseModel):
                 unit="ms",
             ),
             Dsv4Metric(
-                name=f"{prefix}_sparse_merge_forward_median",
-                value=_median(sparse_merge_forward),
+                name=f"{prefix}_sparse_kernel_forward_median",
+                value=_median(sparse_kernel_forward),
                 unit="ms",
             ),
             Dsv4Metric(
-                name=f"{prefix}_sparse_merge_forward_p90",
-                value=_percentile(sparse_merge_forward, 90),
+                name=f"{prefix}_sparse_kernel_forward_p90",
+                value=_percentile(sparse_kernel_forward, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_stage_merge_forward_median",
+                value=_median(stage_merge_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_stage_merge_forward_p90",
+                value=_percentile(stage_merge_forward, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_sink_merge_forward_median",
+                value=_median(sink_merge_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_sink_merge_forward_p90",
+                value=_percentile(sink_merge_forward, 90),
                 unit="ms",
             ),
             Dsv4Metric(
@@ -257,6 +337,16 @@ class RuntimeTiming(BaseModel):
             Dsv4Metric(
                 name=f"{prefix}_backward_total_p90",
                 value=_percentile(backward_total, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_exposed_backward_comm_wait_median",
+                value=_median(exposed_backward_comm_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_exposed_backward_comm_wait_p90",
+                value=_percentile(exposed_backward_comm_wait, 90),
                 unit="ms",
             ),
             Dsv4Metric(
@@ -411,8 +501,14 @@ class RuntimeForwardPhase(BaseModel):
     compression_ms: float
     attention_ms: float
     indexer_ms: float
+    exposed_comm_wait_ms: float
+    compression_halo_wait_ms: float
+    indexer_kv_wait_ms: float
+    stage_kv_wait_ms: float
     stage_materialization_ms: float
-    sparse_merge_ms: float
+    sparse_kernel_ms: float
+    stage_merge_ms: float
+    sink_merge_ms: float
 
 
 class RuntimeStageAttentionPhase(BaseModel):
@@ -421,8 +517,11 @@ class RuntimeStageAttentionPhase(BaseModel):
     attention: Any
     total_ms: float
     launch_ms: float
+    kv_wait_ms: float
     materialization_ms: float
-    sparse_merge_ms: float
+    sparse_kernel_ms: float
+    stage_merge_ms: float
+    sink_merge_ms: float
 
 
 class LabResult(BaseModel):
@@ -613,7 +712,7 @@ def run_runtime_benchmark(
     caveats = (
         "projected-input runtime benchmark; surrounding DSV4 model projections, RMSNorm, RoPE, and output projection are excluded until the non-CP DSV4 handler exists",
         "uses real prepared ART CP state plus public DSV4 compression, indexer/stage-attention, and projected-backward APIs",
-        "forward phase timings split public compression, CSA indexer, stage exchange/materialization, and sparse-kernel/merge execution without production debug hooks",
+        "forward phase timings split public compression, CSA indexer, exposed communication waits, stage exchange/materialization, Miles sparse-kernel execution, real-key stage merge, and sink merge without production debug hooks",
         "planned communication bytes are per-iteration explicit row-exchange bytes derived from DSV4 peer plans and exclude collective algorithm internals for sink and positional-bias all-reduces",
         "phase medians and p90s are rank-max aggregates per phase and are diagnostic rather than additive",
         "warmup excludes first-use TileLang compilation and setup where the iteration count is large enough to amortize it",
@@ -913,8 +1012,15 @@ def _time_runtime_kind(
     compression_forward_ms: list[float] = []
     attention_forward_ms: list[float] = []
     indexer_forward_ms: list[float] = []
+    exposed_forward_comm_wait_ms: list[float] = []
+    compression_halo_wait_ms: list[float] = []
+    indexer_kv_wait_ms: list[float] = []
+    stage_kv_wait_ms: list[float] = []
     stage_materialization_forward_ms: list[float] = []
-    sparse_merge_forward_ms: list[float] = []
+    sparse_kernel_forward_ms: list[float] = []
+    stage_merge_forward_ms: list[float] = []
+    sink_merge_forward_ms: list[float] = []
+    exposed_backward_comm_wait_ms: list[float] = []
     e2e_ms: list[float] = []
     output_abs_sum = 0.0
     dq_abs_sum = 0.0
@@ -977,6 +1083,9 @@ def _time_runtime_kind(
             )
         )
         bwd_launch = _elapsed_ms(bwd_start)
+        exposed_bwd_wait_start = time.perf_counter()
+        backward_work.attention_work.wait()
+        exposed_bwd_wait = _elapsed_ms(exposed_bwd_wait_start)
         bwd_wait_start = time.perf_counter()
         backward = backward_work.wait_post_process()
         torch.cuda.synchronize(device)
@@ -990,12 +1099,19 @@ def _time_runtime_kind(
             compression_forward_ms.append(forward_phase.compression_ms)
             attention_forward_ms.append(forward_phase.attention_ms)
             indexer_forward_ms.append(forward_phase.indexer_ms)
+            exposed_forward_comm_wait_ms.append(forward_phase.exposed_comm_wait_ms)
+            compression_halo_wait_ms.append(forward_phase.compression_halo_wait_ms)
+            indexer_kv_wait_ms.append(forward_phase.indexer_kv_wait_ms)
+            stage_kv_wait_ms.append(forward_phase.stage_kv_wait_ms)
             stage_materialization_forward_ms.append(
                 forward_phase.stage_materialization_ms
             )
-            sparse_merge_forward_ms.append(forward_phase.sparse_merge_ms)
+            sparse_kernel_forward_ms.append(forward_phase.sparse_kernel_ms)
+            stage_merge_forward_ms.append(forward_phase.stage_merge_ms)
+            sink_merge_forward_ms.append(forward_phase.sink_merge_ms)
             backward_launch_ms.append(bwd_launch)
             backward_wait_ms.append(bwd_wait)
+            exposed_backward_comm_wait_ms.append(exposed_bwd_wait)
             backward_total_ms.append(bwd_total)
             e2e_ms.append(total)
             nonfinite_count += _nonfinite_count(forward.attention.out)
@@ -1025,10 +1141,17 @@ def _time_runtime_kind(
         compression_forward_ms=tuple(compression_forward_ms),
         attention_forward_ms=tuple(attention_forward_ms),
         indexer_forward_ms=tuple(indexer_forward_ms),
+        exposed_forward_comm_wait_ms=tuple(exposed_forward_comm_wait_ms),
+        compression_halo_wait_ms=tuple(compression_halo_wait_ms),
+        indexer_kv_wait_ms=tuple(indexer_kv_wait_ms),
+        stage_kv_wait_ms=tuple(stage_kv_wait_ms),
         stage_materialization_forward_ms=tuple(stage_materialization_forward_ms),
-        sparse_merge_forward_ms=tuple(sparse_merge_forward_ms),
+        sparse_kernel_forward_ms=tuple(sparse_kernel_forward_ms),
+        stage_merge_forward_ms=tuple(stage_merge_forward_ms),
+        sink_merge_forward_ms=tuple(sink_merge_forward_ms),
         backward_launch_ms=tuple(backward_launch_ms),
         backward_wait_ms=tuple(backward_wait_ms),
+        exposed_backward_comm_wait_ms=tuple(exposed_backward_comm_wait_ms),
         backward_total_ms=tuple(backward_total_ms),
         e2e_ms=tuple(e2e_ms),
         peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
@@ -1432,6 +1555,10 @@ def _run_runtime_csa_forward(
             async_op=True,
         )
     compression_launch_ms = _elapsed_ms(fwd_start)
+    compression_wait_start = time.perf_counter()
+    main_work.wait()
+    indexer_work.wait()
+    compression_halo_wait_ms = _elapsed_ms(compression_wait_start)
     main_compressed = main_work.wait_post_process()
     indexer_compressed = indexer_work.wait_post_process()
     torch.cuda.synchronize(device)
@@ -1439,7 +1566,7 @@ def _run_runtime_csa_forward(
 
     attention_start = time.perf_counter()
     indexer_start = time.perf_counter()
-    topk_result = launch_dsv4_indexer_topk_from_stage_plans(
+    topk_work = launch_dsv4_indexer_topk_from_stage_plans(
         layout=layout,
         rank=int(context_state.cp_state.rank_plan.rank),
         indexer_stage_plans=plan.csa_indexer_stage_plans,
@@ -1452,7 +1579,11 @@ def _run_runtime_csa_forward(
         group=context_state.cp_state.cp_group,
         async_op=True,
         indexer_kv_peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage or None,
-    ).wait_post_process()
+    )
+    indexer_wait_start = time.perf_counter()
+    topk_work.wait()
+    indexer_kv_wait_ms = _elapsed_ms(indexer_wait_start)
+    topk_result = topk_work.wait_post_process()
     torch.cuda.synchronize(device)
     indexer_ms = _elapsed_ms(indexer_start)
     stage_phase = _run_runtime_stage_attention_forward(
@@ -1487,8 +1618,16 @@ def _run_runtime_csa_forward(
         compression_ms=compression_ms,
         attention_ms=attention_ms,
         indexer_ms=indexer_ms,
+        exposed_comm_wait_ms=(
+            compression_halo_wait_ms + indexer_kv_wait_ms + stage_phase.kv_wait_ms
+        ),
+        compression_halo_wait_ms=compression_halo_wait_ms,
+        indexer_kv_wait_ms=indexer_kv_wait_ms,
+        stage_kv_wait_ms=stage_phase.kv_wait_ms,
         stage_materialization_ms=stage_phase.materialization_ms,
-        sparse_merge_ms=stage_phase.sparse_merge_ms,
+        sparse_kernel_ms=stage_phase.sparse_kernel_ms,
+        stage_merge_ms=stage_phase.stage_merge_ms,
+        sink_merge_ms=stage_phase.sink_merge_ms,
     )
 
 
@@ -1534,6 +1673,9 @@ def _run_runtime_hca_forward(
             async_op=True,
         )
     compression_launch_ms = _elapsed_ms(fwd_start)
+    compression_wait_start = time.perf_counter()
+    compressed_work.wait()
+    compression_halo_wait_ms = _elapsed_ms(compression_wait_start)
     compressed = compressed_work.wait_post_process()
     torch.cuda.synchronize(device)
     compression_ms = _elapsed_ms(fwd_start)
@@ -1570,8 +1712,14 @@ def _run_runtime_hca_forward(
         compression_ms=compression_ms,
         attention_ms=attention_ms,
         indexer_ms=0.0,
+        exposed_comm_wait_ms=compression_halo_wait_ms + stage_phase.kv_wait_ms,
+        compression_halo_wait_ms=compression_halo_wait_ms,
+        indexer_kv_wait_ms=0.0,
+        stage_kv_wait_ms=stage_phase.kv_wait_ms,
         stage_materialization_ms=stage_phase.materialization_ms,
-        sparse_merge_ms=stage_phase.sparse_merge_ms,
+        sparse_kernel_ms=stage_phase.sparse_kernel_ms,
+        stage_merge_ms=stage_phase.stage_merge_ms,
+        sink_merge_ms=stage_phase.sink_merge_ms,
     )
 
 
@@ -1594,10 +1742,15 @@ def _run_runtime_stage_attention_forward(
     stage_kv_peer_plans_by_slot: tuple[tuple[Any, ...], ...] | None,
 ) -> RuntimeStageAttentionPhase:
     from art.megatron.dsv4 import (
+        Dsv4AttentionForwardResult,
         Dsv4CompressionKind,
+        Dsv4StageForwardRecord,
         build_dsv4_stage_inputs_from_stage_plan,
+        dsv4_disabled_attn_sink,
+        dsv4_sparse_fwd,
         launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
-        run_materialized_dsv4_attention_forward,
+        merge_materialized_stage_records,
+        merge_single_sink_branch,
     )
 
     rank = int(context_state.cp_state.rank_plan.rank)
@@ -1642,25 +1795,64 @@ def _run_runtime_stage_attention_forward(
             )
         )
     launch_ms = _elapsed_ms(stage_start)
+    kv_wait_start = time.perf_counter()
+    for work in stage_works:
+        work.wait()
+    kv_wait_ms = _elapsed_ms(kv_wait_start)
     materialization_start = time.perf_counter()
     stages = tuple(work.wait_post_process() for work in stage_works)
     torch.cuda.synchronize(device)
     materialization_ms = _elapsed_ms(materialization_start)
-    sparse_merge_start = time.perf_counter()
-    attention = run_materialized_dsv4_attention_forward(
-        stages=stages,
+    sparse_kernel_start = time.perf_counter()
+    disabled_sink = dsv4_disabled_attn_sink(attn_sink)
+    records = []
+    for stage in stages:
+        stage_result = dsv4_sparse_fwd(
+            q=stage.q_stage,
+            kv=stage.kv_stage,
+            attn_sink=disabled_sink,
+            topk=stage.topk_stage_local,
+            scale=scale,
+        )
+        records.append(
+            Dsv4StageForwardRecord(
+                materialized_stage=stage,
+                out=stage_result.out,
+                lse=stage_result.lse,
+            )
+        )
+    torch.cuda.synchronize(device)
+    sparse_kernel_ms = _elapsed_ms(sparse_kernel_start)
+    stage_merge_start = time.perf_counter()
+    real_out, real_lse = merge_materialized_stage_records(
+        records=tuple(records),
+        query_token_ids=query_token_ids,
+    )
+    torch.cuda.synchronize(device)
+    stage_merge_ms = _elapsed_ms(stage_merge_start)
+    sink_merge_start = time.perf_counter()
+    out, lse = merge_single_sink_branch(real_out, real_lse, attn_sink)
+    torch.cuda.synchronize(device)
+    sink_merge_ms = _elapsed_ms(sink_merge_start)
+    attention = Dsv4AttentionForwardResult(
+        out=out,
+        lse=lse,
+        real_out=real_out,
+        real_lse=real_lse,
         query_token_ids=query_token_ids,
         attn_sink=attn_sink,
         scale=scale,
+        stage_records=tuple(records),
     )
-    torch.cuda.synchronize(device)
-    sparse_merge_ms = _elapsed_ms(sparse_merge_start)
     return RuntimeStageAttentionPhase(
         attention=attention,
         total_ms=_elapsed_ms(stage_start),
         launch_ms=launch_ms,
+        kv_wait_ms=kv_wait_ms,
         materialization_ms=materialization_ms,
-        sparse_merge_ms=sparse_merge_ms,
+        sparse_kernel_ms=sparse_kernel_ms,
+        stage_merge_ms=stage_merge_ms,
+        sink_merge_ms=sink_merge_ms,
     )
 
 
