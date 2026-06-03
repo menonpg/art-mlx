@@ -307,50 +307,72 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
     def _ensure_attention_work(self) -> Any:
         if self._attention_work is not None:
             return self._attention_work
-        with torch.no_grad():
-            self._main_compressed = self.main_compression_work.wait_post_process()
-            if self.indexer_compression_work is not None:
-                self._indexer_compressed = (
-                    self.indexer_compression_work.wait_post_process()
-                )
         if self.compression_kind == Dsv4CompressionKind.CSA:
             if (
-                self._indexer_compressed is None
+                self.indexer_compression_work is None
                 or self.indexer_q is None
                 or self.indexer_weights is None
                 or self.indexer_topk is None
             ):
                 raise RuntimeError("DSV4 CSA projected attention requires indexer data")
-            self._attention_work = (
-                launch_dsv4_csa_attention_forward_from_stage_plan_slots(
-                    layout=self.layout,
-                    rank=int(self.rank),
-                    stage_plan_slots=self.stage_plan_slots,
-                    query=self.query,
-                    query_token_ids=self.query_token_ids,
-                    raw_kv=self.raw_kv,
-                    raw_token_ids=self.raw_token_ids,
-                    compressed_kv=self._main_compressed.compressed_kv,
-                    compressed_entry_ids=self._main_compressed.compressed_entry_ids,
-                    indexer_q=self.indexer_q,
-                    indexer_weights=self.indexer_weights,
-                    indexer_kv=self._indexer_compressed.compressed_kv,
-                    indexer_kv_entry_ids=self._indexer_compressed.compressed_entry_ids,
-                    indexer_topk=int(self.indexer_topk),
-                    indexer_stage_plans=self.indexer_stage_plans,
-                    indexer_kv_peer_plans_by_stage=self.indexer_kv_peer_plans_by_stage,
-                    stage_kv_peer_plans_by_slot=self.stage_kv_peer_plans_by_slot,
-                    attn_sink=self.attn_sink,
-                    group=self.group,
-                    async_op=bool(self.async_op),
-                    indexer_score_scale=float(self.indexer_score_scale),
-                    scale=self.scale,
-                    window_size=int(self.window_size),
-                    raw_list_size=self.raw_list_size,
-                    compressed_list_size=self.compressed_list_size,
+            (
+                rank_int,
+                slots,
+                query_ids,
+                indexer_stage_plans,
+                stage_kv_peer_plans,
+            ) = _prepare_csa_stage_plan_slot_launch(
+                layout=self.layout,
+                rank=int(self.rank),
+                stage_plan_slots=self.stage_plan_slots,
+                query_token_ids=self.query_token_ids,
+                indexer_stage_plans=self.indexer_stage_plans,
+                stage_kv_peer_plans_by_slot=self.stage_kv_peer_plans_by_slot,
+            )
+            with torch.no_grad():
+                self._indexer_compressed = (
+                    self.indexer_compression_work.wait_post_process()
                 )
+            topk_work = _launch_dsv4_csa_indexer_topk_from_prepared_slots(
+                layout=self.layout,
+                rank=rank_int,
+                indexer_stage_plans=indexer_stage_plans,
+                query_token_ids=query_ids,
+                indexer_q=self.indexer_q,
+                indexer_weights=self.indexer_weights,
+                indexer_kv=self._indexer_compressed.compressed_kv,
+                indexer_kv_entry_ids=self._indexer_compressed.compressed_entry_ids,
+                indexer_topk=int(self.indexer_topk),
+                group=self.group,
+                async_op=bool(self.async_op),
+                indexer_score_scale=float(self.indexer_score_scale),
+                indexer_kv_peer_plans_by_stage=self.indexer_kv_peer_plans_by_stage,
+            )
+            with torch.no_grad():
+                self._main_compressed = self.main_compression_work.wait_post_process()
+            self._attention_work = _launch_dsv4_csa_attention_forward_from_topk_work(
+                layout=self.layout,
+                rank=rank_int,
+                slots=slots,
+                query=self.query,
+                query_token_ids=query_ids,
+                raw_kv=self.raw_kv,
+                raw_token_ids=self.raw_token_ids,
+                compressed_kv=self._main_compressed.compressed_kv,
+                compressed_entry_ids=self._main_compressed.compressed_entry_ids,
+                topk_work=topk_work,
+                stage_kv_peer_plans_by_slot=stage_kv_peer_plans,
+                attn_sink=self.attn_sink,
+                group=self.group,
+                async_op=bool(self.async_op),
+                scale=self.scale,
+                window_size=int(self.window_size),
+                raw_list_size=self.raw_list_size,
+                compressed_list_size=self.compressed_list_size,
             )
         elif self.compression_kind == Dsv4CompressionKind.HCA:
+            with torch.no_grad():
+                self._main_compressed = self.main_compression_work.wait_post_process()
             self._attention_work = (
                 launch_dsv4_hca_attention_forward_from_stage_plan_slots(
                     layout=self.layout,
@@ -635,43 +657,21 @@ def launch_dsv4_attention_forward_from_stage_plan_groups(
     )
 
 
-@torch.compiler.disable
-def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+def _prepare_csa_stage_plan_slot_launch(
     *,
     layout: Dsv4CompressedLayout,
     rank: int,
     stage_plan_slots: Sequence[Dsv4StagePlanSlot],
-    query: torch.Tensor,
     query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    compressed_kv: torch.Tensor,
-    compressed_entry_ids: Sequence[int],
-    indexer_q: torch.Tensor,
-    indexer_weights: torch.Tensor,
-    indexer_kv: torch.Tensor,
-    indexer_kv_entry_ids: Sequence[int],
-    indexer_topk: int,
-    attn_sink: torch.Tensor,
-    group: Any,
-    async_op: bool,
-    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
-    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
-    | None = None,
-    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
-    | None = None,
-    indexer_score_scale: float = 1.0,
-    scale: float | None = None,
-    window_size: int = 128,
-    raw_list_size: int | None = None,
-    compressed_list_size: int | None = None,
-) -> Dsv4ExchangedAttentionForwardWork:
-    """Launch DSV4 CSA CP forward from ART StagePlan slots.
-
-    The indexer topk is local to this rank's query rows. Stage KV exchange
-    planning remains topk-independent and uses all ranks' StagePlan K ranges, so
-    this path does not require gathering live topk ids from peer ranks.
-    """
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]] | None,
+) -> tuple[
+    int,
+    tuple[Dsv4StagePlanSlot, ...],
+    tuple[int, ...],
+    tuple[Dsv4IndexerStagePlan, ...],
+    tuple[tuple[Dsv4StageKvExchangePeerPlan, ...], ...] | None,
+]:
     rank_int = int(rank)
     _validate_exchange_rank(
         rank=rank_int, rank_count=len(layout.entry_ids_by_owner_rank)
@@ -709,26 +709,78 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
             )
             for slot in slots
         )
-    indexer_stage_plans = prepared_indexer_stage_plans
-    topk_work = launch_dsv4_indexer_topk_from_stage_plans(
-        layout=layout,
-        rank=rank_int,
-        indexer_stage_plans=indexer_stage_plans,
-        query_token_ids=query_ids,
-        indexer_q=indexer_q,
-        indexer_weights=indexer_weights,
-        indexer_kv=indexer_kv,
-        indexer_kv_entry_ids=indexer_kv_entry_ids,
-        topk=indexer_topk,
-        group=group,
-        async_op=async_op,
-        score_scale=indexer_score_scale,
-        indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
+    return (
+        rank_int,
+        slots,
+        query_ids,
+        prepared_indexer_stage_plans,
+        prepared_stage_kv_peer_plans,
     )
+
+
+@torch.compiler.disable
+def _launch_dsv4_csa_indexer_topk_from_prepared_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan],
+    query_token_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    indexer_topk: int,
+    group: Any,
+    async_op: bool,
+    indexer_score_scale: float,
+    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
+    | None,
+) -> Any:
+    with torch.no_grad():
+        return launch_dsv4_indexer_topk_from_stage_plans(
+            layout=layout,
+            rank=int(rank),
+            indexer_stage_plans=indexer_stage_plans,
+            query_token_ids=query_token_ids,
+            indexer_q=indexer_q,
+            indexer_weights=indexer_weights,
+            indexer_kv=indexer_kv,
+            indexer_kv_entry_ids=indexer_kv_entry_ids,
+            topk=indexer_topk,
+            group=group,
+            async_op=async_op,
+            score_scale=indexer_score_scale,
+            indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
+        )
+
+
+@torch.compiler.disable
+def _launch_dsv4_csa_attention_forward_from_topk_work(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    slots: Sequence[Dsv4StagePlanSlot],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    topk_work: Any,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]] | None,
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    scale: float | None,
+    window_size: int,
+    raw_list_size: int | None,
+    compressed_list_size: int | None,
+) -> Dsv4ExchangedAttentionForwardWork:
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
     deferred_stage_works = tuple(
         launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot(
             layout=layout,
-            rank=rank_int,
+            rank=int(rank),
             stage_plan_slot=slot,
             query=query,
             query_token_ids=query_ids,
@@ -738,8 +790,8 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
             compressed_entry_ids=compressed_entry_ids,
             group=group,
             async_op=async_op,
-            peer_plans=prepared_stage_kv_peer_plans[stage_position]
-            if prepared_stage_kv_peer_plans is not None
+            peer_plans=stage_kv_peer_plans_by_slot[stage_position]
+            if stage_kv_peer_plans_by_slot is not None
             else None,
         )
         for stage_position, slot in enumerate(slots)
@@ -749,7 +801,7 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
         stage_work.bind_stage_inputs(
             build_dsv4_stage_inputs_from_stage_plan(
                 layout=layout,
-                stage_plan=slot.stage_plans_by_rank[rank_int],
+                stage_plan=slot.stage_plans_by_rank[int(rank)],
                 compression_kind=Dsv4CompressionKind.CSA,
                 global_topk=topk_result.indices,
                 topk_query_token_ids=query_ids,
@@ -766,6 +818,94 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
         query_token_ids=query_ids,
         attn_sink=attn_sink,
         scale=scale,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_kv: torch.Tensor,
+    indexer_kv_entry_ids: Sequence[int],
+    indexer_topk: int,
+    attn_sink: torch.Tensor,
+    group: Any,
+    async_op: bool,
+    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
+    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
+    | None = None,
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    | None = None,
+    indexer_score_scale: float = 1.0,
+    scale: float | None = None,
+    window_size: int = 128,
+    raw_list_size: int | None = None,
+    compressed_list_size: int | None = None,
+) -> Dsv4ExchangedAttentionForwardWork:
+    """Launch DSV4 CSA CP forward from ART StagePlan slots.
+
+    The indexer topk is local to this rank's query rows. Stage KV exchange
+    planning remains topk-independent and uses all ranks' StagePlan K ranges, so
+    this path does not require gathering live topk ids from peer ranks.
+    """
+    (
+        rank_int,
+        slots,
+        query_ids,
+        prepared_indexer_stage_plans,
+        prepared_stage_kv_peer_plans,
+    ) = _prepare_csa_stage_plan_slot_launch(
+        layout=layout,
+        rank=rank,
+        stage_plan_slots=stage_plan_slots,
+        query_token_ids=query_token_ids,
+        indexer_stage_plans=indexer_stage_plans,
+        stage_kv_peer_plans_by_slot=stage_kv_peer_plans_by_slot,
+    )
+    topk_work = _launch_dsv4_csa_indexer_topk_from_prepared_slots(
+        layout=layout,
+        rank=rank_int,
+        indexer_stage_plans=prepared_indexer_stage_plans,
+        query_token_ids=query_ids,
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_kv=indexer_kv,
+        indexer_kv_entry_ids=indexer_kv_entry_ids,
+        indexer_topk=indexer_topk,
+        group=group,
+        async_op=async_op,
+        indexer_score_scale=indexer_score_scale,
+        indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
+    )
+    return _launch_dsv4_csa_attention_forward_from_topk_work(
+        layout=layout,
+        rank=rank_int,
+        slots=slots,
+        query=query,
+        query_token_ids=query_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_entry_ids,
+        topk_work=topk_work,
+        stage_kv_peer_plans_by_slot=prepared_stage_kv_peer_plans,
+        attn_sink=attn_sink,
+        group=group,
+        async_op=async_op,
+        scale=scale,
+        window_size=window_size,
+        raw_list_size=raw_list_size,
+        compressed_list_size=compressed_list_size,
     )
 
 

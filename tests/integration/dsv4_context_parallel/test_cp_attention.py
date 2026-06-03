@@ -551,6 +551,128 @@ def test_csa_attention_forward_prelaunches_stage_kv_before_waiting_topk(
     assert "stage_wait_post_process" in events
 
 
+def test_csa_projected_attention_launches_topk_before_main_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    original_wait_post_process = (
+        cp_attention.Dsv4CompressedKvForwardWork.wait_post_process
+    )
+
+    def traced_compression_wait(
+        self: cp_attention.Dsv4CompressedKvForwardWork,
+    ) -> object:
+        label = (
+            "indexer_compression"
+            if int(self.projected_kv.shape[-1]) == 4
+            else "main_compression"
+        )
+        events.append(label)
+        return original_wait_post_process(self)
+
+    class _TopkWork:
+        def wait(self) -> None:
+            events.append("topk_wait")
+
+        def wait_post_process(self) -> Dsv4TopkResult:
+            events.append("topk_wait_post_process")
+            assert "stage_launch" in events
+            return Dsv4TopkResult(
+                indices=torch.tensor([[[0, 1], [0, 1]]], dtype=torch.long),
+                scores=torch.tensor([[[2.0, 1.0], [2.0, 1.0]]], dtype=torch.float32),
+            )
+
+    class _DeferredStageWork:
+        def bind_stage_inputs(self, stage_inputs: object) -> object:
+            events.append("stage_bind")
+            assert stage_inputs is not None
+            return _StageWork()
+
+    class _StageWork:
+        def wait(self) -> None:
+            events.append("stage_wait")
+
+        def wait_post_process(self) -> Dsv4MaterializedStage:
+            events.append("stage_wait_post_process")
+            return _materialized_stage(0, (3, 7))
+
+    def fake_topk_launch(**kwargs: object) -> _TopkWork:
+        events.append("topk_launch")
+        assert not torch.is_grad_enabled()
+        assert cast(torch.Tensor, kwargs["indexer_q"]).requires_grad
+        assert cast(torch.Tensor, kwargs["indexer_weights"]).requires_grad
+        assert "indexer_compression" in events
+        assert "main_compression" not in events
+        return _TopkWork()
+
+    def fake_stage_launch(**_kwargs: object) -> _DeferredStageWork:
+        events.append("stage_launch")
+        assert "main_compression" in events
+        assert events.index("topk_launch") < events.index("main_compression")
+        return _DeferredStageWork()
+
+    monkeypatch.setattr(
+        cp_attention.Dsv4CompressedKvForwardWork,
+        "wait_post_process",
+        traced_compression_wait,
+    )
+    monkeypatch.setattr(
+        cp_attention,
+        "launch_dsv4_indexer_topk_from_stage_plans",
+        fake_topk_launch,
+    )
+    monkeypatch.setattr(
+        cp_attention,
+        "launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot",
+        fake_stage_launch,
+    )
+
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    main_kv, main_gate, main_bias = _projected_inputs(width=6)
+    indexer_kv, indexer_gate, indexer_bias = _projected_inputs(width=4)
+    compression = launch_dsv4_csa_projected_compression_forward(
+        layout=layout,
+        rank=0,
+        main_projected_kv=main_kv,
+        main_projected_gate=main_gate,
+        main_positional_bias=main_bias,
+        main_token_ids=tuple(range(8)),
+        indexer_projected_kv=indexer_kv,
+        indexer_projected_gate=indexer_gate,
+        indexer_positional_bias=indexer_bias,
+        indexer_token_ids=tuple(range(8)),
+        group=None,
+        async_op=True,
+    )
+
+    work = launch_dsv4_csa_projected_attention_forward_from_compression_work(
+        compression_work=compression,
+        stage_plan_slots=_single_rank_slots(),
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        indexer_q=torch.zeros(2, 1, 2, dtype=torch.float32, requires_grad=True),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float32, requires_grad=True),
+        indexer_topk=2,
+        attn_sink=torch.zeros(2, dtype=torch.float64),
+        group=None,
+        async_op=True,
+        window_size=4,
+    )
+    work.wait()
+
+    assert events == [
+        "indexer_compression",
+        "topk_launch",
+        "main_compression",
+        "stage_launch",
+        "topk_wait_post_process",
+        "stage_bind",
+        "stage_wait",
+    ]
+
+
 def test_hca_attention_forward_launcher_uses_stage_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
