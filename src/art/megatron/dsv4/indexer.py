@@ -1262,12 +1262,6 @@ def _branch_view_by_stream(
     raise RuntimeError(f"DSV4 missing branch view {branch_stream_id}")
 
 
-def _token_in_ranges(token_id: int, ranges: Sequence[TokenRangeLike]) -> bool:
-    return any(
-        int(range_.start) <= int(token_id) < int(range_.end) for range_ in ranges
-    )
-
-
 def _ensure_batched_q(indexer_q: torch.Tensor) -> torch.Tensor:
     if indexer_q.ndim == 3:
         return indexer_q.unsqueeze(0)

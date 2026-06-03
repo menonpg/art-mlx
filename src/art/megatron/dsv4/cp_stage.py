@@ -1409,13 +1409,6 @@ def _stage_token_dim(tensor: torch.Tensor) -> int:
     return 0 if tensor.ndim == 2 else 1
 
 
-def _token_in_layout(*, layout: Dsv4CompressedLayout, token_id: int) -> bool:
-    return any(
-        int(stream.start) <= int(token_id) < int(stream.end)
-        for stream in layout.streams
-    )
-
-
 def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int], ...]:
     return tuple(
         sorted((int(stream.start), int(stream.end)) for stream in layout.streams)

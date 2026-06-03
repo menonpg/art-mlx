@@ -10,7 +10,6 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     build_dsv4_compressed_layout,
 )
-from art.megatron.dsv4.compressor import position_in_query_view
 
 
 class _LayoutIndex(BaseModel):
@@ -122,9 +121,9 @@ def test_branch_view_position_maps_only_visible_tokens() -> None:
     )
     branch_one = layout.branch_views[1]
 
-    assert position_in_query_view(branch_view=branch_one, candidate_token_id=6) == 6
-    assert position_in_query_view(branch_view=branch_one, candidate_token_id=10) == 10
-    assert position_in_query_view(branch_view=branch_one, candidate_token_id=14) is None
+    assert branch_one.position_of_token(6) == 6
+    assert branch_one.position_of_token(10) == 10
+    assert branch_one.position_of_token(14) is None
 
 
 def test_layout_rejects_non_tail_padding() -> None:

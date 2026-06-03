@@ -1340,83 +1340,6 @@ def launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_
 
 
 @torch.compiler.disable
-def launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
-    *,
-    context_state: Dsv4ContextParallelState,
-    query: torch.Tensor,
-    query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    main_projected_kv: torch.Tensor,
-    main_projected_gate: torch.Tensor,
-    main_positional_bias: torch.Tensor,
-    main_token_ids: Sequence[int],
-    indexer_projected_kv: torch.Tensor,
-    indexer_projected_gate: torch.Tensor,
-    indexer_positional_bias: torch.Tensor,
-    indexer_token_ids: Sequence[int],
-    indexer_q: torch.Tensor,
-    indexer_weights: torch.Tensor,
-    indexer_topk: int,
-    attn_sink: torch.Tensor,
-    async_op: bool,
-    indexer_score_scale: float = 1.0,
-    scale: float | None = None,
-    window_size: int = 128,
-    raw_list_size: int | None = None,
-    compressed_list_size: int | None = None,
-) -> Dsv4ProjectedAttentionForwardWork:
-    """Launch projected-input CSA DSV4 CP from prepared DSV4 metadata.
-
-    This is the model-handler-facing adapter: it unpacks the host-ahead DSV4
-    plan from `Dsv4ContextParallelState` and delegates to the StagePlan-slot
-    launcher. It performs no activation-dependent planning and keeps custom
-    communication eager/outside compiled regions.
-    """
-    _require_prepared_layout(
-        context_state=context_state,
-        kind=Dsv4CompressionKind.CSA,
-    )
-    _require_prepared_stage_slots(context_state)
-    if not context_state.dsv4_plan.csa_indexer_stage_plans:
-        raise RuntimeError(
-            "DSV4 prepared CSA context state is missing indexer StagePlans"
-        )
-    compression_work = (
-        launch_dsv4_csa_projected_compression_forward_from_context_parallel_state(
-            context_state=context_state,
-            main_projected_kv=main_projected_kv,
-            main_projected_gate=main_projected_gate,
-            main_positional_bias=main_positional_bias,
-            main_token_ids=main_token_ids,
-            indexer_projected_kv=indexer_projected_kv,
-            indexer_projected_gate=indexer_projected_gate,
-            indexer_positional_bias=indexer_positional_bias,
-            indexer_token_ids=indexer_token_ids,
-            async_op=async_op,
-        )
-    )
-    return launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work(
-        context_state=context_state,
-        compression_work=compression_work,
-        query=query,
-        query_token_ids=query_token_ids,
-        raw_kv=raw_kv,
-        raw_token_ids=raw_token_ids,
-        indexer_q=indexer_q,
-        indexer_weights=indexer_weights,
-        indexer_topk=indexer_topk,
-        attn_sink=attn_sink,
-        async_op=async_op,
-        indexer_score_scale=indexer_score_scale,
-        scale=scale,
-        window_size=window_size,
-        raw_list_size=raw_list_size,
-        compressed_list_size=compressed_list_size,
-    )
-
-
-@torch.compiler.disable
 def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
     *,
     layout: Dsv4CompressedLayout,
@@ -1534,57 +1457,6 @@ def launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_
         async_op=async_op,
         stage_kv_peer_plans_by_slot=context_state.dsv4_plan.hca_stage_kv_peer_plans_by_slot
         or None,
-        scale=scale,
-        window_size=window_size,
-        raw_list_size=raw_list_size,
-        compressed_list_size=compressed_list_size,
-    )
-
-
-@torch.compiler.disable
-def launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
-    *,
-    context_state: Dsv4ContextParallelState,
-    query: torch.Tensor,
-    query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    projected_kv: torch.Tensor,
-    projected_gate: torch.Tensor,
-    positional_bias: torch.Tensor,
-    token_ids: Sequence[int],
-    attn_sink: torch.Tensor,
-    async_op: bool,
-    scale: float | None = None,
-    window_size: int = 128,
-    raw_list_size: int | None = None,
-    compressed_list_size: int | None = None,
-) -> Dsv4ProjectedAttentionForwardWork:
-    """Launch projected-input HCA DSV4 CP from prepared DSV4 metadata."""
-    _require_prepared_layout(
-        context_state=context_state,
-        kind=Dsv4CompressionKind.HCA,
-    )
-    _require_prepared_stage_slots(context_state)
-    compression_work = (
-        launch_dsv4_hca_projected_compression_forward_from_context_parallel_state(
-            context_state=context_state,
-            projected_kv=projected_kv,
-            projected_gate=projected_gate,
-            positional_bias=positional_bias,
-            token_ids=token_ids,
-            async_op=async_op,
-        )
-    )
-    return launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work(
-        context_state=context_state,
-        compression_work=compression_work,
-        query=query,
-        query_token_ids=query_token_ids,
-        raw_kv=raw_kv,
-        raw_token_ids=raw_token_ids,
-        attn_sink=attn_sink,
-        async_op=async_op,
         scale=scale,
         window_size=window_size,
         raw_list_size=raw_list_size,
@@ -2363,34 +2235,6 @@ def _slot_stage_indices(slots: Sequence[Dsv4StagePlanSlot]) -> tuple[int, ...]:
     return tuple(int(slot.stage_index) for slot in slots)
 
 
-def _stage_plan_slot_gradient_id_spaces(
-    *,
-    layout: Dsv4CompressedLayout,
-    slots: Sequence[Dsv4StagePlanSlot],
-) -> tuple[
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-]:
-    query_raw_ids = _stage_plan_slot_query_raw_id_spaces(layout=layout, slots=slots)
-    return (
-        query_raw_ids[0],
-        query_raw_ids[1],
-        _stage_plan_slot_compressed_id_spaces(layout=layout, slots=slots),
-    )
-
-
-def _stage_plan_slot_query_raw_id_spaces(
-    *,
-    layout: Dsv4CompressedLayout,
-    slots: Sequence[Dsv4StagePlanSlot],
-) -> tuple[
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-]:
-    return _stage_plan_slot_query_raw_id_and_owner_spaces(layout=layout, slots=slots)[0]
-
-
 def _stage_plan_slot_query_raw_id_and_owner_spaces(
     *,
     layout: Dsv4CompressedLayout,
@@ -2571,61 +2415,6 @@ def _append_unique_seen(target: list[int], seen: set[int], ids: Sequence[int]) -
             seen.add(id_int)
 
 
-def _gradient_owner_spaces(
-    *,
-    layout: Dsv4CompressedLayout,
-    id_spaces: tuple[
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-    ],
-) -> tuple[
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-]:
-    query_raw_owners = _query_raw_owner_spaces(
-        layout=layout,
-        id_spaces=(id_spaces[0], id_spaces[1]),
-    )
-    return (
-        query_raw_owners[0],
-        query_raw_owners[1],
-        _compressed_owner_spaces(
-            layout=layout,
-            compressed_ids_by_rank=id_spaces[2],
-        ),
-    )
-
-
-def _query_raw_owner_spaces(
-    *,
-    layout: Dsv4CompressedLayout,
-    id_spaces: tuple[
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-    ],
-) -> tuple[
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-]:
-    raw_owner_ranks = layout.raw_token_owner_ranks
-    return (
-        tuple(
-            _raw_owner_ranks_for_ids(
-                raw_owner_ranks=raw_owner_ranks, token_ids=rank_ids
-            )
-            for rank_ids in id_spaces[0]
-        ),
-        tuple(
-            _raw_owner_ranks_for_ids(
-                raw_owner_ranks=raw_owner_ranks, token_ids=rank_ids
-            )
-            for rank_ids in id_spaces[1]
-        ),
-    )
-
-
 def _compressed_owner_spaces(
     *,
     layout: Dsv4CompressedLayout,
@@ -2748,69 +2537,6 @@ def _gradient_recv_and_owned_by_rank(
     )
 
 
-def _recv_gradient_ids_by_peer(
-    *,
-    ids_by_rank: tuple[tuple[int, ...], ...],
-    owners_by_rank: tuple[tuple[int, ...], ...],
-    rank: int,
-    rank_count: int,
-) -> tuple[tuple[int, ...], ...]:
-    if len(ids_by_rank) != int(rank_count):
-        raise RuntimeError(
-            "DSV4 gradient id space rank count mismatch: "
-            f"{len(ids_by_rank)} vs {rank_count}"
-        )
-    if len(owners_by_rank) != int(rank_count):
-        raise RuntimeError(
-            "DSV4 gradient owner space rank count mismatch: "
-            f"{len(owners_by_rank)} vs {rank_count}"
-        )
-    return tuple(
-        tuple(
-            id_
-            for id_, owner_rank in zip(peer_ids, peer_owners, strict=True)
-            if int(owner_rank) == int(rank)
-        )
-        for peer_ids, peer_owners in zip(ids_by_rank, owners_by_rank, strict=True)
-    )
-
-
-def _owned_gradient_ids(
-    *,
-    ids_by_rank: tuple[tuple[int, ...], ...],
-    owners_by_rank: tuple[tuple[int, ...], ...],
-    rank: int,
-) -> tuple[int, ...]:
-    owned: list[int] = []
-    seen: set[int] = set()
-    for peer_ids, peer_owners in zip(ids_by_rank, owners_by_rank, strict=True):
-        for id_, owner_rank in zip(peer_ids, peer_owners, strict=True):
-            id_int = int(id_)
-            if int(owner_rank) == int(rank) and id_int not in seen:
-                owned.append(id_int)
-                seen.add(id_int)
-    return tuple(owned)
-
-
-def _raw_token_ids_from_ranges(
-    *,
-    layout: Dsv4CompressedLayout,
-    ranges: Sequence[Any],
-) -> tuple[int, ...]:
-    ids: list[int] = []
-    seen: set[int] = set()
-    for range_ in ranges:
-        for token_id in range(int(range_.start), int(range_.end)):
-            if token_id in seen:
-                continue
-            if 0 <= token_id < len(layout.raw_token_owner_ranks):
-                owner = int(layout.raw_token_owner_ranks[token_id])
-                if owner >= 0:
-                    ids.append(token_id)
-                    seen.add(token_id)
-    return tuple(ids)
-
-
 def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int], ...]:
     return tuple(
         sorted((int(stream.start), int(stream.end)) for stream in layout.streams)
@@ -2823,33 +2549,6 @@ def _token_ids_from_ranges(ranges: Sequence[Any]) -> tuple[int, ...]:
         ids.extend(range(int(range_.start), int(range_.end)))
     _row_by_id(ids=tuple(ids), name="stage_plan_token_ranges")
     return tuple(ids)
-
-
-def _raw_owner_ranks_for_ids(
-    *,
-    raw_owner_ranks: Sequence[int],
-    token_ids: Sequence[int],
-) -> tuple[int, ...]:
-    owners: list[int] = []
-    for token_id in token_ids:
-        token_int = int(token_id)
-        if token_int < 0 or token_int >= len(raw_owner_ranks):
-            raise RuntimeError(f"DSV4 raw/query token {token_int} has no CP owner")
-        owner = int(raw_owner_ranks[token_int])
-        if owner < 0:
-            raise RuntimeError(f"DSV4 raw/query token {token_int} has no CP owner")
-        owners.append(owner)
-    return tuple(owners)
-
-
-def _raw_owner_rank(raw_owner_ranks: Sequence[int], token_id: int) -> int:
-    token_int = int(token_id)
-    if token_int < 0 or token_int >= len(raw_owner_ranks):
-        raise RuntimeError(f"DSV4 raw/query token {token_int} has no CP owner")
-    owner = int(raw_owner_ranks[token_int])
-    if owner < 0:
-        raise RuntimeError(f"DSV4 raw/query token {token_int} has no CP owner")
-    return owner
 
 
 def _compressed_owner_rank(

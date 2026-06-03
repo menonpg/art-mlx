@@ -27,16 +27,20 @@ class Dsv4StreamKind(str, Enum):
     COMPLETION = "completion"
 
 
-class Dsv4CompressionSpec(BaseModel):
+class Dsv4FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+
+class Dsv4TensorModel(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+
+class Dsv4CompressionSpec(Dsv4FrozenModel):
     kind: Dsv4CompressionKind
     ratio: int
 
 
-class Dsv4StreamSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4StreamSpec(Dsv4FrozenModel):
     stream_id: int
     kind: Dsv4StreamKind
     parent_stream_id: int | None
@@ -47,18 +51,14 @@ class Dsv4StreamSpec(BaseModel):
         return int(self.end) - int(self.start)
 
 
-class Dsv4TokenInView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4TokenInView(Dsv4FrozenModel):
     packed_token_id: int
     stream_id: int
     view_pos: int
     stream_pos: int
 
 
-class Dsv4BranchView(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4BranchView(Dsv4FrozenModel):
     branch_stream_id: int
     prefix_stream_id: int
     suffix_stream_id: int | None
@@ -75,22 +75,6 @@ class Dsv4BranchView(BaseModel):
         if self.suffix_start is None or self.suffix_end is None:
             return 0
         return int(self.suffix_end) - int(self.suffix_start)
-
-    def token_id_at(self, view_pos: int) -> int:
-        pos = int(view_pos)
-        if pos < 0 or pos >= self.size():
-            raise RuntimeError(
-                f"DSV4 branch view {self.branch_stream_id} position {pos} "
-                f"is outside length {self.size()}"
-            )
-        prefix_count = int(self.prefix_token_count)
-        if pos < prefix_count:
-            return int(self.prefix_start) + pos
-        if self.suffix_start is None:
-            raise RuntimeError(
-                f"DSV4 branch view {self.branch_stream_id} has no suffix position {pos}"
-            )
-        return int(self.suffix_start) + pos - prefix_count
 
     def position_of_token(self, token_id: int) -> int | None:
         token = int(token_id)
@@ -140,9 +124,7 @@ class Dsv4BranchView(BaseModel):
         return tuple(tokens)
 
 
-class Dsv4CompressedEntry(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4CompressedEntry(Dsv4FrozenModel):
     entry_id: int
     kind: Dsv4CompressionKind
     ratio: int
@@ -158,40 +140,30 @@ class Dsv4CompressedEntry(BaseModel):
     branch_entry_index: int
 
 
-class Dsv4HaloTransfer(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4HaloTransfer(Dsv4FrozenModel):
     source_rank: int
     target_rank: int
     token_ids: tuple[int, ...]
     entry_ids: tuple[int, ...]
 
 
-class Dsv4ProjectedTokenBuffer(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4ProjectedTokenBuffer(Dsv4TensorModel):
     token_ids: tuple[int, ...]
     projected_kv: torch.Tensor
     projected_gate: torch.Tensor
 
 
-class Dsv4TensorExchangePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4TensorExchangePlan(Dsv4FrozenModel):
     send_ids_by_peer: tuple[tuple[int, ...], ...]
     recv_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
-class Dsv4TensorIdBuffer(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4TensorIdBuffer(Dsv4TensorModel):
     ids: tuple[int, ...]
     tensor: torch.Tensor
 
 
-class Dsv4CompressionHaloPayload(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4CompressionHaloPayload(Dsv4TensorModel):
     source_rank: int
     target_rank: int
     token_ids: tuple[int, ...]
@@ -200,9 +172,7 @@ class Dsv4CompressionHaloPayload(BaseModel):
     projected_gate: torch.Tensor
 
 
-class Dsv4CompressionHaloGradientPayload(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4CompressionHaloGradientPayload(Dsv4TensorModel):
     source_rank: int
     target_rank: int
     token_ids: tuple[int, ...]
@@ -211,9 +181,7 @@ class Dsv4CompressionHaloGradientPayload(BaseModel):
     dprojected_gate: torch.Tensor
 
 
-class Dsv4CompressedKvForwardResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4CompressedKvForwardResult(Dsv4TensorModel):
     layout: Dsv4CompressedLayout
     owner_rank: int
     local_token_ids: tuple[int, ...]
@@ -223,25 +191,19 @@ class Dsv4CompressedKvForwardResult(BaseModel):
     compressed_kv: torch.Tensor
 
 
-class Dsv4CompressedKvGradientResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4CompressedKvGradientResult(Dsv4TensorModel):
     token_ids: tuple[int, ...]
     dprojected_kv: torch.Tensor
     dprojected_gate: torch.Tensor
     dpositional_bias: torch.Tensor
 
 
-class Dsv4TopkResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4TopkResult(Dsv4TensorModel):
     indices: torch.Tensor
     scores: torch.Tensor
 
 
-class Dsv4StageInputs(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4StageInputs(Dsv4TensorModel):
     stage_index: int
     query_token_ids: tuple[int, ...]
     raw_token_ids: tuple[int, ...]
@@ -253,40 +215,30 @@ class Dsv4StageInputs(BaseModel):
     topk_stage_local: torch.Tensor
 
 
-class Dsv4IndexerStagePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4IndexerStagePlan(Dsv4FrozenModel):
     stage_index: int
     query_token_ids_by_rank: tuple[tuple[int, ...], ...]
     candidate_entry_ids_by_rank: tuple[tuple[int, ...], ...]
 
 
-class Dsv4IndexerKvExchangePeerPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4IndexerKvExchangePeerPlan(Dsv4FrozenModel):
     send_entry_ids_by_peer: tuple[tuple[int, ...], ...]
     recv_entry_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
-class Dsv4StagePlanSlot(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4StagePlanSlot(Dsv4TensorModel):
     stage_index: int
     stage_plans_by_rank: tuple[Any, ...]
 
 
-class Dsv4StageKvExchangePeerPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4StageKvExchangePeerPlan(Dsv4FrozenModel):
     send_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
     send_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
     recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
     recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
-class Dsv4MaterializedStage(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4MaterializedStage(Dsv4TensorModel):
     stage_index: int
     query_token_ids: tuple[int, ...]
     q_stage: torch.Tensor
@@ -298,32 +250,24 @@ class Dsv4MaterializedStage(BaseModel):
     key_global_ids: tuple[int, ...]
 
 
-class Dsv4SparseForwardResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4SparseForwardResult(Dsv4TensorModel):
     out: torch.Tensor
     lse: torch.Tensor
 
 
-class Dsv4SparseBackwardResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4SparseBackwardResult(Dsv4TensorModel):
     dq: torch.Tensor
     dkv: torch.Tensor
     d_attn_sink: torch.Tensor
 
 
-class Dsv4StageForwardRecord(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4StageForwardRecord(Dsv4TensorModel):
     materialized_stage: Dsv4MaterializedStage
     out: torch.Tensor
     lse: torch.Tensor
 
 
-class Dsv4AttentionForwardResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4AttentionForwardResult(Dsv4TensorModel):
     out: torch.Tensor
     lse: torch.Tensor
     real_out: torch.Tensor
@@ -334,24 +278,18 @@ class Dsv4AttentionForwardResult(BaseModel):
     stage_records: tuple[Dsv4StageForwardRecord, ...]
 
 
-class Dsv4StageBackwardRecord(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4StageBackwardRecord(Dsv4TensorModel):
     materialized_stage: Dsv4MaterializedStage
     dq_stage: torch.Tensor
     dkv_stage: torch.Tensor
 
 
-class Dsv4AttentionBackwardReplayResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4AttentionBackwardReplayResult(Dsv4TensorModel):
     stage_records: tuple[Dsv4StageBackwardRecord, ...]
     d_attn_sink: torch.Tensor
 
 
-class Dsv4AttentionGradientResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4AttentionGradientResult(Dsv4TensorModel):
     query_token_ids: tuple[int, ...]
     raw_token_ids: tuple[int, ...]
     compressed_entry_ids: tuple[int, ...]
@@ -361,9 +299,7 @@ class Dsv4AttentionGradientResult(BaseModel):
     d_attn_sink: torch.Tensor
 
 
-class Dsv4AttentionBackwardRankPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4AttentionBackwardRankPlan(Dsv4FrozenModel):
     query_token_ids: tuple[int, ...]
     raw_token_ids: tuple[int, ...]
     compressed_entry_ids: tuple[int, ...]
@@ -378,33 +314,25 @@ class Dsv4AttentionBackwardRankPlan(BaseModel):
     owned_compressed_entry_ids: tuple[int, ...]
 
 
-class Dsv4AttentionBackwardPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4AttentionBackwardPlan(Dsv4FrozenModel):
     compression_kind: Dsv4CompressionKind
     stage_indices: tuple[int, ...]
     rank_plans: tuple[Dsv4AttentionBackwardRankPlan, ...]
 
 
-class Dsv4ProjectedAttentionForwardResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4ProjectedAttentionForwardResult(Dsv4TensorModel):
     compression_kind: Dsv4CompressionKind
     attention: Dsv4AttentionForwardResult
     main_compressed: Dsv4CompressedKvForwardResult
     indexer_compressed: Dsv4CompressedKvForwardResult | None = None
 
 
-class Dsv4ProjectedAttentionGradientResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4ProjectedAttentionGradientResult(Dsv4TensorModel):
     attention: Dsv4AttentionGradientResult
     main_compressor: Dsv4CompressedKvGradientResult
 
 
-class Dsv4GradientOwnerBucket(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4GradientOwnerBucket(Dsv4TensorModel):
     owner_rank: int
     query_token_ids: tuple[int, ...]
     raw_token_ids: tuple[int, ...]
@@ -414,9 +342,7 @@ class Dsv4GradientOwnerBucket(BaseModel):
     dcompressed_kv: torch.Tensor
 
 
-class Dsv4CompressedLayout(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4CompressedLayout(Dsv4FrozenModel):
     spec: Dsv4CompressionSpec
     streams: tuple[Dsv4StreamSpec, ...]
     branch_views: tuple[Dsv4BranchView, ...]
@@ -441,9 +367,7 @@ class Dsv4CompressedLayout(BaseModel):
         return int(self.compressed_entry_count or len(self.entries))
 
 
-class Dsv4PreparedPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+class Dsv4PreparedPlan(Dsv4FrozenModel):
     csa_layout: Dsv4CompressedLayout | None = None
     hca_layout: Dsv4CompressedLayout | None = None
     stage_plan_slots: tuple[Dsv4StagePlanSlot, ...] = ()
@@ -461,9 +385,7 @@ class Dsv4PreparedPlan(BaseModel):
     hca_attention_backward_plan: Dsv4AttentionBackwardPlan | None = None
 
 
-class Dsv4ContextParallelState(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class Dsv4ContextParallelState(Dsv4TensorModel):
     cp_state: ArtContextParallelState
     dsv4_plan: Dsv4PreparedPlan
     extra: dict[str, Any] = Field(default_factory=dict)

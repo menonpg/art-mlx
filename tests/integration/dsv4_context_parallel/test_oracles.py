@@ -24,10 +24,12 @@ from art.megatron.dsv4 import (
     build_stage_local_topk_for_csa,
     compress_projected_kv,
     compute_indexer_topk,
-    launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
+    launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work,
     launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
-    launch_dsv4_hca_projected_attention_forward_from_context_parallel_state,
+    launch_dsv4_csa_projected_compression_forward_from_context_parallel_state,
+    launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work,
     launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_projected_compression_forward_from_context_parallel_state,
     launch_dsv4_projected_attention_backward_from_context_parallel_state,
     launch_dsv4_projected_attention_backward_from_stage_plan_slots,
     materialize_dsv4_stage_tensors,
@@ -1461,20 +1463,27 @@ def _run_real_planner_csa_context_oracle(
     )
     local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
 
-    forward = launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
+    compression = (
+        launch_dsv4_csa_projected_compression_forward_from_context_parallel_state(
+            context_state=context_state,
+            main_projected_kv=main_projected_kv[list(local_token_ids)],
+            main_projected_gate=main_projected_gate[list(local_token_ids)],
+            main_positional_bias=main_positional_bias,
+            main_token_ids=local_token_ids,
+            indexer_projected_kv=indexer_projected_kv[list(local_token_ids)],
+            indexer_projected_gate=indexer_projected_gate[list(local_token_ids)],
+            indexer_positional_bias=indexer_positional_bias,
+            indexer_token_ids=local_token_ids,
+            async_op=True,
+        )
+    )
+    forward = launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work(
         context_state=context_state,
+        compression_work=compression,
         query=query[list(local_token_ids)],
         query_token_ids=local_token_ids,
         raw_kv=raw_kv[list(local_token_ids)],
         raw_token_ids=local_token_ids,
-        main_projected_kv=main_projected_kv[list(local_token_ids)],
-        main_projected_gate=main_projected_gate[list(local_token_ids)],
-        main_positional_bias=main_positional_bias,
-        main_token_ids=local_token_ids,
-        indexer_projected_kv=indexer_projected_kv[list(local_token_ids)],
-        indexer_projected_gate=indexer_projected_gate[list(local_token_ids)],
-        indexer_positional_bias=indexer_positional_bias,
-        indexer_token_ids=local_token_ids,
         indexer_q=indexer_q[list(local_token_ids)],
         indexer_weights=indexer_weights[list(local_token_ids)],
         indexer_topk=2,
@@ -1736,16 +1745,23 @@ def _run_real_planner_hca_context_oracle(
     )
     local_positions = torch.tensor(local_token_ids, device=device, dtype=torch.long)
 
-    forward = launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
+    compression = (
+        launch_dsv4_hca_projected_compression_forward_from_context_parallel_state(
+            context_state=context_state,
+            projected_kv=projected_kv[list(local_token_ids)],
+            projected_gate=projected_gate[list(local_token_ids)],
+            positional_bias=positional_bias,
+            token_ids=local_token_ids,
+            async_op=True,
+        )
+    )
+    forward = launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work(
         context_state=context_state,
+        compression_work=compression,
         query=query[list(local_token_ids)],
         query_token_ids=local_token_ids,
         raw_kv=raw_kv[list(local_token_ids)],
         raw_token_ids=local_token_ids,
-        projected_kv=projected_kv[list(local_token_ids)],
-        projected_gate=projected_gate[list(local_token_ids)],
-        positional_bias=positional_bias,
-        token_ids=local_token_ids,
         attn_sink=attn_sink,
         async_op=True,
         scale=scale,

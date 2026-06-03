@@ -397,14 +397,6 @@ def build_dsv4_compressed_layouts_from_cp_state(
     )
 
 
-def position_in_query_view(
-    *,
-    branch_view: Dsv4BranchView,
-    candidate_token_id: int,
-) -> int | None:
-    return branch_view.position_of_token(candidate_token_id)
-
-
 def compress_projected_kv(
     *,
     layout: Dsv4CompressedLayout,
@@ -2682,32 +2674,6 @@ def _owner_change_positions(raw_token_owner_ranks: tuple[int, ...]) -> tuple[int
     )
 
 
-def _dependency_range_is_owned(
-    *,
-    raw_token_owner_ranks: tuple[int, ...],
-    owner_change_positions: tuple[int, ...],
-    start: int,
-    end: int,
-    owner_rank: int,
-) -> bool:
-    start_int = int(start)
-    end_int = int(end)
-    if start_int >= end_int:
-        return True
-    if start_int < 0 or end_int > len(raw_token_owner_ranks):
-        raise RuntimeError(f"DSV4 dependency range is outside ownership: {start}:{end}")
-    owner = int(owner_rank)
-    if int(raw_token_owner_ranks[start_int]) != owner:
-        return False
-    if int(raw_token_owner_ranks[end_int - 1]) != owner:
-        return False
-    boundary_index = bisect_left(owner_change_positions, start_int + 1)
-    return (
-        boundary_index >= len(owner_change_positions)
-        or int(owner_change_positions[boundary_index]) >= end_int
-    )
-
-
 def _expand_merged_token_ranges(
     ranges: Sequence[tuple[int, int]],
 ) -> tuple[int, ...]:
@@ -2820,23 +2786,6 @@ def _branch_token_id_at(*, branch_view: Dsv4BranchView, view_pos: int) -> int:
             f"DSV4 branch view {branch_view.branch_stream_id} has no suffix position {pos}"
         )
     return int(branch_view.suffix_start) + pos - prefix_count
-
-
-def _branch_token_ids_for_view_range(
-    *,
-    branch_view: Dsv4BranchView,
-    start: int,
-    end: int,
-) -> tuple[int, ...]:
-    return tuple(
-        token_id
-        for token_range in _branch_token_ranges_for_view_range(
-            branch_view=branch_view,
-            start=start,
-            end=end,
-        )
-        for token_id in token_range
-    )
 
 
 def _compression_dependency_token_ranges(
