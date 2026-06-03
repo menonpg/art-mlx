@@ -135,6 +135,54 @@ def test_layer_lab_runtime_metrics_aggregate_rank_max(tmp_path) -> None:
         metrics["single_family_two_branches_cp2_csa_sparse_merge_forward_median"].value
         == 4.5
     )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_forward_comm_send_bytes_total"
+        ].value
+        == 21.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_forward_comm_recv_bytes_total"
+        ].value
+        == 41.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_backward_comm_send_bytes_total"
+        ].value
+        == 61.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_backward_comm_recv_bytes_total"
+        ].value
+        == 81.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_explicit_comm_send_bytes_total"
+        ].value
+        == 82.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_explicit_comm_recv_bytes_total"
+        ].value
+        == 122.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_explicit_comm_send_bytes_rank_max"
+        ].value
+        == 42.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_csa_planned_explicit_comm_recv_bytes_rank_max"
+        ].value
+        == 62.0
+    )
     assert metrics["single_family_two_branches_cp2_csa_e2e_median"].value == 37.5
     assert metrics["single_family_two_branches_cp2_csa_output_abs_sum"].value == 5.0
     assert metrics["single_family_two_branches_cp2_csa_dq_abs_sum"].passed is True
@@ -187,6 +235,12 @@ def _runtime_timing(
         e2e_ms=e2e_ms,
         peak_allocated_bytes=1024,
         peak_reserved_bytes=2048,
+        planned_forward_comm_send_bytes=10 + rank,
+        planned_forward_comm_recv_bytes=20 + rank,
+        planned_backward_comm_send_bytes=30 + rank,
+        planned_backward_comm_recv_bytes=40 + rank,
+        planned_explicit_comm_send_bytes=40 + 2 * rank,
+        planned_explicit_comm_recv_bytes=60 + 2 * rank,
         output_abs_sum=output_abs_sum,
         dq_abs_sum=dq_abs_sum,
         compressor_grad_abs_sum=compressor_grad_abs_sum,

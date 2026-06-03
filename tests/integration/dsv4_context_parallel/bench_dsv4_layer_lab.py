@@ -120,6 +120,12 @@ class RankRuntimeTiming(BaseModel):
     e2e_ms: tuple[float, ...]
     peak_allocated_bytes: int
     peak_reserved_bytes: int
+    planned_forward_comm_send_bytes: int
+    planned_forward_comm_recv_bytes: int
+    planned_backward_comm_send_bytes: int
+    planned_backward_comm_recv_bytes: int
+    planned_explicit_comm_send_bytes: int
+    planned_explicit_comm_recv_bytes: int
     output_abs_sum: float
     dq_abs_sum: float
     compressor_grad_abs_sum: float
@@ -158,6 +164,20 @@ class RuntimeTiming(BaseModel):
         output_abs = sum(rank.output_abs_sum for rank in self.ranks)
         dq_abs = sum(rank.dq_abs_sum for rank in self.ranks)
         compressor_grad_abs = sum(rank.compressor_grad_abs_sum for rank in self.ranks)
+        forward_send = sum(rank.planned_forward_comm_send_bytes for rank in self.ranks)
+        forward_recv = sum(rank.planned_forward_comm_recv_bytes for rank in self.ranks)
+        backward_send = sum(
+            rank.planned_backward_comm_send_bytes for rank in self.ranks
+        )
+        backward_recv = sum(
+            rank.planned_backward_comm_recv_bytes for rank in self.ranks
+        )
+        explicit_send = sum(
+            rank.planned_explicit_comm_send_bytes for rank in self.ranks
+        )
+        explicit_recv = sum(
+            rank.planned_explicit_comm_recv_bytes for rank in self.ranks
+        )
         return (
             Dsv4Metric(
                 name=f"{prefix}_normal_cp_plan_max",
@@ -270,6 +290,50 @@ class RuntimeTiming(BaseModel):
                 unit="bytes",
             ),
             Dsv4Metric(
+                name=f"{prefix}_planned_forward_comm_send_bytes_total",
+                value=float(forward_send),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_forward_comm_recv_bytes_total",
+                value=float(forward_recv),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_backward_comm_send_bytes_total",
+                value=float(backward_send),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_backward_comm_recv_bytes_total",
+                value=float(backward_recv),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_explicit_comm_send_bytes_total",
+                value=float(explicit_send),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_explicit_comm_recv_bytes_total",
+                value=float(explicit_recv),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_explicit_comm_send_bytes_rank_max",
+                value=float(
+                    max(rank.planned_explicit_comm_send_bytes for rank in self.ranks)
+                ),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_planned_explicit_comm_recv_bytes_rank_max",
+                value=float(
+                    max(rank.planned_explicit_comm_recv_bytes for rank in self.ranks)
+                ),
+                unit="bytes",
+            ),
+            Dsv4Metric(
                 name=f"{prefix}_nonfinite_count",
                 value=float(nonfinite),
                 unit="",
@@ -322,6 +386,21 @@ class RuntimeForwardInputs(BaseModel):
     positional_bias: torch.Tensor | None = None
 
 
+class RuntimeExplicitCommBytes(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    forward_send_bytes: int
+    forward_recv_bytes: int
+    backward_send_bytes: int
+    backward_recv_bytes: int
+
+    def total_send_bytes(self) -> int:
+        return int(self.forward_send_bytes) + int(self.backward_send_bytes)
+
+    def total_recv_bytes(self) -> int:
+        return int(self.forward_recv_bytes) + int(self.backward_recv_bytes)
+
+
 class RuntimeForwardPhase(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -362,6 +441,7 @@ RankRuntimeTiming.model_rebuild()
 RuntimeTiming.model_rebuild()
 RankRuntimeOutput.model_rebuild()
 RuntimeForwardInputs.model_rebuild()
+RuntimeExplicitCommBytes.model_rebuild()
 RuntimeForwardPhase.model_rebuild()
 RuntimeStageAttentionPhase.model_rebuild()
 LabResult.model_rebuild()
@@ -534,6 +614,7 @@ def run_runtime_benchmark(
         "projected-input runtime benchmark; surrounding DSV4 model projections, RMSNorm, RoPE, and output projection are excluded until the non-CP DSV4 handler exists",
         "uses real prepared ART CP state plus public DSV4 compression, indexer/stage-attention, and projected-backward APIs",
         "forward phase timings split public compression, CSA indexer, stage exchange/materialization, and sparse-kernel/merge execution without production debug hooks",
+        "planned communication bytes are per-iteration explicit row-exchange bytes derived from DSV4 peer plans and exclude collective algorithm internals for sink and positional-bias all-reduces",
         "phase medians and p90s are rank-max aggregates per phase and are diagnostic rather than additive",
         "warmup excludes first-use TileLang compilation and setup where the iteration count is large enough to amortize it",
     )
@@ -846,6 +927,12 @@ def _time_runtime_kind(
         device=device,
         dtype=dtype,
     )
+    planned_comm = _planned_runtime_explicit_comm_bytes(
+        context_state=context_state,
+        compression_kind=compression_kind,
+        config=config,
+        dtype=dtype,
+    )
     if int(config.warmup) == 0:
         torch.cuda.reset_peak_memory_stats(device)
     for iteration in range(int(config.warmup) + int(config.iterations)):
@@ -946,6 +1033,12 @@ def _time_runtime_kind(
         e2e_ms=tuple(e2e_ms),
         peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
         peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        planned_forward_comm_send_bytes=int(planned_comm.forward_send_bytes),
+        planned_forward_comm_recv_bytes=int(planned_comm.forward_recv_bytes),
+        planned_backward_comm_send_bytes=int(planned_comm.backward_send_bytes),
+        planned_backward_comm_recv_bytes=int(planned_comm.backward_recv_bytes),
+        planned_explicit_comm_send_bytes=int(planned_comm.total_send_bytes()),
+        planned_explicit_comm_recv_bytes=int(planned_comm.total_recv_bytes()),
         output_abs_sum=float(output_abs_sum),
         dq_abs_sum=float(dq_abs_sum),
         compressor_grad_abs_sum=float(compressor_grad_abs_sum),
@@ -1023,6 +1116,261 @@ def _build_runtime_forward_inputs(
             ),
         )
     raise RuntimeError(f"unsupported runtime kind {compression_kind}")
+
+
+def _planned_runtime_explicit_comm_bytes(
+    *,
+    context_state: Any,
+    compression_kind: str,
+    config: RuntimeBenchmarkConfig,
+    dtype: torch.dtype,
+) -> RuntimeExplicitCommBytes:
+    rank = int(context_state.cp_state.rank_plan.rank)
+    element_bytes = int(torch.empty((), dtype=dtype).element_size())
+    head_dim = int(config.head_dim)
+    plan = context_state.dsv4_plan
+    if compression_kind == "csa":
+        layout = plan.csa_layout
+        backward_plan = plan.csa_attention_backward_plan
+        if layout is None or backward_plan is None:
+            raise RuntimeError("runtime CSA benchmark requires prepared comm plans")
+        main_compression_row_bytes = 4 * head_dim * element_bytes
+        indexer_compression_row_bytes = 4 * int(config.indexer_dim) * element_bytes
+        compression_forward = _planned_halo_exchange_bytes(
+            layout=layout,
+            rank=rank,
+            row_bytes=main_compression_row_bytes + indexer_compression_row_bytes,
+        )
+        compression_backward = _planned_reverse_halo_exchange_bytes(
+            layout=layout,
+            rank=rank,
+            row_bytes=main_compression_row_bytes,
+        )
+        indexer_forward = _planned_indexer_exchange_bytes(
+            peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage,
+            rank=rank,
+            row_bytes=int(config.indexer_dim) * element_bytes,
+        )
+        stage_forward = _planned_stage_exchange_bytes(
+            peer_plans_by_slot=plan.csa_stage_kv_peer_plans_by_slot,
+            rank=rank,
+            row_bytes=head_dim * element_bytes,
+        )
+    elif compression_kind == "hca":
+        layout = plan.hca_layout
+        backward_plan = plan.hca_attention_backward_plan
+        if layout is None or backward_plan is None:
+            raise RuntimeError("runtime HCA benchmark requires prepared comm plans")
+        compression_row_bytes = 2 * head_dim * element_bytes
+        compression_forward = _planned_halo_exchange_bytes(
+            layout=layout,
+            rank=rank,
+            row_bytes=compression_row_bytes,
+        )
+        compression_backward = _planned_reverse_halo_exchange_bytes(
+            layout=layout,
+            rank=rank,
+            row_bytes=compression_row_bytes,
+        )
+        indexer_forward = RuntimeExplicitCommBytes(
+            forward_send_bytes=0,
+            forward_recv_bytes=0,
+            backward_send_bytes=0,
+            backward_recv_bytes=0,
+        )
+        stage_forward = _planned_stage_exchange_bytes(
+            peer_plans_by_slot=plan.hca_stage_kv_peer_plans_by_slot,
+            rank=rank,
+            row_bytes=head_dim * element_bytes,
+        )
+    else:
+        raise RuntimeError(f"unsupported runtime kind {compression_kind}")
+    attention_backward = _planned_attention_backward_exchange_bytes(
+        backward_plan=backward_plan,
+        rank=rank,
+        query_row_bytes=int(config.head_count) * head_dim * element_bytes,
+        kv_row_bytes=head_dim * element_bytes,
+    )
+    return RuntimeExplicitCommBytes(
+        forward_send_bytes=(
+            compression_forward.forward_send_bytes
+            + indexer_forward.forward_send_bytes
+            + stage_forward.forward_send_bytes
+        ),
+        forward_recv_bytes=(
+            compression_forward.forward_recv_bytes
+            + indexer_forward.forward_recv_bytes
+            + stage_forward.forward_recv_bytes
+        ),
+        backward_send_bytes=(
+            attention_backward.backward_send_bytes
+            + compression_backward.backward_send_bytes
+        ),
+        backward_recv_bytes=(
+            attention_backward.backward_recv_bytes
+            + compression_backward.backward_recv_bytes
+        ),
+    )
+
+
+def _planned_halo_exchange_bytes(
+    *,
+    layout: Any,
+    rank: int,
+    row_bytes: int,
+) -> RuntimeExplicitCommBytes:
+    send_rows = sum(
+        len(transfer.token_ids)
+        for transfer in layout.halo_transfers
+        if int(transfer.source_rank) == int(rank)
+        and int(transfer.target_rank) != int(rank)
+    )
+    recv_rows = sum(
+        len(transfer.token_ids)
+        for transfer in layout.halo_transfers
+        if int(transfer.target_rank) == int(rank)
+        and int(transfer.source_rank) != int(rank)
+    )
+    return RuntimeExplicitCommBytes(
+        forward_send_bytes=int(send_rows) * int(row_bytes),
+        forward_recv_bytes=int(recv_rows) * int(row_bytes),
+        backward_send_bytes=0,
+        backward_recv_bytes=0,
+    )
+
+
+def _planned_reverse_halo_exchange_bytes(
+    *,
+    layout: Any,
+    rank: int,
+    row_bytes: int,
+) -> RuntimeExplicitCommBytes:
+    forward = _planned_halo_exchange_bytes(
+        layout=layout,
+        rank=rank,
+        row_bytes=row_bytes,
+    )
+    return RuntimeExplicitCommBytes(
+        forward_send_bytes=0,
+        forward_recv_bytes=0,
+        backward_send_bytes=int(forward.forward_recv_bytes),
+        backward_recv_bytes=int(forward.forward_send_bytes),
+    )
+
+
+def _planned_indexer_exchange_bytes(
+    *,
+    peer_plans_by_stage: tuple[tuple[Any, ...], ...],
+    rank: int,
+    row_bytes: int,
+) -> RuntimeExplicitCommBytes:
+    send_rows = 0
+    recv_rows = 0
+    for stage_peer_plans in peer_plans_by_stage:
+        peer_plan = stage_peer_plans[int(rank)]
+        send_rows += _nonlocal_peer_id_count(
+            peer_plan.send_entry_ids_by_peer,
+            rank=rank,
+        )
+        recv_rows += _nonlocal_peer_id_count(
+            peer_plan.recv_entry_ids_by_peer,
+            rank=rank,
+        )
+    return RuntimeExplicitCommBytes(
+        forward_send_bytes=int(send_rows) * int(row_bytes),
+        forward_recv_bytes=int(recv_rows) * int(row_bytes),
+        backward_send_bytes=0,
+        backward_recv_bytes=0,
+    )
+
+
+def _planned_stage_exchange_bytes(
+    *,
+    peer_plans_by_slot: tuple[tuple[Any, ...], ...],
+    rank: int,
+    row_bytes: int,
+) -> RuntimeExplicitCommBytes:
+    send_rows = 0
+    recv_rows = 0
+    for slot_peer_plans in peer_plans_by_slot:
+        peer_plan = slot_peer_plans[int(rank)]
+        send_rows += _nonlocal_peer_id_count(
+            peer_plan.send_raw_token_ids_by_peer,
+            rank=rank,
+        )
+        send_rows += _nonlocal_peer_id_count(
+            peer_plan.send_compressed_entry_ids_by_peer,
+            rank=rank,
+        )
+        recv_rows += _nonlocal_peer_id_count(
+            peer_plan.recv_raw_token_ids_by_peer,
+            rank=rank,
+        )
+        recv_rows += _nonlocal_peer_id_count(
+            peer_plan.recv_compressed_entry_ids_by_peer,
+            rank=rank,
+        )
+    return RuntimeExplicitCommBytes(
+        forward_send_bytes=int(send_rows) * int(row_bytes),
+        forward_recv_bytes=int(recv_rows) * int(row_bytes),
+        backward_send_bytes=0,
+        backward_recv_bytes=0,
+    )
+
+
+def _planned_attention_backward_exchange_bytes(
+    *,
+    backward_plan: Any,
+    rank: int,
+    query_row_bytes: int,
+    kv_row_bytes: int,
+) -> RuntimeExplicitCommBytes:
+    rank_plan = backward_plan.rank_plans[int(rank)]
+    query_send_rows = sum(
+        1 for owner in rank_plan.query_owner_ranks if int(owner) != int(rank)
+    )
+    raw_send_rows = sum(
+        1 for owner in rank_plan.raw_owner_ranks if int(owner) != int(rank)
+    )
+    compressed_send_rows = sum(
+        1 for owner in rank_plan.compressed_owner_ranks if int(owner) != int(rank)
+    )
+    query_recv_rows = _nonlocal_peer_id_count(
+        rank_plan.recv_query_token_ids_by_peer,
+        rank=rank,
+    )
+    raw_recv_rows = _nonlocal_peer_id_count(
+        rank_plan.recv_raw_token_ids_by_peer,
+        rank=rank,
+    )
+    compressed_recv_rows = _nonlocal_peer_id_count(
+        rank_plan.recv_compressed_entry_ids_by_peer,
+        rank=rank,
+    )
+    return RuntimeExplicitCommBytes(
+        forward_send_bytes=0,
+        forward_recv_bytes=0,
+        backward_send_bytes=(
+            int(query_send_rows) * int(query_row_bytes)
+            + (int(raw_send_rows) + int(compressed_send_rows)) * int(kv_row_bytes)
+        ),
+        backward_recv_bytes=(
+            int(query_recv_rows) * int(query_row_bytes)
+            + (int(raw_recv_rows) + int(compressed_recv_rows)) * int(kv_row_bytes)
+        ),
+    )
+
+
+def _nonlocal_peer_id_count(
+    ids_by_peer: tuple[tuple[int, ...], ...],
+    *,
+    rank: int,
+) -> int:
+    return sum(
+        len(peer_ids)
+        for peer, peer_ids in enumerate(ids_by_peer)
+        if int(peer) != int(rank)
+    )
 
 
 def _run_runtime_csa_forward(
