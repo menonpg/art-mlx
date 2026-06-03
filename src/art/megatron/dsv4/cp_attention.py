@@ -17,13 +17,13 @@ from .compressor import (
 )
 from .cp_stage import (
     build_dsv4_stage_inputs_from_stage_plan,
+    build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts,
     launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot,
     launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
 )
 from .indexer import (
     build_dsv4_indexer_stage_plan_from_stage_plans,
     launch_dsv4_indexer_topk_from_stage_plans,
-    stage_candidate_entry_ids,
 )
 from .types import (
     Dsv4AttentionBackwardPlan,
@@ -1470,10 +1470,16 @@ def build_dsv4_attention_backward_plan_from_stage_plan_slots(
     *,
     layout: Dsv4CompressedLayout,
     stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    | None = None,
 ) -> Dsv4AttentionBackwardPlan:
+    peer_plans_by_layout = (
+        None if stage_kv_peer_plans_by_slot is None else (stage_kv_peer_plans_by_slot,)
+    )
     return build_dsv4_attention_backward_plans_from_stage_plan_slots(
         layouts=(layout,),
         stage_plan_slots=stage_plan_slots,
+        stage_kv_peer_plans_by_layout=peer_plans_by_layout,
     )[0]
 
 
@@ -1482,6 +1488,10 @@ def build_dsv4_attention_backward_plans_from_stage_plan_slots(
     *,
     layouts: Sequence[Dsv4CompressedLayout],
     stage_plan_slots: Sequence[Dsv4StagePlanSlot],
+    stage_kv_peer_plans_by_layout: Sequence[
+        Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
+    ]
+    | None = None,
 ) -> tuple[Dsv4AttentionBackwardPlan, ...]:
     layout_tuple = tuple(layouts)
     if not layout_tuple:
@@ -1499,25 +1509,74 @@ def build_dsv4_attention_backward_plans_from_stage_plan_slots(
                 f"{len(layout.entry_ids_by_owner_rank)} vs {rank_count}"
             )
 
-    query_raw_ids, query_raw_owners = _stage_plan_slot_query_raw_id_and_owner_spaces(
-        layout=layout_tuple[0],
+    if stage_kv_peer_plans_by_layout is None:
+        first_slot_plans = (
+            build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
+                layouts=layout_tuple,
+                stage_plans_by_rank=slots[0].stage_plans_by_rank,
+            )
+        )
+        stage_kv_peer_plans_by_layout = tuple(
+            (layout_plans,) for layout_plans in first_slot_plans
+        )
+        for slot in slots[1:]:
+            slot_plans = (
+                build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
+                    layouts=layout_tuple,
+                    stage_plans_by_rank=slot.stage_plans_by_rank,
+                )
+            )
+            stage_kv_peer_plans_by_layout = tuple(
+                prior + (current,)
+                for prior, current in zip(
+                    stage_kv_peer_plans_by_layout,
+                    slot_plans,
+                    strict=True,
+                )
+            )
+    else:
+        stage_kv_peer_plans_by_layout = tuple(
+            tuple(tuple(rank_plans) for rank_plans in layout_plans)
+            for layout_plans in stage_kv_peer_plans_by_layout
+        )
+        if len(stage_kv_peer_plans_by_layout) != len(layout_tuple):
+            raise RuntimeError(
+                "DSV4 backward peer-plan layout count must match layouts: "
+                f"{len(stage_kv_peer_plans_by_layout)} vs {len(layout_tuple)}"
+            )
+
+    query_ids, query_owners = _stage_plan_slot_query_id_spaces(
         slots=slots,
+        rank_count=rank_count,
+    )
+    raw_ids, raw_owners, raw_recv, raw_owned = _id_spaces_from_stage_peer_plans(
+        peer_plans_by_slot=stage_kv_peer_plans_by_layout[0],
+        recv_attr="recv_raw_token_ids_by_peer",
+        rank_count=rank_count,
     )
     common_rank_parts = _common_backward_rank_parts(
-        id_spaces=query_raw_ids,
-        owner_spaces=query_raw_owners,
+        query_ids_by_rank=query_ids,
+        query_owners_by_rank=query_owners,
+        raw_ids_by_rank=raw_ids,
+        raw_owners_by_rank=raw_owners,
+        raw_recv_by_rank=raw_recv,
+        raw_owned_by_rank=raw_owned,
         rank_count=rank_count,
     )
     stage_indices = _slot_stage_indices(slots)
     return tuple(
         _build_attention_backward_plan_for_layout(
             layout=layout,
-            slots=slots,
             stage_indices=stage_indices,
             common_rank_parts=common_rank_parts,
+            compressed_peer_plans_by_slot=compressed_peer_plans_by_slot,
             rank_count=rank_count,
         )
-        for layout in layout_tuple
+        for layout, compressed_peer_plans_by_slot in zip(
+            layout_tuple,
+            stage_kv_peer_plans_by_layout,
+            strict=True,
+        )
     )
 
 
@@ -2057,23 +2116,15 @@ def _validate_attention_backward_plan(
 def _build_attention_backward_plan_for_layout(
     *,
     layout: Dsv4CompressedLayout,
-    slots: Sequence[Dsv4StagePlanSlot],
     stage_indices: tuple[int, ...],
     common_rank_parts: tuple[dict[str, Any], ...],
+    compressed_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]],
     rank_count: int,
 ) -> Dsv4AttentionBackwardPlan:
-    compressed_ids_by_rank = _stage_plan_slot_compressed_id_spaces(
-        layout=layout,
-        slots=slots,
-    )
-    compressed_owners_by_rank = _compressed_owner_spaces(
-        layout=layout,
-        compressed_ids_by_rank=compressed_ids_by_rank,
-    )
-    recv_compressed_by_rank, owned_compressed_by_rank = (
-        _gradient_recv_and_owned_by_rank(
-            ids_by_rank=compressed_ids_by_rank,
-            owners_by_rank=compressed_owners_by_rank,
+    compressed_ids, compressed_owners, recv_compressed, owned_compressed = (
+        _id_spaces_from_stage_peer_plans(
+            peer_plans_by_slot=compressed_peer_plans_by_slot,
+            recv_attr="recv_compressed_entry_ids_by_peer",
             rank_count=rank_count,
         )
     )
@@ -2083,10 +2134,10 @@ def _build_attention_backward_plan_for_layout(
         rank_plans=tuple(
             _build_attention_backward_rank_plan_from_parts(
                 common=common_rank_parts[rank],
-                compressed_entry_ids=compressed_ids_by_rank[rank],
-                compressed_owner_ranks=compressed_owners_by_rank[rank],
-                recv_compressed_entry_ids_by_peer=recv_compressed_by_rank[rank],
-                owned_compressed_entry_ids=owned_compressed_by_rank[rank],
+                compressed_entry_ids=compressed_ids[rank],
+                compressed_owner_ranks=compressed_owners[rank],
+                recv_compressed_entry_ids_by_peer=recv_compressed[rank],
+                owned_compressed_entry_ids=owned_compressed[rank],
             )
             for rank in range(rank_count)
         ),
@@ -2121,61 +2172,89 @@ def _slot_stage_indices(slots: Sequence[Dsv4StagePlanSlot]) -> tuple[int, ...]:
     return tuple(int(slot.stage_index) for slot in slots)
 
 
-def _stage_plan_slot_query_raw_id_and_owner_spaces(
+def _stage_plan_slot_query_id_spaces(
     *,
-    layout: Dsv4CompressedLayout,
     slots: Sequence[Dsv4StagePlanSlot],
-) -> tuple[
-    tuple[
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-    ],
-    tuple[
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-    ],
-]:
-    rank_count = len(layout.entry_ids_by_owner_rank)
-    raw_owner_ranks = layout.raw_token_owner_ranks
-    valid_ranges = _layout_stream_ranges(layout)
+    rank_count: int,
+) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]:
     query_ranges_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(rank_count)]
-    raw_ranges_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(rank_count)]
     for slot in slots:
         for rank, stage_plan in enumerate(slot.stage_plans_by_rank):
             _append_stage_ranges(
                 query_ranges_by_rank[rank],
                 stage_plan.global_q_ranges,
             )
-            _append_intersected_stage_ranges(
-                raw_ranges_by_rank[rank],
-                ranges=stage_plan.global_k_ranges,
-                valid_ranges=valid_ranges,
-            )
     query_ids_by_rank: list[tuple[int, ...]] = []
     query_owners_by_rank: list[tuple[int, ...]] = []
-    raw_ids_by_rank: list[tuple[int, ...]] = []
-    raw_owners_by_rank: list[tuple[int, ...]] = []
     for rank in range(rank_count):
         query_ids = _token_ids_from_merged_ranges(query_ranges_by_rank[rank])
         query_ids_by_rank.append(query_ids)
         query_owners_by_rank.append((int(rank),) * len(query_ids))
-        raw_ids, raw_owners = _token_ids_and_owners_from_merged_ranges(
-            ranges=raw_ranges_by_rank[rank],
-            raw_owner_ranks=raw_owner_ranks,
-            require_owned=False,
-        )
-        raw_ids_by_rank.append(raw_ids)
-        raw_owners_by_rank.append(raw_owners)
+    return tuple(query_ids_by_rank), tuple(query_owners_by_rank)
+
+
+def _id_spaces_from_stage_peer_plans(
+    *,
+    peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]],
+    recv_attr: str,
+    rank_count: int,
+) -> tuple[
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[tuple[int, ...], ...], ...],
+    tuple[tuple[int, ...], ...],
+]:
+    ids: list[list[int]] = [[] for _ in range(rank_count)]
+    owners: list[list[int]] = [[] for _ in range(rank_count)]
+    recv: list[list[list[int]]] = [
+        [[] for _ in range(rank_count)] for _ in range(rank_count)
+    ]
+    for slot_plans in peer_plans_by_slot:
+        if len(slot_plans) != int(rank_count):
+            raise RuntimeError("DSV4 backward peer-plan rank count mismatch")
+        for peer_rank, plan in enumerate(slot_plans):
+            ids_by_owner = getattr(plan, recv_attr)
+            if len(ids_by_owner) != int(rank_count):
+                raise RuntimeError("DSV4 backward peer-plan owner count mismatch")
+            for owner_rank, owner_ids in enumerate(ids_by_owner):
+                for id_ in owner_ids:
+                    id_int = int(id_)
+                    ids[peer_rank].append(id_int)
+                    owners[peer_rank].append(owner_rank)
+                    recv[owner_rank][peer_rank].append(id_int)
+    deduped = tuple(
+        _dedupe_ids_and_owners(ids=rank_ids, owners=rank_owners)
+        for rank_ids, rank_owners in zip(ids, owners, strict=True)
+    )
+    recv_ids = tuple(
+        tuple(tuple(dict.fromkeys(peer_ids).keys()) for peer_ids in rank_ids)
+        for rank_ids in recv
+    )
     return (
-        (
-            tuple(query_ids_by_rank),
-            tuple(raw_ids_by_rank),
-        ),
-        (
-            tuple(query_owners_by_rank),
-            tuple(raw_owners_by_rank),
+        tuple(rank_ids for rank_ids, _rank_owners in deduped),
+        tuple(rank_owners for _rank_ids, rank_owners in deduped),
+        recv_ids,
+        tuple(
+            tuple(dict.fromkeys(chain.from_iterable(rank_ids)).keys())
+            for rank_ids in recv_ids
         ),
     )
+
+
+def _dedupe_ids_and_owners(
+    *,
+    ids: Sequence[int],
+    owners: Sequence[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    seen: set[int] = set()
+    out_ids: list[int] = []
+    out_owners: list[int] = []
+    for id_, owner in zip(ids, owners, strict=True):
+        if id_ not in seen:
+            seen.add(id_)
+            out_ids.append(id_)
+            out_owners.append(owner)
+    return tuple(out_ids), tuple(out_owners)
 
 
 def _append_stage_ranges(
@@ -2189,33 +2268,6 @@ def _append_stage_ranges(
             target.append((start, end))
 
 
-def _append_intersected_stage_ranges(
-    target: list[tuple[int, int]],
-    *,
-    ranges: Sequence[Any],
-    valid_ranges: tuple[tuple[int, int], ...],
-) -> None:
-    valid_count = len(valid_ranges)
-    valid_index = 0
-    for range_ in ranges:
-        range_start = int(range_.start)
-        range_end = int(range_.end)
-        if range_start >= range_end:
-            continue
-        while valid_index < valid_count and valid_ranges[valid_index][1] <= range_start:
-            valid_index += 1
-        scan_index = valid_index
-        while scan_index < valid_count:
-            stream_start, stream_end = valid_ranges[scan_index]
-            if stream_start >= range_end:
-                break
-            start = max(range_start, stream_start)
-            end = min(range_end, stream_end)
-            if start < end:
-                target.append((start, end))
-            scan_index += 1
-
-
 def _token_ids_from_merged_ranges(ranges: Sequence[tuple[int, int]]) -> tuple[int, ...]:
     ids: list[int] = []
     for start, end in _merge_token_ranges(ranges):
@@ -2223,35 +2275,6 @@ def _token_ids_from_merged_ranges(ranges: Sequence[tuple[int, int]]) -> tuple[in
             raise RuntimeError(f"DSV4 query token range {start}:{end} has no CP owner")
         ids.extend(range(int(start), int(end)))
     return tuple(ids)
-
-
-def _token_ids_and_owners_from_merged_ranges(
-    *,
-    ranges: Sequence[tuple[int, int]],
-    raw_owner_ranks: Sequence[int],
-    require_owned: bool,
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    ids: list[int] = []
-    owners: list[int] = []
-    owner_count = len(raw_owner_ranks)
-    for start, end in _merge_token_ranges(ranges):
-        for token_id in range(int(start), int(end)):
-            if token_id < 0 or token_id >= owner_count:
-                if require_owned:
-                    raise RuntimeError(
-                        f"DSV4 raw/query token {token_id} has no CP owner"
-                    )
-                continue
-            owner = int(raw_owner_ranks[token_id])
-            if owner < 0:
-                if require_owned:
-                    raise RuntimeError(
-                        f"DSV4 raw/query token {token_id} has no CP owner"
-                    )
-                continue
-            ids.append(token_id)
-            owners.append(owner)
-    return tuple(ids), tuple(owners)
 
 
 def _merge_token_ranges(
@@ -2272,81 +2295,26 @@ def _merge_token_ranges(
     return tuple((start, end) for start, end in merged)
 
 
-def _stage_plan_slot_compressed_id_spaces(
-    *,
-    layout: Dsv4CompressedLayout,
-    slots: Sequence[Dsv4StagePlanSlot],
-) -> tuple[tuple[int, ...], ...]:
-    rank_count = len(layout.entry_ids_by_owner_rank)
-    compressed_by_rank: list[list[int]] = [[] for _ in range(rank_count)]
-    compressed_seen_by_rank: list[set[int]] = [set() for _ in range(rank_count)]
-    for slot in slots:
-        for rank, stage_plan in enumerate(slot.stage_plans_by_rank):
-            _append_unique_seen(
-                compressed_by_rank[rank],
-                compressed_seen_by_rank[rank],
-                stage_candidate_entry_ids(
-                    layout=layout,
-                    global_k_ranges=stage_plan.global_k_ranges,
-                ),
-            )
-    return tuple(tuple(ids) for ids in compressed_by_rank)
-
-
-def _append_unique_seen(target: list[int], seen: set[int], ids: Sequence[int]) -> None:
-    for id_ in ids:
-        id_int = int(id_)
-        if id_int not in seen:
-            target.append(id_int)
-            seen.add(id_int)
-
-
-def _compressed_owner_spaces(
-    *,
-    layout: Dsv4CompressedLayout,
-    compressed_ids_by_rank: tuple[tuple[int, ...], ...],
-) -> tuple[tuple[int, ...], ...]:
-    compressed_owner_ranks = _compressed_owner_rank_table(layout)
-    return tuple(
-        tuple(
-            _compressed_owner_rank(compressed_owner_ranks, entry_id)
-            for entry_id in rank_ids
-        )
-        for rank_ids in compressed_ids_by_rank
-    )
-
-
-def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
-    return layout.compressed_entry_owner_ranks
-
-
 def _common_backward_rank_parts(
     *,
-    id_spaces: tuple[
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-    ],
-    owner_spaces: tuple[
-        tuple[tuple[int, ...], ...],
-        tuple[tuple[int, ...], ...],
-    ],
+    query_ids_by_rank: tuple[tuple[int, ...], ...],
+    query_owners_by_rank: tuple[tuple[int, ...], ...],
+    raw_ids_by_rank: tuple[tuple[int, ...], ...],
+    raw_owners_by_rank: tuple[tuple[int, ...], ...],
+    raw_recv_by_rank: tuple[tuple[tuple[int, ...], ...], ...],
+    raw_owned_by_rank: tuple[tuple[int, ...], ...],
     rank_count: int,
 ) -> tuple[dict[str, Any], ...]:
     query_recv_by_rank, query_owned_by_rank = _identity_query_recv_and_owned_by_rank(
-        query_ids_by_rank=id_spaces[0],
-        rank_count=rank_count,
-    )
-    raw_recv_by_rank, raw_owned_by_rank = _gradient_recv_and_owned_by_rank(
-        ids_by_rank=id_spaces[1],
-        owners_by_rank=owner_spaces[1],
+        query_ids_by_rank=query_ids_by_rank,
         rank_count=rank_count,
     )
     return tuple(
         {
-            "query_token_ids": id_spaces[0][rank],
-            "raw_token_ids": id_spaces[1][rank],
-            "query_owner_ranks": owner_spaces[0][rank],
-            "raw_owner_ranks": owner_spaces[1][rank],
+            "query_token_ids": query_ids_by_rank[rank],
+            "raw_token_ids": raw_ids_by_rank[rank],
+            "query_owner_ranks": query_owners_by_rank[rank],
+            "raw_owner_ranks": raw_owners_by_rank[rank],
             "recv_query_token_ids_by_peer": query_recv_by_rank[rank],
             "recv_raw_token_ids_by_peer": raw_recv_by_rank[rank],
             "owned_query_token_ids": query_owned_by_rank[rank],
@@ -2379,70 +2347,12 @@ def _identity_query_recv_and_owned_by_rank(
     return recv, query_ids_by_rank
 
 
-def _gradient_recv_and_owned_by_rank(
-    *,
-    ids_by_rank: tuple[tuple[int, ...], ...],
-    owners_by_rank: tuple[tuple[int, ...], ...],
-    rank_count: int,
-) -> tuple[
-    tuple[tuple[tuple[int, ...], ...], ...],
-    tuple[tuple[int, ...], ...],
-]:
-    if len(ids_by_rank) != int(rank_count):
-        raise RuntimeError(
-            "DSV4 gradient id space rank count mismatch: "
-            f"{len(ids_by_rank)} vs {rank_count}"
-        )
-    if len(owners_by_rank) != int(rank_count):
-        raise RuntimeError(
-            "DSV4 gradient owner space rank count mismatch: "
-            f"{len(owners_by_rank)} vs {rank_count}"
-        )
-    recv: list[list[list[int]]] = [
-        [[] for _ in range(rank_count)] for _ in range(rank_count)
-    ]
-    for peer_rank, (peer_ids, peer_owners) in enumerate(
-        zip(ids_by_rank, owners_by_rank, strict=True)
-    ):
-        for id_, owner_rank in zip(peer_ids, peer_owners, strict=True):
-            owner = int(owner_rank)
-            if owner < 0 or owner >= int(rank_count):
-                raise RuntimeError(
-                    f"DSV4 gradient id {id_} has invalid owner rank {owner}"
-                )
-            id_int = int(id_)
-            recv[owner][peer_rank].append(id_int)
-    return (
-        tuple(tuple(tuple(peer_ids) for peer_ids in rank_ids) for rank_ids in recv),
-        tuple(
-            tuple(dict.fromkeys(chain.from_iterable(rank_ids)).keys())
-            for rank_ids in recv
-        ),
-    )
-
-
-def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int], ...]:
-    return tuple(
-        sorted((int(stream.start), int(stream.end)) for stream in layout.streams)
-    )
-
-
 def _token_ids_from_ranges(ranges: Sequence[Any]) -> tuple[int, ...]:
     ids: list[int] = []
     for range_ in ranges:
         ids.extend(range(int(range_.start), int(range_.end)))
     _row_by_id(ids=tuple(ids), name="stage_plan_token_ranges")
     return tuple(ids)
-
-
-def _compressed_owner_rank(
-    compressed_owner_ranks: Sequence[int],
-    entry_id: int,
-) -> int:
-    entry_int = int(entry_id)
-    if entry_int < 0 or entry_int >= len(compressed_owner_ranks):
-        raise RuntimeError(f"DSV4 compressed entry {entry_int} does not exist")
-    return int(compressed_owner_ranks[entry_int])
 
 
 def _normalize_output_ids(ids: Sequence[int], *, name: str) -> tuple[int, ...]:

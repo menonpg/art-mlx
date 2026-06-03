@@ -181,6 +181,9 @@ def _prepare_dsv4_context_parallel_state_impl(
             build_dsv4_attention_backward_plans_from_stage_plan_slots(
                 layouts=tuple(backward_layouts),
                 stage_plan_slots=stage_slots,
+                stage_kv_peer_plans_by_layout=tuple(
+                    stage_kv_plans_by_name[name] for name in backward_layout_names
+                ),
             ),
             strict=True,
         )
