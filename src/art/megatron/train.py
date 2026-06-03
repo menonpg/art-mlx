@@ -278,6 +278,13 @@ def _build_optimizer(
     return optimizer
 
 
+def clear_moe_routing_replay(runtime: TrainingRuntime) -> None:
+    """Disable any active MoE routing replay bundle on a long-lived runtime."""
+    if runtime.moe_routing_replay_controller is not None:
+        runtime.moe_routing_replay_controller.remove_router_patches()
+        runtime.moe_routing_replay_controller = None
+
+
 def configure_moe_routing_replay(
     runtime: TrainingRuntime,
     *,
@@ -285,24 +292,20 @@ def configure_moe_routing_replay(
     replay_bundle: MoeRoutingReplayBundle | None = None,
     strict: bool = True,
 ) -> None:
-    if runtime.moe_routing_replay_controller is not None:
-        runtime.moe_routing_replay_controller.remove_router_patches()
-        runtime.moe_routing_replay_controller = None
-
+    """Replace the active MoE routing replay bundle, or clear it if no bundle is provided."""
     if replay_bundle is not None and replay_bundle_path is not None:
         raise RuntimeError(
             "Provide either replay_bundle_path or replay_bundle, not both"
         )
     if replay_bundle is None and replay_bundle_path is None:
+        clear_moe_routing_replay(runtime)
         return
 
     if replay_bundle is None:
-        if replay_bundle_path is None:
-            raise RuntimeError(
-                "replay_bundle_path is required when replay_bundle is None"
-            )
+        assert replay_bundle_path is not None
         replay_bundle = MoeRoutingReplayBundle.from_dir(replay_bundle_path)
 
+    clear_moe_routing_replay(runtime)
     controller = MoeRoutingReplayController(
         bundle=replay_bundle,
         strict=strict,
@@ -566,7 +569,7 @@ def run_megatron_rl_job(
             optimizer_state_path=job.optimizer_state_path,
         )
     finally:
-        configure_moe_routing_replay(runtime)
+        clear_moe_routing_replay(runtime)
         if packed_tensors is not None:
             del packed_tensors
         if adapter_model is not None:
@@ -610,7 +613,7 @@ def run_megatron_sft_job(
     adapter_model = None
 
     try:
-        configure_moe_routing_replay(runtime)
+        clear_moe_routing_replay(runtime)
         adapter_model = _load_lora_and_optimizer(
             runtime,
             lora_path=job.lora_path,
