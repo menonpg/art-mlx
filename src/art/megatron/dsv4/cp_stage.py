@@ -18,7 +18,6 @@ from .types import (
     Dsv4StageInputs,
     Dsv4StageKeyKind,
     Dsv4StageKvExchangePeerPlan,
-    Dsv4StagePlanGroup,
     Dsv4StagePlanSlot,
     Dsv4TensorExchangePlan,
 )
@@ -363,73 +362,6 @@ def build_dsv4_stage_inputs_from_stage_plan(
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
         materialize_compressed_metadata=materialize_compressed_metadata,
-    )
-
-
-def build_dsv4_stage_plan_group_from_stage_plans(
-    *,
-    layout: Dsv4CompressedLayout,
-    stage_plans_by_rank: Sequence[Any],
-    compression_kind: Dsv4CompressionKind,
-    global_topk_indices_by_rank: Sequence[torch.Tensor] | None = None,
-    topk_query_token_ids_by_rank: Sequence[Sequence[int]] | None = None,
-    window_size: int = 128,
-    raw_list_size: int | None = None,
-    compressed_list_size: int | None = None,
-) -> Dsv4StagePlanGroup:
-    """Derive DSV4 main-attention metadata from one ART `StagePlan` slot.
-
-    This is host/index metadata plus optional CSA topk row selection only. It
-    uses ART's planned query/K ranges without calling the generic Flex executor.
-    """
-    stage_plans = tuple(stage_plans_by_rank)
-    _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
-    stage_index = _shared_stage_index(stage_plans)
-    if compression_kind == Dsv4CompressionKind.CSA:
-        if global_topk_indices_by_rank is None or topk_query_token_ids_by_rank is None:
-            raise RuntimeError("DSV4 CSA StagePlan conversion requires global topk")
-        if len(global_topk_indices_by_rank) != len(stage_plans) or len(
-            topk_query_token_ids_by_rank
-        ) != len(stage_plans):
-            raise RuntimeError("DSV4 CSA topk metadata must have one entry per rank")
-    elif (
-        global_topk_indices_by_rank is not None
-        or topk_query_token_ids_by_rank is not None
-    ):
-        raise RuntimeError("DSV4 HCA StagePlan conversion does not consume topk")
-
-    csa_topk_by_rank = (
-        tuple(global_topk_indices_by_rank)
-        if global_topk_indices_by_rank is not None
-        else None
-    )
-    csa_topk_ids_by_rank = (
-        tuple(topk_query_token_ids_by_rank)
-        if topk_query_token_ids_by_rank is not None
-        else None
-    )
-    stage_inputs = []
-    for rank, stage_plan in enumerate(stage_plans):
-        stage_inputs.append(
-            build_dsv4_stage_inputs_from_stage_plan(
-                layout=layout,
-                compression_kind=compression_kind,
-                stage_plan=stage_plan,
-                global_topk=csa_topk_by_rank[rank]
-                if csa_topk_by_rank is not None
-                else None,
-                topk_query_token_ids=csa_topk_ids_by_rank[rank]
-                if csa_topk_ids_by_rank is not None
-                else None,
-                window_size=window_size,
-                raw_list_size=raw_list_size,
-                compressed_list_size=compressed_list_size,
-                materialize_compressed_metadata=True,
-            )
-        )
-    return Dsv4StagePlanGroup(
-        stage_index=stage_index,
-        stage_inputs_by_rank=tuple(stage_inputs),
     )
 
 

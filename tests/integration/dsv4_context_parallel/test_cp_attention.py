@@ -27,7 +27,6 @@ from art.megatron.dsv4 import (
     Dsv4StageBackwardRecord,
     Dsv4StageForwardRecord,
     Dsv4StageKeyKind,
-    Dsv4StagePlanGroup,
     Dsv4StagePlanSlot,
     Dsv4TopkResult,
     accumulate_dsv4_gradient_owner_buckets,
@@ -39,7 +38,6 @@ from art.megatron.dsv4 import (
     compress_projected_kv,
     compute_single_sink_grad,
     launch_dsv4_attention_backward_from_stage_plan_slots,
-    launch_dsv4_attention_forward_from_stage_plan_groups,
     launch_dsv4_csa_attention_forward_from_stage_plan_slots,
     launch_dsv4_csa_projected_attention_forward_from_compression_work,
     launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
@@ -313,65 +311,6 @@ def test_exchanged_attention_forward_materializes_stages_then_merges(
     for stage_work in stage_works:
         assert stage_work.wait_count == 1
         assert stage_work.post_process_count == 1
-
-
-def test_stage_plan_group_attention_forward_launcher_assembles_stage_work(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        cp_attention.sparse_kernel,
-        "dsv4_sparse_fwd",
-        _fake_forward_for_replay,
-    )
-    layout = _single_rank_layout()
-    stage = build_stage_local_topk_for_csa(
-        layout=layout,
-        stage_index=0,
-        query_token_ids=(3, 7),
-        global_k_ranges=(_Range(start=0, end=8),),
-        global_topk=torch.tensor([[[0, 1], [1, 0]]], dtype=torch.long),
-        window_size=4,
-    )
-    attn_sink = torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64))
-
-    work = launch_dsv4_attention_forward_from_stage_plan_groups(
-        layout=layout,
-        rank=0,
-        stage_plan_groups=(
-            Dsv4StagePlanGroup(stage_index=0, stage_inputs_by_rank=(stage,)),
-        ),
-        query=torch.zeros(2, 2, 3, dtype=torch.float64),
-        query_token_ids=(3, 7),
-        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
-        raw_token_ids=tuple(range(8)),
-        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
-        compressed_entry_ids=(0, 1),
-        attn_sink=attn_sink,
-        group=None,
-        async_op=True,
-        scale=0.25,
-    )
-    result = work.wait_post_process()
-
-    expected_out, expected_lse = merge_single_sink_branch(
-        _stage_tensor(((1.0, 2.0),)),
-        _stage_lse(((2.0, 4.0),)),
-        attn_sink,
-    )
-    torch.testing.assert_close(result.out, expected_out)
-    torch.testing.assert_close(result.lse, expected_lse)
-    assert result.stage_records[0].materialized_stage.key_global_ids == (
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        0,
-        1,
-    )
 
 
 def test_csa_attention_forward_launcher_uses_local_topk_and_stage_slots(

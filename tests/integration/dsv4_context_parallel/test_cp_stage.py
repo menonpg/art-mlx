@@ -10,9 +10,9 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     Dsv4StageKeyKind,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_inputs_from_stage_plan,
     build_dsv4_stage_kv_exchange_peer_plans,
     build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
-    build_dsv4_stage_plan_group_from_stage_plans,
     build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
@@ -238,31 +238,38 @@ def test_stage_kv_exchange_peer_plan_uses_layout_ownership() -> None:
     assert plans[1].send_compressed_entry_ids_by_peer == ((2,), (2, 3))
 
 
-def test_stage_plan_group_derives_stage_inputs_from_art_stage_plans() -> None:
+def test_stage_inputs_derive_from_art_stage_plans() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
+    rank0_plan = _stage_plan(
+        stage_index=5,
+        q_ranges=((7, 8),),
+        k_ranges=((4, 13),),
+    )
+    rank1_plan = _stage_plan(
+        stage_index=5,
+        q_ranges=((11, 12), (16, 17)),
+        k_ranges=((8, 18),),
+    )
 
-    group = build_dsv4_stage_plan_group_from_stage_plans(
+    rank0 = build_dsv4_stage_inputs_from_stage_plan(
         layout=layout,
-        stage_plans_by_rank=(
-            _stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),
-            _stage_plan(
-                stage_index=5,
-                q_ranges=((11, 12), (16, 17)),
-                k_ranges=((8, 18),),
-            ),
-        ),
+        stage_plan=rank0_plan,
         compression_kind=Dsv4CompressionKind.CSA,
-        global_topk_indices_by_rank=(
-            torch.tensor([[[0, 1], [1, 2], [2, 3]]], dtype=torch.long),
-            torch.tensor([[[2, 3], [3, 2], [0, 1]]], dtype=torch.long),
-        ),
-        topk_query_token_ids_by_rank=((3, 7, 8), (11, 16, 17)),
+        global_topk=torch.tensor([[[0, 1], [1, 2], [2, 3]]], dtype=torch.long),
+        topk_query_token_ids=(3, 7, 8),
+        window_size=4,
+    )
+    rank1 = build_dsv4_stage_inputs_from_stage_plan(
+        layout=layout,
+        stage_plan=rank1_plan,
+        compression_kind=Dsv4CompressionKind.CSA,
+        global_topk=torch.tensor([[[2, 3], [3, 2], [0, 1]]], dtype=torch.long),
+        topk_query_token_ids=(11, 16, 17),
         window_size=4,
     )
 
-    assert group.stage_index == 5
-    assert len(group.stage_inputs_by_rank) == 2
-    rank0, rank1 = group.stage_inputs_by_rank
+    assert rank0.stage_index == 5
+    assert rank1.stage_index == 5
     assert rank0.query_token_ids == (7,)
     assert rank0.raw_token_ids == tuple(range(4, 13))
     assert rank0.compressed_entry_ids == (1, 2)
@@ -302,21 +309,28 @@ def test_stage_kv_exchange_plan_from_stage_plans_does_not_need_topk() -> None:
             k_ranges=((8, 18),),
         ),
     )
-    topk_dependent_group = build_dsv4_stage_plan_group_from_stage_plans(
-        layout=layout,
-        stage_plans_by_rank=stage_plans,
-        compression_kind=Dsv4CompressionKind.CSA,
-        global_topk_indices_by_rank=(
-            torch.tensor([[[1, 2]]], dtype=torch.long),
-            torch.tensor([[[3, 2], [0, 1]]], dtype=torch.long),
+    topk_dependent_stages = (
+        build_dsv4_stage_inputs_from_stage_plan(
+            layout=layout,
+            stage_plan=stage_plans[0],
+            compression_kind=Dsv4CompressionKind.CSA,
+            global_topk=torch.tensor([[[1, 2]]], dtype=torch.long),
+            topk_query_token_ids=(7,),
+            window_size=4,
         ),
-        topk_query_token_ids_by_rank=((7,), (11, 16)),
-        window_size=4,
+        build_dsv4_stage_inputs_from_stage_plan(
+            layout=layout,
+            stage_plan=stage_plans[1],
+            compression_kind=Dsv4CompressionKind.CSA,
+            global_topk=torch.tensor([[[3, 2], [0, 1]]], dtype=torch.long),
+            topk_query_token_ids=(11, 16),
+            window_size=4,
+        ),
     )
 
     from_stage_inputs = build_dsv4_stage_kv_exchange_peer_plans(
         layout=layout,
-        stage_inputs_by_rank=topk_dependent_group.stage_inputs_by_rank,
+        stage_inputs_by_rank=topk_dependent_stages,
     )
     from_stage_plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
         layout=layout,

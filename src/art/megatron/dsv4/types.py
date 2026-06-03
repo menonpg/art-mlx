@@ -268,13 +268,6 @@ class Dsv4IndexerKvExchangePeerPlan(BaseModel):
     recv_entry_ids_by_peer: tuple[tuple[int, ...], ...]
 
 
-class Dsv4StagePlanGroup(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    stage_index: int
-    stage_inputs_by_rank: tuple[Dsv4StageInputs, ...]
-
-
 class Dsv4StagePlanSlot(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -487,7 +480,6 @@ Dsv4CompressedKvGradientResult.model_rebuild()
 Dsv4StageInputs.model_rebuild()
 Dsv4IndexerStagePlan.model_rebuild()
 Dsv4IndexerKvExchangePeerPlan.model_rebuild()
-Dsv4StagePlanGroup.model_rebuild()
 Dsv4StagePlanSlot.model_rebuild()
 Dsv4StageKvExchangePeerPlan.model_rebuild()
 Dsv4MaterializedStage.model_rebuild()
