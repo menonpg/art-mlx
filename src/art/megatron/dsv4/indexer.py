@@ -18,6 +18,7 @@ from .types import (
 )
 
 _INVALID_INDEX = -1
+_INDEXER_SCORE_TILE_ELEMENTS = 1 << 29
 
 
 class TokenRangeLike(Protocol):
@@ -293,31 +294,82 @@ def compute_indexer_topk(
     score_scale: float = 1.0,
     visibility_mask: torch.Tensor | None = None,
 ) -> Dsv4TopkResult:
-    if visibility_mask is None and layout is not None and query_token_ids is not None:
-        visibility_mask = build_indexer_visibility_mask(
-            layout=layout,
-            query_token_ids=query_token_ids,
-            candidate_entry_ids=candidate_entry_ids,
-            device=indexer_q.device,
+    q = _ensure_batched_q(indexer_q)
+    kv = _ensure_batched_kv(indexer_kv, batch_size=int(q.shape[0]))
+    weights = _ensure_batched_weights(indexer_weights, batch_size=int(q.shape[0]))
+    _validate_indexer_shapes(q=q, kv=kv, weights=weights)
+    ids = tuple(int(entry_id) for entry_id in candidate_entry_ids)
+    if len(ids) != int(kv.shape[-2]):
+        raise RuntimeError(
+            "DSV4 candidate ids must match indexer KV rows, got "
+            f"{len(ids)} vs {int(kv.shape[-2])}"
         )
-    scores = compute_indexer_scores(
-        indexer_q=indexer_q,
-        indexer_kv=indexer_kv,
-        indexer_weights=indexer_weights,
-        score_scale=score_scale,
-        visibility_mask=visibility_mask,
+    template = q.new_empty((int(q.shape[0]), int(q.shape[1]), 0), dtype=torch.float32)
+    if topk < 0:
+        raise RuntimeError(f"DSV4 topk must be non-negative, got {topk}")
+    if topk == 0 or not ids:
+        scores, indices = _empty_topk(scores=template, topk=topk)
+        return Dsv4TopkResult(indices=indices.to(torch.int64), scores=scores)
+    candidate_id_tensor = torch.tensor(ids, device=q.device, dtype=torch.long)
+    q_step = max(
+        1,
+        min(
+            int(q.shape[1]),
+            _INDEXER_SCORE_TILE_ELEMENTS
+            // max(1, int(q.shape[0]) * int(q.shape[2]) * min(len(ids), 1024)),
+        ),
     )
-    candidate_ids = torch.tensor(
-        tuple(int(entry_id) for entry_id in candidate_entry_ids),
-        device=scores.device,
-        dtype=torch.long,
+    score_parts: list[torch.Tensor] = []
+    id_parts: list[torch.Tensor] = []
+    for q_start in range(0, int(q.shape[1]), q_step):
+        q_end = min(int(q.shape[1]), q_start + q_step)
+        current_scores, current_ids = _empty_topk(
+            scores=template[:, q_start:q_end], topk=int(topk)
+        )
+        k_step = max(
+            1,
+            _INDEXER_SCORE_TILE_ELEMENTS
+            // max(1, int(q.shape[0]) * (q_end - q_start) * int(q.shape[2])),
+        )
+        for k_start in range(0, len(ids), k_step):
+            k_end = min(len(ids), k_start + k_step)
+            mask = (
+                visibility_mask[q_start:q_end, k_start:k_end].to(
+                    device=q.device, dtype=torch.bool
+                )
+                if visibility_mask is not None
+                else build_indexer_visibility_mask(
+                    layout=layout,
+                    query_token_ids=query_token_ids[q_start:q_end],
+                    candidate_entry_ids=ids[k_start:k_end],
+                    device=q.device,
+                )
+                if layout is not None and query_token_ids is not None
+                else None
+            )
+            scores = compute_indexer_scores(
+                indexer_q=q[:, q_start:q_end],
+                indexer_kv=kv[:, k_start:k_end],
+                indexer_weights=weights[:, q_start:q_end],
+                score_scale=score_scale,
+                visibility_mask=mask,
+            )
+            top_scores, top_ids = stable_topk_by_score_and_id(
+                scores=scores,
+                candidate_ids=candidate_id_tensor[k_start:k_end],
+                topk=int(topk),
+            )
+            current_scores, current_ids = stable_select_from_scored_ids(
+                scores=torch.cat((current_scores, top_scores), dim=-1),
+                indices=torch.cat((current_ids, top_ids), dim=-1),
+                topk=int(topk),
+            )
+        score_parts.append(current_scores)
+        id_parts.append(current_ids)
+    return Dsv4TopkResult(
+        indices=torch.cat(id_parts, dim=1).to(torch.int64),
+        scores=torch.cat(score_parts, dim=1),
     )
-    top_scores, top_ids = stable_topk_by_score_and_id(
-        scores=scores,
-        candidate_ids=candidate_ids,
-        topk=topk,
-    )
-    return Dsv4TopkResult(indices=top_ids.to(torch.int64), scores=top_scores)
 
 
 @torch.no_grad()
@@ -837,68 +889,54 @@ def stable_topk_by_score_and_id(
     if candidate_count == 0:
         return _empty_topk(scores=scores, topk=topk)
 
-    actual_topk = min(int(topk), candidate_count)
-    top_values = torch.topk(scores, actual_topk, dim=-1).values
-    threshold = top_values[..., -1:]
-    finite = torch.isfinite(scores)
-
-    gt_scores = torch.where(
-        finite & (scores > threshold),
-        scores,
-        scores.new_full((), float("-inf")),
-    )
-    gt_values, gt_pos = torch.topk(gt_scores, actual_topk, dim=-1)
-
     candidate_ids = candidate_ids.to(device=scores.device, dtype=torch.long)
-    id_view = _candidate_ids_view(candidate_ids, scores)
-    min_int = torch.iinfo(torch.long).min
-    tie_priority = torch.where(
-        finite & (scores == threshold),
-        -id_view,
-        torch.full_like(id_view, min_int),
+    ids = candidate_ids.view(*((1,) * (scores.ndim - 1)), -1).expand_as(scores)
+    actual_topk = min(int(topk), candidate_count)
+    finite_scores = torch.where(
+        torch.isfinite(scores), scores, scores.new_full((), float("-inf"))
     )
-    tie_priority, tie_pos = torch.topk(tie_priority, actual_topk, dim=-1)
-    tie_scores = scores.gather(-1, tie_pos)
+    top_scores, top_offsets = torch.topk(
+        finite_scores,
+        k=actual_topk,
+        dim=-1,
+        largest=True,
+        sorted=False,
+    )
+    top_ids = ids.gather(-1, top_offsets)
+    kth_score = top_scores.min(dim=-1, keepdim=True).values
+
+    strict = top_scores > kth_score
+    strict_scores = torch.where(
+        strict, top_scores, top_scores.new_full((), float("-inf"))
+    )
+    strict_ids = torch.where(strict, top_ids, torch.full_like(top_ids, _INVALID_INDEX))
+
+    sentinel = _invalid_id_sentinel(scores.device)
+    tie_ids = torch.where(
+        torch.isfinite(finite_scores) & (finite_scores == kth_score),
+        ids,
+        sentinel,
+    )
+    tie_ids, _ = torch.topk(
+        -tie_ids,
+        k=actual_topk,
+        dim=-1,
+        largest=True,
+        sorted=True,
+    )
+    tie_ids = -tie_ids
+    tie_valid = tie_ids != sentinel
     tie_scores = torch.where(
-        tie_priority != min_int,
-        tie_scores,
+        tie_valid,
+        kth_score.expand_as(tie_ids).to(scores.dtype),
         scores.new_full((), float("-inf")),
     )
+    tie_ids = torch.where(tie_valid, tie_ids, torch.full_like(tie_ids, _INVALID_INDEX))
 
-    gt_ids = _ids_for_positions(candidate_ids=candidate_ids, positions=gt_pos)
-    tie_ids = _ids_for_positions(candidate_ids=candidate_ids, positions=tie_pos)
-    sentinel = _invalid_id_sentinel(scores.device)
-    gt_ids = torch.where(torch.isfinite(gt_values), gt_ids, sentinel)
-    tie_ids = torch.where(torch.isfinite(tie_scores), tie_ids, sentinel)
-
-    selected_scores = torch.cat([gt_values, tie_scores], dim=-1)
-    selected_ids = torch.cat([gt_ids, tie_ids], dim=-1)
-    top_scores, top_ids = stable_select_from_scored_ids(
-        scores=selected_scores,
-        indices=selected_ids,
-        topk=actual_topk,
-    )
-    if actual_topk == int(topk):
-        return top_scores, top_ids
-
-    pad = int(topk) - actual_topk
-    return (
-        torch.cat(
-            [top_scores, scores.new_full((*scores.shape[:-1], pad), float("-inf"))],
-            dim=-1,
-        ),
-        torch.cat(
-            [
-                top_ids,
-                torch.full(
-                    (*scores.shape[:-1], pad),
-                    _INVALID_INDEX,
-                    device=scores.device,
-                    dtype=torch.long,
-                ),
-            ],
-            dim=-1,
-        ),
+    return stable_select_from_scored_ids(
+        scores=torch.cat((strict_scores, tie_scores), dim=-1),
+        indices=torch.cat((strict_ids, tie_ids), dim=-1),
+        topk=topk,
     )
 
 
@@ -1130,21 +1168,6 @@ def _transpose_peer_ids(
     )
 
 
-def _compressed_entry_owner_rank(
-    *,
-    layout: Dsv4CompressedLayout,
-    entry_id: int,
-) -> int:
-    entry_int = int(entry_id)
-    if entry_int < 0 or entry_int >= layout.entry_count():
-        raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
-    return int(layout.compressed_entry_owner_ranks[entry_int])
-
-
-def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
-    return layout.compressed_entry_owner_ranks
-
-
 def _normalize_indexer_peer_ids(
     ids_by_peer: Sequence[Sequence[int]],
     *,
@@ -1362,24 +1385,6 @@ def _validate_indexer_shapes(
             "DSV4 indexer KV batch must be 1 or match q batch, got "
             f"{int(kv.shape[0])} vs {int(q.shape[0])}"
         )
-
-
-def _candidate_ids_view(
-    candidate_ids: torch.Tensor, scores: torch.Tensor
-) -> torch.Tensor:
-    return candidate_ids.view(*((1,) * (scores.ndim - 1)), -1).expand_as(scores)
-
-
-def _ids_for_positions(
-    *,
-    candidate_ids: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    view = candidate_ids.view(*((1,) * (positions.ndim - 1)), -1).expand(
-        *positions.shape[:-1],
-        int(candidate_ids.shape[0]),
-    )
-    return view.gather(-1, positions)
 
 
 def _empty_topk(
