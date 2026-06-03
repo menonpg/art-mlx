@@ -58,8 +58,10 @@ def test_prepare_dsv4_context_parallel_state_wraps_real_cp_plan() -> None:
     )
     assert plan.csa_attention_backward_plan is not None
     assert plan.hca_attention_backward_plan is not None
-    assert len(plan.csa_attention_backward_plan.rank_plans) == 2
-    assert len(plan.hca_attention_backward_plan.rank_plans) == 2
+    assert plan.csa_attention_backward_plan.local_rank == 1
+    assert plan.hca_attention_backward_plan.local_rank == 1
+    assert plan.csa_attention_backward_plan.local_rank_plan.query_token_ids
+    assert plan.hca_attention_backward_plan.local_rank_plan.query_token_ids
 
 
 def test_prepare_dsv4_context_parallel_state_allows_hca_only() -> None:

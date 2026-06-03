@@ -105,13 +105,13 @@ def stage_candidate_entry_ids(
         raise RuntimeError(
             "DSV4 compressed layout is missing closure-token entry index"
         )
-    candidates: set[int] = set()
+    candidates: list[int] = []
     closure_tokens = layout.closure_token_ids
     for range_ in global_k_ranges:
         start = bisect_left(closure_tokens, int(range_.start))
         end = bisect_left(closure_tokens, int(range_.end))
         for token_id in closure_tokens[start:end]:
-            candidates.update(layout.entry_ids_by_closure_token.get(token_id, ()))
+            candidates.extend(layout.entry_ids_by_closure_token.get(token_id, ()))
     return tuple(sorted(candidates))
 
 
@@ -119,12 +119,20 @@ def build_dsv4_indexer_kv_exchange_peer_plans(
     *,
     layout: Dsv4CompressedLayout,
     candidate_entry_ids_by_rank: Sequence[Sequence[int]],
+    local_rank: int | None = None,
 ) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
     rank_count = len(layout.entry_ids_by_owner_rank)
     if len(candidate_entry_ids_by_rank) != rank_count:
         raise RuntimeError(
             "DSV4 indexer exchange planning requires one candidate list per rank, "
             f"got {len(candidate_entry_ids_by_rank)} vs {rank_count}"
+        )
+    if local_rank is not None:
+        return _build_local_indexer_kv_exchange_peer_plans(
+            layout=layout,
+            candidate_entry_ids_by_rank=candidate_entry_ids_by_rank,
+            local_rank=int(local_rank),
+            rank_count=rank_count,
         )
     recv_by_rank = tuple(
         _ids_by_owner_rank_from_table(
@@ -149,13 +157,27 @@ def build_dsv4_indexer_stage_plan_from_stage_plans(
     *,
     layout: Dsv4CompressedLayout,
     stage_plans_by_rank: Sequence[Any],
+    local_rank: int | None = None,
 ) -> Dsv4IndexerStagePlan:
     stage_plans = tuple(stage_plans_by_rank)
     _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
     stage_index = _shared_stage_index(stage_plans)
-    query_ids_by_rank = tuple(
-        _token_ids_from_ranges(stage_plan.global_q_ranges) for stage_plan in stage_plans
-    )
+    if local_rank is None:
+        query_ids_by_rank = tuple(
+            _token_ids_from_ranges(stage_plan.global_q_ranges)
+            for stage_plan in stage_plans
+        )
+    else:
+        local_rank_int = _validate_rank(
+            rank=int(local_rank),
+            rank_count=len(layout.entry_ids_by_owner_rank),
+        )
+        query_ids_by_rank = tuple(
+            _token_ids_from_ranges(stage_plan.global_q_ranges)
+            if rank == local_rank_int
+            else ()
+            for rank, stage_plan in enumerate(stage_plans)
+        )
     return Dsv4IndexerStagePlan(
         stage_index=stage_index,
         query_token_ids_by_rank=query_ids_by_rank,
@@ -163,7 +185,7 @@ def build_dsv4_indexer_stage_plan_from_stage_plans(
             stage_candidate_entry_ids(
                 layout=layout,
                 global_k_ranges=stage_plan.global_k_ranges
-                if query_ids_by_rank[rank]
+                if _ranges_have_tokens(stage_plan.global_q_ranges)
                 else (),
             )
             for rank, stage_plan in enumerate(stage_plans)
@@ -995,6 +1017,58 @@ def _ids_by_owner_rank_from_table(
             raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
         by_rank[rank].append(id_int)
     return tuple(tuple(peer_ids) for peer_ids in by_rank)
+
+
+def _build_local_indexer_kv_exchange_peer_plans(
+    *,
+    layout: Dsv4CompressedLayout,
+    candidate_entry_ids_by_rank: Sequence[Sequence[int]],
+    local_rank: int,
+    rank_count: int,
+) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
+    rank_int = _validate_rank(rank=local_rank, rank_count=rank_count)
+    owner_ranks = _compressed_owner_rank_table(layout)
+    recv = _ids_by_owner_rank_from_table(
+        ids=candidate_entry_ids_by_rank[rank_int],
+        rank_count=rank_count,
+        owner_ranks=owner_ranks,
+        name=f"rank{rank_int}_candidate_entry_ids",
+    )
+    send: list[list[int]] = [[] for _ in range(rank_count)]
+    for peer_rank, candidate_ids in enumerate(candidate_entry_ids_by_rank):
+        seen: set[int] = set()
+        for id_ in candidate_ids:
+            entry_id = int(id_)
+            if entry_id in seen:
+                raise RuntimeError(
+                    f"DSV4 rank{peer_rank}_candidate_entry_ids contains duplicate "
+                    f"id {entry_id}"
+                )
+            seen.add(entry_id)
+            if entry_id < 0 or entry_id >= len(owner_ranks):
+                raise RuntimeError(
+                    f"DSV4 rank{peer_rank}_candidate_entry_ids id {entry_id} "
+                    "is outside layout owner table"
+                )
+            if int(owner_ranks[entry_id]) == rank_int:
+                send[peer_rank].append(entry_id)
+    local_plan = Dsv4IndexerKvExchangePeerPlan(
+        send_entry_ids_by_peer=tuple(tuple(ids) for ids in send),
+        recv_entry_ids_by_peer=recv,
+    )
+    return tuple(
+        local_plan
+        if rank == rank_int
+        else Dsv4IndexerKvExchangePeerPlan(
+            send_entry_ids_by_peer=((),) * int(rank_count),
+            recv_entry_ids_by_peer=((),) * int(rank_count),
+        )
+        for rank in range(int(rank_count))
+    )
+
+
+def _ranges_have_tokens(ranges: Sequence[TokenRangeLike]) -> bool:
+    return any(int(range_.start) < int(range_.end) for range_ in ranges)
 
 
 def _validate_rank(*, rank: int, rank_count: int) -> int:

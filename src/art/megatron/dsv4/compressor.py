@@ -258,12 +258,15 @@ def build_dsv4_compressed_layout(
     group_row, parent_row = _validate_metadata(group_ids, parent_ids)
     streams = _build_streams(group_row=group_row, parent_row=parent_row)
     branch_views = _build_branch_views(streams)
-    raw_token_owner_ranks = _build_token_ownership_table(token_layout_index)
+    raw_token_owner_ranks, owner_change_positions = _build_token_ownership_parts(
+        token_layout_index
+    )
     return _build_dsv4_compressed_layout_from_parts(
         spec=spec,
         streams=streams,
         branch_views=branch_views,
         raw_token_owner_ranks=raw_token_owner_ranks,
+        owner_change_positions=owner_change_positions,
         rank_count=len(token_layout_index.ownership_ranges_by_rank),
     )
 
@@ -335,10 +338,9 @@ def build_dsv4_compressed_layouts_from_cp_state(
     group_row, parent_row = _validate_metadata(group_ids, parent_ids)
     streams = _build_streams(group_row=group_row, parent_row=parent_row)
     branch_views = _build_branch_views(streams)
-    raw_token_owner_ranks = _build_token_ownership_table(
+    raw_token_owner_ranks, owner_change_positions = _build_token_ownership_parts(
         state.rank_plan.token_layout_index
     )
-    owner_change_positions = _owner_change_positions(raw_token_owner_ranks)
     rank_count = len(state.rank_plan.token_layout_index.ownership_ranges_by_rank)
     return tuple(
         _build_dsv4_compressed_layout_from_parts(
@@ -1469,9 +1471,9 @@ def _make_branch_view(
     )
 
 
-def _build_token_ownership_table(
+def _build_token_ownership_parts(
     token_layout_index: TokenLayoutIndexLike,
-) -> tuple[int, ...]:
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
     max_end = 0
     for ranges in token_layout_index.ownership_ranges_by_rank:
         for _start, end, _local_start in ranges:
@@ -1486,7 +1488,18 @@ def _build_token_ownership_table(
                     f"DSV4 token ownership range is invalid: {start}:{end}"
                 )
             owner_ranks[start_int:end_int] = [int(rank)] * (end_int - start_int)
-    return tuple(owner_ranks)
+    change_positions: list[int] = []
+    for rank, ranges in enumerate(token_layout_index.ownership_ranges_by_rank):
+        for start, end, _local_start in ranges:
+            start_int = int(start)
+            end_int = int(end)
+            if start_int <= 0 or start_int >= max_end:
+                continue
+            if end_int <= start_int:
+                continue
+            if int(owner_ranks[start_int - 1]) != int(rank):
+                change_positions.append(start_int)
+    return tuple(owner_ranks), tuple(sorted(set(change_positions)))
 
 
 def _normalize_compression_entry_ids(

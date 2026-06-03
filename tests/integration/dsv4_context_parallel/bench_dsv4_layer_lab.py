@@ -1448,7 +1448,12 @@ def _planned_attention_backward_exchange_bytes(
     query_row_bytes: int,
     kv_row_bytes: int,
 ) -> RuntimeExplicitCommBytes:
-    rank_plan = backward_plan.rank_plans[int(rank)]
+    if int(backward_plan.local_rank) != int(rank):
+        raise RuntimeError(
+            "DSV4 benchmark backward plan rank does not match measured rank: "
+            f"{backward_plan.local_rank} vs {rank}"
+        )
+    rank_plan = backward_plan.local_rank_plan
     query_send_rows = sum(
         1 for owner in rank_plan.query_owner_ranks if int(owner) != int(rank)
     )

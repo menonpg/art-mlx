@@ -258,7 +258,8 @@ class Dsv4AttentionBackwardRankPlan(Dsv4FrozenModel):
 class Dsv4AttentionBackwardPlan(Dsv4FrozenModel):
     compression_kind: Dsv4CompressionKind
     stage_indices: tuple[int, ...]
-    rank_plans: tuple[Dsv4AttentionBackwardRankPlan, ...]
+    local_rank: int
+    local_rank_plan: Dsv4AttentionBackwardRankPlan
 
 
 class Dsv4ProjectedAttentionForwardResult(Dsv4TensorModel):

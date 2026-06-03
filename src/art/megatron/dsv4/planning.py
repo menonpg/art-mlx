@@ -123,6 +123,7 @@ def _prepare_dsv4_context_parallel_state_impl(
             build_dsv4_indexer_stage_plan_from_stage_plans(
                 layout=csa_layout,
                 stage_plans_by_rank=slot.stage_plans_by_rank,
+                local_rank=int(cp_state.rank_plan.rank),
             )
             for slot in stage_slots
         )
@@ -134,6 +135,7 @@ def _prepare_dsv4_context_parallel_state_impl(
             build_dsv4_indexer_kv_exchange_peer_plans(
                 layout=csa_layout,
                 candidate_entry_ids_by_rank=stage_plan.candidate_entry_ids_by_rank,
+                local_rank=int(cp_state.rank_plan.rank),
             )
             for stage_plan in csa_indexer_stage_plans
         )
@@ -184,6 +186,7 @@ def _prepare_dsv4_context_parallel_state_impl(
                 stage_kv_peer_plans_by_layout=tuple(
                     stage_kv_plans_by_name[name] for name in backward_layout_names
                 ),
+                local_rank=int(cp_state.rank_plan.rank),
             ),
             strict=True,
         )
