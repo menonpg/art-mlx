@@ -412,7 +412,7 @@ def default_validation_cases() -> tuple[Dsv4WorkloadCase, ...]:
         ),
         Dsv4WorkloadCase(
             name="swa_boundary",
-            sequence_length=320,
+            sequence_length=400,
             rows=(
                 Dsv4PackedRowShape(
                     families=(
