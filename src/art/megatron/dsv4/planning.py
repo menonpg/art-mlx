@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,6 +37,40 @@ def prepare_dsv4_context_parallel_state(
     include_csa: bool = True,
     include_hca: bool = True,
     extra: dict[str, Any] | None = None,
+) -> Dsv4ContextParallelState:
+    """Wrap a normal ART CP state with host-only DSV4 planning metadata.
+
+    DSV4 planning allocates many short-lived Python metadata objects. The
+    planning path is host-only and should run ahead of queued GPU work; a Python
+    GC cycle inside this function can create a visible planning-latency spike
+    without improving correctness. The wrapper temporarily disables GC while
+    preserving the caller's prior GC state.
+    """
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        return _prepare_dsv4_context_parallel_state_impl(
+            cp_state=cp_state,
+            csa_ratio=csa_ratio,
+            hca_ratio=hca_ratio,
+            include_csa=include_csa,
+            include_hca=include_hca,
+            extra=extra,
+        )
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def _prepare_dsv4_context_parallel_state_impl(
+    *,
+    cp_state: ArtContextParallelState,
+    csa_ratio: int,
+    hca_ratio: int,
+    include_csa: bool,
+    include_hca: bool,
+    extra: dict[str, Any] | None,
 ) -> Dsv4ContextParallelState:
     """Wrap a normal ART CP state with host-only DSV4 planning metadata.
 
@@ -131,11 +166,16 @@ def prepare_dsv4_context_parallel_state(
     stage_kv_plans_by_name: dict[str, list[Any]] = {
         name: [] for name in stage_kv_layout_names
     }
-    for slot in stage_slots:
+    for slot_index, slot in enumerate(stage_slots):
+        compressed_peer_plans_by_layout = tuple(
+            csa_indexer_kv_peer_plans_by_stage[slot_index] if name == "csa" else None
+            for name in stage_kv_layout_names
+        )
         plans_for_slot = (
             build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
                 layouts=tuple(stage_kv_layouts),
                 stage_plans_by_rank=slot.stage_plans_by_rank,
+                compressed_peer_plans_by_layout=compressed_peer_plans_by_layout,
             )
         )
         for name, plans in zip(stage_kv_layout_names, plans_for_slot, strict=True):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -12,6 +13,7 @@ from .types import (
     Dsv4BranchView,
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
+    Dsv4IndexerKvExchangePeerPlan,
     Dsv4MaterializedStage,
     Dsv4StageInputs,
     Dsv4StageKeyKind,
@@ -523,6 +525,10 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
     *,
     layouts: Sequence[Dsv4CompressedLayout],
     stage_plans_by_rank: Sequence[Any],
+    compressed_peer_plans_by_layout: Sequence[
+        Sequence[Dsv4IndexerKvExchangePeerPlan] | None
+    ]
+    | None = None,
 ) -> tuple[tuple[Dsv4StageKvExchangePeerPlan, ...], ...]:
     """Plan fused stage KV exchange metadata for multiple DSV4 layouts.
 
@@ -533,6 +539,16 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
     layout_tuple = tuple(layouts)
     if not layout_tuple:
         return ()
+    compressed_peer_plan_tuple = (
+        (None,) * len(layout_tuple)
+        if compressed_peer_plans_by_layout is None
+        else tuple(compressed_peer_plans_by_layout)
+    )
+    if len(compressed_peer_plan_tuple) != len(layout_tuple):
+        raise RuntimeError(
+            "DSV4 stage KV compressed peer-plan override count must match layouts: "
+            f"{len(compressed_peer_plan_tuple)} vs {len(layout_tuple)}"
+        )
     stage_plans = tuple(stage_plans_by_rank)
     _validate_stage_plan_count(layout=layout_tuple[0], stage_plans_by_rank=stage_plans)
     _shared_stage_index(stage_plans)
@@ -547,21 +563,13 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
     has_queries = tuple(
         _ranges_have_tokens(stage_plan.global_q_ranges) for stage_plan in stage_plans
     )
-    raw_by_rank = tuple(
-        _stage_raw_token_ids(
+    recv_raw = tuple(
+        _stage_raw_token_ids_by_owner_rank(
             layout=layout_tuple[0],
             ranges=stage_plan.global_k_ranges if has_queries[rank] else (),
+            rank_count=rank_count,
         )
         for rank, stage_plan in enumerate(stage_plans)
-    )
-    recv_raw = tuple(
-        _ids_by_owner_rank_from_table(
-            ids=raw_token_ids,
-            rank_count=rank_count,
-            owner_ranks=layout_tuple[0].raw_token_owner_ranks,
-            name=f"rank{rank}_raw_token_ids",
-        )
-        for rank, raw_token_ids in enumerate(raw_by_rank)
     )
     send_raw = _transpose_peer_ids(recv_raw)
     return tuple(
@@ -572,8 +580,13 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
             send_raw=send_raw,
             recv_raw=recv_raw,
             rank_count=rank_count,
+            compressed_peer_plans=compressed_peer_plans,
         )
-        for layout in layout_tuple
+        for layout, compressed_peer_plans in zip(
+            layout_tuple,
+            compressed_peer_plan_tuple,
+            strict=True,
+        )
     )
 
 
@@ -585,7 +598,24 @@ def _build_stage_kv_exchange_peer_plans_for_layout(
     send_raw: tuple[tuple[tuple[int, ...], ...], ...],
     recv_raw: tuple[tuple[tuple[int, ...], ...], ...],
     rank_count: int,
+    compressed_peer_plans: Sequence[Dsv4IndexerKvExchangePeerPlan] | None,
 ) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
+    if compressed_peer_plans is not None:
+        plans = tuple(compressed_peer_plans)
+        if len(plans) != int(rank_count):
+            raise RuntimeError(
+                "DSV4 stage KV compressed peer-plan override rank count must "
+                f"match: {len(plans)} vs {rank_count}"
+            )
+        return tuple(
+            Dsv4StageKvExchangePeerPlan.model_construct(
+                send_raw_token_ids_by_peer=send_raw[rank],
+                send_compressed_entry_ids_by_peer=plans[rank].send_entry_ids_by_peer,
+                recv_raw_token_ids_by_peer=recv_raw[rank],
+                recv_compressed_entry_ids_by_peer=plans[rank].recv_entry_ids_by_peer,
+            )
+            for rank in range(rank_count)
+        )
     compressed_by_rank = tuple(
         stage_candidate_entry_ids(
             layout=layout,
@@ -982,6 +1012,69 @@ def _stage_raw_token_ids(
     return tuple(token_ids)
 
 
+def _stage_raw_token_ids_by_owner_rank(
+    *,
+    layout: Dsv4CompressedLayout,
+    ranges: Sequence[TokenRangeLike],
+    rank_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    by_rank: list[list[int]] = [[] for _ in range(int(rank_count))]
+    intersections: list[tuple[int, int]] = []
+    valid_ranges = _layout_stream_ranges(layout)
+    owner_ranks = layout.raw_token_owner_ranks
+    owner_count = len(owner_ranks)
+    owner_changes = layout.raw_token_owner_change_positions
+    for range_ in ranges:
+        range_start = int(range_.start)
+        range_end = int(range_.end)
+        for stream_start, stream_end in valid_ranges:
+            start = max(range_start, stream_start)
+            end = min(range_end, stream_end)
+            if start < end:
+                intersections.append((start, end))
+    for start, end in _merge_stage_id_ranges(intersections):
+        current = int(start)
+        end_int = int(end)
+        if current < 0 or end_int > owner_count:
+            raise RuntimeError(
+                f"DSV4 stage raw token range {current}:{end_int} is outside owner table"
+            )
+        while current < end_int:
+            rank = int(owner_ranks[current])
+            if rank < 0 or rank >= int(rank_count):
+                raise RuntimeError(
+                    f"DSV4 stage raw token id {current} has invalid owner rank {rank}"
+                )
+            change_index = bisect_left(owner_changes, current + 1)
+            next_change = (
+                int(owner_changes[change_index])
+                if change_index < len(owner_changes)
+                else end_int
+            )
+            segment_end = min(end_int, next_change)
+            by_rank[rank].extend(range(current, segment_end))
+            current = segment_end
+    return tuple(tuple(ids) for ids in by_rank)
+
+
+def _merge_stage_id_ranges(
+    ranges: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    sorted_ranges = sorted(
+        (int(start), int(end)) for start, end in ranges if int(start) < int(end)
+    )
+    if not sorted_ranges:
+        return ()
+    merged: list[list[int]] = [[sorted_ranges[0][0], sorted_ranges[0][1]]]
+    for start, end in sorted_ranges[1:]:
+        current = merged[-1]
+        if int(start) <= int(current[1]):
+            current[1] = max(int(current[1]), int(end))
+        else:
+            merged.append([int(start), int(end)])
+    return tuple((int(start), int(end)) for start, end in merged)
+
+
 def _validate_stage_plan_count(
     *,
     layout: Dsv4CompressedLayout,
@@ -1069,6 +1162,35 @@ def _ids_by_owner_rank(
 
 
 def _ids_by_owner_rank_from_table(
+    *,
+    ids: Sequence[int],
+    rank_count: int,
+    owner_ranks: Sequence[int],
+    name: str,
+) -> tuple[tuple[int, ...], ...]:
+    by_rank: list[list[int]] = [[] for _ in range(rank_count)]
+    owner_count = len(owner_ranks)
+    previous: int | None = None
+    for id_ in ids:
+        id_int = int(id_)
+        if previous is not None and id_int <= previous:
+            return _strict_ids_by_owner_rank_from_table(
+                ids=ids,
+                rank_count=rank_count,
+                owner_ranks=owner_ranks,
+                name=name,
+            )
+        previous = id_int
+        if id_int < 0 or id_int >= owner_count:
+            raise RuntimeError(f"DSV4 {name} id {id_int} is outside layout owner table")
+        rank = int(owner_ranks[id_int])
+        if rank < 0 or rank >= int(rank_count):
+            raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
+        by_rank[rank].append(id_int)
+    return tuple(tuple(peer_ids) for peer_ids in by_rank)
+
+
+def _strict_ids_by_owner_rank_from_table(
     *,
     ids: Sequence[int],
     rank_count: int,

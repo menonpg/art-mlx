@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from itertools import chain
 from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -1884,7 +1885,7 @@ def _stage_plan_slot_query_raw_id_and_owner_spaces(
     ],
 ]:
     rank_count = len(layout.entry_ids_by_owner_rank)
-    raw_owner_ranks = tuple(int(owner) for owner in layout.raw_token_owner_ranks)
+    raw_owner_ranks = layout.raw_token_owner_ranks
     valid_ranges = _layout_stream_ranges(layout)
     query_ranges_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(rank_count)]
     raw_ranges_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(rank_count)]
@@ -2087,7 +2088,7 @@ def _query_raw_owner_spaces(
     tuple[tuple[int, ...], ...],
     tuple[tuple[int, ...], ...],
 ]:
-    raw_owner_ranks = tuple(int(owner) for owner in layout.raw_token_owner_ranks)
+    raw_owner_ranks = layout.raw_token_owner_ranks
     return (
         tuple(
             _raw_owner_ranks_for_ids(
@@ -2206,8 +2207,6 @@ def _gradient_recv_and_owned_by_rank(
     recv: list[list[list[int]]] = [
         [[] for _ in range(rank_count)] for _ in range(rank_count)
     ]
-    owned: list[list[int]] = [[] for _ in range(rank_count)]
-    seen_owned: list[set[int]] = [set() for _ in range(rank_count)]
     for peer_rank, (peer_ids, peer_owners) in enumerate(
         zip(ids_by_rank, owners_by_rank, strict=True)
     ):
@@ -2219,12 +2218,12 @@ def _gradient_recv_and_owned_by_rank(
                 )
             id_int = int(id_)
             recv[owner][peer_rank].append(id_int)
-            if id_int not in seen_owned[owner]:
-                owned[owner].append(id_int)
-                seen_owned[owner].add(id_int)
     return (
         tuple(tuple(tuple(peer_ids) for peer_ids in rank_ids) for rank_ids in recv),
-        tuple(tuple(ids) for ids in owned),
+        tuple(
+            tuple(dict.fromkeys(chain.from_iterable(rank_ids)).keys())
+            for rank_ids in recv
+        ),
     )
 
 

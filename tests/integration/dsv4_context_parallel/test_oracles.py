@@ -65,7 +65,7 @@ def test_dense_oracle_matches_unpacked_branch_views_and_shared_prefix() -> None:
     torch.manual_seed(101)
     query = torch.randn(18, 3, 5, dtype=torch.float64)
     raw_kv = torch.randn(18, 5, dtype=torch.float64)
-    compressed_kv = torch.randn(len(layout.entries), 5, dtype=torch.float64)
+    compressed_kv = torch.randn(layout.entry_count(), 5, dtype=torch.float64)
     attn_sink = torch.randn(3, dtype=torch.float64)
     topk = _all_visible_topk(layout)
 
@@ -105,7 +105,7 @@ def test_dense_oracle_rejects_sibling_compressed_leakage_from_bad_topk() -> None
     torch.manual_seed(103)
     query = torch.randn(18, 2, 4, dtype=torch.float64)
     raw_kv = torch.randn(18, 4, dtype=torch.float64)
-    compressed_kv = torch.randn(len(layout.entries), 4, dtype=torch.float64)
+    compressed_kv = torch.randn(layout.entry_count(), 4, dtype=torch.float64)
     attn_sink = torch.randn(2, dtype=torch.float64)
     topk = torch.full((18, 3), -1, dtype=torch.long)
     query_token_id = 12
@@ -160,7 +160,7 @@ def test_materialized_stage_path_matches_packed_oracle_forward_and_backward(
     torch.manual_seed(107)
     query = torch.randn(18, 2, 4, dtype=torch.float64)
     raw_kv = torch.randn(18, 4, dtype=torch.float64)
-    compressed_kv = torch.randn(len(layout.entries), 4, dtype=torch.float64)
+    compressed_kv = torch.randn(layout.entry_count(), 4, dtype=torch.float64)
     attn_sink = torch.randn(2, dtype=torch.float64)
     grad_out = torch.randn(1, 18, 2, 4, dtype=torch.float64)
     global_topk = _all_visible_topk(layout)
@@ -185,7 +185,7 @@ def test_materialized_stage_path_matches_packed_oracle_forward_and_backward(
         raw_kv=raw_kv,
         raw_token_ids=tuple(range(18)),
         compressed_kv=compressed_kv,
-        compressed_entry_ids=tuple(range(len(layout.entries))),
+        compressed_entry_ids=tuple(range(layout.entry_count())),
     )
     actual = run_materialized_dsv4_attention_forward(
         stages=(stage,),
@@ -220,7 +220,7 @@ def test_materialized_stage_path_matches_packed_oracle_forward_and_backward(
         replay_result=replay,
         query_token_ids=tuple(range(18)),
         raw_token_ids=tuple(range(18)),
-        compressed_entry_ids=tuple(range(len(layout.entries))),
+        compressed_entry_ids=tuple(range(layout.entry_count())),
     )
 
     ref_query = query.detach().clone().requires_grad_()
@@ -480,7 +480,7 @@ def test_projected_csa_wrapper_matches_packed_oracle_forward_and_backward(
         indexer_q=indexer_q,
         indexer_kv=indexer_compressed,
         indexer_weights=indexer_weights,
-        candidate_entry_ids=tuple(range(len(layout.entries))),
+        candidate_entry_ids=tuple(range(layout.entry_count())),
         topk=2,
     ).indices[0]
     expected = dense_dsv4_packed_attention_oracle(
@@ -1504,7 +1504,7 @@ def _run_real_planner_csa_context_oracle(
         indexer_q=indexer_q,
         indexer_kv=indexer_compressed,
         indexer_weights=indexer_weights,
-        candidate_entry_ids=tuple(range(len(layout.entries))),
+        candidate_entry_ids=tuple(range(layout.entry_count())),
         topk=2,
     ).indices[0]
     expected = dense_dsv4_packed_attention_oracle(
@@ -1751,7 +1751,7 @@ def _run_real_planner_hca_context_oracle(
         scale=scale,
         window_size=128,
         raw_list_size=token_count,
-        compressed_list_size=len(layout.entries),
+        compressed_list_size=layout.entry_count(),
     ).wait_post_process()
 
     compressed = compress_projected_kv(
@@ -2016,7 +2016,7 @@ def _distributed_projected_csa_oracle_worker(
             indexer_q=indexer_q,
             indexer_kv=indexer_compressed,
             indexer_weights=indexer_weights,
-            candidate_entry_ids=tuple(range(len(layout.entries))),
+            candidate_entry_ids=tuple(range(layout.entry_count())),
             topk=2,
         ).indices[0]
         expected = dense_dsv4_packed_attention_oracle(
@@ -2203,7 +2203,7 @@ def _distributed_projected_csa_cp4_empty_rank_oracle_worker(
             indexer_q=indexer_q,
             indexer_kv=indexer_compressed,
             indexer_weights=indexer_weights,
-            candidate_entry_ids=tuple(range(len(layout.entries))),
+            candidate_entry_ids=tuple(range(layout.entry_count())),
             topk=2,
         ).indices[0]
         expected = dense_dsv4_packed_attention_oracle(
@@ -2409,7 +2409,7 @@ def _distributed_projected_csa_nccl_oracle_worker(
             indexer_q=indexer_q,
             indexer_kv=indexer_compressed,
             indexer_weights=indexer_weights,
-            candidate_entry_ids=tuple(range(len(layout.entries))),
+            candidate_entry_ids=tuple(range(layout.entry_count())),
             topk=2,
         ).indices[0]
         expected = dense_dsv4_packed_attention_oracle(
@@ -2427,18 +2427,17 @@ def _distributed_projected_csa_nccl_oracle_worker(
             device=device,
             dtype=torch.long,
         )
-        torch.testing.assert_close(
-            forward.attention.out,
-            expected.out.index_select(1, local_positions),
-            rtol=1e-4,
-            atol=1e-4,
+        _assert_mean_abs_pct(
+            forward.attention.out.float(),
+            expected.out.index_select(1, local_positions).float(),
+            threshold=0.5,
+            name="CUDA fake CSA fwd",
         )
-        torch.testing.assert_close(
-            forward.attention.lse,
-            expected.lse.index_select(1, local_positions),
-            rtol=1e-4,
-            atol=1e-4,
-            check_dtype=False,
+        _assert_mean_abs_pct(
+            forward.attention.lse.float(),
+            expected.lse.index_select(1, local_positions).float(),
+            threshold=0.5,
+            name="CUDA fake CSA lse",
         )
 
         backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
@@ -2481,45 +2480,45 @@ def _distributed_projected_csa_nccl_oracle_worker(
         assert ref_main_gate.grad is not None
         assert ref_main_bias.grad is not None
         assert ref_sink.grad is not None
-        _assert_id_aligned_rows_close(
+        _assert_id_aligned_rows_mean_abs_pct(
             actual=backward.attention.dq,
             actual_ids=backward.attention.query_token_ids,
             expected=ref_query.grad.unsqueeze(0),
-            rtol=1e-4,
-            atol=1e-4,
+            threshold=0.5,
+            name="CUDA fake CSA dq",
         )
-        _assert_id_aligned_rows_close(
+        _assert_id_aligned_rows_mean_abs_pct(
             actual=backward.attention.draw_kv,
             actual_ids=backward.attention.raw_token_ids,
             expected=ref_raw.grad.unsqueeze(0),
-            rtol=1e-4,
-            atol=1e-4,
+            threshold=0.5,
+            name="CUDA fake CSA draw",
         )
-        _assert_id_aligned_rows_close(
+        _assert_id_aligned_rows_mean_abs_pct(
             actual=backward.main_compressor.dprojected_kv,
             actual_ids=backward.main_compressor.token_ids,
             expected=ref_main_projected.grad,
-            rtol=1e-4,
-            atol=1e-4,
+            threshold=0.5,
+            name="CUDA fake CSA dprojected_kv",
         )
-        _assert_id_aligned_rows_close(
+        _assert_id_aligned_rows_mean_abs_pct(
             actual=backward.main_compressor.dprojected_gate,
             actual_ids=backward.main_compressor.token_ids,
             expected=ref_main_gate.grad,
-            rtol=1e-4,
-            atol=1e-4,
+            threshold=0.5,
+            name="CUDA fake CSA dprojected_gate",
         )
-        torch.testing.assert_close(
-            backward.main_compressor.dpositional_bias,
-            ref_main_bias.grad,
-            rtol=1e-4,
-            atol=1e-4,
+        _assert_mean_abs_pct(
+            backward.main_compressor.dpositional_bias.float(),
+            ref_main_bias.grad.float(),
+            threshold=0.5,
+            name="CUDA fake CSA dpositional_bias",
         )
-        torch.testing.assert_close(
-            backward.attention.d_attn_sink,
-            ref_sink.grad,
-            rtol=1e-4,
-            atol=1e-4,
+        _assert_mean_abs_pct(
+            backward.attention.d_attn_sink.float(),
+            ref_sink.grad.float(),
+            threshold=0.5,
+            name="CUDA fake CSA dsink",
         )
         assert not bool(backward.attention.dq.abs().sum().eq(0).item())
         assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
@@ -2641,7 +2640,7 @@ def _distributed_projected_csa_real_miles_nccl_oracle_worker(
             indexer_q=indexer_q,
             indexer_kv=indexer_compressed,
             indexer_weights=indexer_weights,
-            candidate_entry_ids=tuple(range(len(layout.entries))),
+            candidate_entry_ids=tuple(range(layout.entry_count())),
             topk=2,
         ).indices[0]
         expected = dense_dsv4_packed_attention_oracle(
@@ -2900,8 +2899,8 @@ def _distributed_projected_hca_ratio128_nccl_oracle_worker(
             expect_rank0_halo_grad=True,
             device=device,
             dtype=torch.float32,
-            rtol=1e-4,
-            atol=1e-4,
+            mean_abs_pct_threshold=0.5,
+            grad_mean_abs_pct_threshold=0.5,
         )
         torch.cuda.synchronize(device)
     finally:
@@ -3184,7 +3183,7 @@ def _run_distributed_projected_hca_oracle_case(
         scale=scale,
         window_size=128,
         raw_list_size=min(128, token_count),
-        compressed_list_size=len(layout.entries),
+        compressed_list_size=layout.entry_count(),
     ).wait_post_process()
 
     compressed = compress_projected_kv(

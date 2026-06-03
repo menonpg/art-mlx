@@ -432,6 +432,7 @@ class Dsv4CompressedLayout(BaseModel):
     halo_transfers: tuple[Dsv4HaloTransfer, ...]
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
     raw_token_owner_ranks: tuple[int, ...]
+    raw_token_owner_change_positions: tuple[int, ...] = ()
     compressed_entry_owner_ranks: tuple[int, ...] = ()
     entry_branch_stream_ids: tuple[int, ...] = ()
     entry_prefix_stream_ids: tuple[int, ...] = ()

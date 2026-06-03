@@ -281,21 +281,60 @@ def _visible_compressed_ids(
 ) -> tuple[int, ...]:
     selected = None if topk_rows is None else set(topk_rows.get(query_token_id, ()))
     visible: list[int] = []
-    for entry in layout.entries:
-        entry_id = int(entry.entry_id)
+    for (
+        entry_id,
+        branch_stream_id,
+        prefix_stream_id,
+        closure_view_pos,
+        shared,
+    ) in _iter_entry_visibility(layout):
         if entry_id not in compressed_map:
             continue
         if selected is not None and entry_id not in selected:
             continue
-        same_branch = int(entry.branch_stream_id) == int(branch.branch_stream_id)
-        shared_prefix = bool(entry.shared_prefix_entry) and int(
-            entry.prefix_stream_id
-        ) == int(branch.prefix_stream_id)
-        if (same_branch or shared_prefix) and int(entry.closure_view_pos) <= int(
+        same_branch = int(branch_stream_id) == int(branch.branch_stream_id)
+        shared_prefix = bool(shared) and int(prefix_stream_id) == int(
+            branch.prefix_stream_id
+        )
+        if (same_branch or shared_prefix) and int(closure_view_pos) <= int(
             query_view_pos
         ):
             visible.append(entry_id)
     return tuple(visible)
+
+
+def _iter_entry_visibility(
+    layout: Dsv4CompressedLayout,
+) -> tuple[tuple[int, int, int, int, bool], ...]:
+    if layout.entries:
+        return tuple(
+            (
+                int(entry.entry_id),
+                int(entry.branch_stream_id),
+                int(entry.prefix_stream_id),
+                int(entry.closure_view_pos),
+                bool(entry.shared_prefix_entry),
+            )
+            for entry in layout.entries
+        )
+    count = int(layout.entry_count())
+    if (
+        len(layout.entry_branch_stream_ids) < count
+        or len(layout.entry_prefix_stream_ids) < count
+        or len(layout.entry_closure_view_positions) < count
+        or len(layout.entry_shared_prefix_flags) < count
+    ):
+        raise RuntimeError("DSV4 compact oracle layout is missing entry metadata")
+    return tuple(
+        (
+            entry_id,
+            int(layout.entry_branch_stream_ids[entry_id]),
+            int(layout.entry_prefix_stream_ids[entry_id]),
+            int(layout.entry_closure_view_positions[entry_id]),
+            bool(layout.entry_shared_prefix_flags[entry_id]),
+        )
+        for entry_id in range(count)
+    )
 
 
 def _select_kv_rows(
