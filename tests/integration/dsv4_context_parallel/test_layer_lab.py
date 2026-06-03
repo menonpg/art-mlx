@@ -113,6 +113,14 @@ def test_layer_lab_runtime_metrics_aggregate_rank_max(tmp_path) -> None:
     assert (
         metrics["single_family_two_branches_cp2_csa_forward_total_median"].value == 17.5
     )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_compression_forward_median"].value
+        == 3.5
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_csa_attention_forward_median"].value
+        == 6.5
+    )
     assert metrics["single_family_two_branches_cp2_csa_e2e_median"].value == 37.5
     assert metrics["single_family_two_branches_cp2_csa_output_abs_sum"].value == 5.0
     assert metrics["single_family_two_branches_cp2_csa_dq_abs_sum"].passed is True
@@ -154,6 +162,8 @@ def _runtime_timing(
         forward_launch_ms=(1.0, 1.0),
         forward_wait_ms=(1.0, 1.0),
         forward_total_ms=forward_total_ms,
+        compression_forward_ms=(3.0, 4.0),
+        attention_forward_ms=(6.0, 7.0),
         backward_launch_ms=(1.0, 1.0),
         backward_wait_ms=(1.0, 1.0),
         backward_total_ms=backward_total_ms,

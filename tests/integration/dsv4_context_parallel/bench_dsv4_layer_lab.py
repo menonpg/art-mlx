@@ -109,6 +109,8 @@ class RankRuntimeTiming(BaseModel):
     forward_launch_ms: tuple[float, ...]
     forward_wait_ms: tuple[float, ...]
     forward_total_ms: tuple[float, ...]
+    compression_forward_ms: tuple[float, ...]
+    attention_forward_ms: tuple[float, ...]
     backward_launch_ms: tuple[float, ...]
     backward_wait_ms: tuple[float, ...]
     backward_total_ms: tuple[float, ...]
@@ -132,6 +134,8 @@ class RuntimeTiming(BaseModel):
     def metrics(self) -> tuple[Dsv4Metric, ...]:
         prefix = f"{self.case_name}_{self.topology}_{self.compression_kind}"
         forward_total = _iteration_rank_max(self.ranks, "forward_total_ms")
+        compression_forward = _iteration_rank_max(self.ranks, "compression_forward_ms")
+        attention_forward = _iteration_rank_max(self.ranks, "attention_forward_ms")
         backward_total = _iteration_rank_max(self.ranks, "backward_total_ms")
         e2e = _iteration_rank_max(self.ranks, "e2e_ms")
         token_count = max((rank.token_count for rank in self.ranks), default=0)
@@ -163,6 +167,26 @@ class RuntimeTiming(BaseModel):
             Dsv4Metric(
                 name=f"{prefix}_forward_total_p90",
                 value=_percentile(forward_total, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_compression_forward_median",
+                value=_median(compression_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_compression_forward_p90",
+                value=_percentile(compression_forward, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_attention_forward_median",
+                value=_median(attention_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_attention_forward_p90",
+                value=_percentile(attention_forward, 90),
                 unit="ms",
             ),
             Dsv4Metric(
@@ -242,6 +266,33 @@ class RankRuntimeOutput(BaseModel):
     timings: tuple[RankRuntimeTiming, ...]
 
 
+class RuntimeForwardInputs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    main_projected_kv: torch.Tensor | None = None
+    main_projected_gate: torch.Tensor | None = None
+    main_positional_bias: torch.Tensor | None = None
+    indexer_projected_kv: torch.Tensor | None = None
+    indexer_projected_gate: torch.Tensor | None = None
+    indexer_positional_bias: torch.Tensor | None = None
+    indexer_q: torch.Tensor | None = None
+    indexer_weights: torch.Tensor | None = None
+    projected_kv: torch.Tensor | None = None
+    projected_gate: torch.Tensor | None = None
+    positional_bias: torch.Tensor | None = None
+
+
+class RuntimeForwardPhase(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    forward: Any
+    launch_ms: float
+    wait_ms: float
+    total_ms: float
+    compression_ms: float
+    attention_ms: float
+
+
 class LabResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -257,6 +308,8 @@ RuntimeBenchmarkConfig.model_rebuild()
 RankRuntimeTiming.model_rebuild()
 RuntimeTiming.model_rebuild()
 RankRuntimeOutput.model_rebuild()
+RuntimeForwardInputs.model_rebuild()
+RuntimeForwardPhase.model_rebuild()
 LabResult.model_rebuild()
 
 
@@ -425,8 +478,9 @@ def run_runtime_benchmark(
     passed = all(metric.passed is not False for metric in metrics)
     caveats = (
         "projected-input runtime benchmark; surrounding DSV4 model projections, RMSNorm, RoPE, and output projection are excluded until the non-CP DSV4 handler exists",
-        "uses real prepared ART CP state and DSV4 projected CSA/HCA forward/backward APIs",
-        "launch/wait timing is measured at the public projected-attention API boundary, not with production debug hooks",
+        "uses real prepared ART CP state plus public DSV4 compression, indexer/stage-attention, and projected-backward APIs",
+        "forward phase timings split public compression versus indexer/stage-attention execution without production debug hooks",
+        "phase medians and p90s are rank-max aggregates per phase and are diagnostic rather than additive",
         "warmup excludes first-use TileLang compilation and setup where the iteration count is large enough to amortize it",
     )
     case_summaries = tuple(summarize_case(case) for case in cases)
@@ -721,11 +775,20 @@ def _time_runtime_kind(
     backward_launch_ms: list[float] = []
     backward_wait_ms: list[float] = []
     backward_total_ms: list[float] = []
+    compression_forward_ms: list[float] = []
+    attention_forward_ms: list[float] = []
     e2e_ms: list[float] = []
     output_abs_sum = 0.0
     dq_abs_sum = 0.0
     compressor_grad_abs_sum = 0.0
     nonfinite_count = 0
+    forward_inputs = _build_runtime_forward_inputs(
+        compression_kind=compression_kind,
+        local_token_count=local_count,
+        config=config,
+        device=device,
+        dtype=dtype,
+    )
     if int(config.warmup) == 0:
         torch.cuda.reset_peak_memory_stats(device)
     for iteration in range(int(config.warmup) + int(config.iterations)):
@@ -734,35 +797,32 @@ def _time_runtime_kind(
             torch.cuda.reset_peak_memory_stats(device)
         e2e_start = time.perf_counter()
         if compression_kind == "csa":
-            forward_work = _launch_runtime_csa_forward(
+            forward_phase = _run_runtime_csa_forward(
                 context_state=context_state,
                 query=query,
                 raw_kv=raw_kv,
                 attn_sink=attn_sink,
                 local_token_ids=local_token_ids,
                 config=config,
-                dtype=dtype,
+                forward_inputs=forward_inputs,
                 scale=scale,
+                device=device,
             )
         elif compression_kind == "hca":
-            forward_work = _launch_runtime_hca_forward(
+            forward_phase = _run_runtime_hca_forward(
                 context_state=context_state,
                 query=query,
                 raw_kv=raw_kv,
                 attn_sink=attn_sink,
                 local_token_ids=local_token_ids,
                 config=config,
-                dtype=dtype,
+                forward_inputs=forward_inputs,
                 scale=scale,
+                device=device,
             )
         else:
             raise RuntimeError(f"unsupported runtime kind {compression_kind}")
-        fwd_launch = _elapsed_ms(e2e_start)
-        fwd_wait_start = time.perf_counter()
-        forward = forward_work.wait_post_process()
-        torch.cuda.synchronize(device)
-        fwd_wait = _elapsed_ms(fwd_wait_start)
-        fwd_total = _elapsed_ms(e2e_start)
+        forward = forward_phase.forward
         bwd_start = time.perf_counter()
         backward_work = (
             launch_dsv4_projected_attention_backward_from_context_parallel_state(
@@ -780,9 +840,11 @@ def _time_runtime_kind(
         bwd_total = _elapsed_ms(bwd_start)
         total = _elapsed_ms(e2e_start)
         if iteration >= int(config.warmup):
-            forward_launch_ms.append(fwd_launch)
-            forward_wait_ms.append(fwd_wait)
-            forward_total_ms.append(fwd_total)
+            forward_launch_ms.append(forward_phase.launch_ms)
+            forward_wait_ms.append(forward_phase.wait_ms)
+            forward_total_ms.append(forward_phase.total_ms)
+            compression_forward_ms.append(forward_phase.compression_ms)
+            attention_forward_ms.append(forward_phase.attention_ms)
             backward_launch_ms.append(bwd_launch)
             backward_wait_ms.append(bwd_wait)
             backward_total_ms.append(bwd_total)
@@ -811,6 +873,8 @@ def _time_runtime_kind(
         forward_launch_ms=tuple(forward_launch_ms),
         forward_wait_ms=tuple(forward_wait_ms),
         forward_total_ms=tuple(forward_total_ms),
+        compression_forward_ms=tuple(compression_forward_ms),
+        attention_forward_ms=tuple(attention_forward_ms),
         backward_launch_ms=tuple(backward_launch_ms),
         backward_wait_ms=tuple(backward_wait_ms),
         backward_total_ms=tuple(backward_total_ms),
@@ -824,7 +888,79 @@ def _time_runtime_kind(
     )
 
 
-def _launch_runtime_csa_forward(
+def _build_runtime_forward_inputs(
+    *,
+    compression_kind: str,
+    local_token_count: int,
+    config: RuntimeBenchmarkConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> RuntimeForwardInputs:
+    if compression_kind == "csa":
+        main_projected_kv = torch.randn(
+            int(local_token_count),
+            2 * int(config.head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        indexer_projected_kv = torch.randn(
+            int(local_token_count),
+            2 * int(config.indexer_dim),
+            device=device,
+            dtype=dtype,
+        )
+        return RuntimeForwardInputs(
+            main_projected_kv=main_projected_kv,
+            main_projected_gate=torch.randn_like(main_projected_kv),
+            main_positional_bias=torch.randn(
+                int(config.csa_ratio),
+                2 * int(config.head_dim),
+                device=device,
+                dtype=torch.float32,
+            ),
+            indexer_projected_kv=indexer_projected_kv,
+            indexer_projected_gate=torch.randn_like(indexer_projected_kv),
+            indexer_positional_bias=torch.randn(
+                int(config.csa_ratio),
+                2 * int(config.indexer_dim),
+                device=device,
+                dtype=torch.float32,
+            ),
+            indexer_q=torch.randn(
+                int(local_token_count),
+                int(config.head_count),
+                int(config.indexer_dim),
+                device=device,
+                dtype=dtype,
+            ),
+            indexer_weights=torch.randn(
+                int(local_token_count),
+                int(config.head_count),
+                device=device,
+                dtype=dtype,
+            ),
+        )
+    if compression_kind == "hca":
+        projected_kv = torch.randn(
+            int(local_token_count),
+            int(config.head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        return RuntimeForwardInputs(
+            projected_kv=projected_kv,
+            projected_gate=torch.randn_like(projected_kv),
+            positional_bias=torch.randn(
+                int(config.hca_ratio),
+                int(config.head_dim),
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
+    raise RuntimeError(f"unsupported runtime kind {compression_kind}")
+
+
+def _run_runtime_csa_forward(
     *,
     context_state: Any,
     query: torch.Tensor,
@@ -832,77 +968,110 @@ def _launch_runtime_csa_forward(
     attn_sink: torch.Tensor,
     local_token_ids: tuple[int, ...],
     config: RuntimeBenchmarkConfig,
-    dtype: torch.dtype,
+    forward_inputs: RuntimeForwardInputs,
     scale: float,
-) -> Any:
+    device: torch.device,
+) -> RuntimeForwardPhase:
     from art.megatron.dsv4 import (
-        launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
+        Dsv4CompressionKind,
+        Dsv4ProjectedAttentionForwardResult,
+        launch_dsv4_compressed_kv_forward,
+        launch_dsv4_csa_attention_forward_from_stage_plan_slots,
     )
 
-    main_projected_kv = torch.randn(
-        len(local_token_ids),
-        2 * int(config.head_dim),
-        device=query.device,
-        dtype=dtype,
+    plan = context_state.dsv4_plan
+    layout = plan.csa_layout
+    if layout is None:
+        raise RuntimeError("runtime CSA benchmark requires a prepared CSA layout")
+    required = (
+        forward_inputs.main_projected_kv,
+        forward_inputs.main_projected_gate,
+        forward_inputs.main_positional_bias,
+        forward_inputs.indexer_projected_kv,
+        forward_inputs.indexer_projected_gate,
+        forward_inputs.indexer_positional_bias,
+        forward_inputs.indexer_q,
+        forward_inputs.indexer_weights,
     )
-    main_projected_gate = torch.randn_like(main_projected_kv)
-    indexer_projected_kv = torch.randn(
-        len(local_token_ids),
-        2 * int(config.indexer_dim),
-        device=query.device,
-        dtype=dtype,
-    )
-    indexer_projected_gate = torch.randn_like(indexer_projected_kv)
-    indexer_q = torch.randn(
-        len(local_token_ids),
-        int(config.head_count),
-        int(config.indexer_dim),
-        device=query.device,
-        dtype=dtype,
-    )
-    indexer_weights = torch.randn(
-        len(local_token_ids),
-        int(config.head_count),
-        device=query.device,
-        dtype=dtype,
-    )
-    return launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
-        context_state=context_state,
+    if any(item is None for item in required):
+        raise RuntimeError("runtime CSA benchmark inputs are incomplete")
+
+    fwd_start = time.perf_counter()
+    with torch.no_grad():
+        main_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=int(context_state.cp_state.rank_plan.rank),
+            projected_kv=forward_inputs.main_projected_kv,
+            projected_gate=forward_inputs.main_projected_gate,
+            positional_bias=forward_inputs.main_positional_bias,
+            token_ids=local_token_ids,
+            group=context_state.cp_state.cp_group,
+            async_op=True,
+        )
+        indexer_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=int(context_state.cp_state.rank_plan.rank),
+            projected_kv=forward_inputs.indexer_projected_kv,
+            projected_gate=forward_inputs.indexer_projected_gate,
+            positional_bias=forward_inputs.indexer_positional_bias,
+            token_ids=local_token_ids,
+            group=context_state.cp_state.cp_group,
+            async_op=True,
+        )
+    compression_launch_ms = _elapsed_ms(fwd_start)
+    main_compressed = main_work.wait_post_process()
+    indexer_compressed = indexer_work.wait_post_process()
+    torch.cuda.synchronize(device)
+    compression_ms = _elapsed_ms(fwd_start)
+
+    attention_start = time.perf_counter()
+    attention_work = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=int(context_state.cp_state.rank_plan.rank),
+        stage_plan_slots=plan.stage_plan_slots,
         query=query,
         query_token_ids=local_token_ids,
         raw_kv=raw_kv,
         raw_token_ids=local_token_ids,
-        main_projected_kv=main_projected_kv,
-        main_projected_gate=main_projected_gate,
-        main_positional_bias=torch.randn(
-            int(config.csa_ratio),
-            2 * int(config.head_dim),
-            device=query.device,
-            dtype=torch.float32,
-        ),
-        main_token_ids=local_token_ids,
-        indexer_projected_kv=indexer_projected_kv,
-        indexer_projected_gate=indexer_projected_gate,
-        indexer_positional_bias=torch.randn(
-            int(config.csa_ratio),
-            2 * int(config.indexer_dim),
-            device=query.device,
-            dtype=torch.float32,
-        ),
-        indexer_token_ids=local_token_ids,
-        indexer_q=indexer_q,
-        indexer_weights=indexer_weights,
+        compressed_kv=main_compressed.compressed_kv,
+        compressed_entry_ids=main_compressed.compressed_entry_ids,
+        indexer_q=forward_inputs.indexer_q,
+        indexer_weights=forward_inputs.indexer_weights,
+        indexer_kv=indexer_compressed.compressed_kv,
+        indexer_kv_entry_ids=indexer_compressed.compressed_entry_ids,
         indexer_topk=int(config.indexer_topk),
+        indexer_stage_plans=plan.csa_indexer_stage_plans,
+        indexer_kv_peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage or None,
+        stage_kv_peer_plans_by_slot=plan.csa_stage_kv_peer_plans_by_slot or None,
         attn_sink=attn_sink,
+        group=context_state.cp_state.cp_group,
         async_op=True,
         scale=scale,
         window_size=int(config.window_size),
         raw_list_size=int(config.window_size),
         compressed_list_size=int(config.indexer_topk),
     )
+    attention_launch_ms = _elapsed_ms(attention_start)
+    attention = attention_work.wait_post_process()
+    torch.cuda.synchronize(device)
+    attention_ms = _elapsed_ms(attention_start)
+    total_ms = _elapsed_ms(fwd_start)
+    return RuntimeForwardPhase(
+        forward=Dsv4ProjectedAttentionForwardResult(
+            compression_kind=Dsv4CompressionKind.CSA,
+            attention=attention,
+            main_compressed=main_compressed,
+            indexer_compressed=indexer_compressed,
+        ),
+        launch_ms=compression_launch_ms + attention_launch_ms,
+        wait_ms=max(total_ms - compression_launch_ms - attention_launch_ms, 0.0),
+        total_ms=total_ms,
+        compression_ms=compression_ms,
+        attention_ms=attention_ms,
+    )
 
 
-def _launch_runtime_hca_forward(
+def _run_runtime_hca_forward(
     *,
     context_state: Any,
     query: torch.Tensor,
@@ -910,40 +1079,81 @@ def _launch_runtime_hca_forward(
     attn_sink: torch.Tensor,
     local_token_ids: tuple[int, ...],
     config: RuntimeBenchmarkConfig,
-    dtype: torch.dtype,
+    forward_inputs: RuntimeForwardInputs,
     scale: float,
-) -> Any:
+    device: torch.device,
+) -> RuntimeForwardPhase:
     from art.megatron.dsv4 import (
-        launch_dsv4_hca_projected_attention_forward_from_context_parallel_state,
+        Dsv4CompressionKind,
+        Dsv4ProjectedAttentionForwardResult,
+        launch_dsv4_compressed_kv_forward,
+        launch_dsv4_hca_attention_forward_from_stage_plan_slots,
     )
 
-    projected_kv = torch.randn(
-        len(local_token_ids),
-        int(config.head_dim),
-        device=query.device,
-        dtype=dtype,
-    )
-    return launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
-        context_state=context_state,
+    plan = context_state.dsv4_plan
+    layout = plan.hca_layout
+    if layout is None:
+        raise RuntimeError("runtime HCA benchmark requires a prepared HCA layout")
+    if (
+        forward_inputs.projected_kv is None
+        or forward_inputs.projected_gate is None
+        or forward_inputs.positional_bias is None
+    ):
+        raise RuntimeError("runtime HCA benchmark inputs are incomplete")
+
+    fwd_start = time.perf_counter()
+    with torch.no_grad():
+        compressed_work = launch_dsv4_compressed_kv_forward(
+            layout=layout,
+            rank=int(context_state.cp_state.rank_plan.rank),
+            projected_kv=forward_inputs.projected_kv,
+            projected_gate=forward_inputs.projected_gate,
+            positional_bias=forward_inputs.positional_bias,
+            token_ids=local_token_ids,
+            group=context_state.cp_state.cp_group,
+            async_op=True,
+        )
+    compression_launch_ms = _elapsed_ms(fwd_start)
+    compressed = compressed_work.wait_post_process()
+    torch.cuda.synchronize(device)
+    compression_ms = _elapsed_ms(fwd_start)
+
+    attention_start = time.perf_counter()
+    attention_work = launch_dsv4_hca_attention_forward_from_stage_plan_slots(
+        layout=layout,
+        rank=int(context_state.cp_state.rank_plan.rank),
+        stage_plan_slots=plan.stage_plan_slots,
         query=query,
         query_token_ids=local_token_ids,
         raw_kv=raw_kv,
         raw_token_ids=local_token_ids,
-        projected_kv=projected_kv,
-        projected_gate=torch.randn_like(projected_kv),
-        positional_bias=torch.randn(
-            int(config.hca_ratio),
-            int(config.head_dim),
-            device=query.device,
-            dtype=torch.float32,
-        ),
-        token_ids=local_token_ids,
+        compressed_kv=compressed.compressed_kv,
+        compressed_entry_ids=compressed.compressed_entry_ids,
         attn_sink=attn_sink,
+        group=context_state.cp_state.cp_group,
         async_op=True,
+        stage_kv_peer_plans_by_slot=plan.hca_stage_kv_peer_plans_by_slot or None,
         scale=scale,
         window_size=int(config.window_size),
         raw_list_size=int(config.window_size),
         compressed_list_size=None,
+    )
+    attention_launch_ms = _elapsed_ms(attention_start)
+    attention = attention_work.wait_post_process()
+    torch.cuda.synchronize(device)
+    attention_ms = _elapsed_ms(attention_start)
+    total_ms = _elapsed_ms(fwd_start)
+    return RuntimeForwardPhase(
+        forward=Dsv4ProjectedAttentionForwardResult(
+            compression_kind=Dsv4CompressionKind.HCA,
+            attention=attention,
+            main_compressed=compressed,
+        ),
+        launch_ms=compression_launch_ms + attention_launch_ms,
+        wait_ms=max(total_ms - compression_launch_ms - attention_launch_ms, 0.0),
+        total_ms=total_ms,
+        compression_ms=compression_ms,
+        attention_ms=attention_ms,
     )
 
 
