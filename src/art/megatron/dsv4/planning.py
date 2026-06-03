@@ -38,14 +38,7 @@ def prepare_dsv4_context_parallel_state(
     include_hca: bool = True,
     extra: dict[str, Any] | None = None,
 ) -> Dsv4ContextParallelState:
-    """Wrap a normal ART CP state with host-only DSV4 planning metadata.
-
-    DSV4 planning allocates many short-lived Python metadata objects. The
-    planning path is host-only and should run ahead of queued GPU work; a Python
-    GC cycle inside this function can create a visible planning-latency spike
-    without improving correctness. The wrapper temporarily disables GC while
-    preserving the caller's prior GC state.
-    """
+    """Wrap ART CP state with DSV4 host-only planning metadata; must not synchronize CUDA."""
     gc_was_enabled = gc.isenabled()
     if gc_was_enabled:
         gc.disable()
@@ -72,15 +65,7 @@ def _prepare_dsv4_context_parallel_state_impl(
     include_hca: bool,
     extra: dict[str, Any] | None,
 ) -> Dsv4ContextParallelState:
-    """Wrap a normal ART CP state with host-only DSV4 planning metadata.
-
-    This function is part of the host-ahead planning path. It must not inspect
-    activation tensors, read CUDA metadata, or branch on CUDA tensor values; if
-    that invariant is broken, the CPU can block on device work and destroy the
-    intended overlap between previous-micro GPU execution and next-micro
-    planning. The returned metadata is reusable by every DSV4 layer in the
-    microbatch.
-    """
+    """Build reusable DSV4 host-ahead metadata without reading activation tensors or CUDA state."""
     if not include_csa and not include_hca:
         raise RuntimeError("DSV4 planning requires CSA, HCA, or both")
     if (

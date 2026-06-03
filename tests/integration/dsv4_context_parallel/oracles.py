@@ -26,6 +26,27 @@ class Dsv4OracleAttentionResult(BaseModel):
     branches: tuple[Dsv4OracleBranchResult, ...]
 
 
+def branch_view_tokens(branch: Dsv4BranchView) -> tuple[tuple[int, int], ...]:
+    prefix = tuple(
+        (int(packed_id), int(pos))
+        for pos, packed_id in enumerate(
+            range(int(branch.prefix_start), int(branch.prefix_end))
+        )
+    )
+    if (
+        branch.suffix_stream_id is None
+        or branch.suffix_start is None
+        or branch.suffix_end is None
+    ):
+        return prefix
+    return prefix + tuple(
+        (int(packed_id), int(branch.prefix_token_count) + int(offset))
+        for offset, packed_id in enumerate(
+            range(int(branch.suffix_start), int(branch.suffix_end))
+        )
+    )
+
+
 def dense_dsv4_packed_attention_oracle(
     *,
     layout: Dsv4CompressedLayout,
@@ -137,16 +158,16 @@ def dense_dsv4_branch_attention_reference(
     window_size: int = 128,
     scale: float = 1.0,
 ) -> Dsv4OracleBranchResult:
-    branch_token_ids = tuple(int(token.packed_token_id) for token in branch.tokens)
+    branch_tokens = branch_view_tokens(branch)
+    branch_token_ids = tuple(token_id for token_id, _ in branch_tokens)
     branch_out: list[torch.Tensor] = []
     branch_lse: list[torch.Tensor] = []
-    for token in branch.tokens:
-        query_token_id = int(token.packed_token_id)
+    for query_token_id, query_view_pos in branch_tokens:
         if query_token_id not in q_map:
             continue
         raw_ids = _visible_raw_ids(
             branch=branch,
-            query_view_pos=int(token.view_pos),
+            query_view_pos=query_view_pos,
             raw_map=raw_map,
             window_size=window_size,
         )
@@ -154,7 +175,7 @@ def dense_dsv4_branch_attention_reference(
             layout=layout,
             branch=branch,
             query_token_id=query_token_id,
-            query_view_pos=int(token.view_pos),
+            query_view_pos=query_view_pos,
             compressed_map=compressed_map,
             topk_rows=topk_rows,
         )
@@ -262,11 +283,11 @@ def _visible_raw_ids(
     window_size: int,
 ) -> tuple[int, ...]:
     return tuple(
-        int(token.packed_token_id)
-        for token in branch.tokens
-        if int(token.packed_token_id) in raw_map
-        and int(token.view_pos) <= int(query_view_pos)
-        and int(query_view_pos) - int(token.view_pos) < int(window_size)
+        token_id
+        for token_id, view_pos in branch_view_tokens(branch)
+        if token_id in raw_map
+        and view_pos <= int(query_view_pos)
+        and int(query_view_pos) - view_pos < int(window_size)
     )
 
 

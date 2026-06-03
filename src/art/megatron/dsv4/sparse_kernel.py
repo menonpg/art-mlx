@@ -26,13 +26,6 @@ def dsv4_sparse_fwd(
     topk: torch.Tensor,
     scale: float | None = None,
 ) -> Dsv4SparseForwardResult:
-    """Run the Miles DSV4 list-sparse forward kernel.
-
-    ART-facing LSE is natural log. Miles TileLang emits log2 LSE, so this
-    wrapper is the single boundary where forward LSE is multiplied by ln(2).
-    CP stage callers should pass `sink=-inf` and merge the real sink once after
-    all real-key stages.
-    """
     _validate_sparse_inputs(q=q, kv=kv, attn_sink=attn_sink, topk=topk)
     if int(kv.shape[1]) == 0 or int(topk.shape[-1]) == 0:
         return Dsv4SparseForwardResult(
@@ -71,12 +64,6 @@ def dsv4_sparse_bwd(
     global_lse: torch.Tensor,
     scale: float | None = None,
 ) -> Dsv4SparseBackwardResult:
-    """Replay one DSV4 sparse stage backward with global output and LSE.
-
-    `global_lse` is natural log on the ART side and is divided by ln(2) before
-    entering Miles backward. This is the CP replay path: pass the globally
-    merged output/LSE, not the stage-local forward output/LSE.
-    """
     _validate_sparse_inputs(q=q, kv=kv, attn_sink=attn_sink, topk=topk)
     if global_out.shape != q.shape or grad_out.shape != q.shape:
         raise RuntimeError(
@@ -220,16 +207,6 @@ def _validate_sparse_inputs(
 
 
 def _safe_topk_for_miles(topk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Avoid unsafe Miles all-invalid rows without synchronizing CUDA.
-
-    The current TileLang kernel masks `-1` indices but still reads the indexed
-    KV row. A row containing only `-1` would therefore read `KV[-1]` and, with
-    sink disabled for CP stages, produce an invalid denominator. We keep the
-    list shape stable, patch only the first index of all-invalid rows to `0`,
-    and let callers overwrite those rows to the mathematical zero-output,
-    sink-only LSE result. Backward callers also zero replay inputs for those
-    rows, so the harmless key contributes no gradient.
-    """
     topk_i32 = topk.to(dtype=torch.int32).contiguous()
     row_has_key = topk_i32.ge(0).any(dim=-1)
     safe_first = torch.where(
@@ -252,16 +229,6 @@ def _chunked_miles_sparse_bwd(
     global_lse_log2: torch.Tensor,
     scale: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Replay Miles backward in single-block chunks for long topk lists.
-
-    The current Miles DSV4 TileLang backward emits NaNs when its internal
-    32-key loop has `NS > 1`, even for all-valid topk. A 64-key single-block
-    kernel is finite on the DSV4 Flash shape and avoids excessive launch
-    count. Attention backward is additive over keys when replay receives the
-    global output and global LSE, so each chunk contributes one slice of
-    `dq/dkv`; the sink gradient is computed analytically once to avoid
-    duplicating it across chunks.
-    """
     preprocess_factory, bwd_factory, postprocess_factory = (
         _load_miles_sparse_mla_bwd_factories()
     )

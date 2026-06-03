@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from oracles import branch_view_tokens
 from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
@@ -475,9 +476,8 @@ def _entry_dependency_token_ids(
         if layout.spec.kind == Dsv4CompressionKind.HCA or start == 0
         else start - ratio
     )
-    return tuple(
-        int(branch.tokens[pos].packed_token_id) for pos in range(first, start + ratio)
-    )
+    tokens = branch_view_tokens(branch)
+    return tuple(token_id for token_id, _ in tokens[first : start + ratio])
 
 
 def _layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:

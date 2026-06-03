@@ -1,139 +1,27 @@
-"""DeepSeek-V4 context-parallel attention support."""
+from importlib import import_module
+from typing import Any
 
-from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
-from .compressor import (
-    Dsv4CompressedKvBackwardWork,
-    Dsv4CompressedKvForwardWork,
-    Dsv4CompressionHaloExchangeWork,
-    Dsv4CompressionHaloGradientExchangeWork,
-    accumulate_dsv4_compression_halo_gradient_payloads,
-    build_dsv4_compressed_layout,
-    build_dsv4_compressed_layout_from_cp_state,
-    compress_owned_projected_kv,
-    compress_projected_kv,
-    launch_dsv4_compressed_kv_backward,
-    launch_dsv4_compressed_kv_forward,
-    launch_dsv4_compression_halo_exchange,
-    launch_dsv4_compression_halo_gradient_exchange,
-    materialize_dsv4_compression_token_buffer,
-    pack_dsv4_compression_halo_gradient_payloads,
-    pack_dsv4_compression_halo_payloads,
+_MODULES = (
+    "types",
+    "comm",
+    "sparse_kernel",
+    "compressor",
+    "cp_stage",
+    "indexer",
+    "cp_attention",
+    "planning",
 )
-from .cp_attention import (
-    Dsv4ExchangedAttentionBackwardWork,
-    Dsv4ExchangedAttentionForwardWork,
-    Dsv4GradientOwnerExchangeWork,
-    Dsv4ProjectedAttentionBackwardWork,
-    Dsv4ProjectedAttentionForwardWork,
-    Dsv4ProjectedCompressionForwardWork,
-    Dsv4SinkGradientReduceWork,
-    accumulate_dsv4_gradient_owner_buckets,
-    accumulate_materialized_dsv4_attention_backward,
-    build_dsv4_attention_backward_plan_from_stage_plan_slots,
-    compute_single_sink_grad,
-    launch_dsv4_attention_backward_from_stage_plan_slots,
-    launch_dsv4_attn_sink_gradient_reduce,
-    launch_dsv4_csa_attention_forward_from_stage_plan_slots,
-    launch_dsv4_csa_projected_attention_forward_from_compression_work,
-    launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work,
-    launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
-    launch_dsv4_csa_projected_compression_forward,
-    launch_dsv4_csa_projected_compression_forward_from_context_parallel_state,
-    launch_dsv4_gradient_owner_bucket_exchange,
-    launch_dsv4_hca_attention_forward_from_stage_plan_slots,
-    launch_dsv4_hca_projected_attention_forward_from_compression_work,
-    launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work,
-    launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
-    launch_dsv4_hca_projected_compression_forward,
-    launch_dsv4_hca_projected_compression_forward_from_context_parallel_state,
-    launch_dsv4_projected_attention_backward_from_context_parallel_state,
-    launch_dsv4_projected_attention_backward_from_stage_plan_slots,
-    launch_exchanged_dsv4_attention_backward,
-    launch_exchanged_dsv4_attention_forward,
-    merge_materialized_stage_records,
-    merge_single_sink_branch,
-    merge_stage_outputs,
-    merge_two_stage_outputs,
-    pack_dsv4_gradient_owner_buckets,
-    replay_materialized_dsv4_attention_backward,
-    run_materialized_dsv4_attention_forward,
-)
-from .cp_stage import (
-    Dsv4StageKvExchangeWork,
-    build_dsv4_stage_inputs,
-    build_dsv4_stage_inputs_from_stage_plan,
-    build_dsv4_stage_kv_exchange_peer_plans,
-    build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
-    build_dsv4_stage_plan_slots,
-    build_stage_local_topk_for_csa,
-    build_stage_local_topk_for_hca,
-    launch_dsv4_stage_kv_exchange,
-    launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot,
-    launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
-    launch_planned_dsv4_stage_kv_exchange,
-    materialize_dsv4_stage_tensors,
-    raw_swa_token_ids_for_query,
-)
-from .indexer import (
-    Dsv4ExchangedIndexerTopkWork,
-    Dsv4IndexerKvExchangeWork,
-    build_dsv4_indexer_kv_exchange_peer_plans,
-    build_dsv4_indexer_stage_plan_from_stage_plans,
-    build_indexer_visibility_mask,
-    compute_indexer_scores,
-    compute_indexer_stage_topk,
-    compute_indexer_topk,
-    launch_dsv4_indexer_kv_exchange,
-    launch_dsv4_indexer_topk_from_stage_plans,
-    launch_exchanged_dsv4_indexer_topk,
-    launch_planned_dsv4_indexer_kv_exchange,
-    merge_indexer_topk_results,
-    stable_topk_by_score_and_id,
-    stage_candidate_entry_ids,
-    visible_entry_ids_for_query,
-)
-from .planning import prepare_dsv4_context_parallel_state
-from .sparse_kernel import (
-    dsv4_disabled_attn_sink,
-    dsv4_sparse_bwd,
-    dsv4_sparse_fwd,
-)
-from .types import (
-    Dsv4AttentionBackwardPlan,
-    Dsv4AttentionBackwardRankPlan,
-    Dsv4AttentionBackwardReplayResult,
-    Dsv4AttentionForwardResult,
-    Dsv4AttentionGradientResult,
-    Dsv4BranchView,
-    Dsv4CompressedKvForwardResult,
-    Dsv4CompressedKvGradientResult,
-    Dsv4CompressedLayout,
-    Dsv4CompressionHaloGradientPayload,
-    Dsv4CompressionHaloPayload,
-    Dsv4CompressionKind,
-    Dsv4CompressionSpec,
-    Dsv4ContextParallelState,
-    Dsv4GradientOwnerBucket,
-    Dsv4HaloTransfer,
-    Dsv4IndexerKvExchangePeerPlan,
-    Dsv4IndexerStagePlan,
-    Dsv4MaterializedStage,
-    Dsv4PreparedPlan,
-    Dsv4ProjectedAttentionForwardResult,
-    Dsv4ProjectedAttentionGradientResult,
-    Dsv4ProjectedTokenBuffer,
-    Dsv4SparseBackwardResult,
-    Dsv4SparseForwardResult,
-    Dsv4StageBackwardRecord,
-    Dsv4StageForwardRecord,
-    Dsv4StageInputs,
-    Dsv4StageKeyKind,
-    Dsv4StageKvExchangePeerPlan,
-    Dsv4StagePlanSlot,
-    Dsv4StreamKind,
-    Dsv4StreamSpec,
-    Dsv4TensorExchangePlan,
-    Dsv4TensorIdBuffer,
-    Dsv4TokenInView,
-    Dsv4TopkResult,
-)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _MODULES:
+        module = import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    for module_name in _MODULES:
+        module = import_module(f"{__name__}.{module_name}")
+        if hasattr(module, name):
+            value = getattr(module, name)
+            globals()[name] = value
+            return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

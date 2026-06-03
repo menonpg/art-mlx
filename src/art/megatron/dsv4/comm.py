@@ -21,7 +21,6 @@ class Dsv4TensorExchangeWork(BaseModel):
     stream: Any | None = None
     event: Any | None = None
     output_ndim: int
-    label: str = "dsv4_tensor_exchange"
     allow_duplicate_recv_ids: bool = False
     _wait_complete: bool = PrivateAttr(default=False)
 
@@ -59,17 +58,8 @@ def launch_dsv4_tensor_exchange(
     plan: Dsv4TensorExchangePlan,
     group: Any,
     async_op: bool,
-    label: str = "dsv4_tensor_exchange",
     allow_duplicate_recv_ids: bool = False,
 ) -> Dsv4TensorExchangeWork:
-    """Exchange DSV4 KV-like tensor rows by explicit ids.
-
-    This is bespoke DSV4 communication and should remain eager. For CUDA async
-    execution it uses a side-stream handoff with stable packed buffers. Each
-    work records a CUDA event after its own collective, so waiting this work
-    does not accidentally wait later DSV4 exchanges queued on the same reusable
-    comm stream; that precision is required for useful host-ahead overlap.
-    """
     _validate_exchange_tensor(tensor)
     world_size = _world_size(group)
     _validate_plan(
@@ -115,7 +105,6 @@ def launch_dsv4_tensor_exchange(
             send_buffer=send_buffer,
             stream=None,
             output_ndim=tensor.ndim,
-            label=label,
             allow_duplicate_recv_ids=bool(allow_duplicate_recv_ids),
         )
 
@@ -156,7 +145,6 @@ def launch_dsv4_tensor_exchange(
         stream=stream,
         event=event,
         output_ndim=tensor.ndim,
-        label=label,
         allow_duplicate_recv_ids=bool(allow_duplicate_recv_ids),
     )
 

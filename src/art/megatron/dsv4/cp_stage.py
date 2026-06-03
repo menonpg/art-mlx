@@ -104,12 +104,6 @@ def build_dsv4_stage_inputs(
     compressed_list_size: int | None = None,
     materialize_compressed_metadata: bool = True,
 ) -> Dsv4StageInputs:
-    """Build DSV4 Miles-kernel stage metadata from ART CP stage ranges.
-
-    The returned `topk_stage_local` indexes `raw_token_ids + compressed_entry_ids`.
-    It is metadata/index materialization only: it does not fetch Q/KV tensors or
-    launch communication.
-    """
     if int(window_size) <= 0:
         raise RuntimeError(
             f"DSV4 raw SWA window size must be positive, got {window_size}"
@@ -281,12 +275,6 @@ def build_dsv4_stage_plan_slots(
     *,
     stage_plans_by_rank: Sequence[Sequence[Any]],
 ) -> tuple[Dsv4StagePlanSlot, ...]:
-    """Group ART StagePlans by stage index across all CP ranks.
-
-    This is host-only DSV4 planning metadata. It preserves rank 0's stage order
-    and validates that every rank has exactly one StagePlan for each stage id,
-    so later DSV4 launchers can derive compatible all-rank exchange requests.
-    """
     plans_by_rank = tuple(tuple(rank_plans) for rank_plans in stage_plans_by_rank)
     if not plans_by_rank:
         raise RuntimeError("DSV4 StagePlan slot grouping requires at least one rank")
@@ -337,7 +325,6 @@ def build_dsv4_stage_inputs_from_stage_plan(
     compressed_list_size: int | None = None,
     materialize_compressed_metadata: bool = True,
 ) -> Dsv4StageInputs:
-    """Build this rank's DSV4 stage inputs from one ART StagePlan."""
     query_ids = _token_ids_from_ranges(stage_plan.global_q_ranges)
     stage_topk = None
     if compression_kind == Dsv4CompressionKind.CSA:
@@ -370,13 +357,6 @@ def build_dsv4_stage_kv_exchange_peer_plans(
     layout: Dsv4CompressedLayout,
     stage_inputs_by_rank: Sequence[Dsv4StageInputs],
 ) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
-    """Plan fused raw+compressed KV exchange peer ids for DSV4 stages.
-
-    This is host metadata work: it must not inspect live activation tensors or
-    synchronize CUDA. Each rank receives the raw/compressed ids needed by its
-    stage, grouped by owner rank; send lists are the transpose of those receive
-    requests.
-    """
     rank_count = len(layout.entry_ids_by_owner_rank)
     if len(stage_inputs_by_rank) != rank_count:
         raise RuntimeError(
@@ -453,14 +433,6 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
     layout: Dsv4CompressedLayout,
     stage_plans_by_rank: Sequence[Any],
 ) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
-    """Plan fused stage KV exchange from ART StagePlans without topk metadata.
-
-    The KV exchange fetches every raw token and compressed candidate whose
-    closure lies in the stage K ranges. CSA topk only affects the local sparse
-    kernel list tensor, not which compressed candidate rows are fetched for the
-    stage. This avoids requiring an all-rank topk tensor gather before planning
-    compatible all-to-all sends.
-    """
     return build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
         layouts=(layout,),
         stage_plans_by_rank=stage_plans_by_rank,
@@ -476,12 +448,6 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
     ]
     | None = None,
 ) -> tuple[tuple[Dsv4StageKvExchangePeerPlan, ...], ...]:
-    """Plan fused stage KV exchange metadata for multiple DSV4 layouts.
-
-    CSA and HCA share the raw SWA token requests for one ART StagePlan slot.
-    Building them together avoids expanding raw K ranges and bucketing raw
-    owners separately for each compression family.
-    """
     layout_tuple = tuple(layouts)
     if not layout_tuple:
         return ()
@@ -615,13 +581,6 @@ def materialize_dsv4_stage_tensors(
     compressed_kv: torch.Tensor,
     compressed_entry_ids: Sequence[int],
 ) -> Dsv4MaterializedStage:
-    """Gather already-available DSV4 stage tensors into sparse-kernel order.
-
-    This function does no communication and makes no physical-id shortcut. The
-    caller supplies explicit row-id maps for local/fetched tensors. The returned
-    KV rows are exactly `stage.raw_token_ids + stage.compressed_entry_ids`, which
-    is the id space used by `stage.topk_stage_local`.
-    """
     q_stage = _gather_mapped_rows(
         tensor=query,
         tensor_ids=query_token_ids,
@@ -714,13 +673,6 @@ def launch_dsv4_stage_kv_exchange(
     group: Any,
     async_op: bool,
 ) -> Dsv4StageKvExchangeWork:
-    """Launch one fused raw+compressed KV exchange for a DSV4 attention stage.
-
-    Raw and compressed rows share the main attention KV dim, so the production
-    stage path exchanges one fused tensor per stage instead of separate raw and
-    compressed collectives. Wire ids encode key kind to keep raw token ids and
-    compressed entry ids in disjoint spaces.
-    """
     return _launch_dsv4_stage_kv_exchange_impl(
         stage_inputs=stage_inputs,
         query=query,
@@ -814,7 +766,6 @@ def _launch_dsv4_stage_kv_exchange_impl(
             ),
             group=group,
             async_op=async_op,
-            label="dsv4_stage_kv_exchange",
         ),
     )
 
@@ -835,12 +786,6 @@ def launch_planned_dsv4_stage_kv_exchange(
     async_op: bool,
     peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
 ) -> Dsv4StageKvExchangeWork:
-    """Launch one rank's fused stage KV exchange from DSV4 host metadata.
-
-    This wrapper turns all-rank stage metadata into this rank's peer send/recv
-    lists, then delegates to the eager raw+compressed KV exchange path. It keeps
-    DSV4-specific planning outside the generic Flex CP executor.
-    """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
     plans = _stage_kv_peer_plans_or_build(
         layout=layout,
@@ -882,14 +827,6 @@ def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
     async_op: bool,
     peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
 ) -> Dsv4StageKvExchangeWork:
-    """Launch one rank's fused stage KV exchange from an ART StagePlan slot.
-
-    `local_stage_inputs` contains this rank's real sparse-kernel topk list.
-    Peer send/recv lists are derived from all ranks' StagePlan K ranges and are
-    deliberately independent of CSA topk, because every compressed candidate in
-    a stage K range may be fetched while the local topk list selects the rows
-    the Miles kernel actually scores.
-    """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
     if int(stage_plan_slot.stage_index) != int(local_stage_inputs.stage_index):
         raise RuntimeError(
@@ -935,14 +872,6 @@ def launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot(
     async_op: bool,
     peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
 ) -> Dsv4StageKvExchangeWork:
-    """Launch a stage KV exchange before CSA topk-derived inputs exist.
-
-    CSA topk controls only the sparse-kernel list tensor. The raw/compressed
-    candidate rows fetched for an ART StagePlan slot are determined by the CP
-    K ranges, so this topk-independent exchange can be queued while the frozen
-    indexer topk is still pending, then bound to `Dsv4StageInputs` before
-    materialization.
-    """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
     plans = _stage_kv_peer_plans_or_build_from_slot(
         layout=layout,

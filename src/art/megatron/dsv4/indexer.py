@@ -97,7 +97,6 @@ def stage_candidate_entry_ids(
     layout: Dsv4CompressedLayout,
     global_k_ranges: Sequence[TokenRangeLike],
 ) -> tuple[int, ...]:
-    """Return compressed ids whose raw closure token is in a CP stage K range."""
     if not global_k_ranges:
         return ()
     if layout.entry_count() and (
@@ -121,12 +120,6 @@ def build_dsv4_indexer_kv_exchange_peer_plans(
     layout: Dsv4CompressedLayout,
     candidate_entry_ids_by_rank: Sequence[Sequence[int]],
 ) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
-    """Plan indexer-compressed KV exchange peer ids for CSA stage scoring.
-
-    This is host metadata work only. It derives each receiver's candidate
-    compressed entries from layout ownership and transposes those requests into
-    send lists, without touching live activation tensors or CUDA state.
-    """
     rank_count = len(layout.entry_ids_by_owner_rank)
     if len(candidate_entry_ids_by_rank) != rank_count:
         raise RuntimeError(
@@ -157,12 +150,6 @@ def build_dsv4_indexer_stage_plan_from_stage_plans(
     layout: Dsv4CompressedLayout,
     stage_plans_by_rank: Sequence[Any],
 ) -> Dsv4IndexerStagePlan:
-    """Derive DSV4 indexer metadata from one ART `StagePlan` slot.
-
-    This is host-only metadata work. It uses ART's planned query/K ranges but
-    does not execute the generic Flex stage executor or inspect activation
-    tensors.
-    """
     stage_plans = tuple(stage_plans_by_rank)
     _validate_stage_plan_count(layout=layout, stage_plans_by_rank=stage_plans)
     stage_index = _shared_stage_index(stage_plans)
@@ -190,7 +177,6 @@ def visible_entry_ids_for_query(
     query_token_id: int,
     candidate_entry_ids: Sequence[int] | None = None,
 ) -> tuple[int, ...]:
-    """Return candidate compressed ids visible to one packed query token."""
     query = _query_visibility(layout=layout, query_token_id=query_token_id)
     if candidate_entry_ids is None:
         candidate_entry_ids = range(layout.entry_count())
@@ -214,7 +200,6 @@ def build_indexer_visibility_mask(
     candidate_entry_ids: Sequence[int],
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """Build a `[Q, C]` mask for branch-view indexer candidate visibility."""
     if device is None:
         device = torch.device("cpu")
     query_branch, query_prefix, query_pos = _query_visibility_tensors(
@@ -242,12 +227,6 @@ def compute_indexer_scores(
     score_scale: float = 1.0,
     visibility_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute DSV4 CSA indexer logits.
-
-    Shapes are `[Q,H,D]` or `[B,Q,H,D]` for `indexer_q`, `[C,D]` or `[B,C,D]`
-    for `indexer_kv`, and `[Q,H]` or `[B,Q,H]` for `indexer_weights`. The
-    result is always `[B,Q,C]` fp32.
-    """
     q = _ensure_batched_q(indexer_q)
     kv = _ensure_batched_kv(indexer_kv, batch_size=int(q.shape[0]))
     weights = _ensure_batched_weights(indexer_weights, batch_size=int(q.shape[0]))
@@ -283,7 +262,6 @@ def compute_indexer_topk(
     score_scale: float = 1.0,
     visibility_mask: torch.Tensor | None = None,
 ) -> Dsv4TopkResult:
-    """Compute no-grad global compressed-id topk for DSV4 CSA routing."""
     if visibility_mask is None and layout is not None and query_token_ids is not None:
         visibility_mask = build_indexer_visibility_mask(
             layout=layout,
@@ -324,13 +302,6 @@ def compute_indexer_stage_topk(
     topk: int,
     score_scale: float = 1.0,
 ) -> Dsv4TopkResult:
-    """Compute CSA indexer topk for one CP stage's compressed candidates.
-
-    The caller provides an explicit id space for the fetched indexer-compressed
-    KV rows. This keeps the stage path independent of how communication fetched
-    those rows, while still rejecting missing or duplicate compressed ids before
-    scoring.
-    """
     candidate_ids = tuple(int(entry_id) for entry_id in candidate_entry_ids)
     candidate_kv = _gather_indexer_kv_by_ids(
         tensor=indexer_kv,
@@ -366,13 +337,6 @@ def launch_dsv4_indexer_kv_exchange(
     async_op: bool,
     score_scale: float = 1.0,
 ) -> Dsv4IndexerKvExchangeWork:
-    """Launch distributed indexer-compressed KV fetch and stage topk scoring.
-
-    This is the DSV4 CSA indexer communication path. The indexer KV projection
-    has its own dim and is intentionally separate from main-attention KV
-    communication; after fetch, `wait_post_process` runs the existing frozen
-    no-grad stage topk implementation over explicit compressed entry ids.
-    """
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
     candidate_ids = tuple(int(entry_id) for entry_id in candidate_entry_ids)
     _row_by_id(candidate_ids, name="candidate_entry_ids")
@@ -412,7 +376,6 @@ def launch_dsv4_indexer_kv_exchange(
             ),
             group=group,
             async_op=async_op,
-            label="dsv4_indexer_kv_exchange",
         ),
     )
 
@@ -434,12 +397,6 @@ def launch_planned_dsv4_indexer_kv_exchange(
     score_scale: float = 1.0,
     peer_plans: Sequence[Dsv4IndexerKvExchangePeerPlan] | None = None,
 ) -> Dsv4IndexerKvExchangeWork:
-    """Launch one rank's indexer KV exchange from DSV4 host metadata.
-
-    The peer-id plan is CPU metadata derived from compressed-entry ownership.
-    The actual exchange remains the existing eager custom-communication path,
-    outside compiled regions.
-    """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
     plans = _indexer_kv_peer_plans_or_build(
         layout=layout,
@@ -484,13 +441,6 @@ def launch_dsv4_indexer_topk_from_stage_plans(
     indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
     | None = None,
 ) -> Dsv4ExchangedIndexerTopkWork:
-    """Launch all CSA indexer stages for one rank and return global topk work.
-
-    This is the rank-level eager assembly point for DSV4 indexer CP. Stage
-    metadata is precomputed from ART StagePlans; this function gathers
-    rank-local indexer query rows, launches each custom KV exchange, and returns
-    the existing query-id-aware topk merge work.
-    """
     rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
     stage_plans = tuple(indexer_stage_plans)
     if not stage_plans:
@@ -553,13 +503,6 @@ def launch_exchanged_dsv4_indexer_topk(
     query_token_ids: Sequence[int],
     topk: int,
 ) -> Dsv4ExchangedIndexerTopkWork:
-    """Create the eager bridge from exchanged indexer stages to global topk.
-
-    Each stage work owns custom DSV4 indexer KV communication plus stage-local
-    topk scoring. ART stages may cover only a subset of this rank's query rows,
-    so this wrapper keeps the wait/materialization boundary eager and merges by
-    explicit query token id before selecting one global compressed-id topk.
-    """
     works = tuple(stage_works)
     if not works:
         raise RuntimeError("DSV4 exchanged indexer topk requires at least one stage")
@@ -631,7 +574,6 @@ def merge_indexer_topk_results(
     results: Sequence[Dsv4TopkResult],
     topk: int,
 ) -> Dsv4TopkResult:
-    """Merge stage-local topk results by score desc and global id asc."""
     if not results:
         raise RuntimeError("DSV4 indexer topk merge requires at least one result")
     scores = torch.cat([result.scores for result in results], dim=-1)
@@ -833,7 +775,6 @@ def stable_topk_by_score_and_id(
     candidate_ids: torch.Tensor,
     topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select exact stable topk without sorting every candidate in the usual case."""
     if scores.ndim != 3:
         raise RuntimeError(f"DSV4 indexer scores must be [B,Q,C], got {scores.shape}")
     if candidate_ids.ndim != 1 or int(candidate_ids.shape[0]) != int(scores.shape[-1]):

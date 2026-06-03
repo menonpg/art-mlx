@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from oracles import branch_view_tokens
 from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
@@ -139,4 +140,4 @@ def _two_rank_layout() -> _LayoutIndex:
 
 
 def _packed_tokens(branch_view: Dsv4BranchView) -> tuple[int, ...]:
-    return tuple(int(token.packed_token_id) for token in branch_view.tokens)
+    return tuple(token_id for token_id, _ in branch_view_tokens(branch_view))

@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import Any, cast
 
-from oracles import dense_dsv4_packed_attention_oracle
+from oracles import branch_view_tokens, dense_dsv4_packed_attention_oracle
 from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
@@ -989,22 +989,20 @@ def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
         sum(
             1
             for entry_id in range(layout.entry_count())
-            if _entry_visible_to_token(layout, entry_id, branch, int(token.view_pos))
+            if _entry_visible_to_token(layout, entry_id, branch, view_pos)
         )
         for branch in layout.branch_views
-        for token in branch.tokens
+        for _, view_pos in branch_view_tokens(branch)
     )
     topk = torch.full((18, max_visible), -1, dtype=torch.long)
     for branch in layout.branch_views:
-        for token in branch.tokens:
+        for token_id, view_pos in branch_view_tokens(branch):
             visible = [
                 entry_id
                 for entry_id in range(layout.entry_count())
-                if _entry_visible_to_token(
-                    layout, entry_id, branch, int(token.view_pos)
-                )
+                if _entry_visible_to_token(layout, entry_id, branch, view_pos)
             ]
-            topk[int(token.packed_token_id), : len(visible)] = torch.tensor(visible)
+            topk[token_id, : len(visible)] = torch.tensor(visible)
     return topk
 
 

@@ -251,13 +251,6 @@ def build_dsv4_compressed_layout(
     token_layout_index: TokenLayoutIndexLike,
     spec: Dsv4CompressionSpec,
 ) -> Dsv4CompressedLayout:
-    """Build host-ahead DSV4 compression metadata from shared-prefix layout.
-
-    This function is CPU metadata planning only. It does not inspect activations
-    and must not read CUDA tensors in the production lookahead path. Compressed
-    entries are deduplicated only when their full dependency is inside the
-    shared prefix; closure-token ownership follows the ART CP token layout.
-    """
     if group_ids.device.type != "cpu" or parent_ids.device.type != "cpu":
         raise RuntimeError("DSV4 compression planning requires CPU metadata tensors")
     if int(spec.ratio) <= 0:
@@ -317,29 +310,11 @@ def _build_dsv4_compressed_layout_from_parts(
     )
 
 
-def build_dsv4_compressed_layout_from_cp_state(
-    *,
-    state: ArtContextParallelState,
-    spec: Dsv4CompressionSpec,
-) -> Dsv4CompressedLayout:
-    return build_dsv4_compressed_layout(
-        group_ids=state.group_ids.unsqueeze(0)
-        if state.group_ids.ndim == 1
-        else state.group_ids,
-        parent_ids=state.parent_ids.unsqueeze(0)
-        if state.parent_ids.ndim == 1
-        else state.parent_ids,
-        token_layout_index=state.rank_plan.token_layout_index,
-        spec=spec,
-    )
-
-
 def build_dsv4_compressed_layouts_from_cp_state(
     *,
     state: ArtContextParallelState,
     specs: Sequence[Dsv4CompressionSpec],
 ) -> tuple[Dsv4CompressedLayout, ...]:
-    """Build multiple layouts while sharing stream and branch-view planning."""
     if not specs:
         return ()
     group_ids = (
@@ -387,15 +362,6 @@ def compress_projected_kv(
     entry_ids: Sequence[int] | None = None,
     token_ids: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """Compress projected DSV4 KV/gate tensors according to a branch layout.
-
-    `projected_kv` and `projected_gate` are the outputs of the DSV4 compressor
-    projections, before RMSNorm/RoPE. For HCA their last dim is `D`; for CSA it
-    is `2 * D` and the A/B halves are selected according to the Miles overlap
-    transform. `token_ids` maps rows in the projected tensors to packed token ids
-    when the rank owns a compact local+halo buffer; if omitted, tensor row `t`
-    is packed token `t`.
-    """
     if projected_kv.shape != projected_gate.shape:
         raise RuntimeError(
             "DSV4 projected KV and gate tensors must share shape, got "
@@ -502,13 +468,6 @@ def launch_dsv4_compressed_kv_forward(
     group: Any,
     async_op: bool,
 ) -> Dsv4CompressedKvForwardWork:
-    """Launch DSV4 compressed-KV production with projected-token halo exchange.
-
-    This is the production compression boundary the model handler can call after
-    local compressor projections. It starts the fused projected KV/gate halo
-    exchange immediately; `wait_post_process()` materializes the local+halo
-    token buffer and computes this rank's owned compressed entries.
-    """
     _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
     rank_int = _validate_layout_rank_value(
         rank=rank,
@@ -552,14 +511,6 @@ def launch_dsv4_compressed_kv_backward(
     group: Any,
     async_op: bool,
 ) -> Dsv4CompressedKvBackwardWork:
-    """Replay compressor backward and launch reverse halo-gradient exchange.
-
-    The compressed-KV forward path can be used outside normal autograd because
-    DSV4 sparse attention backward is replay-based. This function recomputes the
-    small compression operation over the saved local+halo token buffer, scatters
-    owner-local projected-token gradients, returns remote halo gradients, and
-    CP-reduces the positional-bias gradient.
-    """
     _validate_dcompressed_kv(
         forward_result=forward_result,
         dcompressed_kv=dcompressed_kv,
@@ -622,13 +573,6 @@ def pack_dsv4_compression_halo_payloads(
     projected_gate: torch.Tensor,
     token_ids: Sequence[int],
 ) -> tuple[Dsv4CompressionHaloPayload, ...]:
-    """Pack projected compressor tensors needed by remote closure owners.
-
-    The returned payloads are the stable inputs for an eager DSV4 halo
-    communication path. Future NCCL/P2P code should launch outside compiled
-    regions and make producer-to-comm, comm-to-consumer, and tensor lifetime
-    ordering explicit.
-    """
     _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
     token_ids = _normalize_token_ids(
         token_ids=token_ids,
@@ -668,14 +612,6 @@ def launch_dsv4_compression_halo_exchange(
     group: Any,
     async_op: bool,
 ) -> Dsv4CompressionHaloExchangeWork:
-    """Launch fused projected-KV/gate halo exchange for DSV4 compression.
-
-    This is a DSV4-specific eager communication boundary. It fuses KV and gate
-    rows into one explicit-id exchange so CSA/HCA closure owners receive exactly
-    the remote projected rows needed for `materialize_dsv4_compression_token_buffer`.
-    Callers must await the returned work before using payload tensors; otherwise
-    async CUDA communication can race the compression consumer.
-    """
     _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
     token_ids = _normalize_token_ids(
         token_ids=token_ids,
@@ -695,7 +631,6 @@ def launch_dsv4_compression_halo_exchange(
             plan=plan,
             group=group,
             async_op=async_op,
-            label="dsv4_compression_halo_exchange",
         ),
     )
 
@@ -709,12 +644,6 @@ def materialize_dsv4_compression_token_buffer(
     token_ids: Sequence[int],
     halo_payloads: Sequence[Dsv4CompressionHaloPayload] = (),
 ) -> Dsv4ProjectedTokenBuffer:
-    """Build the compact local+halo token buffer for owned compression entries.
-
-    Compression ownership is by closure token. This helper consumes local
-    projected compressor tensors plus received halo payloads and returns exactly
-    the packed-token rows required by `compress_owned_projected_kv`.
-    """
     _validate_projected_pair(projected_kv=projected_kv, projected_gate=projected_gate)
     token_ids = _normalize_token_ids(
         token_ids=token_ids,
@@ -783,12 +712,6 @@ def pack_dsv4_compression_halo_gradient_payloads(
     dprojected_kv: torch.Tensor,
     dprojected_gate: torch.Tensor,
 ) -> tuple[Dsv4CompressionHaloGradientPayload, ...]:
-    """Pack gradients for remote projected tokens imported by this owner.
-
-    This is the reverse payload of `pack_dsv4_compression_halo_payloads`: the
-    compression owner sends gradients back to the raw-token owner. Actual
-    communication should stay eager with explicit stream and lifetime ordering.
-    """
     _validate_projected_pair(
         projected_kv=dprojected_kv,
         projected_gate=dprojected_gate,
@@ -831,13 +754,6 @@ def launch_dsv4_compression_halo_gradient_exchange(
     group: Any,
     async_op: bool,
 ) -> Dsv4CompressionHaloGradientExchangeWork:
-    """Launch fused reverse halo-gradient exchange for DSV4 compression.
-
-    Compression owners call this with gradients for their local+halo token
-    buffers. Raw-token owners receive projected KV/gate gradients for imported
-    boundary rows and can pass the returned payloads to
-    `accumulate_dsv4_compression_halo_gradient_payloads`.
-    """
     _validate_projected_pair(
         projected_kv=dprojected_kv,
         projected_gate=dprojected_gate,
@@ -860,7 +776,6 @@ def launch_dsv4_compression_halo_gradient_exchange(
             plan=plan,
             group=group,
             async_op=async_op,
-            label="dsv4_compression_halo_gradient_exchange",
             allow_duplicate_recv_ids=True,
         ),
     )
@@ -874,7 +789,6 @@ def accumulate_dsv4_compression_halo_gradient_payloads(
     dprojected_gate: torch.Tensor,
     halo_gradient_payloads: Sequence[Dsv4CompressionHaloGradientPayload],
 ) -> Dsv4ProjectedTokenBuffer:
-    """Add returned halo gradients into this raw-token owner's grad space."""
     _validate_projected_pair(
         projected_kv=dprojected_kv,
         projected_gate=dprojected_gate,
@@ -1871,174 +1785,11 @@ def _build_compact_entries(
         else _owner_change_positions(raw_token_owner_ranks)
     )
     if spec.kind is Dsv4CompressionKind.CSA:
-        return _build_compact_csa_entries(
-            branch_views=branch_views,
-            raw_token_owner_ranks=raw_token_owner_ranks,
-            owner_change_positions=compact_owner_change_positions,
-            spec=spec,
-            rank_count=rank_count,
-        )
-    if spec.kind is Dsv4CompressionKind.HCA:
-        return _build_compact_hca_entries(
-            branch_views=branch_views,
-            raw_token_owner_ranks=raw_token_owner_ranks,
-            owner_change_positions=compact_owner_change_positions,
-            spec=spec,
-            rank_count=rank_count,
-        )
-    raise RuntimeError(f"Unsupported DSV4 compression kind: {spec.kind}")
-
-
-def _build_compact_csa_entries(
-    *,
-    branch_views: tuple[Dsv4BranchView, ...],
-    raw_token_owner_ranks: tuple[int, ...],
-    owner_change_positions: tuple[int, ...],
-    spec: Dsv4CompressionSpec,
-    rank_count: int,
-) -> _Dsv4LayoutBuildResult:
-    ratio = int(spec.ratio)
-    entry_ids_by_owner: list[list[int]] = [[] for _ in range(int(rank_count))]
-    owner_ranks: list[int] = []
-    branch_stream_ids: list[int] = []
-    prefix_stream_ids: list[int] = []
-    closure_view_positions: list[int] = []
-    shared_prefix_flags: list[bool] = []
-    dependency_start_view_positions: list[int] = []
-    dependency_ranges_by_owner: list[list[tuple[int, int]]] = [
-        [] for _ in range(int(rank_count))
-    ]
-    entry_ids_by_closure: dict[int, list[int]] = defaultdict(list)
-    closure_tokens: set[int] = set()
-    halo_by_peer: dict[tuple[int, int], dict[int, set[int]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-    for branch_view in branch_views:
-        min_closure_view_pos = (
-            int(branch_view.prefix_token_count)
-            if branch_view.suffix_stream_id is not None
-            else 0
-        )
-        prefix_token_count = int(branch_view.prefix_token_count)
-        branch_len = int(branch_view.size())
-        branch_shared_prefix_entry = branch_view.suffix_stream_id is None
-        run_owner_rank: int | None = None
-        run_first_entry_id = 0
-        run_first_start = 0
-        run_last_start = 0
-        branch_first_start = _first_compression_start_with_closure_at_or_after(
-            min_closure_view_pos=min_closure_view_pos,
-            ratio=ratio,
-        )
-        branch_first_entry_id = len(owner_ranks)
-        next_entry_id = branch_first_entry_id
-        for start in range(branch_first_start, branch_len - ratio + 1, ratio):
-            closure_view_pos = start + ratio - 1
-            closure_token_id = _fast_branch_token_id_at(
-                branch_view=branch_view,
-                view_pos=closure_view_pos,
-            )
-            owner_rank = int(raw_token_owner_ranks[int(closure_token_id)])
-            entry_id = next_entry_id
-            next_entry_id += 1
-            if run_owner_rank is None:
-                run_owner_rank = int(owner_rank)
-                run_first_entry_id = entry_id
-                run_first_start = int(start)
-            elif int(owner_rank) != run_owner_rank:
-                _append_compact_entry_metadata_run(
-                    first_entry_id=run_first_entry_id,
-                    first_start=run_first_start,
-                    last_start=run_last_start,
-                    ratio=ratio,
-                    owner_rank=run_owner_rank,
-                    branch_stream_id=int(branch_view.branch_stream_id),
-                    prefix_stream_id=int(branch_view.prefix_stream_id),
-                    shared_prefix_entry=branch_shared_prefix_entry,
-                    entry_ids_by_owner=entry_ids_by_owner,
-                    owner_ranks=owner_ranks,
-                    branch_stream_ids=branch_stream_ids,
-                    prefix_stream_ids=prefix_stream_ids,
-                    closure_view_positions=closure_view_positions,
-                    shared_prefix_flags=shared_prefix_flags,
-                    dependency_start_view_positions=dependency_start_view_positions,
-                )
-                _append_compact_csa_dependency_run(
-                    branch_view=branch_view,
-                    first_start=run_first_start,
-                    last_start=run_last_start,
-                    ratio=ratio,
-                    owner_rank=run_owner_rank,
-                    dependency_ranges_by_owner=dependency_ranges_by_owner,
-                )
-                run_owner_rank = int(owner_rank)
-                run_first_entry_id = entry_id
-                run_first_start = int(start)
-            run_last_start = int(start)
-            entry_ids_by_closure[int(closure_token_id)].append(entry_id)
-            closure_tokens.add(int(closure_token_id))
-        if run_owner_rank is not None:
-            _append_compact_entry_metadata_run(
-                first_entry_id=run_first_entry_id,
-                first_start=run_first_start,
-                last_start=run_last_start,
-                ratio=ratio,
-                owner_rank=run_owner_rank,
-                branch_stream_id=int(branch_view.branch_stream_id),
-                prefix_stream_id=int(branch_view.prefix_stream_id),
-                shared_prefix_entry=branch_shared_prefix_entry,
-                entry_ids_by_owner=entry_ids_by_owner,
-                owner_ranks=owner_ranks,
-                branch_stream_ids=branch_stream_ids,
-                prefix_stream_ids=prefix_stream_ids,
-                closure_view_positions=closure_view_positions,
-                shared_prefix_flags=shared_prefix_flags,
-                dependency_start_view_positions=dependency_start_view_positions,
-            )
-            _append_compact_csa_dependency_run(
-                branch_view=branch_view,
-                first_start=run_first_start,
-                last_start=run_last_start,
-                ratio=ratio,
-                owner_rank=run_owner_rank,
-                dependency_ranges_by_owner=dependency_ranges_by_owner,
-            )
-            _add_compact_remote_halo_for_branch(
-                branch_view=branch_view,
-                first_start=branch_first_start,
-                last_start=run_last_start,
-                first_entry_id=branch_first_entry_id,
-                ratio=ratio,
-                lookback=ratio,
-                raw_token_owner_ranks=raw_token_owner_ranks,
-                owner_change_positions=owner_change_positions,
-                halo_by_peer=halo_by_peer,
-            )
-    return _compact_layout_build_result(
-        spec=spec,
-        rank_count=rank_count,
-        owner_ranks=owner_ranks,
-        entry_ids_by_owner=entry_ids_by_owner,
-        branch_stream_ids=branch_stream_ids,
-        prefix_stream_ids=prefix_stream_ids,
-        closure_view_positions=closure_view_positions,
-        shared_prefix_flags=shared_prefix_flags,
-        dependency_start_view_positions=dependency_start_view_positions,
-        dependency_ranges_by_owner=dependency_ranges_by_owner,
-        entry_ids_by_closure=entry_ids_by_closure,
-        closure_tokens=closure_tokens,
-        halo_by_peer=halo_by_peer,
-    )
-
-
-def _build_compact_hca_entries(
-    *,
-    branch_views: tuple[Dsv4BranchView, ...],
-    raw_token_owner_ranks: tuple[int, ...],
-    owner_change_positions: tuple[int, ...],
-    spec: Dsv4CompressionSpec,
-    rank_count: int,
-) -> _Dsv4LayoutBuildResult:
+        lookback = int(spec.ratio)
+    elif spec.kind is Dsv4CompressionKind.HCA:
+        lookback = 0
+    else:
+        raise RuntimeError(f"Unsupported DSV4 compression kind: {spec.kind}")
     ratio = int(spec.ratio)
     entry_ids_by_owner: list[list[int]] = [[] for _ in range(int(rank_count))]
     owner_ranks: list[int] = []
@@ -2105,11 +1856,12 @@ def _build_compact_hca_entries(
                     shared_prefix_flags=shared_prefix_flags,
                     dependency_start_view_positions=dependency_start_view_positions,
                 )
-                _append_compact_hca_dependency_run(
+                _append_compact_dependency_run(
                     branch_view=branch_view,
                     first_start=run_first_start,
                     last_start=run_last_start,
                     ratio=ratio,
+                    lookback=lookback,
                     owner_rank=run_owner_rank,
                     dependency_ranges_by_owner=dependency_ranges_by_owner,
                 )
@@ -2137,11 +1889,12 @@ def _build_compact_hca_entries(
                 shared_prefix_flags=shared_prefix_flags,
                 dependency_start_view_positions=dependency_start_view_positions,
             )
-            _append_compact_hca_dependency_run(
+            _append_compact_dependency_run(
                 branch_view=branch_view,
                 first_start=run_first_start,
                 last_start=run_last_start,
                 ratio=ratio,
+                lookback=lookback,
                 owner_rank=run_owner_rank,
                 dependency_ranges_by_owner=dependency_ranges_by_owner,
             )
@@ -2151,9 +1904,9 @@ def _build_compact_hca_entries(
                 last_start=run_last_start,
                 first_entry_id=branch_first_entry_id,
                 ratio=ratio,
-                lookback=0,
+                lookback=lookback,
                 raw_token_owner_ranks=raw_token_owner_ranks,
-                owner_change_positions=owner_change_positions,
+                owner_change_positions=compact_owner_change_positions,
                 halo_by_peer=halo_by_peer,
             )
     return _compact_layout_build_result(
@@ -2173,16 +1926,17 @@ def _build_compact_hca_entries(
     )
 
 
-def _append_compact_hca_dependency_run(
+def _append_compact_dependency_run(
     *,
     branch_view: Dsv4BranchView,
     first_start: int,
     last_start: int,
     ratio: int,
+    lookback: int,
     owner_rank: int,
     dependency_ranges_by_owner: list[list[tuple[int, int]]],
 ) -> None:
-    dependency_start = int(first_start)
+    dependency_start = max(0, int(first_start) - int(lookback))
     dependency_end = int(last_start) + int(ratio)
     for token_range in _fast_branch_token_ranges_for_view_range(
         branch_view=branch_view,
@@ -2230,27 +1984,6 @@ def _append_compact_entry_metadata_run(
     dependency_start_view_positions.extend(
         range(int(first_start), int(last_start) + 1, int(ratio))
     )
-
-
-def _append_compact_csa_dependency_run(
-    *,
-    branch_view: Dsv4BranchView,
-    first_start: int,
-    last_start: int,
-    ratio: int,
-    owner_rank: int,
-    dependency_ranges_by_owner: list[list[tuple[int, int]]],
-) -> None:
-    dependency_start = int(first_start) - int(ratio) if int(first_start) > 0 else 0
-    dependency_end = int(last_start) + int(ratio)
-    for token_range in _fast_branch_token_ranges_for_view_range(
-        branch_view=branch_view,
-        start=dependency_start,
-        end=dependency_end,
-    ):
-        dependency_ranges_by_owner[int(owner_rank)].append(
-            (int(token_range.start), int(token_range.stop))
-        )
 
 
 def _add_compact_csa_remote_halo(

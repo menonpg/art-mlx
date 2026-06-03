@@ -224,15 +224,6 @@ class Dsv4ExchangedAttentionBackwardWork(BaseModel):
 
 
 class Dsv4ProjectedCompressionForwardWork(BaseModel):
-    """Prelaunched projected-compression halo work for DSV4 attention.
-
-    Model code should launch this as soon as compressor KV/gate projections are
-    available, then run independent query/raw-KV work while the same-stream
-    async halo exchange is in flight. `wait()` is intentionally only the
-    communication wait boundary; projected compression materialization remains
-    lazy in the later attention-bind work object.
-    """
-
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     compression_kind: Dsv4CompressionKind
@@ -464,12 +455,6 @@ def merge_two_stage_outputs(
     stage_out: torch.Tensor,
     stage_lse: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge two DSV4 CP stage outputs in natural-log LSE space.
-
-    This is the same softmax merge algebra as generic attention CP, but it is
-    DSV4-owned so the later sparse-kernel path can replay stage backward with
-    global output/LSE instead of depending on autograd through the merge.
-    """
     merged_lse = _safe_logaddexp(prev_lse, stage_lse)
     prev_weight = _safe_exp_diff(prev_lse, merged_lse).unsqueeze(-1)
     stage_weight = _safe_exp_diff(stage_lse, merged_lse).unsqueeze(-1)
@@ -481,13 +466,6 @@ def merge_stage_outputs(
     stage_outputs: Sequence[torch.Tensor],
     stage_lses: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge all real-key DSV4 CP stage outputs before the sink branch.
-
-    Stage LSE tensors must already be converted to natural log. Miles TileLang
-    writes log2 LSE, so the sparse-kernel wrapper must multiply by ln(2) before
-    calling this function. Invalid rows are represented by LSE=-inf and produce
-    exact zero output.
-    """
     if len(stage_outputs) == 0:
         raise ValueError("at least one DSV4 stage output is required")
     if len(stage_outputs) != len(stage_lses):
@@ -524,13 +502,6 @@ def run_materialized_dsv4_attention_forward(
     attn_sink: torch.Tensor,
     scale: float | None = None,
 ) -> Dsv4AttentionForwardResult:
-    """Run materialized DSV4 CP stages and merge sink-once output.
-
-    This helper owns sparse stage execution and replay metadata after tensors
-    have already been materialized. It deliberately does not launch CP
-    communication or reduce gradients; those remain separate production steps.
-    Custom comm paths should stay eager and outside compiled regions.
-    """
     if len(stages) == 0:
         raise ValueError("at least one materialized DSV4 stage is required")
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
@@ -581,13 +552,6 @@ def launch_exchanged_dsv4_attention_forward(
     attn_sink: torch.Tensor,
     scale: float | None = None,
 ) -> Dsv4ExchangedAttentionForwardWork:
-    """Create the eager bridge from exchanged DSV4 stages to sparse attention.
-
-    Stage KV exchanges are custom eager communication. This wrapper deliberately
-    keeps their wait/materialization boundary out of compiled regions, then uses
-    the materialized-stage forward path for sparse kernel execution and global
-    real-key plus sink merge.
-    """
     works = tuple(stage_works)
     if not works:
         raise ValueError("at least one DSV4 exchanged attention stage is required")
@@ -797,12 +761,6 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ExchangedAttentionForwardWork:
-    """Launch DSV4 CSA CP forward from ART StagePlan slots.
-
-    The indexer topk is local to this rank's query rows. Stage KV exchange
-    planning remains topk-independent and uses all ranks' StagePlan K ranges, so
-    this path does not require gathering live topk ids from peer ranks.
-    """
     (
         rank_int,
         slots,
@@ -876,7 +834,6 @@ def launch_dsv4_hca_attention_forward_from_stage_plan_slots(
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ExchangedAttentionForwardWork:
-    """Launch DSV4 HCA CP forward from ART StagePlan slots."""
     rank_int = int(rank)
     _validate_exchange_rank(
         rank=rank_int, rank_count=len(layout.entry_ids_by_owner_rank)
@@ -940,13 +897,6 @@ def launch_dsv4_csa_projected_compression_forward(
     group: Any,
     async_op: bool,
 ) -> Dsv4ProjectedCompressionForwardWork:
-    """Launch CSA main and frozen-indexer projected compression halo work.
-
-    This activation-dependent eager boundary is the intra-layer overlap hook:
-    launch it after compressor projections, compute independent q/raw-KV paths,
-    then bind the returned work to attention. Communication is custom DSV4 CP
-    traffic and stays outside compiled regions.
-    """
     if layout.spec.kind != Dsv4CompressionKind.CSA:
         raise RuntimeError(
             f"DSV4 CSA compression launch received {layout.spec.kind} layout"
@@ -998,7 +948,6 @@ def launch_dsv4_hca_projected_compression_forward(
     group: Any,
     async_op: bool,
 ) -> Dsv4ProjectedCompressionForwardWork:
-    """Launch HCA projected compression halo work for later attention binding."""
     if layout.spec.kind != Dsv4CompressionKind.HCA:
         raise RuntimeError(
             f"DSV4 HCA compression launch received {layout.spec.kind} layout"
@@ -1053,7 +1002,6 @@ def launch_dsv4_csa_projected_attention_forward_from_compression_work(
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ProjectedAttentionForwardWork:
-    """Bind prelaunched CSA compression work to query/raw attention inputs."""
     compression = _validate_projected_compression_work(
         compression_work=compression_work,
         kind=Dsv4CompressionKind.CSA,
@@ -1121,7 +1069,6 @@ def launch_dsv4_hca_projected_attention_forward_from_compression_work(
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ProjectedAttentionForwardWork:
-    """Bind prelaunched HCA compression work to query/raw attention inputs."""
     compression = _validate_projected_compression_work(
         compression_work=compression_work,
         kind=Dsv4CompressionKind.HCA,
@@ -1192,15 +1139,6 @@ def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ProjectedAttentionForwardWork:
-    """Launch projected-input CSA DSV4 CP attention.
-
-    The caller owns DSV4 model projections. This eager wrapper launches main
-    and frozen-indexer compression halo work over projected KV/gate tensors,
-    then feeds the resulting compressed entries into the existing StagePlan-slot
-    CSA indexer and sparse-attention path. Compression forward runs under
-    no-grad because backward is replayed explicitly from global-LSE attention
-    gradients.
-    """
     compression_work = launch_dsv4_csa_projected_compression_forward(
         layout=layout,
         rank=rank,
@@ -1253,12 +1191,6 @@ def launch_dsv4_csa_projected_compression_forward_from_context_parallel_state(
     indexer_token_ids: Sequence[int],
     async_op: bool,
 ) -> Dsv4ProjectedCompressionForwardWork:
-    """Launch CSA compression from prepared DSV4 CP metadata.
-
-    This is the first half of the model-handler-facing overlap API. It unpacks
-    only rank/group/layout metadata, launches projected halo exchange, and does
-    not require q/raw-KV tensors to already exist.
-    """
     return launch_dsv4_csa_projected_compression_forward(
         layout=_require_prepared_layout(
             context_state=context_state,
@@ -1298,7 +1230,6 @@ def launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ProjectedAttentionForwardWork:
-    """Bind prelaunched CSA compression to prepared DSV4 CP attention metadata."""
     plan = context_state.dsv4_plan
     layout = _require_prepared_layout(
         context_state=context_state,
@@ -1363,7 +1294,6 @@ def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ProjectedAttentionForwardWork:
-    """Launch projected-input HCA DSV4 CP attention."""
     compression_work = launch_dsv4_hca_projected_compression_forward(
         layout=layout,
         rank=rank,
@@ -1402,7 +1332,6 @@ def launch_dsv4_hca_projected_compression_forward_from_context_parallel_state(
     token_ids: Sequence[int],
     async_op: bool,
 ) -> Dsv4ProjectedCompressionForwardWork:
-    """Launch HCA compression from prepared DSV4 CP metadata."""
     return launch_dsv4_hca_projected_compression_forward(
         layout=_require_prepared_layout(
             context_state=context_state,
@@ -1434,7 +1363,6 @@ def launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_
     raw_list_size: int | None = None,
     compressed_list_size: int | None = None,
 ) -> Dsv4ProjectedAttentionForwardWork:
-    """Bind prelaunched HCA compression to prepared DSV4 CP attention metadata."""
     layout = _require_prepared_layout(
         context_state=context_state,
         kind=Dsv4CompressionKind.HCA,
@@ -1479,13 +1407,6 @@ def launch_dsv4_projected_attention_backward_from_stage_plan_slots(
     owned_compressed_entry_ids: Sequence[int] | None = None,
     backward_plan: Dsv4AttentionBackwardPlan | None = None,
 ) -> Dsv4ProjectedAttentionBackwardWork:
-    """Replay DSV4 projected-input CP attention backward.
-
-    Attention backward first reduces gradients into owner query/raw/compressed
-    id spaces. The compressed-entry gradient is then scattered into the exact
-    owned compressed-entry order saved by compression forward and used to replay
-    compressor backward, including reverse halo-gradient exchange.
-    """
     if forward_result.compression_kind != layout.spec.kind:
         raise RuntimeError(
             "DSV4 projected forward kind does not match layout kind: "
@@ -1523,7 +1444,6 @@ def launch_dsv4_projected_attention_backward_from_context_parallel_state(
     owned_raw_token_ids: Sequence[int] | None = None,
     owned_compressed_entry_ids: Sequence[int] | None = None,
 ) -> Dsv4ProjectedAttentionBackwardWork:
-    """Replay projected-input DSV4 CP backward from prepared DSV4 metadata."""
     return launch_dsv4_projected_attention_backward_from_stage_plan_slots(
         layout=_require_prepared_layout(
             context_state=context_state,
@@ -1551,13 +1471,6 @@ def build_dsv4_attention_backward_plan_from_stage_plan_slots(
     layout: Dsv4CompressedLayout,
     stage_plan_slots: Sequence[Dsv4StagePlanSlot],
 ) -> Dsv4AttentionBackwardPlan:
-    """Precompute DSV4 backward owner-gradient metadata from StagePlan slots.
-
-    This is host-only DSV4 planning metadata. It must not inspect live
-    activation tensors or CUDA state; prepared plans built here are reusable by
-    every DSV4 layer in the microbatch and keep owner-gradient id-space
-    derivation out of per-layer backward execution.
-    """
     return build_dsv4_attention_backward_plans_from_stage_plan_slots(
         layouts=(layout,),
         stage_plan_slots=stage_plan_slots,
@@ -1570,13 +1483,6 @@ def build_dsv4_attention_backward_plans_from_stage_plan_slots(
     layouts: Sequence[Dsv4CompressedLayout],
     stage_plan_slots: Sequence[Dsv4StagePlanSlot],
 ) -> tuple[Dsv4AttentionBackwardPlan, ...]:
-    """Precompute DSV4 backward metadata for multiple layouts together.
-
-    CSA and HCA share query-token and raw-token id spaces for the same ART
-    StagePlan slots. Building them together avoids repeating the expensive
-    query/raw range expansion, owner-rank lookup, and owner bucket derivation
-    while still producing independent compressed-entry plans per layout.
-    """
     layout_tuple = tuple(layouts)
     if not layout_tuple:
         return ()
@@ -1630,14 +1536,6 @@ def launch_dsv4_attention_backward_from_stage_plan_slots(
     owned_compressed_entry_ids: Sequence[int] | None = None,
     backward_plan: Dsv4AttentionBackwardPlan | None = None,
 ) -> Dsv4ExchangedAttentionBackwardWork:
-    """Replay DSV4 backward and reduce owner grads from ART StagePlan slots.
-
-    This is the backward counterpart to the CSA/HCA StagePlan-slot forward
-    launchers. It derives gradient id spaces and owner-receive plans from host
-    StagePlan metadata only, then delegates to the existing global-LSE replay and
-    explicit-id owner exchange. Custom communication remains eager and outside
-    compiled regions.
-    """
     rank_int = int(rank)
     rank_count = len(layout.entry_ids_by_owner_rank)
     _validate_exchange_rank(rank=rank_int, rank_count=rank_count)
@@ -1706,12 +1604,6 @@ def launch_exchanged_dsv4_attention_backward(
     group: Any,
     async_op: bool,
 ) -> Dsv4ExchangedAttentionBackwardWork:
-    """Replay DSV4 stage backward and launch owner-gradient exchange.
-
-    This is an eager bridge around custom communication. It composes the
-    materialized global-LSE replay path with the DSV4 explicit-id owner exchange
-    without adding DSV4 behavior to the generic CP executor.
-    """
     owned_query_ids = _normalize_output_ids(
         owned_query_token_ids,
         name="owned_query_token_ids",
@@ -1773,12 +1665,6 @@ def launch_dsv4_attn_sink_gradient_reduce(
     group: Any,
     async_op: bool,
 ) -> Dsv4SinkGradientReduceWork:
-    """Launch CP-wide reduction for the DSV4 attention-sink gradient.
-
-    Sink is merged once globally in forward, but its gradient is accumulated from
-    every rank's local query rows. This eager same-stream all-reduce keeps the
-    custom communication boundary outside compiled regions.
-    """
     rank = int(rank)
     rank_count = int(rank_count)
     _validate_exchange_rank(rank=rank, rank_count=rank_count)
@@ -2626,12 +2512,6 @@ def merge_single_sink_branch(
     real_lse: torch.Tensor,
     attn_sink: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge the DSV4 sink exactly once after all real-key CP stages.
-
-    CP stage kernels must run with sink disabled, otherwise every stage would add
-    the same denominator term and inflate the sink probability. `attn_sink` is a
-    per-head natural-logit tensor with shape [H].
-    """
     if attn_sink.ndim != 1:
         raise ValueError("attn_sink must be a per-head tensor with shape [H]")
     if real_out.shape[:-1] != real_lse.shape:
@@ -2658,12 +2538,6 @@ def replay_materialized_dsv4_attention_backward(
     forward_result: Dsv4AttentionForwardResult,
     grad_out: torch.Tensor,
 ) -> Dsv4AttentionBackwardReplayResult:
-    """Replay sparse stage backward with global output/LSE.
-
-    Each Miles backward receives the stage's query rows gathered from the
-    globally merged output, global LSE, and external output gradient. Sink grad
-    is computed once analytically from the global result.
-    """
     if grad_out.shape != forward_result.out.shape:
         raise ValueError(
             "DSV4 replay grad_out must match forward output, got "
@@ -2718,13 +2592,6 @@ def accumulate_materialized_dsv4_attention_backward(
     raw_token_ids: Sequence[int],
     compressed_entry_ids: Sequence[int],
 ) -> Dsv4AttentionGradientResult:
-    """Accumulate replayed stage grads into explicit local id spaces.
-
-    This is the local reduce step before distributed owner reduction. It sums
-    per-stage query gradients by query token id, splits each `dkv_stage` into raw
-    and compressed slices using the materialized-stage metadata, and sums those
-    slices by raw token id or compressed entry id.
-    """
     if len(replay_result.stage_records) == 0:
         raise ValueError("at least one DSV4 replay stage record is required")
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
@@ -2829,12 +2696,6 @@ def pack_dsv4_gradient_owner_buckets(
     raw_owner_ranks: Sequence[int],
     compressed_owner_ranks: Sequence[int],
 ) -> tuple[Dsv4GradientOwnerBucket, ...]:
-    """Pack local DSV4 grads into owner-ranked buckets for eager communication.
-
-    This helper only builds stable send payloads. The actual distributed send
-    path should keep custom communication eager and make stream/lifetime
-    ordering explicit.
-    """
     query_owner_ranks = _validate_owner_ranks(
         ranks=query_owner_ranks,
         expected_count=len(gradients.query_token_ids),
@@ -2906,13 +2767,6 @@ def launch_dsv4_gradient_owner_bucket_exchange(
     group: Any,
     async_op: bool,
 ) -> Dsv4GradientOwnerExchangeWork:
-    """Launch distributed owner reduction payload exchange for DSV4 grads.
-
-    This is an eager DSV4 communication boundary. Actual ids may repeat across
-    source ranks, so the wire id includes the source rank; `wait_post_process`
-    converts received rows back to ordinary `Dsv4GradientOwnerBucket`s and
-    leaves summation to `accumulate_dsv4_gradient_owner_buckets`.
-    """
     _validate_gradient_result_shapes(gradients)
     rank = int(rank)
     rank_count = int(rank_count)
@@ -3010,7 +2864,6 @@ def launch_dsv4_gradient_owner_bucket_exchange(
             ),
             group=group,
             async_op=async_op,
-            label="dsv4_gradient_owner_query_exchange",
         ),
         raw_work=launch_dsv4_tensor_exchange(
             tensor=raw_tensor,
@@ -3024,7 +2877,6 @@ def launch_dsv4_gradient_owner_bucket_exchange(
             ),
             group=group,
             async_op=async_op,
-            label="dsv4_gradient_owner_raw_exchange",
         ),
         compressed_work=launch_dsv4_tensor_exchange(
             tensor=compressed_tensor,
@@ -3038,7 +2890,6 @@ def launch_dsv4_gradient_owner_bucket_exchange(
             ),
             group=group,
             async_op=async_op,
-            label="dsv4_gradient_owner_compressed_exchange",
         ),
     )
 
@@ -3051,7 +2902,6 @@ def accumulate_dsv4_gradient_owner_buckets(
     compressed_entry_ids: Sequence[int],
     d_attn_sink: torch.Tensor,
 ) -> Dsv4AttentionGradientResult:
-    """Reduce received owner buckets into this rank's explicit id spaces."""
     if len(buckets) == 0:
         raise ValueError("at least one DSV4 gradient owner bucket is required")
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
@@ -3155,12 +3005,6 @@ def compute_single_sink_grad(
     global_lse: torch.Tensor,
     attn_sink: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute the per-head DSV4 sink gradient from global output and LSE.
-
-    The sink has zero value, so dL/dsink = -Delta * p_sink where
-    Delta = dot(global_out, grad_out). This must be computed once from the
-    globally merged CP result, not per stage.
-    """
     if attn_sink.ndim != 1:
         raise ValueError("attn_sink must be a per-head tensor with shape [H]")
     if global_out.shape != grad_out.shape or global_out.shape[:-1] != global_lse.shape:

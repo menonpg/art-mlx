@@ -51,13 +51,6 @@ class Dsv4StreamSpec(Dsv4FrozenModel):
         return int(self.end) - int(self.start)
 
 
-class Dsv4TokenInView(Dsv4FrozenModel):
-    packed_token_id: int
-    stream_id: int
-    view_pos: int
-    stream_pos: int
-
-
 class Dsv4BranchView(Dsv4FrozenModel):
     branch_stream_id: int
     prefix_stream_id: int
@@ -69,12 +62,11 @@ class Dsv4BranchView(Dsv4FrozenModel):
     prefix_token_count: int
 
     def size(self) -> int:
-        return int(self.prefix_token_count) + self.suffix_size()
-
-    def suffix_size(self) -> int:
         if self.suffix_start is None or self.suffix_end is None:
-            return 0
-        return int(self.suffix_end) - int(self.suffix_start)
+            return int(self.prefix_token_count)
+        return (
+            int(self.prefix_token_count) + int(self.suffix_end) - int(self.suffix_start)
+        )
 
     def position_of_token(self, token_id: int) -> int | None:
         token = int(token_id)
@@ -87,41 +79,6 @@ class Dsv4BranchView(Dsv4FrozenModel):
         ):
             return int(self.prefix_token_count) + token - int(self.suffix_start)
         return None
-
-    @property
-    def tokens(self) -> tuple[Dsv4TokenInView, ...]:
-        tokens: list[Dsv4TokenInView] = []
-        cursor = 0
-        for offset, packed_id in enumerate(
-            range(int(self.prefix_start), int(self.prefix_end))
-        ):
-            tokens.append(
-                Dsv4TokenInView(
-                    packed_token_id=packed_id,
-                    stream_id=int(self.prefix_stream_id),
-                    view_pos=cursor,
-                    stream_pos=offset,
-                )
-            )
-            cursor += 1
-        if (
-            self.suffix_stream_id is not None
-            and self.suffix_start is not None
-            and self.suffix_end is not None
-        ):
-            for offset, packed_id in enumerate(
-                range(int(self.suffix_start), int(self.suffix_end))
-            ):
-                tokens.append(
-                    Dsv4TokenInView(
-                        packed_token_id=packed_id,
-                        stream_id=int(self.suffix_stream_id),
-                        view_pos=cursor,
-                        stream_pos=offset,
-                    )
-                )
-                cursor += 1
-        return tuple(tokens)
 
 
 class Dsv4HaloTransfer(Dsv4FrozenModel):
@@ -371,33 +328,3 @@ class Dsv4ContextParallelState(Dsv4TensorModel):
     cp_state: ArtContextParallelState
     dsv4_plan: Dsv4PreparedPlan
     extra: dict[str, Any] = Field(default_factory=dict)
-
-
-Dsv4TopkResult.model_rebuild()
-Dsv4ProjectedTokenBuffer.model_rebuild()
-Dsv4TensorExchangePlan.model_rebuild()
-Dsv4TensorIdBuffer.model_rebuild()
-Dsv4CompressionHaloPayload.model_rebuild()
-Dsv4CompressionHaloGradientPayload.model_rebuild()
-Dsv4CompressedKvForwardResult.model_rebuild()
-Dsv4CompressedKvGradientResult.model_rebuild()
-Dsv4StageInputs.model_rebuild()
-Dsv4IndexerStagePlan.model_rebuild()
-Dsv4IndexerKvExchangePeerPlan.model_rebuild()
-Dsv4StagePlanSlot.model_rebuild()
-Dsv4StageKvExchangePeerPlan.model_rebuild()
-Dsv4MaterializedStage.model_rebuild()
-Dsv4SparseForwardResult.model_rebuild()
-Dsv4SparseBackwardResult.model_rebuild()
-Dsv4StageForwardRecord.model_rebuild()
-Dsv4AttentionForwardResult.model_rebuild()
-Dsv4StageBackwardRecord.model_rebuild()
-Dsv4AttentionBackwardReplayResult.model_rebuild()
-Dsv4AttentionGradientResult.model_rebuild()
-Dsv4AttentionBackwardRankPlan.model_rebuild()
-Dsv4AttentionBackwardPlan.model_rebuild()
-Dsv4ProjectedAttentionForwardResult.model_rebuild()
-Dsv4ProjectedAttentionGradientResult.model_rebuild()
-Dsv4GradientOwnerBucket.model_rebuild()
-Dsv4PreparedPlan.model_rebuild()
-Dsv4ContextParallelState.model_rebuild()
