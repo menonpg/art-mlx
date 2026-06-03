@@ -497,18 +497,17 @@ def run_megatron_rl_job(
             ref_logprobs_by_index = _precompute_reference_logprobs(
                 runtime=runtime,
                 packed_tensors=packed_tensors,
-                sample_indices=sorted(
-                    {
-                        sample_index
-                        for step_index in range(num_steps)
-                        for sample_index in build_micro_sample_indices(
-                            step_index=step_index,
-                            num_sequences=num_sequences,
-                            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
-                        )
-                        if sample_index is not None
-                    }
-                ),
+                sample_step_indices={
+                    sample_index: step_index
+                    for step_index in range(num_steps)
+                    for sample_index in build_micro_sample_indices(
+                        step_index=step_index,
+                        num_sequences=num_sequences,
+                        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                    )
+                    if sample_index is not None
+                },
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
             if os.path.abspath(ref_adapter_path) != os.path.abspath(job.lora_path):
                 assert runtime.optimizer is not None
@@ -1124,7 +1123,23 @@ def _calculate_megatron_logprobs(
     model_chunks: ModelChunks,
     model_support_handler: Any,
     inputs: PackedTensors,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    step_index: int | None = None,
+    sample_index: int | None = None,
+    global_grad_accumulation_sequences: int | None = None,
 ) -> torch.Tensor:
+    if moe_routing_replay_controller is not None:
+        if step_index is None or sample_index is None:
+            raise ValueError(
+                "step_index and sample_index are required for routing replay"
+            )
+        moe_routing_replay_controller.set_step(
+            step_index=step_index,
+            sample_index=sample_index,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        moe_routing_replay_controller.begin_micro(sample_index, 0)
+
     device = next(model_chunks[0].parameters()).device
     _move_inputs_to_device(inputs, device)
     attention_state = create_shared_prefix_attention_state(
@@ -1143,6 +1158,7 @@ def _calculate_megatron_logprobs(
     previous_training_modes = [chunk.training for chunk in model_chunks]
     for chunk in model_chunks:
         chunk.eval()
+    forward_succeeded = False
     try:
         logprobs = -model_chunks[0](
             input_ids=inputs["tokens"],
@@ -1154,9 +1170,12 @@ def _calculate_megatron_logprobs(
                 attention_bias=attention_state,
             ),
         )
+        forward_succeeded = True
     finally:
         for chunk, was_training in zip(model_chunks, previous_training_modes):
             chunk.train(was_training)
+        if moe_routing_replay_controller is not None and forward_succeeded:
+            moe_routing_replay_controller.finalize_step()
     return logprobs.detach().cpu()
 
 
@@ -1164,12 +1183,13 @@ def _precompute_reference_logprobs(
     *,
     runtime: TrainingRuntime,
     packed_tensors: PackedTensors,
-    sample_indices: list[int],
+    sample_step_indices: dict[int, int],
+    global_grad_accumulation_sequences: int,
 ) -> dict[int, torch.Tensor]:
     print0(
         runtime.rank,
         "Precomputing KL reference logprobs for",
-        len(sample_indices),
+        len(sample_step_indices),
         "local sequences",
     )
     return {
@@ -1177,8 +1197,12 @@ def _precompute_reference_logprobs(
             model_chunks=runtime.model,
             model_support_handler=runtime.model_support_handler,
             inputs=select_indexed_inputs(packed_tensors, sample_index),
+            moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+            step_index=step_index,
+            sample_index=sample_index,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
-        for sample_index in sample_indices
+        for sample_index, step_index in sorted(sample_step_indices.items())
     }
 
 
