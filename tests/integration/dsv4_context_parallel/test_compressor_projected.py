@@ -194,7 +194,7 @@ def test_compression_halo_payloads_match_global_compression_and_return_grads() -
         token_ids=tuple(range(8, 18)),
         halo_payloads=received_payloads,
     )
-    assert buffer.token_ids == (4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16)
+    assert buffer.token_ids == tuple(range(8, 18)) + (4, 5, 6, 7)
 
     actual = compress_owned_projected_kv(
         layout=layout,

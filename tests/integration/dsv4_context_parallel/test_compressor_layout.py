@@ -49,10 +49,6 @@ def test_csa_layout_reuses_shared_prefix_and_adds_branch_entries() -> None:
     assert layout.entry_closure_view_positions == (3, 7, 11, 11)
     assert layout.entry_shared_prefix_flags == (True, True, False, False)
     assert layout.entry_dependency_start_view_positions == (0, 4, 8, 8)
-    assert layout.dependency_token_ids_by_owner_rank == (
-        tuple(range(8)),
-        tuple(range(4, 12)) + tuple(range(13, 17)),
-    )
     assert layout.closure_token_ids == (3, 7, 11, 16)
     assert layout.closure_entry_ids == (0, 1, 2, 3)
 
@@ -78,10 +74,6 @@ def test_hca_layout_drops_incomplete_tails_and_reuses_prefix_entries() -> None:
     assert layout.entry_closure_view_positions == (3, 7, 11, 11)
     assert layout.entry_shared_prefix_flags == (True, True, False, False)
     assert layout.entry_dependency_start_view_positions == (0, 4, 8, 8)
-    assert layout.dependency_token_ids_by_owner_rank == (
-        tuple(range(8)),
-        tuple(range(8, 12)) + tuple(range(13, 17)),
-    )
     assert layout.closure_token_ids == (3, 7, 11, 16)
     assert layout.closure_entry_ids == (0, 1, 2, 3)
     assert layout.halo_transfers == ()

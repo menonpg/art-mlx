@@ -475,11 +475,15 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
     has_queries = tuple(
         _ranges_have_tokens(stage_plan.global_q_ranges) for stage_plan in stage_plans
     )
+    raw_valid_ranges = _layout_stream_ranges(layout_tuple[0])
+    raw_valid_starts = tuple(start for start, _end in raw_valid_ranges)
     recv_raw = tuple(
         _stage_raw_token_ids_by_owner_rank(
             layout=layout_tuple[0],
             ranges=stage_plan.global_k_ranges if has_queries[rank] else (),
             rank_count=rank_count,
+            valid_ranges=raw_valid_ranges,
+            valid_range_starts=raw_valid_starts,
         )
         for rank, stage_plan in enumerate(stage_plans)
     )
@@ -973,17 +977,27 @@ def _stage_raw_token_ids_by_owner_rank(
     layout: Dsv4CompressedLayout,
     ranges: Sequence[TokenRangeLike],
     rank_count: int,
+    valid_ranges: Sequence[tuple[int, int]] | None = None,
+    valid_range_starts: Sequence[int] | None = None,
 ) -> tuple[tuple[int, ...], ...]:
     by_rank: list[list[int]] = [[] for _ in range(int(rank_count))]
     intersections: list[tuple[int, int]] = []
-    valid_ranges = _layout_stream_ranges(layout)
+    if valid_ranges is None:
+        valid_ranges = _layout_stream_ranges(layout)
+    if valid_range_starts is None:
+        valid_range_starts = tuple(start for start, _end in valid_ranges)
     owner_ranks = layout.raw_token_owner_ranks
     owner_count = len(owner_ranks)
     owner_changes = layout.raw_token_owner_change_positions
     for range_ in ranges:
         range_start = int(range_.start)
         range_end = int(range_.end)
-        for stream_start, stream_end in valid_ranges:
+        range_index = bisect_left(valid_range_starts, range_start)
+        if range_index:
+            range_index -= 1
+        for stream_start, stream_end in valid_ranges[range_index:]:
+            if stream_start >= range_end:
+                break
             start = max(range_start, stream_start)
             end = min(range_end, stream_end)
             if start < end:

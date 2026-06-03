@@ -299,7 +299,6 @@ class Dsv4CompressedLayout(Dsv4FrozenModel):
     entry_closure_view_positions: tuple[int, ...] = ()
     entry_shared_prefix_flags: tuple[bool, ...] = ()
     entry_dependency_start_view_positions: tuple[int, ...] = ()
-    dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...] = ()
     closure_token_ids: tuple[int, ...] = ()
     closure_entry_ids: tuple[int, ...] = ()
 

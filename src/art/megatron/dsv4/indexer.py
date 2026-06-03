@@ -108,11 +108,16 @@ def stage_candidate_entry_ids(
     candidates: list[int] = []
     closure_tokens = layout.closure_token_ids
     closure_entry_ids = layout.closure_entry_ids
+    previous_end: int | None = None
     for range_ in global_k_ranges:
-        start = bisect_left(closure_tokens, int(range_.start))
-        end = bisect_left(closure_tokens, int(range_.end))
+        range_start = int(range_.start)
+        range_end = int(range_.end)
+        if previous_end is not None and range_start < previous_end:
+            raise RuntimeError("DSV4 stage K ranges must be sorted and non-overlapping")
+        previous_end = range_end
+        start = bisect_left(closure_tokens, range_start)
+        end = bisect_left(closure_tokens, range_end)
         candidates.extend(closure_entry_ids[start:end])
-    candidates.sort()
     return tuple(candidates)
 
 
@@ -767,9 +772,21 @@ def _shared_stage_index(stage_plans: Sequence[Any]) -> int:
 
 def _token_ids_from_ranges(ranges: Sequence[TokenRangeLike]) -> tuple[int, ...]:
     token_ids: list[int] = []
+    previous_end: int | None = None
     for range_ in ranges:
-        token_ids.extend(range(int(range_.start), int(range_.end)))
-    _row_by_id(tuple(token_ids), name="stage_plan_token_ranges")
+        start = int(range_.start)
+        end = int(range_.end)
+        if start < 0 or end < start:
+            raise RuntimeError(
+                f"DSV4 stage_plan_token_ranges contains invalid range [{start}, {end})"
+            )
+        if previous_end is not None and start < previous_end:
+            raise RuntimeError(
+                "DSV4 stage_plan_token_ranges contains overlapping or unsorted "
+                f"range [{start}, {end}) after previous end {previous_end}"
+            )
+        token_ids.extend(range(start, end))
+        previous_end = end
     return tuple(token_ids)
 
 
@@ -1038,27 +1055,13 @@ def _build_local_indexer_kv_exchange_peer_plans(
         owner_ranks=owner_ranks,
         name=f"rank{rank_int}_candidate_entry_ids",
     )
-    send: list[list[int]] = [[] for _ in range(rank_count)]
-    owner_count = len(owner_ranks)
-    for peer_rank, candidate_ids in enumerate(candidate_entry_ids_by_rank):
-        previous: int | None = None
-        for id_ in candidate_ids:
-            entry_id = int(id_)
-            if previous is not None and entry_id <= previous:
-                raise RuntimeError(
-                    f"DSV4 rank{peer_rank}_candidate_entry_ids contains duplicate "
-                    f"id or unsorted id {entry_id}"
-                )
-            previous = entry_id
-            if entry_id < 0 or entry_id >= owner_count:
-                raise RuntimeError(
-                    f"DSV4 rank{peer_rank}_candidate_entry_ids id {entry_id} "
-                    "is outside layout owner table"
-                )
-            if int(owner_ranks[entry_id]) == rank_int:
-                send[peer_rank].append(entry_id)
+    owned_ranges = _sorted_id_ranges(layout.entry_ids_by_owner_rank[rank_int])
+    send = tuple(
+        _ids_in_sorted_ranges(candidate_ids, owned_ranges)
+        for candidate_ids in candidate_entry_ids_by_rank
+    )
     local_plan = Dsv4IndexerKvExchangePeerPlan(
-        send_entry_ids_by_peer=tuple(tuple(ids) for ids in send),
+        send_entry_ids_by_peer=send,
         recv_entry_ids_by_peer=recv,
     )
     return tuple(
@@ -1070,6 +1073,31 @@ def _build_local_indexer_kv_exchange_peer_plans(
         )
         for rank in range(int(rank_count))
     )
+
+
+def _sorted_id_ranges(ids: Sequence[int]) -> tuple[tuple[int, int], ...]:
+    if not ids:
+        return ()
+    ranges: list[tuple[int, int]] = []
+    start = previous = int(ids[0])
+    for id_ in ids[1:]:
+        id_int = int(id_)
+        if id_int != previous + 1:
+            ranges.append((start, previous + 1))
+            start = id_int
+        previous = id_int
+    ranges.append((start, previous + 1))
+    return tuple(ranges)
+
+
+def _ids_in_sorted_ranges(
+    ids: Sequence[int],
+    ranges: Sequence[tuple[int, int]],
+) -> tuple[int, ...]:
+    selected: list[int] = []
+    for start, end in ranges:
+        selected.extend(ids[bisect_left(ids, start) : bisect_left(ids, end)])
+    return tuple(selected)
 
 
 def _ranges_have_tokens(ranges: Sequence[TokenRangeLike]) -> bool:

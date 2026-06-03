@@ -159,7 +159,6 @@ class _Dsv4LayoutBuildResult(BaseModel):
     entry_closure_view_positions: tuple[int, ...]
     entry_shared_prefix_flags: tuple[bool, ...]
     entry_dependency_start_view_positions: tuple[int, ...]
-    dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...]
     closure_token_ids: tuple[int, ...]
     closure_entry_ids: tuple[int, ...]
 
@@ -307,7 +306,6 @@ def _build_dsv4_compressed_layout_from_parts(
         entry_closure_view_positions=built.entry_closure_view_positions,
         entry_shared_prefix_flags=built.entry_shared_prefix_flags,
         entry_dependency_start_view_positions=built.entry_dependency_start_view_positions,
-        dependency_token_ids_by_owner_rank=built.dependency_token_ids_by_owner_rank,
         closure_token_ids=built.closure_token_ids,
         closure_entry_ids=built.closure_entry_ids,
     )
@@ -652,7 +650,6 @@ def materialize_dsv4_compression_token_buffer(
         tensor_token_count=int(projected_kv.shape[-2]),
         name="token_ids",
     )
-    needed_token_ids = _needed_tokens_for_owner(layout=layout, owner_rank=owner_rank)
     all_kv = [projected_kv]
     all_gate = [projected_gate]
     all_token_ids = list(token_ids)
@@ -683,9 +680,22 @@ def materialize_dsv4_compression_token_buffer(
         all_kv.append(payload.projected_kv)
         all_gate.append(payload.projected_gate)
         all_token_ids.extend(int(token_id) for token_id in payload.token_ids)
+    expected_halo = {
+        int(token_id)
+        for transfer in _incoming_halo_transfers(layout=layout, rank=owner_rank)
+        for token_id in transfer.token_ids
+    }
+    received_halo = {
+        int(token_id) for payload in halo_payloads for token_id in payload.token_ids
+    }
+    if missing_halo := expected_halo - received_halo:
+        raise RuntimeError(
+            "DSV4 required halo tokens are missing from local+halo token_ids: "
+            f"{tuple(sorted(missing_halo))}"
+        )
     _row_by_token_id(all_token_ids, name="local+halo token_ids")
 
-    if not needed_token_ids:
+    if not layout.entry_ids_by_owner_rank[int(owner_rank)]:
         return Dsv4ProjectedTokenBuffer(
             token_ids=(),
             projected_kv=_empty_token_rows_like(projected_kv),
@@ -694,15 +704,10 @@ def materialize_dsv4_compression_token_buffer(
 
     merged_kv = torch.cat(all_kv, dim=_token_dim(projected_kv))
     merged_gate = torch.cat(all_gate, dim=_token_dim(projected_gate))
-    positions = _positions_for_token_ids(
-        available_token_ids=tuple(all_token_ids),
-        requested_token_ids=needed_token_ids,
-        name="local+halo token_ids",
-    )
     return Dsv4ProjectedTokenBuffer(
-        token_ids=needed_token_ids,
-        projected_kv=_index_select_token_dim(merged_kv, positions),
-        projected_gate=_index_select_token_dim(merged_gate, positions),
+        token_ids=tuple(all_token_ids),
+        projected_kv=merged_kv,
+        projected_gate=merged_gate,
     )
 
 
@@ -962,29 +967,6 @@ def _normalize_token_ids(
         )
     _row_by_token_id(token_ids, name=name)
     return token_ids
-
-
-def _needed_tokens_for_owner(
-    *,
-    layout: Dsv4CompressedLayout,
-    owner_rank: int,
-) -> tuple[int, ...]:
-    if int(owner_rank) < 0 or int(owner_rank) >= len(layout.entry_ids_by_owner_rank):
-        raise RuntimeError(f"DSV4 owner rank {owner_rank} is outside layout rank count")
-    if layout.dependency_token_ids_by_owner_rank:
-        return layout.dependency_token_ids_by_owner_rank[int(owner_rank)]
-    return tuple(
-        sorted(
-            {
-                int(token_id)
-                for entry_id in layout.entry_ids_by_owner_rank[int(owner_rank)]
-                for token_id in _dependency_token_ids_for_entry(
-                    layout=layout,
-                    entry_id=int(entry_id),
-                )
-            }
-        )
-    )
 
 
 def _compression_halo_exchange_plan(
@@ -1318,6 +1300,12 @@ def _validate_metadata(
 
 
 def _valid_token_count(group_row: torch.Tensor) -> int:
+    token_count = int(group_row.numel())
+    if token_count == 0:
+        return 0
+    has_padding = bool((group_row == _PADDING_GROUP_ID).any().item())
+    if not has_padding:
+        return token_count
     valid = group_row != _PADDING_GROUP_ID
     count = int(valid.sum().item())
     if count == 0:
@@ -1437,15 +1425,17 @@ def _validate_stream_graph(streams: list[Dsv4StreamSpec]) -> None:
 def _build_branch_views(
     streams: tuple[Dsv4StreamSpec, ...],
 ) -> tuple[Dsv4BranchView, ...]:
-    by_id = {stream.stream_id: stream for stream in streams}
+    prefixes: dict[int, Dsv4StreamSpec] = {}
     branch_views: list[Dsv4BranchView] = []
     for stream in streams:
         if stream.kind is Dsv4StreamKind.PREFIX:
+            prefixes[stream.stream_id] = stream
             branch_views.append(_make_branch_view(prefix=stream, suffix=None))
-    for stream in streams:
-        if stream.kind is Dsv4StreamKind.PREFIX:
             continue
-        parent = by_id.get(stream.parent_stream_id)
+        parent_stream_id = stream.parent_stream_id
+        if parent_stream_id is None:
+            raise RuntimeError(f"DSV4 completion {stream.stream_id} has no parent")
+        parent = prefixes.get(parent_stream_id)
         if parent is None:
             raise RuntimeError(
                 f"DSV4 completion {stream.stream_id} missing parent {stream.parent_stream_id}"
@@ -1811,10 +1801,8 @@ def _build_compact_entries(
     closure_view_positions: list[int] = []
     shared_prefix_flags: list[bool] = []
     dependency_start_view_positions: list[int] = []
-    dependency_ranges_by_owner: list[list[tuple[int, int]]] = [
-        [] for _ in range(int(rank_count))
-    ]
-    entry_id_by_closure: dict[int, int] = {}
+    closure_token_ids: list[int] = []
+    closure_entry_ids: list[int] = []
     halo_by_peer: dict[tuple[int, int], dict[int, set[int]]] = defaultdict(
         lambda: defaultdict(set)
     )
@@ -1829,31 +1817,56 @@ def _build_compact_entries(
         suffix_start = int(branch_view.suffix_start or 0)
         branch_len = int(branch_view.size())
         branch_shared_prefix_entry = branch_view.suffix_stream_id is None
-        run_owner_rank: int | None = None
-        run_first_entry_id = 0
-        run_first_start = 0
-        run_last_start = 0
         branch_first_start = _first_compression_start_with_closure_at_or_after(
             min_closure_view_pos=min_closure_view_pos,
             ratio=ratio,
         )
+        if branch_first_start > branch_len - ratio:
+            continue
         branch_first_entry_id = len(owner_ranks)
-        next_entry_id = branch_first_entry_id
-        for start in range(branch_first_start, branch_len - ratio + 1, ratio):
-            closure_view_pos = start + ratio - 1
-            closure_token_id = (
-                prefix_start + closure_view_pos
-                if closure_view_pos < prefix_token_count
-                else suffix_start + closure_view_pos - prefix_token_count
+        branch_last_start = (
+            branch_first_start
+            + ((branch_len - ratio - branch_first_start) // ratio) * ratio
+        )
+        raw_base = (
+            prefix_start
+            if branch_view.suffix_stream_id is None
+            else suffix_start - prefix_token_count
+        )
+        first_closure_token_id = raw_base + branch_first_start + ratio - 1
+        last_closure_token_id = raw_base + branch_last_start + ratio - 1
+        branch_entry_count = (branch_last_start - branch_first_start) // ratio + 1
+        if closure_token_ids and first_closure_token_id <= closure_token_ids[-1]:
+            raise RuntimeError("DSV4 compressed closure tokens must be built in order")
+        closure_token_ids.extend(
+            range(first_closure_token_id, last_closure_token_id + 1, ratio)
+        )
+        closure_entry_ids.extend(
+            range(branch_first_entry_id, branch_first_entry_id + branch_entry_count)
+        )
+        run_first_start = branch_first_start
+        boundary_start = bisect_left(
+            compact_owner_change_positions, first_closure_token_id + 1
+        )
+        boundary_end = bisect_left(
+            compact_owner_change_positions, last_closure_token_id + 1
+        )
+        for owner_boundary in compact_owner_change_positions[
+            boundary_start:boundary_end
+        ]:
+            run_last_start = (
+                branch_first_start
+                + ((int(owner_boundary) - first_closure_token_id + ratio - 1) // ratio)
+                * ratio
+                - ratio
             )
-            owner_rank = raw_token_owner_ranks[closure_token_id]
-            entry_id = next_entry_id
-            next_entry_id += 1
-            if run_owner_rank is None:
-                run_owner_rank = owner_rank
-                run_first_entry_id = entry_id
-                run_first_start = start
-            elif owner_rank != run_owner_rank:
+            if run_last_start >= run_first_start:
+                run_owner_rank = raw_token_owner_ranks[
+                    raw_base + run_first_start + ratio - 1
+                ]
+                run_first_entry_id = branch_first_entry_id + (
+                    (run_first_start - branch_first_start) // ratio
+                )
                 _append_compact_entry_metadata_run(
                     first_entry_id=run_first_entry_id,
                     first_start=run_first_start,
@@ -1871,25 +1884,18 @@ def _build_compact_entries(
                     shared_prefix_flags=shared_prefix_flags,
                     dependency_start_view_positions=dependency_start_view_positions,
                 )
-                _append_compact_dependency_run(
-                    branch_view=branch_view,
-                    first_start=run_first_start,
-                    last_start=run_last_start,
-                    ratio=ratio,
-                    lookback=lookback,
-                    owner_rank=run_owner_rank,
-                    dependency_ranges_by_owner=dependency_ranges_by_owner,
-                )
-                run_owner_rank = owner_rank
-                run_first_entry_id = entry_id
-                run_first_start = start
-            run_last_start = start
-            entry_id_by_closure[closure_token_id] = entry_id
-        if run_owner_rank is not None:
+            run_first_start = run_last_start + ratio
+        if run_first_start <= branch_last_start:
+            run_owner_rank = raw_token_owner_ranks[
+                raw_base + run_first_start + ratio - 1
+            ]
+            run_first_entry_id = branch_first_entry_id + (
+                (run_first_start - branch_first_start) // ratio
+            )
             _append_compact_entry_metadata_run(
                 first_entry_id=run_first_entry_id,
                 first_start=run_first_start,
-                last_start=run_last_start,
+                last_start=branch_last_start,
                 ratio=ratio,
                 owner_rank=run_owner_rank,
                 branch_stream_id=int(branch_view.branch_stream_id),
@@ -1903,26 +1909,17 @@ def _build_compact_entries(
                 shared_prefix_flags=shared_prefix_flags,
                 dependency_start_view_positions=dependency_start_view_positions,
             )
-            _append_compact_dependency_run(
-                branch_view=branch_view,
-                first_start=run_first_start,
-                last_start=run_last_start,
-                ratio=ratio,
-                lookback=lookback,
-                owner_rank=run_owner_rank,
-                dependency_ranges_by_owner=dependency_ranges_by_owner,
-            )
-            _add_compact_remote_halo_for_branch(
-                branch_view=branch_view,
-                first_start=branch_first_start,
-                last_start=run_last_start,
-                first_entry_id=branch_first_entry_id,
-                ratio=ratio,
-                lookback=lookback,
-                raw_token_owner_ranks=raw_token_owner_ranks,
-                owner_change_positions=compact_owner_change_positions,
-                halo_by_peer=halo_by_peer,
-            )
+        _add_compact_remote_halo_for_branch(
+            branch_view=branch_view,
+            first_start=branch_first_start,
+            last_start=branch_last_start,
+            first_entry_id=branch_first_entry_id,
+            ratio=ratio,
+            lookback=lookback,
+            raw_token_owner_ranks=raw_token_owner_ranks,
+            owner_change_positions=compact_owner_change_positions,
+            halo_by_peer=halo_by_peer,
+        )
     return _compact_layout_build_result(
         spec=spec,
         rank_count=rank_count,
@@ -1933,32 +1930,10 @@ def _build_compact_entries(
         closure_view_positions=closure_view_positions,
         shared_prefix_flags=shared_prefix_flags,
         dependency_start_view_positions=dependency_start_view_positions,
-        dependency_ranges_by_owner=dependency_ranges_by_owner,
-        entry_id_by_closure=entry_id_by_closure,
+        closure_token_ids=closure_token_ids,
+        closure_entry_ids=closure_entry_ids,
         halo_by_peer=halo_by_peer,
     )
-
-
-def _append_compact_dependency_run(
-    *,
-    branch_view: Dsv4BranchView,
-    first_start: int,
-    last_start: int,
-    ratio: int,
-    lookback: int,
-    owner_rank: int,
-    dependency_ranges_by_owner: list[list[tuple[int, int]]],
-) -> None:
-    dependency_start = max(0, int(first_start) - int(lookback))
-    dependency_end = int(last_start) + int(ratio)
-    for token_range in _fast_branch_token_ranges_for_view_range(
-        branch_view=branch_view,
-        start=dependency_start,
-        end=dependency_end,
-    ):
-        dependency_ranges_by_owner[int(owner_rank)].append(
-            (int(token_range.start), int(token_range.stop))
-        )
 
 
 def _append_compact_entry_metadata_run(
@@ -1979,24 +1954,16 @@ def _append_compact_entry_metadata_run(
     shared_prefix_flags: list[bool],
     dependency_start_view_positions: list[int],
 ) -> None:
-    count = (int(last_start) - int(first_start)) // int(ratio) + 1
-    entry_ids_by_owner[int(owner_rank)].extend(
-        range(int(first_entry_id), int(first_entry_id) + count)
-    )
-    owner_ranks.extend([int(owner_rank)] * count)
-    branch_stream_ids.extend([int(branch_stream_id)] * count)
-    prefix_stream_ids.extend([int(prefix_stream_id)] * count)
+    count = (last_start - first_start) // ratio + 1
+    entry_ids_by_owner[owner_rank].extend(range(first_entry_id, first_entry_id + count))
+    owner_ranks.extend([owner_rank] * count)
+    branch_stream_ids.extend([branch_stream_id] * count)
+    prefix_stream_ids.extend([prefix_stream_id] * count)
     closure_view_positions.extend(
-        range(
-            int(first_start) + int(ratio) - 1,
-            int(last_start) + int(ratio),
-            int(ratio),
-        )
+        range(first_start + ratio - 1, last_start + ratio, ratio)
     )
-    shared_prefix_flags.extend([bool(shared_prefix_entry)] * count)
-    dependency_start_view_positions.extend(
-        range(int(first_start), int(last_start) + 1, int(ratio))
-    )
+    shared_prefix_flags.extend([shared_prefix_entry] * count)
+    dependency_start_view_positions.extend(range(first_start, last_start + 1, ratio))
 
 
 def _add_compact_csa_remote_halo(
@@ -2256,27 +2223,6 @@ def _owner_change_positions(raw_token_owner_ranks: tuple[int, ...]) -> tuple[int
     )
 
 
-def _expand_merged_token_ranges(
-    ranges: Sequence[tuple[int, int]],
-) -> tuple[int, ...]:
-    sorted_ranges = sorted(
-        (int(start), int(end)) for start, end in ranges if int(start) < int(end)
-    )
-    if not sorted_ranges:
-        return ()
-    token_ids: list[int] = []
-    current_start, current_end = sorted_ranges[0]
-    for start, end in sorted_ranges[1:]:
-        if int(start) <= int(current_end):
-            current_end = max(int(current_end), int(end))
-            continue
-        token_ids.extend(range(int(current_start), int(current_end)))
-        current_start = int(start)
-        current_end = int(end)
-    token_ids.extend(range(int(current_start), int(current_end)))
-    return tuple(token_ids)
-
-
 def _compact_layout_build_result(
     *,
     spec: Dsv4CompressionSpec,
@@ -2288,16 +2234,14 @@ def _compact_layout_build_result(
     closure_view_positions: list[int],
     shared_prefix_flags: list[bool],
     dependency_start_view_positions: list[int],
-    dependency_ranges_by_owner: list[list[tuple[int, int]]],
-    entry_id_by_closure: dict[int, int],
+    closure_token_ids: list[int],
+    closure_entry_ids: list[int],
     halo_by_peer: dict[tuple[int, int], dict[int, set[int]]],
 ) -> _Dsv4LayoutBuildResult:
-    if len(entry_id_by_closure) != len(owner_ranks):
+    if len(closure_token_ids) != len(owner_ranks) or len(closure_entry_ids) != len(
+        owner_ranks
+    ):
         raise RuntimeError("DSV4 compressed entries must have unique closure tokens")
-    closure_items = sorted(entry_id_by_closure.items())
-    closure_tokens, closure_entries = (
-        zip(*closure_items, strict=True) if closure_items else ((), ())
-    )
     halo_transfers: list[Dsv4HaloTransfer] = []
     for (source_rank, target_rank), token_to_entries in sorted(halo_by_peer.items()):
         halo_transfers.append(
@@ -2328,12 +2272,8 @@ def _compact_layout_build_result(
         entry_closure_view_positions=tuple(closure_view_positions),
         entry_shared_prefix_flags=tuple(shared_prefix_flags),
         entry_dependency_start_view_positions=tuple(dependency_start_view_positions),
-        dependency_token_ids_by_owner_rank=tuple(
-            _expand_merged_token_ranges(token_ranges)
-            for token_ranges in dependency_ranges_by_owner
-        ),
-        closure_token_ids=closure_tokens,
-        closure_entry_ids=closure_entries,
+        closure_token_ids=tuple(closure_token_ids),
+        closure_entry_ids=tuple(closure_entry_ids),
     )
 
 
