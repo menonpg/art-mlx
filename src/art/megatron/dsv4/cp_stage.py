@@ -34,17 +34,31 @@ class TokenRangeLike(Protocol):
 class Dsv4StageKvExchangeWork(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    stage_inputs: Dsv4StageInputs
+    stage_inputs: Dsv4StageInputs | None
     query: torch.Tensor
     query_token_ids: tuple[int, ...]
     recv_raw_token_ids_by_peer: tuple[tuple[int, ...], ...]
     recv_compressed_entry_ids_by_peer: tuple[tuple[int, ...], ...]
     tensor_work: Dsv4TensorExchangeWork
 
+    def bind_stage_inputs(
+        self,
+        stage_inputs: Dsv4StageInputs,
+    ) -> Dsv4StageKvExchangeWork:
+        if self.stage_inputs is not None:
+            raise RuntimeError("DSV4 stage KV exchange already has stage inputs")
+        self.stage_inputs = stage_inputs
+        return self
+
     def wait(self) -> None:
         self.tensor_work.wait()
 
     def wait_post_process(self) -> Dsv4MaterializedStage:
+        if self.stage_inputs is None:
+            raise RuntimeError(
+                "DSV4 stage KV exchange must be bound to stage inputs before "
+                "materialization"
+            )
         result = self.tensor_work.wait_post_process()
         expected_wire_ids = _stage_wire_peer_ids_by_peer(
             raw_ids_by_peer=self.recv_raw_token_ids_by_peer,
@@ -775,6 +789,39 @@ def launch_dsv4_stage_kv_exchange(
     compressed collectives. Wire ids encode key kind to keep raw token ids and
     compressed entry ids in disjoint spaces.
     """
+    return _launch_dsv4_stage_kv_exchange_impl(
+        stage_inputs=stage_inputs,
+        query=query,
+        query_token_ids=query_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_entry_ids,
+        send_raw_token_ids_by_peer=send_raw_token_ids_by_peer,
+        send_compressed_entry_ids_by_peer=send_compressed_entry_ids_by_peer,
+        recv_raw_token_ids_by_peer=recv_raw_token_ids_by_peer,
+        recv_compressed_entry_ids_by_peer=recv_compressed_entry_ids_by_peer,
+        group=group,
+        async_op=async_op,
+    )
+
+
+def _launch_dsv4_stage_kv_exchange_impl(
+    *,
+    stage_inputs: Dsv4StageInputs | None,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    send_raw_token_ids_by_peer: Sequence[Sequence[int]],
+    send_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
+    recv_raw_token_ids_by_peer: Sequence[Sequence[int]],
+    recv_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
+    group: Any,
+    async_op: bool,
+) -> Dsv4StageKvExchangeWork:
     query_ids = tuple(int(token_id) for token_id in query_token_ids)
     _validate_stage_kv_pair(
         raw_kv=raw_kv,
@@ -925,6 +972,54 @@ def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
     plan = plans[rank_int]
     return launch_dsv4_stage_kv_exchange(
         stage_inputs=local_stage_inputs,
+        query=query,
+        query_token_ids=query_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=raw_token_ids,
+        compressed_kv=compressed_kv,
+        compressed_entry_ids=compressed_entry_ids,
+        send_raw_token_ids_by_peer=plan.send_raw_token_ids_by_peer,
+        send_compressed_entry_ids_by_peer=plan.send_compressed_entry_ids_by_peer,
+        recv_raw_token_ids_by_peer=plan.recv_raw_token_ids_by_peer,
+        recv_compressed_entry_ids_by_peer=plan.recv_compressed_entry_ids_by_peer,
+        group=group,
+        async_op=async_op,
+    )
+
+
+@torch.compiler.disable
+def launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot(
+    *,
+    layout: Dsv4CompressedLayout,
+    rank: int,
+    stage_plan_slot: Dsv4StagePlanSlot,
+    query: torch.Tensor,
+    query_token_ids: Sequence[int],
+    raw_kv: torch.Tensor,
+    raw_token_ids: Sequence[int],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: Sequence[int],
+    group: Any,
+    async_op: bool,
+    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
+) -> Dsv4StageKvExchangeWork:
+    """Launch a stage KV exchange before CSA topk-derived inputs exist.
+
+    CSA topk controls only the sparse-kernel list tensor. The raw/compressed
+    candidate rows fetched for an ART StagePlan slot are determined by the CP
+    K ranges, so this topk-independent exchange can be queued while the frozen
+    indexer topk is still pending, then bound to `Dsv4StageInputs` before
+    materialization.
+    """
+    rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
+    plans = _stage_kv_peer_plans_or_build_from_slot(
+        layout=layout,
+        stage_plan_slot=stage_plan_slot,
+        peer_plans=peer_plans,
+    )
+    plan = plans[rank_int]
+    return _launch_dsv4_stage_kv_exchange_impl(
+        stage_inputs=None,
         query=query,
         query_token_ids=query_token_ids,
         raw_kv=raw_kv,

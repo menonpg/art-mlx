@@ -16,6 +16,7 @@ from art.megatron.dsv4 import (
     build_dsv4_stage_plan_slots,
     build_stage_local_topk_for_csa,
     build_stage_local_topk_for_hca,
+    launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot,
     launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
     materialize_dsv4_stage_tensors,
     raw_swa_token_ids_for_query,
@@ -398,6 +399,52 @@ def test_stage_slot_exchange_uses_prepared_peer_plan(
     )
 
 
+def test_deferred_stage_slot_exchange_binds_stage_inputs_later() -> None:
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slot = build_dsv4_stage_plan_slots(
+        stage_plans_by_rank=(
+            (_stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),),
+        )
+    )[0]
+    stage_inputs = build_stage_local_topk_for_csa(
+        layout=layout,
+        stage_index=5,
+        query_token_ids=(7,),
+        global_k_ranges=(_Range(start=4, end=13),),
+        global_topk=torch.tensor([[[1, 2]]], dtype=torch.long),
+        window_size=4,
+    )
+    work = launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot(
+        layout=layout,
+        rank=0,
+        stage_plan_slot=slot,
+        query=_query_rows((7,)),
+        query_token_ids=(7,),
+        raw_kv=_kv_rows(tuple(range(18))),
+        raw_token_ids=tuple(range(18)),
+        compressed_kv=_kv_rows((201, 202)),
+        compressed_entry_ids=(1, 2),
+        group=None,
+        async_op=False,
+    )
+
+    with pytest.raises(RuntimeError, match="bound to stage inputs"):
+        work.wait_post_process()
+
+    materialized = work.bind_stage_inputs(stage_inputs).wait_post_process()
+
+    assert materialized.stage_index == 5
+    assert materialized.query_token_ids == (7,)
+    assert materialized.raw_count == 9
+    assert materialized.compressed_count == 2
+    torch.testing.assert_close(
+        materialized.topk_stage_local,
+        stage_inputs.topk_stage_local,
+    )
+    with pytest.raises(RuntimeError, match="already has stage inputs"):
+        work.bind_stage_inputs(stage_inputs)
+
+
 def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
     stage = build_stage_local_topk_for_csa(
@@ -511,6 +558,18 @@ def _layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:
                 ((8, 18, 0),),
             ),
             token_counts_by_rank=(8, 10),
+        ),
+        spec=Dsv4CompressionSpec(kind=kind, ratio=4),
+    )
+
+
+def _single_rank_layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:
+    return build_dsv4_compressed_layout(
+        group_ids=torch.tensor([[0] * 8 + [1] * 5 + [2] * 5 + [-1] * 2]),
+        parent_ids=torch.tensor([[0] * 8 + [0] * 5 + [0] * 5 + [-1] * 2]),
+        token_layout_index=_LayoutIndex(
+            ownership_ranges_by_rank=(((0, 18, 0),),),
+            token_counts_by_rank=(18,),
         ),
         spec=Dsv4CompressionSpec(kind=kind, ratio=4),
     )

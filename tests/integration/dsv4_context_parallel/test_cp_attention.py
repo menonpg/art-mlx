@@ -29,6 +29,7 @@ from art.megatron.dsv4 import (
     Dsv4StageKeyKind,
     Dsv4StagePlanGroup,
     Dsv4StagePlanSlot,
+    Dsv4TopkResult,
     accumulate_dsv4_gradient_owner_buckets,
     accumulate_materialized_dsv4_attention_backward,
     build_dsv4_attention_backward_plan_from_stage_plan_slots,
@@ -461,6 +462,93 @@ def test_csa_attention_forward_launcher_uses_local_topk_and_stage_slots(
     assert stage.raw_count == 8
     assert stage.compressed_count == 2
     assert stage.key_global_ids == (0, 1, 2, 3, 4, 5, 6, 7, 0, 1)
+
+
+def test_csa_attention_forward_prelaunches_stage_kv_before_waiting_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class _TopkWork:
+        def wait(self) -> None:
+            events.append("topk_wait")
+
+        def wait_post_process(self) -> Dsv4TopkResult:
+            events.append("topk_wait_post_process")
+            assert "stage_launch" in events
+            return Dsv4TopkResult(
+                indices=torch.tensor([[[0, 1], [0, 1]]], dtype=torch.long),
+                scores=torch.tensor([[[2.0, 1.0], [2.0, 1.0]]], dtype=torch.float32),
+            )
+
+    class _DeferredStageWork:
+        def bind_stage_inputs(self, stage_inputs: object) -> object:
+            events.append("stage_bind")
+            assert "topk_wait_post_process" in events
+            assert stage_inputs is not None
+            return _StageWork()
+
+    class _StageWork:
+        def wait(self) -> None:
+            events.append("stage_wait")
+
+        def wait_post_process(self) -> Dsv4MaterializedStage:
+            events.append("stage_wait_post_process")
+            return _materialized_stage(0, (3, 7))
+
+    def fake_topk_launch(**_kwargs: object) -> _TopkWork:
+        events.append("topk_launch")
+        return _TopkWork()
+
+    def fake_stage_launch(**_kwargs: object) -> _DeferredStageWork:
+        events.append("stage_launch")
+        return _DeferredStageWork()
+
+    monkeypatch.setattr(
+        cp_attention,
+        "launch_dsv4_indexer_topk_from_stage_plans",
+        fake_topk_launch,
+    )
+    monkeypatch.setattr(
+        cp_attention,
+        "launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot",
+        fake_stage_launch,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+
+    result = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+        layout=_single_rank_layout(Dsv4CompressionKind.CSA),
+        rank=0,
+        stage_plan_slots=_single_rank_slots(),
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        compressed_kv=torch.zeros(2, 3, dtype=torch.float64),
+        compressed_entry_ids=(0, 1),
+        indexer_q=torch.zeros(2, 1, 2, dtype=torch.float32),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float32),
+        indexer_kv=torch.zeros(2, 2, dtype=torch.float32),
+        indexer_kv_entry_ids=(0, 1),
+        indexer_topk=2,
+        attn_sink=torch.zeros(2, dtype=torch.float64),
+        group=None,
+        async_op=True,
+        window_size=4,
+    ).wait_post_process()
+
+    assert result.stage_records[0].materialized_stage.query_token_ids == (3, 7)
+    assert events[:4] == [
+        "topk_launch",
+        "stage_launch",
+        "topk_wait_post_process",
+        "stage_bind",
+    ]
+    assert "stage_wait_post_process" in events
 
 
 def test_hca_attention_forward_launcher_uses_stage_slots(

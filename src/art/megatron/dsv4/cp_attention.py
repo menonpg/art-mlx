@@ -17,6 +17,7 @@ from .compressor import (
 )
 from .cp_stage import (
     build_dsv4_stage_inputs_from_stage_plan,
+    launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot,
     launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
     launch_planned_dsv4_stage_kv_exchange,
 )
@@ -709,7 +710,7 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
             for slot in slots
         )
     indexer_stage_plans = prepared_indexer_stage_plans
-    topk_result = launch_dsv4_indexer_topk_from_stage_plans(
+    topk_work = launch_dsv4_indexer_topk_from_stage_plans(
         layout=layout,
         rank=rank_int,
         indexer_stage_plans=indexer_stage_plans,
@@ -723,16 +724,12 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
         async_op=async_op,
         score_scale=indexer_score_scale,
         indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
-    ).wait_post_process()
-    stage_works = tuple(
-        _launch_dsv4_stage_from_slot(
-            stage_kv_peer_plans=prepared_stage_kv_peer_plans[stage_position]
-            if prepared_stage_kv_peer_plans is not None
-            else None,
+    )
+    deferred_stage_works = tuple(
+        launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot(
             layout=layout,
             rank=rank_int,
-            slot=slot,
-            compression_kind=Dsv4CompressionKind.CSA,
+            stage_plan_slot=slot,
             query=query,
             query_token_ids=query_ids,
             raw_kv=raw_kv,
@@ -741,13 +738,28 @@ def launch_dsv4_csa_attention_forward_from_stage_plan_slots(
             compressed_entry_ids=compressed_entry_ids,
             group=group,
             async_op=async_op,
-            global_topk=topk_result.indices,
-            topk_query_token_ids=query_ids,
-            window_size=window_size,
-            raw_list_size=raw_list_size,
-            compressed_list_size=compressed_list_size,
+            peer_plans=prepared_stage_kv_peer_plans[stage_position]
+            if prepared_stage_kv_peer_plans is not None
+            else None,
         )
         for stage_position, slot in enumerate(slots)
+    )
+    topk_result = topk_work.wait_post_process()
+    stage_works = tuple(
+        stage_work.bind_stage_inputs(
+            build_dsv4_stage_inputs_from_stage_plan(
+                layout=layout,
+                stage_plan=slot.stage_plans_by_rank[rank_int],
+                compression_kind=Dsv4CompressionKind.CSA,
+                global_topk=topk_result.indices,
+                topk_query_token_ids=query_ids,
+                window_size=window_size,
+                raw_list_size=raw_list_size,
+                compressed_list_size=compressed_list_size,
+                materialize_compressed_metadata=False,
+            )
+        )
+        for stage_work, slot in zip(deferred_stage_works, slots, strict=True)
     )
     return launch_exchanged_dsv4_attention_forward(
         stage_works=stage_works,

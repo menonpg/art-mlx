@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 
 from art.megatron.dsv4 import (
     Dsv4TensorExchangePlan,
+    Dsv4TensorExchangeWork,
     launch_dsv4_tensor_exchange,
 )
 
@@ -71,6 +72,51 @@ def test_dsv4_tensor_exchange_rejects_bad_id_spaces() -> None:
             group=None,
             async_op=False,
         )
+
+
+def test_dsv4_tensor_exchange_wait_uses_precise_event_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Handle:
+        def __init__(self) -> None:
+            self.wait_count = 0
+
+        def wait(self) -> None:
+            self.wait_count += 1
+
+    class _ConsumerStream:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+            self.streams: list[object] = []
+
+        def wait_event(self, event: object) -> None:
+            self.events.append(event)
+
+        def wait_stream(self, stream: object) -> None:
+            self.streams.append(stream)
+
+    handle = _Handle()
+    consumer = _ConsumerStream()
+    event = object()
+    stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: consumer)
+
+    work = Dsv4TensorExchangeWork(
+        recv_buffer=torch.empty(0, 2),
+        recv_ids_by_peer=((),),
+        handle=handle,
+        send_buffer=None,
+        stream=stream,
+        event=event,
+        output_ndim=2,
+    )
+
+    work.wait()
+    work.wait()
+
+    assert handle.wait_count == 1
+    assert consumer.events == [event]
+    assert consumer.streams == []
 
 
 def _exchange_worker(rank: int, world_size: int, init_path: str) -> None:

@@ -18,7 +18,8 @@ class Dsv4TensorExchangeWork(BaseModel):
     recv_ids_by_peer: tuple[tuple[int, ...], ...]
     handle: Any | None
     send_buffer: torch.Tensor | None = None
-    stream: torch.cuda.Stream | None = None
+    stream: Any | None = None
+    event: Any | None = None
     output_ndim: int
     label: str = "dsv4_tensor_exchange"
     allow_duplicate_recv_ids: bool = False
@@ -29,7 +30,9 @@ class Dsv4TensorExchangeWork(BaseModel):
             return
         if self.handle is not None:
             self.handle.wait()
-        if self.stream is not None:
+        if self.event is not None:
+            torch.cuda.current_stream(self.recv_buffer.device).wait_event(self.event)
+        elif self.stream is not None:
             torch.cuda.current_stream(self.recv_buffer.device).wait_stream(self.stream)
         self._wait_complete = True
 
@@ -62,10 +65,10 @@ def launch_dsv4_tensor_exchange(
     """Exchange DSV4 KV-like tensor rows by explicit ids.
 
     This is bespoke DSV4 communication and should remain eager. For CUDA async
-    execution it uses a side-stream handoff with stable packed buffers:
-    pack on the producer stream, make the comm stream wait on that stream,
-    record packed-buffer lifetimes on the comm stream, and make the consumer
-    stream wait during `wait()`.
+    execution it uses a side-stream handoff with stable packed buffers. Each
+    work records a CUDA event after its own collective, so waiting this work
+    does not accidentally wait later DSV4 exchanges queued on the same reusable
+    comm stream; that precision is required for useful host-ahead overlap.
     """
     _validate_exchange_tensor(tensor)
     world_size = _world_size(group)
@@ -133,6 +136,8 @@ def launch_dsv4_tensor_exchange(
                 group=group,
                 async_op=True,
             )
+            event = torch.cuda.Event()
+            event.record(stream)
     else:
         handle = _all_to_all_single(
             recv_buffer=recv_buffer,
@@ -142,12 +147,14 @@ def launch_dsv4_tensor_exchange(
             group=group,
             async_op=async_op,
         )
+        event = None
     return Dsv4TensorExchangeWork(
         recv_buffer=recv_buffer,
         recv_ids_by_peer=plan.recv_ids_by_peer,
         handle=handle,
         send_buffer=send_buffer,
         stream=stream,
+        event=event,
         output_ndim=tensor.ndim,
         label=label,
         allow_duplicate_recv_ids=bool(allow_duplicate_recv_ids),
