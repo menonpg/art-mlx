@@ -111,6 +111,9 @@ class RankRuntimeTiming(BaseModel):
     forward_total_ms: tuple[float, ...]
     compression_forward_ms: tuple[float, ...]
     attention_forward_ms: tuple[float, ...]
+    indexer_forward_ms: tuple[float, ...]
+    stage_materialization_forward_ms: tuple[float, ...]
+    sparse_merge_forward_ms: tuple[float, ...]
     backward_launch_ms: tuple[float, ...]
     backward_wait_ms: tuple[float, ...]
     backward_total_ms: tuple[float, ...]
@@ -136,6 +139,13 @@ class RuntimeTiming(BaseModel):
         forward_total = _iteration_rank_max(self.ranks, "forward_total_ms")
         compression_forward = _iteration_rank_max(self.ranks, "compression_forward_ms")
         attention_forward = _iteration_rank_max(self.ranks, "attention_forward_ms")
+        indexer_forward = _iteration_rank_max(self.ranks, "indexer_forward_ms")
+        stage_materialization_forward = _iteration_rank_max(
+            self.ranks, "stage_materialization_forward_ms"
+        )
+        sparse_merge_forward = _iteration_rank_max(
+            self.ranks, "sparse_merge_forward_ms"
+        )
         backward_total = _iteration_rank_max(self.ranks, "backward_total_ms")
         e2e = _iteration_rank_max(self.ranks, "e2e_ms")
         token_count = max((rank.token_count for rank in self.ranks), default=0)
@@ -187,6 +197,36 @@ class RuntimeTiming(BaseModel):
             Dsv4Metric(
                 name=f"{prefix}_attention_forward_p90",
                 value=_percentile(attention_forward, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_indexer_forward_median",
+                value=_median(indexer_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_indexer_forward_p90",
+                value=_percentile(indexer_forward, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_stage_materialization_forward_median",
+                value=_median(stage_materialization_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_stage_materialization_forward_p90",
+                value=_percentile(stage_materialization_forward, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_sparse_merge_forward_median",
+                value=_median(sparse_merge_forward),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_sparse_merge_forward_p90",
+                value=_percentile(sparse_merge_forward, 90),
                 unit="ms",
             ),
             Dsv4Metric(
@@ -291,6 +331,19 @@ class RuntimeForwardPhase(BaseModel):
     total_ms: float
     compression_ms: float
     attention_ms: float
+    indexer_ms: float
+    stage_materialization_ms: float
+    sparse_merge_ms: float
+
+
+class RuntimeStageAttentionPhase(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    attention: Any
+    total_ms: float
+    launch_ms: float
+    materialization_ms: float
+    sparse_merge_ms: float
 
 
 class LabResult(BaseModel):
@@ -310,6 +363,7 @@ RuntimeTiming.model_rebuild()
 RankRuntimeOutput.model_rebuild()
 RuntimeForwardInputs.model_rebuild()
 RuntimeForwardPhase.model_rebuild()
+RuntimeStageAttentionPhase.model_rebuild()
 LabResult.model_rebuild()
 
 
@@ -479,7 +533,7 @@ def run_runtime_benchmark(
     caveats = (
         "projected-input runtime benchmark; surrounding DSV4 model projections, RMSNorm, RoPE, and output projection are excluded until the non-CP DSV4 handler exists",
         "uses real prepared ART CP state plus public DSV4 compression, indexer/stage-attention, and projected-backward APIs",
-        "forward phase timings split public compression versus indexer/stage-attention execution without production debug hooks",
+        "forward phase timings split public compression, CSA indexer, stage exchange/materialization, and sparse-kernel/merge execution without production debug hooks",
         "phase medians and p90s are rank-max aggregates per phase and are diagnostic rather than additive",
         "warmup excludes first-use TileLang compilation and setup where the iteration count is large enough to amortize it",
     )
@@ -777,6 +831,9 @@ def _time_runtime_kind(
     backward_total_ms: list[float] = []
     compression_forward_ms: list[float] = []
     attention_forward_ms: list[float] = []
+    indexer_forward_ms: list[float] = []
+    stage_materialization_forward_ms: list[float] = []
+    sparse_merge_forward_ms: list[float] = []
     e2e_ms: list[float] = []
     output_abs_sum = 0.0
     dq_abs_sum = 0.0
@@ -845,6 +902,11 @@ def _time_runtime_kind(
             forward_total_ms.append(forward_phase.total_ms)
             compression_forward_ms.append(forward_phase.compression_ms)
             attention_forward_ms.append(forward_phase.attention_ms)
+            indexer_forward_ms.append(forward_phase.indexer_ms)
+            stage_materialization_forward_ms.append(
+                forward_phase.stage_materialization_ms
+            )
+            sparse_merge_forward_ms.append(forward_phase.sparse_merge_ms)
             backward_launch_ms.append(bwd_launch)
             backward_wait_ms.append(bwd_wait)
             backward_total_ms.append(bwd_total)
@@ -875,6 +937,9 @@ def _time_runtime_kind(
         forward_total_ms=tuple(forward_total_ms),
         compression_forward_ms=tuple(compression_forward_ms),
         attention_forward_ms=tuple(attention_forward_ms),
+        indexer_forward_ms=tuple(indexer_forward_ms),
+        stage_materialization_forward_ms=tuple(stage_materialization_forward_ms),
+        sparse_merge_forward_ms=tuple(sparse_merge_forward_ms),
         backward_launch_ms=tuple(backward_launch_ms),
         backward_wait_ms=tuple(backward_wait_ms),
         backward_total_ms=tuple(backward_total_ms),
@@ -976,7 +1041,7 @@ def _run_runtime_csa_forward(
         Dsv4CompressionKind,
         Dsv4ProjectedAttentionForwardResult,
         launch_dsv4_compressed_kv_forward,
-        launch_dsv4_csa_attention_forward_from_stage_plan_slots,
+        launch_dsv4_indexer_topk_from_stage_plans,
     )
 
     plan = context_state.dsv4_plan
@@ -1025,49 +1090,57 @@ def _run_runtime_csa_forward(
     compression_ms = _elapsed_ms(fwd_start)
 
     attention_start = time.perf_counter()
-    attention_work = launch_dsv4_csa_attention_forward_from_stage_plan_slots(
+    indexer_start = time.perf_counter()
+    topk_result = launch_dsv4_indexer_topk_from_stage_plans(
         layout=layout,
         rank=int(context_state.cp_state.rank_plan.rank),
-        stage_plan_slots=plan.stage_plan_slots,
+        indexer_stage_plans=plan.csa_indexer_stage_plans,
+        query_token_ids=local_token_ids,
+        indexer_q=forward_inputs.indexer_q,
+        indexer_weights=forward_inputs.indexer_weights,
+        indexer_kv=indexer_compressed.compressed_kv,
+        indexer_kv_entry_ids=indexer_compressed.compressed_entry_ids,
+        topk=int(config.indexer_topk),
+        group=context_state.cp_state.cp_group,
+        async_op=True,
+        indexer_kv_peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage or None,
+    ).wait_post_process()
+    torch.cuda.synchronize(device)
+    indexer_ms = _elapsed_ms(indexer_start)
+    stage_phase = _run_runtime_stage_attention_forward(
+        context_state=context_state,
+        layout=layout,
+        compression_kind=Dsv4CompressionKind.CSA,
         query=query,
         query_token_ids=local_token_ids,
         raw_kv=raw_kv,
         raw_token_ids=local_token_ids,
         compressed_kv=main_compressed.compressed_kv,
         compressed_entry_ids=main_compressed.compressed_entry_ids,
-        indexer_q=forward_inputs.indexer_q,
-        indexer_weights=forward_inputs.indexer_weights,
-        indexer_kv=indexer_compressed.compressed_kv,
-        indexer_kv_entry_ids=indexer_compressed.compressed_entry_ids,
-        indexer_topk=int(config.indexer_topk),
-        indexer_stage_plans=plan.csa_indexer_stage_plans,
-        indexer_kv_peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage or None,
-        stage_kv_peer_plans_by_slot=plan.csa_stage_kv_peer_plans_by_slot or None,
+        global_topk=topk_result.indices,
         attn_sink=attn_sink,
-        group=context_state.cp_state.cp_group,
-        async_op=True,
+        config=config,
         scale=scale,
-        window_size=int(config.window_size),
-        raw_list_size=int(config.window_size),
-        compressed_list_size=int(config.indexer_topk),
+        device=device,
+        stage_kv_peer_plans_by_slot=plan.csa_stage_kv_peer_plans_by_slot or None,
     )
-    attention_launch_ms = _elapsed_ms(attention_start)
-    attention = attention_work.wait_post_process()
-    torch.cuda.synchronize(device)
     attention_ms = _elapsed_ms(attention_start)
     total_ms = _elapsed_ms(fwd_start)
     return RuntimeForwardPhase(
         forward=Dsv4ProjectedAttentionForwardResult(
             compression_kind=Dsv4CompressionKind.CSA,
-            attention=attention,
+            attention=stage_phase.attention,
             main_compressed=main_compressed,
             indexer_compressed=indexer_compressed,
         ),
-        launch_ms=compression_launch_ms + attention_launch_ms,
-        wait_ms=max(total_ms - compression_launch_ms - attention_launch_ms, 0.0),
+        launch_ms=compression_launch_ms + stage_phase.launch_ms,
+        wait_ms=max(total_ms - compression_launch_ms - stage_phase.launch_ms, 0.0),
         total_ms=total_ms,
         compression_ms=compression_ms,
         attention_ms=attention_ms,
+        indexer_ms=indexer_ms,
+        stage_materialization_ms=stage_phase.materialization_ms,
+        sparse_merge_ms=stage_phase.sparse_merge_ms,
     )
 
 
@@ -1087,7 +1160,6 @@ def _run_runtime_hca_forward(
         Dsv4CompressionKind,
         Dsv4ProjectedAttentionForwardResult,
         launch_dsv4_compressed_kv_forward,
-        launch_dsv4_hca_attention_forward_from_stage_plan_slots,
     )
 
     plan = context_state.dsv4_plan
@@ -1119,41 +1191,128 @@ def _run_runtime_hca_forward(
     compression_ms = _elapsed_ms(fwd_start)
 
     attention_start = time.perf_counter()
-    attention_work = launch_dsv4_hca_attention_forward_from_stage_plan_slots(
+    stage_phase = _run_runtime_stage_attention_forward(
+        context_state=context_state,
         layout=layout,
-        rank=int(context_state.cp_state.rank_plan.rank),
-        stage_plan_slots=plan.stage_plan_slots,
+        compression_kind=Dsv4CompressionKind.HCA,
         query=query,
         query_token_ids=local_token_ids,
         raw_kv=raw_kv,
         raw_token_ids=local_token_ids,
         compressed_kv=compressed.compressed_kv,
         compressed_entry_ids=compressed.compressed_entry_ids,
+        global_topk=None,
         attn_sink=attn_sink,
-        group=context_state.cp_state.cp_group,
-        async_op=True,
-        stage_kv_peer_plans_by_slot=plan.hca_stage_kv_peer_plans_by_slot or None,
+        config=config,
         scale=scale,
-        window_size=int(config.window_size),
-        raw_list_size=int(config.window_size),
-        compressed_list_size=None,
+        device=device,
+        stage_kv_peer_plans_by_slot=plan.hca_stage_kv_peer_plans_by_slot or None,
     )
-    attention_launch_ms = _elapsed_ms(attention_start)
-    attention = attention_work.wait_post_process()
-    torch.cuda.synchronize(device)
     attention_ms = _elapsed_ms(attention_start)
     total_ms = _elapsed_ms(fwd_start)
     return RuntimeForwardPhase(
         forward=Dsv4ProjectedAttentionForwardResult(
             compression_kind=Dsv4CompressionKind.HCA,
-            attention=attention,
+            attention=stage_phase.attention,
             main_compressed=compressed,
         ),
-        launch_ms=compression_launch_ms + attention_launch_ms,
-        wait_ms=max(total_ms - compression_launch_ms - attention_launch_ms, 0.0),
+        launch_ms=compression_launch_ms + stage_phase.launch_ms,
+        wait_ms=max(total_ms - compression_launch_ms - stage_phase.launch_ms, 0.0),
         total_ms=total_ms,
         compression_ms=compression_ms,
         attention_ms=attention_ms,
+        indexer_ms=0.0,
+        stage_materialization_ms=stage_phase.materialization_ms,
+        sparse_merge_ms=stage_phase.sparse_merge_ms,
+    )
+
+
+def _run_runtime_stage_attention_forward(
+    *,
+    context_state: Any,
+    layout: Any,
+    compression_kind: Any,
+    query: torch.Tensor,
+    query_token_ids: tuple[int, ...],
+    raw_kv: torch.Tensor,
+    raw_token_ids: tuple[int, ...],
+    compressed_kv: torch.Tensor,
+    compressed_entry_ids: tuple[int, ...],
+    global_topk: torch.Tensor | None,
+    attn_sink: torch.Tensor,
+    config: RuntimeBenchmarkConfig,
+    scale: float,
+    device: torch.device,
+    stage_kv_peer_plans_by_slot: tuple[tuple[Any, ...], ...] | None,
+) -> RuntimeStageAttentionPhase:
+    from art.megatron.dsv4 import (
+        Dsv4CompressionKind,
+        build_dsv4_stage_inputs_from_stage_plan,
+        launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
+        run_materialized_dsv4_attention_forward,
+    )
+
+    rank = int(context_state.cp_state.rank_plan.rank)
+    slots = tuple(context_state.dsv4_plan.stage_plan_slots)
+    if not slots:
+        raise RuntimeError("runtime stage benchmark requires prepared StagePlan slots")
+    stage_start = time.perf_counter()
+    stage_works = []
+    for stage_position, slot in enumerate(slots):
+        stage_inputs = build_dsv4_stage_inputs_from_stage_plan(
+            layout=layout,
+            stage_plan=slot.stage_plans_by_rank[rank],
+            compression_kind=compression_kind,
+            global_topk=global_topk,
+            topk_query_token_ids=query_token_ids
+            if compression_kind == Dsv4CompressionKind.CSA
+            else None,
+            window_size=int(config.window_size),
+            raw_list_size=int(config.window_size),
+            compressed_list_size=int(config.indexer_topk)
+            if compression_kind == Dsv4CompressionKind.CSA
+            else None,
+            materialize_compressed_metadata=compression_kind != Dsv4CompressionKind.CSA,
+        )
+        stage_works.append(
+            launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
+                layout=layout,
+                rank=rank,
+                stage_plan_slot=slot,
+                local_stage_inputs=stage_inputs,
+                query=query,
+                query_token_ids=query_token_ids,
+                raw_kv=raw_kv,
+                raw_token_ids=raw_token_ids,
+                compressed_kv=compressed_kv,
+                compressed_entry_ids=compressed_entry_ids,
+                group=context_state.cp_state.cp_group,
+                async_op=True,
+                peer_plans=stage_kv_peer_plans_by_slot[stage_position]
+                if stage_kv_peer_plans_by_slot is not None
+                else None,
+            )
+        )
+    launch_ms = _elapsed_ms(stage_start)
+    materialization_start = time.perf_counter()
+    stages = tuple(work.wait_post_process() for work in stage_works)
+    torch.cuda.synchronize(device)
+    materialization_ms = _elapsed_ms(materialization_start)
+    sparse_merge_start = time.perf_counter()
+    attention = run_materialized_dsv4_attention_forward(
+        stages=stages,
+        query_token_ids=query_token_ids,
+        attn_sink=attn_sink,
+        scale=scale,
+    )
+    torch.cuda.synchronize(device)
+    sparse_merge_ms = _elapsed_ms(sparse_merge_start)
+    return RuntimeStageAttentionPhase(
+        attention=attention,
+        total_ms=_elapsed_ms(stage_start),
+        launch_ms=launch_ms,
+        materialization_ms=materialization_ms,
+        sparse_merge_ms=sparse_merge_ms,
     )
 
 
