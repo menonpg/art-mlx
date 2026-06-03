@@ -418,7 +418,7 @@ def _build_stage_kv_exchange_peer_plans_from_ids(
     send_raw = _transpose_peer_ids(recv_raw)
     send_compressed = _transpose_peer_ids(recv_compressed)
     return tuple(
-        Dsv4StageKvExchangePeerPlan(
+        Dsv4StageKvExchangePeerPlan.model_construct(
             send_raw_token_ids_by_peer=send_raw[rank],
             send_compressed_entry_ids_by_peer=send_compressed[rank],
             recv_raw_token_ids_by_peer=recv_raw[rank],

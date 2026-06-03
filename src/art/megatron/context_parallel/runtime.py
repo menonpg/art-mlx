@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from functools import wraps
+import gc
 import hashlib
 import json
 from typing import Any, cast
@@ -60,6 +62,28 @@ class _PlanningBundle(BaseModel):
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
 _RUNTIME_PLAN_CACHE: dict[tuple[str, int], ContextParallelRuntimePlan] = {}
 _GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int], Any] = {}
+
+
+def _disable_gc_during_host_planning(func: Any) -> Any:
+    """Prevent Python GC pauses inside host-ahead CP planning.
+
+    Planning must run ahead of device work without CUDA syncs and without large
+    host outliers; if GC runs mid-plan, the next microbatch can miss the overlap
+    window even when the actual planner is fast enough.
+    """
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    return wrapped
 
 
 def _json_cache_key(payload: Any) -> str:
@@ -2189,6 +2213,7 @@ def prepare_cp_micro(
     )
 
 
+@_disable_gc_during_host_planning
 def prepare_megatron_context_parallel_state(
     *,
     micro: PackedTensors,

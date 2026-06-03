@@ -82,6 +82,7 @@ def _prepare_dsv4_context_parallel_state_impl(
             f"{tuple(cp_state.group_ids.shape)} and {tuple(cp_state.parent_ids.shape)}"
         )
 
+    rank_int = int(cp_state.rank_plan.rank)
     runtime_plan = _runtime_plan_from_cp_state(cp_state)
     stage_slots = build_dsv4_stage_plan_slots(
         stage_plans_by_rank=tuple(
@@ -123,7 +124,7 @@ def _prepare_dsv4_context_parallel_state_impl(
             build_dsv4_indexer_stage_plan_from_stage_plans(
                 layout=csa_layout,
                 stage_plans_by_rank=slot.stage_plans_by_rank,
-                local_rank=int(cp_state.rank_plan.rank),
+                local_rank=rank_int,
             )
             for slot in stage_slots
         )
@@ -135,7 +136,7 @@ def _prepare_dsv4_context_parallel_state_impl(
             build_dsv4_indexer_kv_exchange_peer_plans(
                 layout=csa_layout,
                 candidate_entry_ids_by_rank=stage_plan.candidate_entry_ids_by_rank,
-                local_rank=int(cp_state.rank_plan.rank),
+                local_rank=rank_int,
             )
             for stage_plan in csa_indexer_stage_plans
         )
@@ -186,16 +187,16 @@ def _prepare_dsv4_context_parallel_state_impl(
                 stage_kv_peer_plans_by_layout=tuple(
                     stage_kv_plans_by_name[name] for name in backward_layout_names
                 ),
-                local_rank=int(cp_state.rank_plan.rank),
+                local_rank=rank_int,
             ),
             strict=True,
         )
     )
     csa_attention_backward_plan = backward_plans.get("csa")
     hca_attention_backward_plan = backward_plans.get("hca")
-    return Dsv4ContextParallelState(
+    return Dsv4ContextParallelState.model_construct(
         cp_state=cp_state,
-        dsv4_plan=Dsv4PreparedPlan(
+        dsv4_plan=Dsv4PreparedPlan.model_construct(
             csa_layout=csa_layout,
             hca_layout=hca_layout,
             stage_plan_slots=stage_slots,

@@ -1457,7 +1457,7 @@ def _make_branch_view(
         prefix_end=prefix.end,
         suffix_start=None if suffix is None else suffix.start,
         suffix_end=None if suffix is None else suffix.end,
-        prefix_token_count=prefix.size(),
+        prefix_token_count=int(prefix.end) - int(prefix.start),
     )
 
 
@@ -2048,12 +2048,16 @@ def _add_compact_remote_halo_for_branch(
     halo_by_peer: dict[tuple[int, int], dict[int, set[int]]],
 ) -> None:
     lookback_int = int(lookback)
+    min_boundary = int(first_start) - lookback_int + 1
+    max_boundary = int(last_start) + int(ratio) - 1
     seen_starts: set[int] = set()
     for boundary_view_pos in _compact_csa_owner_boundary_view_positions(
         branch_view=branch_view,
         raw_token_owner_ranks=raw_token_owner_ranks,
         owner_change_positions=owner_change_positions,
     ):
+        if boundary_view_pos < min_boundary or boundary_view_pos > max_boundary:
+            continue
         first_candidate = _ceil_div(
             int(boundary_view_pos) - int(ratio) + 1,
             int(ratio),
@@ -2097,10 +2101,13 @@ def _compact_csa_owner_boundary_view_positions(
     prefix_start = int(branch_view.prefix_start)
     prefix_end = int(branch_view.prefix_end)
     prefix_count = int(branch_view.prefix_token_count)
-    for owner_change in owner_change_positions:
-        change = int(owner_change)
-        if prefix_start < change < prefix_end:
-            boundaries.append(change - prefix_start)
+    for change in owner_change_positions[
+        bisect_left(owner_change_positions, prefix_start + 1) : bisect_left(
+            owner_change_positions,
+            prefix_end,
+        )
+    ]:
+        boundaries.append(int(change) - prefix_start)
     if branch_view.suffix_start is None or branch_view.suffix_end is None:
         return tuple(boundaries)
     suffix_start = int(branch_view.suffix_start)
@@ -2112,10 +2119,13 @@ def _compact_csa_owner_boundary_view_positions(
         != int(raw_token_owner_ranks[suffix_start])
     ):
         boundaries.append(prefix_count)
-    for owner_change in owner_change_positions:
-        change = int(owner_change)
-        if suffix_start < change < suffix_end:
-            boundaries.append(prefix_count + change - suffix_start)
+    for change in owner_change_positions[
+        bisect_left(owner_change_positions, suffix_start + 1) : bisect_left(
+            owner_change_positions,
+            suffix_end,
+        )
+    ]:
+        boundaries.append(prefix_count + int(change) - suffix_start)
     return tuple(sorted(set(boundaries)))
 
 

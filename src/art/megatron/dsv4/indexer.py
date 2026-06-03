@@ -184,7 +184,7 @@ def build_dsv4_indexer_stage_plan_from_stage_plans(
             else ()
             for rank, stage_plan in enumerate(stage_plans)
         )
-    return Dsv4IndexerStagePlan(
+    return Dsv4IndexerStagePlan.model_construct(
         stage_index=stage_index,
         query_token_ids_by_rank=query_ids_by_rank,
         candidate_entry_ids_by_rank=tuple(
@@ -1060,14 +1060,14 @@ def _build_local_indexer_kv_exchange_peer_plans(
         _ids_in_sorted_ranges(candidate_ids, owned_ranges)
         for candidate_ids in candidate_entry_ids_by_rank
     )
-    local_plan = Dsv4IndexerKvExchangePeerPlan(
+    local_plan = Dsv4IndexerKvExchangePeerPlan.model_construct(
         send_entry_ids_by_peer=send,
         recv_entry_ids_by_peer=recv,
     )
     return tuple(
         local_plan
         if rank == rank_int
-        else Dsv4IndexerKvExchangePeerPlan(
+        else Dsv4IndexerKvExchangePeerPlan.model_construct(
             send_entry_ids_by_peer=((),) * int(rank_count),
             recv_entry_ids_by_peer=((),) * int(rank_count),
         )
