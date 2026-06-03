@@ -98,6 +98,22 @@ def test_stacked_runtime_metrics_aggregate_rank_max(tmp_path) -> None:
         == 17.5
     )
     assert (
+        metrics[
+            "single_family_two_branches_cp2_stacked_forward_compression_wait_median"
+        ].value
+        == 2.0
+    )
+    assert (
+        metrics[
+            "single_family_two_branches_cp2_stacked_forward_attention_wait_median"
+        ].value
+        == 2.5
+    )
+    assert (
+        metrics["single_family_two_branches_cp2_stacked_forward_work_wait_median"].value
+        == 4.5
+    )
+    assert (
         metrics["single_family_two_branches_cp2_stacked_backward_total_median"].value
         == 9.5
     )
@@ -169,6 +185,8 @@ def _rank_timing(
         normal_cp_plan_ms=normal_cp_plan_ms,
         dsv4_plan_ms=dsv4_plan_ms,
         forward_launch_ms=(1.0, 1.0),
+        forward_compression_wait_ms=(2.0, 2.0),
+        forward_attention_wait_ms=(2.0, 3.0),
         forward_work_wait_ms=(4.0, 5.0),
         forward_total_ms=forward_total_ms,
         backward_launch_ms=(1.0, 1.0),

@@ -84,6 +84,8 @@ class RankStackedTiming(BaseModel):
     normal_cp_plan_ms: float
     dsv4_plan_ms: float
     forward_launch_ms: tuple[float, ...]
+    forward_compression_wait_ms: tuple[float, ...]
+    forward_attention_wait_ms: tuple[float, ...]
     forward_work_wait_ms: tuple[float, ...]
     forward_total_ms: tuple[float, ...]
     backward_launch_ms: tuple[float, ...]
@@ -114,6 +116,14 @@ class StackedTiming(BaseModel):
     def metrics(self) -> tuple[Dsv4Metric, ...]:
         prefix = f"{self.case_name}_{self.topology}_stacked"
         forward_total = _iteration_rank_max(self.ranks, "forward_total_ms")
+        forward_compression_wait = _iteration_rank_max(
+            self.ranks,
+            "forward_compression_wait_ms",
+        )
+        forward_attention_wait = _iteration_rank_max(
+            self.ranks,
+            "forward_attention_wait_ms",
+        )
         forward_wait = _iteration_rank_max(
             self.ranks,
             "forward_work_wait_ms",
@@ -179,6 +189,26 @@ class StackedTiming(BaseModel):
             Dsv4Metric(
                 name=f"{prefix}_forward_total_p90",
                 value=_percentile(forward_total, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_forward_compression_wait_median",
+                value=_median(forward_compression_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_forward_compression_wait_p90",
+                value=_percentile(forward_compression_wait, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_forward_attention_wait_median",
+                value=_median(forward_attention_wait),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_forward_attention_wait_p90",
+                value=_percentile(forward_attention_wait, 90),
                 unit="ms",
             ),
             Dsv4Metric(
@@ -439,7 +469,8 @@ def run_stacked_benchmark(
         "stacked layers are independent projected attention-core invocations over the same packed row; this measures repeated DSV4 CP layer cost but is not a full model trainability claim",
         "main e2e timing excludes host planning and reports plan_plus_e2e separately so overlapped planning and exposed planning cost stay visible",
         "planned communication bytes are per-iteration explicit row-exchange bytes summed across layers and exclude collective algorithm internals for sink and positional-bias all-reduces",
-        "forward_work_wait is a direct host timing around the public projected-forward work wait boundary; it is diagnostic and includes lazy public-work progression needed before stage exchange waits, so it is not a pure communication metric",
+        "forward_compression_wait is a direct host timing around the public projected-compression halo wait boundary; projected inputs are prebuilt, so this benchmark reports the overlap boundary but does not simulate surrounding q/raw-KV projection compute",
+        "forward_attention_wait is a direct host timing around the bound projected-forward work wait boundary after compression halo wait; forward_work_wait is their sum",
         "backward_owner_wait is a direct host timing around the public attention owner/sink-gradient wait boundary; total e2e uses one synchronization after each stacked forward/backward pass",
         "warmup excludes first-use TileLang compilation and setup where the iteration count is large enough to amortize it",
     )
@@ -640,6 +671,8 @@ def _time_stacked_runtime(
         for kind in set(config.layer_kinds)
     }
     forward_launch_ms: list[float] = []
+    forward_compression_wait_ms: list[float] = []
+    forward_attention_wait_ms: list[float] = []
     forward_work_wait_ms: list[float] = []
     forward_total_ms: list[float] = []
     backward_launch_ms: list[float] = []
@@ -660,20 +693,37 @@ def _time_stacked_runtime(
         fwd_start = time.perf_counter()
         forward_results: list[tuple[Any, torch.Tensor]] = []
         iter_forward_launch = 0.0
+        iter_forward_compression_wait = 0.0
+        iter_forward_attention_wait = 0.0
         iter_forward_wait = 0.0
         for layer in layers:
             layer_launch_start = time.perf_counter()
-            forward_work = _launch_layer_forward(
+            compression_work = _launch_layer_compression(
                 context_state=context_state,
                 layer=layer,
                 token_ids=local_token_ids,
                 config=config,
-                scale=scale,
             )
             iter_forward_launch += _elapsed_ms(layer_launch_start)
-            layer_wait_start = time.perf_counter()
+            layer_compression_wait_start = time.perf_counter()
+            compression_work.wait()
+            compression_wait = _elapsed_ms(layer_compression_wait_start)
+            iter_forward_compression_wait += compression_wait
+            layer_bind_start = time.perf_counter()
+            forward_work = _bind_layer_forward(
+                context_state=context_state,
+                layer=layer,
+                compression_work=compression_work,
+                token_ids=local_token_ids,
+                config=config,
+                scale=scale,
+            )
+            iter_forward_launch += _elapsed_ms(layer_bind_start)
+            layer_attention_wait_start = time.perf_counter()
             forward_work.wait()
-            iter_forward_wait += _elapsed_ms(layer_wait_start)
+            attention_wait = _elapsed_ms(layer_attention_wait_start)
+            iter_forward_attention_wait += attention_wait
+            iter_forward_wait += compression_wait + attention_wait
             forward_results.append((forward_work.wait_post_process(), layer.grad_out))
         torch.cuda.synchronize(device)
         fwd_total = _elapsed_ms(fwd_start)
@@ -712,6 +762,8 @@ def _time_stacked_runtime(
         total = _elapsed_ms(e2e_start)
         if iteration >= int(config.warmup):
             forward_launch_ms.append(iter_forward_launch)
+            forward_compression_wait_ms.append(iter_forward_compression_wait)
+            forward_attention_wait_ms.append(iter_forward_attention_wait)
             forward_work_wait_ms.append(iter_forward_wait)
             forward_total_ms.append(fwd_total)
             backward_launch_ms.append(iter_backward_launch)
@@ -745,6 +797,8 @@ def _time_stacked_runtime(
         normal_cp_plan_ms=float(normal_cp_plan_ms),
         dsv4_plan_ms=float(dsv4_plan_ms),
         forward_launch_ms=tuple(forward_launch_ms),
+        forward_compression_wait_ms=tuple(forward_compression_wait_ms),
+        forward_attention_wait_ms=tuple(forward_attention_wait_ms),
         forward_work_wait_ms=tuple(forward_work_wait_ms),
         forward_total_ms=tuple(forward_total_ms),
         backward_launch_ms=tuple(backward_launch_ms),
@@ -822,17 +876,16 @@ def _build_layer_inputs(
     )
 
 
-def _launch_layer_forward(
+def _launch_layer_compression(
     *,
     context_state: Any,
     layer: StackedLayerInputs,
     token_ids: tuple[int, ...],
     config: StackedBenchmarkConfig,
-    scale: float,
 ) -> Any:
     from art.megatron.dsv4 import (
-        launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
-        launch_dsv4_hca_projected_attention_forward_from_context_parallel_state,
+        launch_dsv4_csa_projected_compression_forward_from_context_parallel_state,
+        launch_dsv4_hca_projected_compression_forward_from_context_parallel_state,
     )
 
     inputs = layer.forward_inputs
@@ -844,24 +897,67 @@ def _launch_layer_forward(
             or inputs.indexer_projected_kv is None
             or inputs.indexer_projected_gate is None
             or inputs.indexer_positional_bias is None
-            or inputs.indexer_q is None
-            or inputs.indexer_weights is None
         ):
             raise RuntimeError("stacked CSA layer inputs are incomplete")
-        return launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
+        return (
+            launch_dsv4_csa_projected_compression_forward_from_context_parallel_state(
+                context_state=context_state,
+                main_projected_kv=inputs.main_projected_kv,
+                main_projected_gate=inputs.main_projected_gate,
+                main_positional_bias=inputs.main_positional_bias,
+                main_token_ids=token_ids,
+                indexer_projected_kv=inputs.indexer_projected_kv,
+                indexer_projected_gate=inputs.indexer_projected_gate,
+                indexer_positional_bias=inputs.indexer_positional_bias,
+                indexer_token_ids=token_ids,
+                async_op=True,
+            )
+        )
+    if layer.kind == "hca":
+        if (
+            inputs.projected_kv is None
+            or inputs.projected_gate is None
+            or inputs.positional_bias is None
+        ):
+            raise RuntimeError("stacked HCA layer inputs are incomplete")
+        return (
+            launch_dsv4_hca_projected_compression_forward_from_context_parallel_state(
+                context_state=context_state,
+                projected_kv=inputs.projected_kv,
+                projected_gate=inputs.projected_gate,
+                positional_bias=inputs.positional_bias,
+                token_ids=token_ids,
+                async_op=True,
+            )
+        )
+    raise RuntimeError(f"unsupported stacked layer kind {layer.kind}")
+
+
+def _bind_layer_forward(
+    *,
+    context_state: Any,
+    layer: StackedLayerInputs,
+    compression_work: Any,
+    token_ids: tuple[int, ...],
+    config: StackedBenchmarkConfig,
+    scale: float,
+) -> Any:
+    from art.megatron.dsv4 import (
+        launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work,
+        launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work,
+    )
+
+    inputs = layer.forward_inputs
+    if layer.kind == "csa":
+        if inputs.indexer_q is None or inputs.indexer_weights is None:
+            raise RuntimeError("stacked CSA layer inputs are incomplete")
+        return launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work(
             context_state=context_state,
+            compression_work=compression_work,
             query=layer.query,
             query_token_ids=token_ids,
             raw_kv=layer.raw_kv,
             raw_token_ids=token_ids,
-            main_projected_kv=inputs.main_projected_kv,
-            main_projected_gate=inputs.main_projected_gate,
-            main_positional_bias=inputs.main_positional_bias,
-            main_token_ids=token_ids,
-            indexer_projected_kv=inputs.indexer_projected_kv,
-            indexer_projected_gate=inputs.indexer_projected_gate,
-            indexer_positional_bias=inputs.indexer_positional_bias,
-            indexer_token_ids=token_ids,
             indexer_q=inputs.indexer_q,
             indexer_weights=inputs.indexer_weights,
             indexer_topk=int(config.indexer_topk),
@@ -873,22 +969,13 @@ def _launch_layer_forward(
             compressed_list_size=int(config.indexer_topk),
         )
     if layer.kind == "hca":
-        if (
-            inputs.projected_kv is None
-            or inputs.projected_gate is None
-            or inputs.positional_bias is None
-        ):
-            raise RuntimeError("stacked HCA layer inputs are incomplete")
-        return launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
+        return launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work(
             context_state=context_state,
+            compression_work=compression_work,
             query=layer.query,
             query_token_ids=token_ids,
             raw_kv=layer.raw_kv,
             raw_token_ids=token_ids,
-            projected_kv=inputs.projected_kv,
-            projected_gate=inputs.projected_gate,
-            positional_bias=inputs.positional_bias,
-            token_ids=token_ids,
             attn_sink=layer.attn_sink,
             async_op=True,
             scale=scale,
