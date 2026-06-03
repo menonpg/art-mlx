@@ -140,11 +140,14 @@ def build_dsv4_indexer_kv_exchange_peer_plans(
             local_rank=int(local_rank),
             rank_count=rank_count,
         )
+    owner_ranges_by_rank = tuple(
+        _sorted_id_ranges(entry_ids) for entry_ids in layout.entry_ids_by_owner_rank
+    )
     recv_by_rank = tuple(
-        _ids_by_owner_rank_from_table(
+        _ids_by_owner_rank_from_ranges(
             ids=candidate_ids,
-            rank_count=rank_count,
-            owner_ranks=_compressed_owner_rank_table(layout),
+            ranges_by_rank=owner_ranges_by_rank,
+            owner_count=layout.entry_count(),
             name=f"rank{rank}_candidate_entry_ids",
         )
         for rank, candidate_ids in enumerate(candidate_entry_ids_by_rank)
@@ -1014,15 +1017,22 @@ def _indexer_peer_count(*peers: Sequence[Sequence[int]]) -> int:
     return counts.pop()
 
 
-def _ids_by_owner_rank_from_table(
+def _ids_by_owner_rank_from_ranges(
     *,
     ids: Sequence[int],
-    rank_count: int,
-    owner_ranks: Sequence[int],
+    ranges_by_rank: Sequence[Sequence[tuple[int, int]]],
+    owner_count: int,
     name: str,
 ) -> tuple[tuple[int, ...], ...]:
-    by_rank: list[list[int]] = [[] for _ in range(rank_count)]
-    owner_count = len(owner_ranks)
+    if ids:
+        first = int(ids[0])
+        last = int(ids[-1])
+        if first < 0 or last >= owner_count:
+            raise RuntimeError(f"DSV4 {name} id range is outside layout owner table")
+        if last - first + 1 == len(ids):
+            return tuple(
+                _ids_in_sorted_ranges(ids, ranges) for ranges in ranges_by_rank
+            )
     previous: int | None = None
     for id_ in ids:
         id_int = int(id_)
@@ -1033,11 +1043,7 @@ def _ids_by_owner_rank_from_table(
         previous = id_int
         if id_int < 0 or id_int >= owner_count:
             raise RuntimeError(f"DSV4 {name} id {id_int} is outside layout owner table")
-        rank = int(owner_ranks[id_int])
-        if rank < 0 or rank >= int(rank_count):
-            raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
-        by_rank[rank].append(id_int)
-    return tuple(tuple(peer_ids) for peer_ids in by_rank)
+    return tuple(_ids_in_sorted_ranges(ids, ranges) for ranges in ranges_by_rank)
 
 
 def _build_local_indexer_kv_exchange_peer_plans(
@@ -1048,16 +1054,17 @@ def _build_local_indexer_kv_exchange_peer_plans(
     rank_count: int,
 ) -> tuple[Dsv4IndexerKvExchangePeerPlan, ...]:
     rank_int = _validate_rank(rank=local_rank, rank_count=rank_count)
-    owner_ranks = _compressed_owner_rank_table(layout)
-    recv = _ids_by_owner_rank_from_table(
+    owner_ranges_by_rank = tuple(
+        _sorted_id_ranges(entry_ids) for entry_ids in layout.entry_ids_by_owner_rank
+    )
+    recv = _ids_by_owner_rank_from_ranges(
         ids=candidate_entry_ids_by_rank[rank_int],
-        rank_count=rank_count,
-        owner_ranks=owner_ranks,
+        ranges_by_rank=owner_ranges_by_rank,
+        owner_count=layout.entry_count(),
         name=f"rank{rank_int}_candidate_entry_ids",
     )
-    owned_ranges = _sorted_id_ranges(layout.entry_ids_by_owner_rank[rank_int])
     send = tuple(
-        _ids_in_sorted_ranges(candidate_ids, owned_ranges)
+        _ids_in_sorted_ranges(candidate_ids, owner_ranges_by_rank[rank_int])
         for candidate_ids in candidate_entry_ids_by_rank
     )
     local_plan = Dsv4IndexerKvExchangePeerPlan.model_construct(
@@ -1078,6 +1085,8 @@ def _build_local_indexer_kv_exchange_peer_plans(
 def _sorted_id_ranges(ids: Sequence[int]) -> tuple[tuple[int, int], ...]:
     if not ids:
         return ()
+    if int(ids[-1]) - int(ids[0]) + 1 == len(ids):
+        return ((int(ids[0]), int(ids[-1]) + 1),)
     ranges: list[tuple[int, int]] = []
     start = previous = int(ids[0])
     for id_ in ids[1:]:

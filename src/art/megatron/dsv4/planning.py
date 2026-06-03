@@ -216,10 +216,7 @@ def _runtime_plan_from_cp_state(cp_state: ArtContextParallelState):
 
     original_seq_len = int(cp_state.rank_plan.original_seq_len)
     runtime_plan = cp_runtime._RUNTIME_PLAN_CACHE.get(
-        (
-            cp_runtime._json_cache_key(cp_state.runtime_key.model_dump(mode="json")),
-            original_seq_len,
-        )
+        (cp_state.runtime_key, original_seq_len)
     )
     if runtime_plan is None:
         raise RuntimeError(

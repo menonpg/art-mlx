@@ -60,7 +60,9 @@ class _PlanningBundle(BaseModel):
 
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
-_RUNTIME_PLAN_CACHE: dict[tuple[str, int], ContextParallelRuntimePlan] = {}
+_RUNTIME_PLAN_CACHE: dict[
+    tuple[ContextParallelRuntimeKey, int], ContextParallelRuntimePlan
+] = {}
 _GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int], Any] = {}
 
 
@@ -2496,10 +2498,7 @@ def get_or_build_runtime_plan(
     runtime_key: ContextParallelRuntimeKey,
     original_seq_len: int,
 ) -> ContextParallelRuntimePlan:
-    key = (
-        _json_cache_key(runtime_key.model_dump(mode="json")),
-        int(original_seq_len),
-    )
+    key = (runtime_key, int(original_seq_len))
     cached = _RUNTIME_PLAN_CACHE.get(key)
     if cached is not None:
         return cached
