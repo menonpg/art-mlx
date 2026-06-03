@@ -20,7 +20,7 @@ from art.tau_bench.client import (
 )
 
 
-def test_client_uses_short_lived_connection_pool_by_default(
+def test_client_reuses_connections_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
@@ -40,7 +40,7 @@ def test_client_uses_short_lived_connection_pool_by_default(
     limits = seen["transport_kwargs"]["limits"]
     assert isinstance(limits, httpx.Limits)
     assert limits.max_connections == 512
-    assert limits.max_keepalive_connections == 0
+    assert limits.max_keepalive_connections == 512
     assert seen["transport_kwargs"]["retries"] == 2
     assert isinstance(seen["timeout"], httpx.Timeout)
 
