@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import json
 
-from bench_dsv4_layer_lab import run_dry_run_cases, run_planning_benchmark
+from bench_dsv4_layer_lab import (
+    RankRuntimeOutput,
+    RankRuntimeTiming,
+    _load_runtime_timings,
+    _runtime_kinds,
+    run_dry_run_cases,
+    run_planning_benchmark,
+)
 from cases import default_validation_cases
 import pytest
 
@@ -31,7 +38,7 @@ def test_layer_lab_dry_run_writes_manifest_and_summary(tmp_path) -> None:
 
 
 def test_layer_lab_planning_benchmark_uses_real_cp_and_dsv4_planner(tmp_path) -> None:
-    pytest.importorskip("megatron.core")
+    _require_megatron_or_skip()
     case = next(
         case
         for case in default_validation_cases()
@@ -59,3 +66,102 @@ def test_layer_lab_planning_benchmark_uses_real_cp_and_dsv4_planner(tmp_path) ->
     assert "single_family_two_branches_cp2_total_plan_median" in metric_names
     assert "normal_cp_plan_median" in summary
     assert "dsv4_plan_median" in summary
+
+
+def test_layer_lab_runtime_metrics_aggregate_rank_max(tmp_path) -> None:
+    result_dir = tmp_path / "rank_results"
+    result_dir.mkdir()
+    rank0 = _runtime_timing(
+        rank=0,
+        normal_cp_plan_ms=3.0,
+        dsv4_plan_ms=4.0,
+        forward_total_ms=(10.0, 20.0),
+        backward_total_ms=(7.0, 9.0),
+        e2e_ms=(30.0, 40.0),
+        output_abs_sum=1.0,
+        dq_abs_sum=2.0,
+        compressor_grad_abs_sum=3.0,
+    )
+    rank1 = _runtime_timing(
+        rank=1,
+        normal_cp_plan_ms=5.0,
+        dsv4_plan_ms=6.0,
+        forward_total_ms=(15.0, 18.0),
+        backward_total_ms=(6.0, 12.0),
+        e2e_ms=(35.0, 32.0),
+        output_abs_sum=4.0,
+        dq_abs_sum=5.0,
+        compressor_grad_abs_sum=6.0,
+    )
+    for timing in (rank0, rank1):
+        output = RankRuntimeOutput(timings=(timing,))
+        path = result_dir / f"single_family_two_branches_cp2_rank{timing.rank}.json"
+        path.write_text(output.model_dump_json())
+
+    runtime = _load_runtime_timings(
+        result_dir=result_dir,
+        case_name="single_family_two_branches",
+        topology="cp2",
+        kinds=("csa",),
+        world_size=2,
+    )[0]
+    metrics = {metric.name: metric for metric in runtime.metrics()}
+
+    assert _runtime_kinds("both") == ("csa", "hca")
+    assert metrics["single_family_two_branches_cp2_csa_normal_cp_plan_max"].value == 5.0
+    assert metrics["single_family_two_branches_cp2_csa_dsv4_plan_max"].value == 6.0
+    assert (
+        metrics["single_family_two_branches_cp2_csa_forward_total_median"].value == 17.5
+    )
+    assert metrics["single_family_two_branches_cp2_csa_e2e_median"].value == 37.5
+    assert metrics["single_family_two_branches_cp2_csa_output_abs_sum"].value == 5.0
+    assert metrics["single_family_two_branches_cp2_csa_dq_abs_sum"].passed is True
+
+
+def _require_megatron_or_skip() -> None:
+    try:
+        import megatron.core  # noqa: F401
+    except Exception as exc:
+        pytest.skip(f"megatron.core is unavailable: {exc}")
+
+
+def _runtime_timing(
+    *,
+    rank: int,
+    normal_cp_plan_ms: float,
+    dsv4_plan_ms: float,
+    forward_total_ms: tuple[float, ...],
+    backward_total_ms: tuple[float, ...],
+    e2e_ms: tuple[float, ...],
+    output_abs_sum: float,
+    dq_abs_sum: float,
+    compressor_grad_abs_sum: float,
+) -> RankRuntimeTiming:
+    return RankRuntimeTiming(
+        case_name="single_family_two_branches",
+        topology="cp2",
+        compression_kind="csa",
+        rank=rank,
+        world_size=2,
+        iterations=2,
+        warmup=1,
+        dtype="bf16",
+        token_count=32,
+        local_token_count=16,
+        completion_count=2,
+        normal_cp_plan_ms=normal_cp_plan_ms,
+        dsv4_plan_ms=dsv4_plan_ms,
+        forward_launch_ms=(1.0, 1.0),
+        forward_wait_ms=(1.0, 1.0),
+        forward_total_ms=forward_total_ms,
+        backward_launch_ms=(1.0, 1.0),
+        backward_wait_ms=(1.0, 1.0),
+        backward_total_ms=backward_total_ms,
+        e2e_ms=e2e_ms,
+        peak_allocated_bytes=1024,
+        peak_reserved_bytes=2048,
+        output_abs_sum=output_abs_sum,
+        dq_abs_sum=dq_abs_sum,
+        compressor_grad_abs_sum=compressor_grad_abs_sum,
+        nonfinite_count=0,
+    )

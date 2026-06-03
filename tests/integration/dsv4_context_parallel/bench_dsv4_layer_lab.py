@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable
+import os
 from pathlib import Path
 import statistics
 import sys
 import time
-from typing import Any
+from typing import Any, cast
 
 from artifacts import Dsv4Metric, write_manifest, write_readable_summary
 from cases import Dsv4WorkloadCase, canonical_benchmark_cases, default_validation_cases
 from packed_layout import build_dsv4_packed_tensors, summarize_case
 from pydantic import BaseModel, ConfigDict, Field
 import torch
+from torch.distributed import destroy_process_group, init_process_group
+import torch.multiprocessing as mp
 
 
 class PlanningTiming(BaseModel):
@@ -68,6 +71,177 @@ class PlanningTiming(BaseModel):
         )
 
 
+class RuntimeBenchmarkConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    iterations: int
+    warmup: int
+    dtype: str
+    head_count: int
+    head_dim: int
+    indexer_dim: int
+    indexer_topk: int
+    block_size: int
+    planner_chunk_size: int
+    csa_ratio: int
+    hca_ratio: int
+    window_size: int
+    kinds: tuple[str, ...]
+    miles_path: str
+
+
+class RankRuntimeTiming(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    case_name: str
+    topology: str
+    compression_kind: str
+    rank: int
+    world_size: int
+    iterations: int
+    warmup: int
+    dtype: str
+    token_count: int
+    local_token_count: int
+    completion_count: int
+    normal_cp_plan_ms: float
+    dsv4_plan_ms: float
+    forward_launch_ms: tuple[float, ...]
+    forward_wait_ms: tuple[float, ...]
+    forward_total_ms: tuple[float, ...]
+    backward_launch_ms: tuple[float, ...]
+    backward_wait_ms: tuple[float, ...]
+    backward_total_ms: tuple[float, ...]
+    e2e_ms: tuple[float, ...]
+    peak_allocated_bytes: int
+    peak_reserved_bytes: int
+    output_abs_sum: float
+    dq_abs_sum: float
+    compressor_grad_abs_sum: float
+    nonfinite_count: int
+
+
+class RuntimeTiming(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    case_name: str
+    topology: str
+    compression_kind: str
+    ranks: tuple[RankRuntimeTiming, ...]
+
+    def metrics(self) -> tuple[Dsv4Metric, ...]:
+        prefix = f"{self.case_name}_{self.topology}_{self.compression_kind}"
+        forward_total = _iteration_rank_max(self.ranks, "forward_total_ms")
+        backward_total = _iteration_rank_max(self.ranks, "backward_total_ms")
+        e2e = _iteration_rank_max(self.ranks, "e2e_ms")
+        token_count = max((rank.token_count for rank in self.ranks), default=0)
+        completion_count = max(
+            (rank.completion_count for rank in self.ranks), default=0
+        )
+        median_e2e = _median(e2e)
+        seconds = max(median_e2e / 1000.0, 1e-12)
+        nonfinite = sum(rank.nonfinite_count for rank in self.ranks)
+        output_abs = sum(rank.output_abs_sum for rank in self.ranks)
+        dq_abs = sum(rank.dq_abs_sum for rank in self.ranks)
+        compressor_grad_abs = sum(rank.compressor_grad_abs_sum for rank in self.ranks)
+        return (
+            Dsv4Metric(
+                name=f"{prefix}_normal_cp_plan_max",
+                value=max(rank.normal_cp_plan_ms for rank in self.ranks),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_dsv4_plan_max",
+                value=max(rank.dsv4_plan_ms for rank in self.ranks),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_forward_total_median",
+                value=_median(forward_total),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_forward_total_p90",
+                value=_percentile(forward_total, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_backward_total_median",
+                value=_median(backward_total),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_backward_total_p90",
+                value=_percentile(backward_total, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_e2e_median",
+                value=median_e2e,
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_e2e_p90",
+                value=_percentile(e2e, 90),
+                unit="ms",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_tokens_per_second",
+                value=float(token_count) / seconds,
+                unit="tok/s",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_examples_per_second",
+                value=float(completion_count) / seconds,
+                unit="examples/s",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_peak_allocated_max",
+                value=float(max(rank.peak_allocated_bytes for rank in self.ranks)),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_peak_reserved_max",
+                value=float(max(rank.peak_reserved_bytes for rank in self.ranks)),
+                unit="bytes",
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_nonfinite_count",
+                value=float(nonfinite),
+                unit="",
+                threshold=0.0,
+                passed=nonfinite == 0,
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_output_abs_sum",
+                value=float(output_abs),
+                unit="",
+                threshold=0.0,
+                passed=output_abs > 0.0,
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_dq_abs_sum",
+                value=float(dq_abs),
+                unit="",
+                threshold=0.0,
+                passed=dq_abs > 0.0,
+            ),
+            Dsv4Metric(
+                name=f"{prefix}_compressor_grad_abs_sum",
+                value=float(compressor_grad_abs),
+                unit="",
+                threshold=0.0,
+                passed=compressor_grad_abs > 0.0,
+            ),
+        )
+
+
+class RankRuntimeOutput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    timings: tuple[RankRuntimeTiming, ...]
+
+
 class LabResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -75,9 +249,14 @@ class LabResult(BaseModel):
     manifest_path: Path
     summary_path: Path
     timings: tuple[PlanningTiming, ...] = Field(default_factory=tuple)
+    runtime_timings: tuple[RuntimeTiming, ...] = Field(default_factory=tuple)
 
 
 PlanningTiming.model_rebuild()
+RuntimeBenchmarkConfig.model_rebuild()
+RankRuntimeTiming.model_rebuild()
+RuntimeTiming.model_rebuild()
+RankRuntimeOutput.model_rebuild()
 LabResult.model_rebuild()
 
 
@@ -190,6 +369,97 @@ def run_planning_benchmark(
     )
 
 
+def run_runtime_benchmark(
+    *,
+    output_dir: Path,
+    cases: tuple[Dsv4WorkloadCase, ...],
+    topologies: tuple[int, ...],
+    config: RuntimeBenchmarkConfig,
+    command: list[str],
+) -> LabResult:
+    _require_megatron()
+    _require_cuda_for_runtime()
+    _add_miles_path_to_sys_path(config.miles_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.resolve()
+    timings: list[RuntimeTiming] = []
+    for case in cases:
+        _require_single_packed_row(case)
+        for cp_size in topologies:
+            if cp_size > torch.cuda.device_count():
+                raise RuntimeError(
+                    f"runtime benchmark requested cp{cp_size}, but only "
+                    f"{torch.cuda.device_count()} CUDA devices are visible"
+                )
+            init_path = (
+                output_dir
+                / f"dist_{_safe_name(case.name)}_cp{cp_size}_{time.time_ns()}"
+            )
+            if init_path.exists():
+                init_path.unlink()
+            result_dir = output_dir / "rank_results"
+            result_dir.mkdir(parents=True, exist_ok=True)
+            mp.start_processes(
+                _runtime_worker,
+                args=(
+                    int(cp_size),
+                    str(init_path),
+                    str(result_dir),
+                    case.model_dump_json(),
+                    config.model_dump_json(),
+                ),
+                nprocs=int(cp_size),
+                join=True,
+                start_method="spawn",
+            )
+            timings.extend(
+                _load_runtime_timings(
+                    result_dir=result_dir,
+                    case_name=case.name,
+                    topology=f"cp{cp_size}",
+                    kinds=config.kinds,
+                    world_size=cp_size,
+                )
+            )
+    metrics = tuple(metric for timing in timings for metric in timing.metrics())
+    passed = all(metric.passed is not False for metric in metrics)
+    caveats = (
+        "projected-input runtime benchmark; surrounding DSV4 model projections, RMSNorm, RoPE, and output projection are excluded until the non-CP DSV4 handler exists",
+        "uses real prepared ART CP state and DSV4 projected CSA/HCA forward/backward APIs",
+        "launch/wait timing is measured at the public projected-attention API boundary, not with production debug hooks",
+        "warmup excludes first-use TileLang compilation and setup where the iteration count is large enough to amortize it",
+    )
+    case_summaries = tuple(summarize_case(case) for case in cases)
+    manifest_path = write_manifest(
+        output_dir,
+        kind="dsv4_layer_lab_runtime",
+        command=command,
+        configs={
+            "mode": "benchmark",
+            "topologies": [f"cp{cp_size}" for cp_size in topologies],
+            **config.model_dump(),
+        },
+        cases=case_summaries,
+        metrics=metrics,
+        caveats=caveats,
+    )
+    summary_path = write_readable_summary(
+        output_dir,
+        title="DSV4 Layer Lab Runtime Benchmark",
+        status="pass" if passed else "fail",
+        manifest_path=manifest_path,
+        case_summaries=case_summaries,
+        metrics=metrics,
+        caveats=caveats,
+    )
+    return LabResult(
+        status="pass" if passed else "fail",
+        manifest_path=manifest_path,
+        summary_path=summary_path,
+        runtime_timings=tuple(timings),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     cases = _select_cases(case_set=args.case_set, names=tuple(args.case or ()))
@@ -200,7 +470,30 @@ def main(argv: list[str] | None = None) -> int:
         / time.strftime("%Y%m%d_%H%M%S")
     )
     command = [Path(sys.argv[0]).name, *(sys.argv[1:] if argv is None else argv)]
-    if args.benchmark_planning:
+    if args.benchmark:
+        result = run_runtime_benchmark(
+            output_dir=output_dir,
+            cases=cases,
+            topologies=tuple(_parse_topology(value) for value in args.topology),
+            config=RuntimeBenchmarkConfig(
+                iterations=args.iterations,
+                warmup=args.warmup,
+                dtype=args.dtype,
+                head_count=args.head_count,
+                head_dim=args.head_dim,
+                indexer_dim=args.indexer_dim,
+                indexer_topk=args.indexer_topk,
+                block_size=args.block_size,
+                planner_chunk_size=args.planner_chunk_size,
+                csa_ratio=args.csa_ratio,
+                hca_ratio=args.hca_ratio,
+                window_size=args.window_size,
+                kinds=_runtime_kinds(args.runtime_kind),
+                miles_path=args.miles_path,
+            ),
+            command=command,
+        )
+    elif args.benchmark_planning:
         result = run_planning_benchmark(
             output_dir=output_dir,
             cases=cases,
@@ -295,6 +588,365 @@ def _time_planning_case(
     )
 
 
+def _runtime_worker(
+    rank: int,
+    world_size: int,
+    init_path: str,
+    result_dir: str,
+    case_json: str,
+    config_json: str,
+) -> None:
+    from art.megatron.context_parallel import ContextParallelConfig, ParallelTopology
+    from art.megatron.context_parallel.runtime import (
+        prepare_megatron_context_parallel_state,
+    )
+    from art.megatron.dsv4 import prepare_dsv4_context_parallel_state
+
+    case = Dsv4WorkloadCase.model_validate_json(case_json)
+    config = RuntimeBenchmarkConfig.model_validate_json(config_json)
+    _add_miles_path_to_sys_path(config.miles_path)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29671")
+    torch.cuda.set_device(int(rank))
+    device = torch.device("cuda", int(rank))
+    init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=int(rank),
+        world_size=int(world_size),
+    )
+    try:
+        micro = _fresh_micro(case, iteration=0)
+        cp_start = time.perf_counter()
+        cp_state, _rank_plan, _spec, _pad = prepare_megatron_context_parallel_state(
+            micro=micro,
+            topology=ParallelTopology(cp=int(world_size)),
+            config=ContextParallelConfig(
+                block_size=int(config.block_size),
+                planner_chunk_size=int(config.planner_chunk_size),
+            ),
+            cp_group=cast(Any, torch.distributed).group.WORLD,
+            cp_rank=int(rank),
+        )
+        normal_cp_plan_ms = _elapsed_ms(cp_start)
+        dsv4_start = time.perf_counter()
+        context_state = prepare_dsv4_context_parallel_state(
+            cp_state=cp_state,
+            csa_ratio=int(config.csa_ratio),
+            hca_ratio=int(config.hca_ratio),
+            include_csa="csa" in config.kinds,
+            include_hca="hca" in config.kinds,
+        )
+        dsv4_plan_ms = _elapsed_ms(dsv4_start)
+        local_token_ids = _local_token_ids_from_context_state(context_state)
+        timings = tuple(
+            _time_runtime_kind(
+                context_state=context_state,
+                case=case,
+                config=config,
+                compression_kind=kind,
+                rank=int(rank),
+                world_size=int(world_size),
+                device=device,
+                local_token_ids=local_token_ids,
+                normal_cp_plan_ms=normal_cp_plan_ms,
+                dsv4_plan_ms=dsv4_plan_ms,
+            )
+            for kind in config.kinds
+        )
+        output = RankRuntimeOutput(timings=timings)
+        path = (
+            Path(result_dir) / f"{_safe_name(case.name)}_cp{world_size}_rank{rank}.json"
+        )
+        path.write_text(output.model_dump_json(indent=2) + "\n")
+    finally:
+        destroy_process_group()
+
+
+def _time_runtime_kind(
+    *,
+    context_state: Any,
+    case: Dsv4WorkloadCase,
+    config: RuntimeBenchmarkConfig,
+    compression_kind: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    local_token_ids: tuple[int, ...],
+    normal_cp_plan_ms: float,
+    dsv4_plan_ms: float,
+) -> RankRuntimeTiming:
+    from art.megatron.dsv4 import (
+        launch_dsv4_projected_attention_backward_from_context_parallel_state,
+    )
+
+    dtype = _dtype_from_name(config.dtype)
+    token_count = int(context_state.cp_state.rank_plan.original_seq_len)
+    local_count = len(local_token_ids)
+    completion_count = summarize_case(case).completion_count
+    torch.manual_seed(10_000 + rank * 97 + (0 if compression_kind == "csa" else 1))
+    query = torch.randn(
+        local_count,
+        int(config.head_count),
+        int(config.head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    raw_kv = torch.randn(
+        local_count,
+        int(config.head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    attn_sink = (
+        torch.randn(
+            int(config.head_count),
+            device=device,
+            dtype=torch.float32,
+        )
+        * 0.1
+    )
+    grad_out = torch.randn(
+        1,
+        local_count,
+        int(config.head_count),
+        int(config.head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    scale = 1.0 / (int(config.head_dim) ** 0.5)
+    forward_launch_ms: list[float] = []
+    forward_wait_ms: list[float] = []
+    forward_total_ms: list[float] = []
+    backward_launch_ms: list[float] = []
+    backward_wait_ms: list[float] = []
+    backward_total_ms: list[float] = []
+    e2e_ms: list[float] = []
+    output_abs_sum = 0.0
+    dq_abs_sum = 0.0
+    compressor_grad_abs_sum = 0.0
+    nonfinite_count = 0
+    if int(config.warmup) == 0:
+        torch.cuda.reset_peak_memory_stats(device)
+    for iteration in range(int(config.warmup) + int(config.iterations)):
+        if iteration == int(config.warmup):
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        e2e_start = time.perf_counter()
+        if compression_kind == "csa":
+            forward_work = _launch_runtime_csa_forward(
+                context_state=context_state,
+                query=query,
+                raw_kv=raw_kv,
+                attn_sink=attn_sink,
+                local_token_ids=local_token_ids,
+                config=config,
+                dtype=dtype,
+                scale=scale,
+            )
+        elif compression_kind == "hca":
+            forward_work = _launch_runtime_hca_forward(
+                context_state=context_state,
+                query=query,
+                raw_kv=raw_kv,
+                attn_sink=attn_sink,
+                local_token_ids=local_token_ids,
+                config=config,
+                dtype=dtype,
+                scale=scale,
+            )
+        else:
+            raise RuntimeError(f"unsupported runtime kind {compression_kind}")
+        fwd_launch = _elapsed_ms(e2e_start)
+        fwd_wait_start = time.perf_counter()
+        forward = forward_work.wait_post_process()
+        torch.cuda.synchronize(device)
+        fwd_wait = _elapsed_ms(fwd_wait_start)
+        fwd_total = _elapsed_ms(e2e_start)
+        bwd_start = time.perf_counter()
+        backward_work = (
+            launch_dsv4_projected_attention_backward_from_context_parallel_state(
+                context_state=context_state,
+                forward_result=forward,
+                grad_out=grad_out,
+                async_op=True,
+            )
+        )
+        bwd_launch = _elapsed_ms(bwd_start)
+        bwd_wait_start = time.perf_counter()
+        backward = backward_work.wait_post_process()
+        torch.cuda.synchronize(device)
+        bwd_wait = _elapsed_ms(bwd_wait_start)
+        bwd_total = _elapsed_ms(bwd_start)
+        total = _elapsed_ms(e2e_start)
+        if iteration >= int(config.warmup):
+            forward_launch_ms.append(fwd_launch)
+            forward_wait_ms.append(fwd_wait)
+            forward_total_ms.append(fwd_total)
+            backward_launch_ms.append(bwd_launch)
+            backward_wait_ms.append(bwd_wait)
+            backward_total_ms.append(bwd_total)
+            e2e_ms.append(total)
+            nonfinite_count += _nonfinite_count(forward.attention.out)
+            nonfinite_count += _nonfinite_count(forward.attention.lse)
+            nonfinite_count += _nonfinite_count(backward.attention.dq)
+            nonfinite_count += _nonfinite_count(backward.main_compressor.dprojected_kv)
+            output_abs_sum += _abs_sum(forward.attention.out)
+            dq_abs_sum += _abs_sum(backward.attention.dq)
+            compressor_grad_abs_sum += _abs_sum(backward.main_compressor.dprojected_kv)
+    return RankRuntimeTiming(
+        case_name=case.name,
+        topology=f"cp{world_size}",
+        compression_kind=compression_kind,
+        rank=int(rank),
+        world_size=int(world_size),
+        iterations=int(config.iterations),
+        warmup=int(config.warmup),
+        dtype=config.dtype,
+        token_count=token_count,
+        local_token_count=local_count,
+        completion_count=completion_count,
+        normal_cp_plan_ms=float(normal_cp_plan_ms),
+        dsv4_plan_ms=float(dsv4_plan_ms),
+        forward_launch_ms=tuple(forward_launch_ms),
+        forward_wait_ms=tuple(forward_wait_ms),
+        forward_total_ms=tuple(forward_total_ms),
+        backward_launch_ms=tuple(backward_launch_ms),
+        backward_wait_ms=tuple(backward_wait_ms),
+        backward_total_ms=tuple(backward_total_ms),
+        e2e_ms=tuple(e2e_ms),
+        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        output_abs_sum=float(output_abs_sum),
+        dq_abs_sum=float(dq_abs_sum),
+        compressor_grad_abs_sum=float(compressor_grad_abs_sum),
+        nonfinite_count=int(nonfinite_count),
+    )
+
+
+def _launch_runtime_csa_forward(
+    *,
+    context_state: Any,
+    query: torch.Tensor,
+    raw_kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    local_token_ids: tuple[int, ...],
+    config: RuntimeBenchmarkConfig,
+    dtype: torch.dtype,
+    scale: float,
+) -> Any:
+    from art.megatron.dsv4 import (
+        launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
+    )
+
+    main_projected_kv = torch.randn(
+        len(local_token_ids),
+        2 * int(config.head_dim),
+        device=query.device,
+        dtype=dtype,
+    )
+    main_projected_gate = torch.randn_like(main_projected_kv)
+    indexer_projected_kv = torch.randn(
+        len(local_token_ids),
+        2 * int(config.indexer_dim),
+        device=query.device,
+        dtype=dtype,
+    )
+    indexer_projected_gate = torch.randn_like(indexer_projected_kv)
+    indexer_q = torch.randn(
+        len(local_token_ids),
+        int(config.head_count),
+        int(config.indexer_dim),
+        device=query.device,
+        dtype=dtype,
+    )
+    indexer_weights = torch.randn(
+        len(local_token_ids),
+        int(config.head_count),
+        device=query.device,
+        dtype=dtype,
+    )
+    return launch_dsv4_csa_projected_attention_forward_from_context_parallel_state(
+        context_state=context_state,
+        query=query,
+        query_token_ids=local_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=local_token_ids,
+        main_projected_kv=main_projected_kv,
+        main_projected_gate=main_projected_gate,
+        main_positional_bias=torch.randn(
+            int(config.csa_ratio),
+            2 * int(config.head_dim),
+            device=query.device,
+            dtype=torch.float32,
+        ),
+        main_token_ids=local_token_ids,
+        indexer_projected_kv=indexer_projected_kv,
+        indexer_projected_gate=indexer_projected_gate,
+        indexer_positional_bias=torch.randn(
+            int(config.csa_ratio),
+            2 * int(config.indexer_dim),
+            device=query.device,
+            dtype=torch.float32,
+        ),
+        indexer_token_ids=local_token_ids,
+        indexer_q=indexer_q,
+        indexer_weights=indexer_weights,
+        indexer_topk=int(config.indexer_topk),
+        attn_sink=attn_sink,
+        async_op=True,
+        scale=scale,
+        window_size=int(config.window_size),
+        raw_list_size=int(config.window_size),
+        compressed_list_size=int(config.indexer_topk),
+    )
+
+
+def _launch_runtime_hca_forward(
+    *,
+    context_state: Any,
+    query: torch.Tensor,
+    raw_kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    local_token_ids: tuple[int, ...],
+    config: RuntimeBenchmarkConfig,
+    dtype: torch.dtype,
+    scale: float,
+) -> Any:
+    from art.megatron.dsv4 import (
+        launch_dsv4_hca_projected_attention_forward_from_context_parallel_state,
+    )
+
+    projected_kv = torch.randn(
+        len(local_token_ids),
+        int(config.head_dim),
+        device=query.device,
+        dtype=dtype,
+    )
+    return launch_dsv4_hca_projected_attention_forward_from_context_parallel_state(
+        context_state=context_state,
+        query=query,
+        query_token_ids=local_token_ids,
+        raw_kv=raw_kv,
+        raw_token_ids=local_token_ids,
+        projected_kv=projected_kv,
+        projected_gate=torch.randn_like(projected_kv),
+        positional_bias=torch.randn(
+            int(config.hca_ratio),
+            int(config.head_dim),
+            device=query.device,
+            dtype=torch.float32,
+        ),
+        token_ids=local_token_ids,
+        attn_sink=attn_sink,
+        async_op=True,
+        scale=scale,
+        window_size=int(config.window_size),
+        raw_list_size=int(config.window_size),
+        compressed_list_size=None,
+    )
+
+
 def _fresh_micro(case: Dsv4WorkloadCase, *, iteration: int) -> Any:
     from art.preprocessing.pack import PackedTensors
 
@@ -342,6 +994,7 @@ def _case_iter(case_set: str) -> Iterable[Dsv4WorkloadCase]:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DSV4 CP layer lab")
     parser.add_argument("--dry-run-cases", action="store_true")
+    parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--benchmark-planning", action="store_true")
     parser.add_argument(
         "--case-set",
@@ -357,15 +1010,42 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--planner-chunk-size", type=int, default=512)
     parser.add_argument("--csa-ratio", type=int, default=4)
     parser.add_argument("--hca-ratio", type=int, default=128)
+    parser.add_argument("--window-size", type=int, default=128)
     parser.add_argument("--hca-only", action="store_true")
+    parser.add_argument(
+        "--runtime-kind",
+        choices=("both", "csa", "hca"),
+        default="both",
+    )
+    parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--head-count", type=int, default=64)
+    parser.add_argument("--head-dim", type=int, default=512)
+    parser.add_argument("--indexer-dim", type=int, default=128)
+    parser.add_argument("--indexer-topk", type=int, default=1024)
+    parser.add_argument(
+        "--miles-path",
+        default=os.environ.get(
+            "DSV4_MILES_PATH", "/mnt/ws_pvc/ws/scratch/miles_inspect"
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
     )
     args = parser.parse_args(argv)
-    if args.dry_run_cases and args.benchmark_planning:
-        parser.error("--dry-run-cases and --benchmark-planning are mutually exclusive")
-    if not args.dry_run_cases and not args.benchmark_planning:
+    mode_count = sum(
+        bool(value)
+        for value in (
+            args.dry_run_cases,
+            args.benchmark,
+            args.benchmark_planning,
+        )
+    )
+    if mode_count > 1:
+        parser.error(
+            "--dry-run-cases, --benchmark, and --benchmark-planning are mutually exclusive"
+        )
+    if mode_count == 0:
         args.dry_run_cases = True
     if args.topology is None:
         args.topology = ["cp2"]
@@ -377,8 +1057,8 @@ def _parse_topology(value: str) -> int:
     if not normalized.startswith("cp"):
         raise RuntimeError(f"topology must look like cp2/cp4/cp8, got {value}")
     cp_size = int(normalized[2:])
-    if cp_size <= 1:
-        raise RuntimeError(f"planning benchmark requires CP > 1, got {value}")
+    if cp_size < 1:
+        raise RuntimeError(f"topology must be positive, got {value}")
     return cp_size
 
 
@@ -394,6 +1074,115 @@ def _require_megatron() -> None:
         import megatron.core  # noqa: F401
     except Exception as exc:
         raise RuntimeError("DSV4 planning lab requires megatron.core") from exc
+
+
+def _require_cuda_for_runtime() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "DSV4 runtime benchmark requires CUDA and real Miles kernels"
+        )
+
+
+def _add_miles_path_to_sys_path(miles_path: str) -> None:
+    if miles_path and Path(miles_path).exists() and miles_path not in sys.path:
+        sys.path.insert(0, miles_path)
+
+
+def _load_runtime_timings(
+    *,
+    result_dir: Path,
+    case_name: str,
+    topology: str,
+    kinds: tuple[str, ...],
+    world_size: int,
+) -> tuple[RuntimeTiming, ...]:
+    records_by_kind: dict[str, list[RankRuntimeTiming]] = {kind: [] for kind in kinds}
+    cp_size = int(topology[2:])
+    for rank in range(int(world_size)):
+        path = result_dir / f"{_safe_name(case_name)}_cp{cp_size}_rank{rank}.json"
+        output = RankRuntimeOutput.model_validate_json(path.read_text())
+        for timing in output.timings:
+            records_by_kind[timing.compression_kind].append(timing)
+    timings: list[RuntimeTiming] = []
+    for kind, records in records_by_kind.items():
+        if len(records) != int(world_size):
+            raise RuntimeError(
+                f"runtime benchmark expected {world_size} rank records for {kind}, "
+                f"got {len(records)}"
+            )
+        timings.append(
+            RuntimeTiming(
+                case_name=case_name,
+                topology=topology,
+                compression_kind=kind,
+                ranks=tuple(sorted(records, key=lambda item: item.rank)),
+            )
+        )
+    return tuple(timings)
+
+
+def _local_token_ids_from_context_state(context_state: Any) -> tuple[int, ...]:
+    rank = int(context_state.cp_state.rank_plan.rank)
+    ranges = (
+        context_state.cp_state.rank_plan.token_layout_index.ownership_ranges_by_rank[
+            rank
+        ]
+    )
+    return tuple(
+        token_id
+        for start, end, _offset in ranges
+        for token_id in range(int(start), int(end))
+    )
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    if name == "bf16":
+        return torch.bfloat16
+    if name == "fp32":
+        return torch.float32
+    raise RuntimeError(f"unsupported DSV4 runtime dtype {name}")
+
+
+def _runtime_kinds(value: str) -> tuple[str, ...]:
+    if value == "both":
+        return ("csa", "hca")
+    if value in {"csa", "hca"}:
+        return (value,)
+    raise RuntimeError(f"unsupported DSV4 runtime kind {value}")
+
+
+def _iteration_rank_max(
+    ranks: tuple[RankRuntimeTiming, ...],
+    field_name: str,
+) -> tuple[float, ...]:
+    if not ranks:
+        raise RuntimeError("runtime metric aggregation requires rank timings")
+    iteration_count = min(
+        len(cast(tuple[float, ...], getattr(rank, field_name))) for rank in ranks
+    )
+    if iteration_count == 0:
+        raise RuntimeError(f"runtime metric {field_name} has no timed iterations")
+    return tuple(
+        max(
+            cast(tuple[float, ...], getattr(rank, field_name))[iteration]
+            for rank in ranks
+        )
+        for iteration in range(iteration_count)
+    )
+
+
+def _nonfinite_count(tensor: torch.Tensor) -> int:
+    return int(torch.logical_not(torch.isfinite(tensor)).sum().item())
+
+
+def _abs_sum(tensor: torch.Tensor) -> float:
+    return float(tensor.detach().abs().sum().item())
+
+
+def _safe_name(value: str) -> str:
+    return "".join(
+        char if char.isalnum() or char in {"_", "-"} else "_" for char in value
+    )
 
 
 def _elapsed_ms(start: float) -> float:
