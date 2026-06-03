@@ -126,7 +126,7 @@ def test_projected_compression_supports_compact_token_buffer_and_entry_subset() 
             {
                 token_id
                 for entry_id in entry_ids
-                for token_id in layout.entries[entry_id].dependency_token_ids
+                for token_id in _entry_dependency_token_ids(layout, entry_id)
             }
         )
     )
@@ -357,22 +357,22 @@ def _slow_compress_projected(
     positional_bias: torch.Tensor,
     entry_ids: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    entries = (
-        layout.entries
+    normalized_entry_ids = (
+        tuple(range(layout.entry_count()))
         if entry_ids is None
-        else tuple(layout.entries[int(entry_id)] for entry_id in entry_ids)
+        else tuple(int(entry_id) for entry_id in entry_ids)
     )
     if projected_kv.ndim == 2:
         return torch.stack(
             [
                 _slow_compress_entry(
                     layout=layout,
-                    entry_id=int(entry.entry_id),
+                    entry_id=entry_id,
                     projected_kv=projected_kv,
                     projected_gate=projected_gate,
                     positional_bias=positional_bias,
                 )
-                for entry in entries
+                for entry_id in normalized_entry_ids
             ]
         )
     return torch.stack(
@@ -415,18 +415,18 @@ def _slow_compress_entry(
     projected_gate: torch.Tensor,
     positional_bias: torch.Tensor,
 ) -> torch.Tensor:
-    entry = layout.entries[entry_id]
-    deps = torch.tensor(entry.dependency_token_ids, dtype=torch.long)
+    dependency_token_ids = _entry_dependency_token_ids(layout, entry_id)
+    deps = torch.tensor(dependency_token_ids, dtype=torch.long)
     ratio = int(layout.spec.ratio)
     if layout.spec.kind == Dsv4CompressionKind.HCA:
         rows_kv = projected_kv.index_select(0, deps)
         rows_score = (
             projected_gate.index_select(0, deps)
-            + positional_bias[: len(entry.dependency_token_ids)]
+            + positional_bias[: len(dependency_token_ids)]
         )
     elif layout.spec.kind == Dsv4CompressionKind.CSA:
         head_dim = int(projected_kv.shape[-1]) // 2
-        if len(entry.dependency_token_ids) == ratio:
+        if len(dependency_token_ids) == ratio:
             rows_kv = projected_kv.index_select(0, deps)[..., head_dim:]
             rows_score = (
                 projected_gate.index_select(0, deps)[..., head_dim:]
@@ -455,6 +455,29 @@ def _slow_compress_entry(
         raise RuntimeError(f"Unsupported compression kind {layout.spec.kind}")
     weights = torch.softmax(rows_score.float(), dim=0)
     return rows_kv.mul(weights).sum(dim=0)
+
+
+def _entry_dependency_token_ids(
+    layout: Dsv4CompressedLayout,
+    entry_id: int,
+) -> tuple[int, ...]:
+    entry_int = int(entry_id)
+    branch_id = int(layout.entry_branch_stream_ids[entry_int])
+    branch = next(
+        branch
+        for branch in layout.branch_views
+        if int(branch.branch_stream_id) == branch_id
+    )
+    start = int(layout.entry_dependency_start_view_positions[entry_int])
+    ratio = int(layout.spec.ratio)
+    first = (
+        start
+        if layout.spec.kind == Dsv4CompressionKind.HCA or start == 0
+        else start - ratio
+    )
+    return tuple(
+        int(branch.tokens[pos].packed_token_id) for pos in range(first, start + ratio)
+    )
 
 
 def _layout(kind: Dsv4CompressionKind) -> Dsv4CompressedLayout:

@@ -124,22 +124,6 @@ class Dsv4BranchView(Dsv4FrozenModel):
         return tuple(tokens)
 
 
-class Dsv4CompressedEntry(Dsv4FrozenModel):
-    entry_id: int
-    kind: Dsv4CompressionKind
-    ratio: int
-    branch_stream_id: int
-    prefix_stream_id: int
-    closure_token_id: int
-    closure_view_pos: int
-    owner_rank: int
-    owner_local_offset: int
-    dependency_token_ids: tuple[int, ...]
-    remote_dependency_token_ids: tuple[int, ...]
-    shared_prefix_entry: bool
-    branch_entry_index: int
-
-
 class Dsv4HaloTransfer(Dsv4FrozenModel):
     source_rank: int
     target_rank: int
@@ -346,8 +330,7 @@ class Dsv4CompressedLayout(Dsv4FrozenModel):
     spec: Dsv4CompressionSpec
     streams: tuple[Dsv4StreamSpec, ...]
     branch_views: tuple[Dsv4BranchView, ...]
-    entries: tuple[Dsv4CompressedEntry, ...]
-    compressed_entry_count: int = 0
+    compressed_entry_count: int
     halo_transfers: tuple[Dsv4HaloTransfer, ...]
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
     raw_token_owner_ranks: tuple[int, ...]
@@ -359,12 +342,11 @@ class Dsv4CompressedLayout(Dsv4FrozenModel):
     entry_shared_prefix_flags: tuple[bool, ...] = ()
     entry_dependency_start_view_positions: tuple[int, ...] = ()
     dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...] = ()
-    entry_ids_by_branch_stream: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     entry_ids_by_closure_token: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     closure_token_ids: tuple[int, ...] = ()
 
     def entry_count(self) -> int:
-        return int(self.compressed_entry_count or len(self.entries))
+        return int(self.compressed_entry_count)
 
 
 class Dsv4PreparedPlan(Dsv4FrozenModel):

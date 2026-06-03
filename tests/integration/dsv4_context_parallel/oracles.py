@@ -306,17 +306,6 @@ def _visible_compressed_ids(
 def _iter_entry_visibility(
     layout: Dsv4CompressedLayout,
 ) -> tuple[tuple[int, int, int, int, bool], ...]:
-    if layout.entries:
-        return tuple(
-            (
-                int(entry.entry_id),
-                int(entry.branch_stream_id),
-                int(entry.prefix_stream_id),
-                int(entry.closure_view_pos),
-                bool(entry.shared_prefix_entry),
-            )
-            for entry in layout.entries
-        )
     count = int(layout.entry_count())
     if (
         len(layout.entry_branch_stream_ids) < count

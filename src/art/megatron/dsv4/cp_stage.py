@@ -1433,15 +1433,11 @@ def _compressed_entry_owner_rank(
     entry_int = int(entry_id)
     if entry_int < 0 or entry_int >= layout.entry_count():
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
-    if layout.compressed_entry_owner_ranks:
-        return int(layout.compressed_entry_owner_ranks[entry_int])
-    return int(layout.entries[entry_int].owner_rank)
+    return int(layout.compressed_entry_owner_ranks[entry_int])
 
 
 def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
-    if layout.compressed_entry_owner_ranks:
-        return layout.compressed_entry_owner_ranks
-    return tuple(int(entry.owner_rank) for entry in layout.entries)
+    return layout.compressed_entry_owner_ranks
 
 
 def _visible_raw_swa_token_ids(

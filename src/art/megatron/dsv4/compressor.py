@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -12,7 +12,6 @@ import torch.distributed as dist
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .types import (
     Dsv4BranchView,
-    Dsv4CompressedEntry,
     Dsv4CompressedKvForwardResult,
     Dsv4CompressedKvGradientResult,
     Dsv4CompressedLayout,
@@ -151,7 +150,6 @@ class Dsv4CompressionHaloGradientExchangeWork(BaseModel):
 class _Dsv4LayoutBuildResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
-    entries: tuple[Dsv4CompressedEntry, ...]
     compressed_entry_count: int
     halo_transfers: tuple[Dsv4HaloTransfer, ...]
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
@@ -162,7 +160,6 @@ class _Dsv4LayoutBuildResult(BaseModel):
     entry_shared_prefix_flags: tuple[bool, ...]
     entry_dependency_start_view_positions: tuple[int, ...]
     dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...]
-    entry_ids_by_branch_stream: dict[int, tuple[int, ...]]
     entry_ids_by_closure_token: dict[int, tuple[int, ...]]
     closure_token_ids: tuple[int, ...]
 
@@ -253,7 +250,6 @@ def build_dsv4_compressed_layout(
     parent_ids: torch.Tensor,
     token_layout_index: TokenLayoutIndexLike,
     spec: Dsv4CompressionSpec,
-    materialize_entries: bool = True,
 ) -> Dsv4CompressedLayout:
     """Build host-ahead DSV4 compression metadata from shared-prefix layout.
 
@@ -269,17 +265,13 @@ def build_dsv4_compressed_layout(
     group_row, parent_row = _validate_metadata(group_ids, parent_ids)
     streams = _build_streams(group_row=group_row, parent_row=parent_row)
     branch_views = _build_branch_views(streams)
-    raw_token_owner_ranks, raw_token_local_offsets = _build_token_ownership_tables(
-        token_layout_index
-    )
+    raw_token_owner_ranks = _build_token_ownership_table(token_layout_index)
     return _build_dsv4_compressed_layout_from_parts(
         spec=spec,
         streams=streams,
         branch_views=branch_views,
         raw_token_owner_ranks=raw_token_owner_ranks,
-        raw_token_local_offsets=raw_token_local_offsets,
         rank_count=len(token_layout_index.ownership_ranges_by_rank),
-        materialize_entries=materialize_entries,
     )
 
 
@@ -289,30 +281,25 @@ def _build_dsv4_compressed_layout_from_parts(
     streams: tuple[Dsv4StreamSpec, ...],
     branch_views: tuple[Dsv4BranchView, ...],
     raw_token_owner_ranks: tuple[int, ...],
-    raw_token_local_offsets: tuple[int, ...],
     owner_change_positions: tuple[int, ...] | None = None,
     rank_count: int,
-    materialize_entries: bool,
 ) -> Dsv4CompressedLayout:
     raw_owner_change_positions = (
         owner_change_positions
         if owner_change_positions is not None
         else _owner_change_positions(raw_token_owner_ranks)
     )
-    built = _build_entries(
+    built = _build_compact_entries(
         branch_views=branch_views,
         raw_token_owner_ranks=raw_token_owner_ranks,
-        raw_token_local_offsets=raw_token_local_offsets,
         owner_change_positions=raw_owner_change_positions,
         spec=spec,
         rank_count=int(rank_count),
-        materialize_entries=materialize_entries,
     )
     return Dsv4CompressedLayout.model_construct(
         spec=spec,
         streams=streams,
         branch_views=branch_views,
-        entries=built.entries,
         compressed_entry_count=built.compressed_entry_count,
         halo_transfers=built.halo_transfers,
         entry_ids_by_owner_rank=built.entry_ids_by_owner_rank,
@@ -325,7 +312,6 @@ def _build_dsv4_compressed_layout_from_parts(
         entry_shared_prefix_flags=built.entry_shared_prefix_flags,
         entry_dependency_start_view_positions=built.entry_dependency_start_view_positions,
         dependency_token_ids_by_owner_rank=built.dependency_token_ids_by_owner_rank,
-        entry_ids_by_branch_stream=built.entry_ids_by_branch_stream,
         entry_ids_by_closure_token=built.entry_ids_by_closure_token,
         closure_token_ids=built.closure_token_ids,
     )
@@ -335,7 +321,6 @@ def build_dsv4_compressed_layout_from_cp_state(
     *,
     state: ArtContextParallelState,
     spec: Dsv4CompressionSpec,
-    materialize_entries: bool = False,
 ) -> Dsv4CompressedLayout:
     return build_dsv4_compressed_layout(
         group_ids=state.group_ids.unsqueeze(0)
@@ -346,7 +331,6 @@ def build_dsv4_compressed_layout_from_cp_state(
         else state.parent_ids,
         token_layout_index=state.rank_plan.token_layout_index,
         spec=spec,
-        materialize_entries=materialize_entries,
     )
 
 
@@ -354,7 +338,6 @@ def build_dsv4_compressed_layouts_from_cp_state(
     *,
     state: ArtContextParallelState,
     specs: Sequence[Dsv4CompressionSpec],
-    materialize_entries: bool = False,
 ) -> tuple[Dsv4CompressedLayout, ...]:
     """Build multiple layouts while sharing stream and branch-view planning."""
     if not specs:
@@ -377,7 +360,7 @@ def build_dsv4_compressed_layouts_from_cp_state(
     group_row, parent_row = _validate_metadata(group_ids, parent_ids)
     streams = _build_streams(group_row=group_row, parent_row=parent_row)
     branch_views = _build_branch_views(streams)
-    raw_token_owner_ranks, raw_token_local_offsets = _build_token_ownership_tables(
+    raw_token_owner_ranks = _build_token_ownership_table(
         state.rank_plan.token_layout_index
     )
     owner_change_positions = _owner_change_positions(raw_token_owner_ranks)
@@ -388,10 +371,8 @@ def build_dsv4_compressed_layouts_from_cp_state(
             streams=streams,
             branch_views=branch_views,
             raw_token_owner_ranks=raw_token_owner_ranks,
-            raw_token_local_offsets=raw_token_local_offsets,
             owner_change_positions=owner_change_positions,
             rank_count=rank_count,
-            materialize_entries=materialize_entries,
         )
         for spec in specs
     )
@@ -1574,31 +1555,24 @@ def _make_branch_view(
     )
 
 
-def _build_token_ownership_tables(
+def _build_token_ownership_table(
     token_layout_index: TokenLayoutIndexLike,
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
+) -> tuple[int, ...]:
     max_end = 0
     for ranges in token_layout_index.ownership_ranges_by_rank:
         for _start, end, _local_start in ranges:
             max_end = max(max_end, int(end))
     owner_ranks = [-1] * max_end
-    local_offsets = [-1] * max_end
     for rank, ranges in enumerate(token_layout_index.ownership_ranges_by_rank):
-        for start, end, local_start in ranges:
+        for start, end, _local_start in ranges:
             start_int = int(start)
             end_int = int(end)
-            local_start_int = int(local_start)
             if start_int < 0 or end_int < start_int:
                 raise RuntimeError(
                     f"DSV4 token ownership range is invalid: {start}:{end}"
                 )
-            count = end_int - start_int
-            owner_ranks[start_int:end_int] = [int(rank)] * count
-            local_offsets[start_int:end_int] = range(
-                local_start_int,
-                local_start_int + count,
-            )
-    return tuple(owner_ranks), tuple(local_offsets)
+            owner_ranks[start_int:end_int] = [int(rank)] * (end_int - start_int)
+    return tuple(owner_ranks)
 
 
 def _normalize_compression_entry_ids(
@@ -1627,24 +1601,37 @@ def _dependency_token_ids_for_entry(
     entry_count = layout.entry_count()
     if entry_int < 0 or entry_int >= entry_count:
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
-    if layout.entry_dependency_start_view_positions:
-        _validate_compact_entry_columns(layout=layout)
-        branch_id = int(layout.entry_branch_stream_ids[entry_int])
-        branch_view = _branch_view_by_stream_id(
-            layout=layout, branch_stream_id=branch_id
+    _validate_compact_entry_columns(layout=layout)
+    branch_id = int(layout.entry_branch_stream_ids[entry_int])
+    branch_view = _branch_view_by_stream_id(layout=layout, branch_stream_id=branch_id)
+    start = int(layout.entry_dependency_start_view_positions[entry_int])
+    ratio = int(layout.spec.ratio)
+    if layout.spec.kind == Dsv4CompressionKind.HCA:
+        ranges = _fast_branch_token_ranges_for_view_range(
+            branch_view=branch_view,
+            start=start,
+            end=start + ratio,
         )
-        return tuple(
-            token_id
-            for token_range in _compression_dependency_token_ranges(
+    elif layout.spec.kind == Dsv4CompressionKind.CSA:
+        ranges = (
+            *(
+                _fast_branch_token_ranges_for_view_range(
+                    branch_view=branch_view,
+                    start=start - ratio,
+                    end=start,
+                )
+                if start > 0
+                else ()
+            ),
+            *_fast_branch_token_ranges_for_view_range(
                 branch_view=branch_view,
-                start=int(layout.entry_dependency_start_view_positions[entry_int]),
-                spec=layout.spec,
-            )
-            for token_id in token_range
+                start=start,
+                end=start + ratio,
+            ),
         )
-    return tuple(
-        int(token_id) for token_id in layout.entries[entry_int].dependency_token_ids
-    )
+    else:
+        raise RuntimeError(f"Unsupported DSV4 compression kind: {layout.spec.kind}")
+    return tuple(int(token_id) for token_range in ranges for token_id in token_range)
 
 
 def _branch_view_by_stream_id(
@@ -1870,193 +1857,42 @@ def _select_csa_positional_bias(
     return flat.reshape(*ape_row.shape, head_dim)
 
 
-def _build_entries(
+def _build_compact_entries(
     *,
     branch_views: tuple[Dsv4BranchView, ...],
     raw_token_owner_ranks: tuple[int, ...],
-    raw_token_local_offsets: tuple[int, ...],
     owner_change_positions: tuple[int, ...] | None = None,
     spec: Dsv4CompressionSpec,
     rank_count: int,
-    materialize_entries: bool,
 ) -> _Dsv4LayoutBuildResult:
-    if not materialize_entries:
-        compact_owner_change_positions = (
-            owner_change_positions
-            if owner_change_positions is not None
-            else _owner_change_positions(raw_token_owner_ranks)
-        )
-        if spec.kind is Dsv4CompressionKind.CSA:
-            return _build_compact_csa_entries(
-                branch_views=branch_views,
-                raw_token_owner_ranks=raw_token_owner_ranks,
-                raw_token_local_offsets=raw_token_local_offsets,
-                owner_change_positions=compact_owner_change_positions,
-                spec=spec,
-                rank_count=rank_count,
-            )
-        if spec.kind is Dsv4CompressionKind.HCA:
-            return _build_compact_hca_entries(
-                branch_views=branch_views,
-                raw_token_owner_ranks=raw_token_owner_ranks,
-                owner_change_positions=compact_owner_change_positions,
-                spec=spec,
-                rank_count=rank_count,
-            )
-
-    entries: list[Dsv4CompressedEntry] = []
-    entry_ids_by_branch: dict[int, list[int]] = defaultdict(list)
-    entry_ids_by_owner: list[list[int]] = [[] for _ in range(int(rank_count))]
-    owner_ranks: list[int] = []
-    branch_stream_ids: list[int] = []
-    prefix_stream_ids: list[int] = []
-    closure_view_positions: list[int] = []
-    shared_prefix_flags: list[bool] = []
-    dependency_start_view_positions: list[int] = []
-    dependency_ids_by_owner: list[set[int]] = [set() for _ in range(int(rank_count))]
-    entry_ids_by_closure: dict[int, list[int]] = defaultdict(list)
-    closure_tokens: set[int] = set()
-    halo_by_peer: dict[tuple[int, int], dict[int, set[int]]] = defaultdict(
-        lambda: defaultdict(set)
+    compact_owner_change_positions = (
+        owner_change_positions
+        if owner_change_positions is not None
+        else _owner_change_positions(raw_token_owner_ranks)
     )
-    for branch_view in branch_views:
-        if materialize_entries and branch_view.suffix_stream_id is not None:
-            entry_ids_by_branch[int(branch_view.branch_stream_id)].extend(
-                entry_ids_by_branch[int(branch_view.prefix_stream_id)]
-            )
-        branch_entry_index = (
-            len(entry_ids_by_branch[int(branch_view.branch_stream_id)])
-            if materialize_entries
-            else 0
-        )
-        min_closure_view_pos = (
-            int(branch_view.prefix_token_count)
-            if branch_view.suffix_stream_id is not None
-            else 0
-        )
-        prefix_token_count = int(branch_view.prefix_token_count)
-        ratio = int(spec.ratio)
-        for start in _compression_starts(
-            branch_len=branch_view.size(),
-            min_closure_view_pos=min_closure_view_pos,
+    if spec.kind is Dsv4CompressionKind.CSA:
+        return _build_compact_csa_entries(
+            branch_views=branch_views,
+            raw_token_owner_ranks=raw_token_owner_ranks,
+            owner_change_positions=compact_owner_change_positions,
             spec=spec,
-        ):
-            closure_view_pos = start + ratio - 1
-            dependency_ranges = _compression_dependency_token_ranges(
-                branch_view=branch_view,
-                start=start,
-                spec=spec,
-            )
-            closure_token_id = _branch_token_id_at(
-                branch_view=branch_view,
-                view_pos=closure_view_pos,
-            )
-            shared_prefix_entry = int(closure_view_pos) < prefix_token_count
-            owner_rank, owner_local_offset = _owner_for_token(
-                raw_token_owner_ranks=raw_token_owner_ranks,
-                raw_token_local_offsets=raw_token_local_offsets,
-                token_id=closure_token_id,
-            )
-            entry_id = len(owner_ranks)
-            dependency_tokens: list[int] | None = [] if materialize_entries else None
-            remote_dependency_token_ids: list[int] = []
-            for dependency_range in dependency_ranges:
-                for token_id in dependency_range:
-                    token_int = int(token_id)
-                    if dependency_tokens is not None:
-                        dependency_tokens.append(token_int)
-                    dependency_ids_by_owner[int(owner_rank)].add(token_int)
-                    source_rank = int(raw_token_owner_ranks[token_int])
-                    if source_rank != int(owner_rank):
-                        remote_dependency_token_ids.append(token_int)
-                        halo_by_peer[(source_rank, int(owner_rank))][token_int].add(
-                            entry_id
-                        )
-            if materialize_entries:
-                entries.append(
-                    Dsv4CompressedEntry.model_construct(
-                        entry_id=entry_id,
-                        kind=spec.kind,
-                        ratio=spec.ratio,
-                        branch_stream_id=branch_view.branch_stream_id,
-                        prefix_stream_id=branch_view.prefix_stream_id,
-                        closure_token_id=closure_token_id,
-                        closure_view_pos=closure_view_pos,
-                        owner_rank=owner_rank,
-                        owner_local_offset=owner_local_offset,
-                        dependency_token_ids=tuple(dependency_tokens or ()),
-                        remote_dependency_token_ids=tuple(remote_dependency_token_ids),
-                        shared_prefix_entry=shared_prefix_entry,
-                        branch_entry_index=branch_entry_index,
-                    )
-                )
-            if materialize_entries:
-                entry_ids_by_branch[int(branch_view.branch_stream_id)].append(entry_id)
-            entry_ids_by_owner[int(owner_rank)].append(entry_id)
-            owner_ranks.append(int(owner_rank))
-            branch_stream_ids.append(int(branch_view.branch_stream_id))
-            prefix_stream_ids.append(int(branch_view.prefix_stream_id))
-            closure_view_positions.append(int(closure_view_pos))
-            shared_prefix_flags.append(bool(shared_prefix_entry))
-            dependency_start_view_positions.append(int(start))
-            entry_ids_by_closure[int(closure_token_id)].append(entry_id)
-            closure_tokens.add(int(closure_token_id))
-            branch_entry_index += 1
-    halo_transfers: list[Dsv4HaloTransfer] = []
-    for (source_rank, target_rank), token_to_entries in sorted(halo_by_peer.items()):
-        halo_transfers.append(
-            Dsv4HaloTransfer.model_construct(
-                source_rank=source_rank,
-                target_rank=target_rank,
-                token_ids=tuple(sorted(token_to_entries)),
-                entry_ids=tuple(
-                    sorted(
-                        {
-                            entry_id
-                            for entry_ids in token_to_entries.values()
-                            for entry_id in entry_ids
-                        }
-                    )
-                ),
-            )
+            rank_count=rank_count,
         )
-    return _Dsv4LayoutBuildResult.model_construct(
-        entries=tuple(entries),
-        compressed_entry_count=len(owner_ranks),
-        halo_transfers=tuple(halo_transfers),
-        entry_ids_by_owner_rank=tuple(
-            tuple(entry_ids) for entry_ids in entry_ids_by_owner
-        ),
-        compressed_entry_owner_ranks=tuple(owner_ranks),
-        entry_branch_stream_ids=tuple(branch_stream_ids),
-        entry_prefix_stream_ids=tuple(prefix_stream_ids),
-        entry_closure_view_positions=tuple(closure_view_positions),
-        entry_shared_prefix_flags=tuple(shared_prefix_flags),
-        entry_dependency_start_view_positions=tuple(dependency_start_view_positions),
-        dependency_token_ids_by_owner_rank=tuple(
-            tuple(sorted(token_ids)) for token_ids in dependency_ids_by_owner
-        ),
-        entry_ids_by_branch_stream=(
-            {
-                branch_id: tuple(entry_ids)
-                for branch_id, entry_ids in sorted(entry_ids_by_branch.items())
-            }
-            if materialize_entries
-            else {}
-        ),
-        entry_ids_by_closure_token={
-            token_id: tuple(entry_ids)
-            for token_id, entry_ids in entry_ids_by_closure.items()
-        },
-        closure_token_ids=tuple(sorted(closure_tokens)),
-    )
+    if spec.kind is Dsv4CompressionKind.HCA:
+        return _build_compact_hca_entries(
+            branch_views=branch_views,
+            raw_token_owner_ranks=raw_token_owner_ranks,
+            owner_change_positions=compact_owner_change_positions,
+            spec=spec,
+            rank_count=rank_count,
+        )
+    raise RuntimeError(f"Unsupported DSV4 compression kind: {spec.kind}")
 
 
 def _build_compact_csa_entries(
     *,
     branch_views: tuple[Dsv4BranchView, ...],
     raw_token_owner_ranks: tuple[int, ...],
-    raw_token_local_offsets: tuple[int, ...],
     owner_change_positions: tuple[int, ...],
     spec: Dsv4CompressionSpec,
     rank_count: int,
@@ -2730,7 +2566,6 @@ def _compact_layout_build_result(
             )
         )
     return _Dsv4LayoutBuildResult.model_construct(
-        entries=(),
         compressed_entry_count=len(owner_ranks),
         halo_transfers=tuple(halo_transfers),
         entry_ids_by_owner_rank=tuple(
@@ -2746,124 +2581,11 @@ def _compact_layout_build_result(
             _expand_merged_token_ranges(token_ranges)
             for token_ranges in dependency_ranges_by_owner
         ),
-        entry_ids_by_branch_stream={},
         entry_ids_by_closure_token={
             token_id: tuple(entry_ids)
             for token_id, entry_ids in entry_ids_by_closure.items()
         },
         closure_token_ids=tuple(sorted(closure_tokens)),
-    )
-
-
-def _compression_starts(
-    *,
-    branch_len: int,
-    min_closure_view_pos: int,
-    spec: Dsv4CompressionSpec,
-) -> Iterator[int]:
-    start_pos = _first_compression_start_with_closure_at_or_after(
-        min_closure_view_pos=int(min_closure_view_pos),
-        ratio=int(spec.ratio),
-    )
-    if spec.kind not in (Dsv4CompressionKind.CSA, Dsv4CompressionKind.HCA):
-        raise RuntimeError(f"Unsupported DSV4 compression kind: {spec.kind}")
-    for start in range(start_pos, branch_len - spec.ratio + 1, spec.ratio):
-        yield start
-
-
-def _branch_token_id_at(*, branch_view: Dsv4BranchView, view_pos: int) -> int:
-    pos = int(view_pos)
-    prefix_count = int(branch_view.prefix_token_count)
-    if pos < 0 or pos >= branch_view.size():
-        raise RuntimeError(
-            f"DSV4 branch view {branch_view.branch_stream_id} position {pos} "
-            f"is outside length {branch_view.size()}"
-        )
-    if pos < prefix_count:
-        return int(branch_view.prefix_start) + pos
-    if branch_view.suffix_start is None:
-        raise RuntimeError(
-            f"DSV4 branch view {branch_view.branch_stream_id} has no suffix position {pos}"
-        )
-    return int(branch_view.suffix_start) + pos - prefix_count
-
-
-def _compression_dependency_token_ranges(
-    *,
-    branch_view: Dsv4BranchView,
-    start: int,
-    spec: Dsv4CompressionSpec,
-) -> tuple[range, ...]:
-    ratio = int(spec.ratio)
-    if spec.kind == Dsv4CompressionKind.HCA:
-        return _branch_token_ranges_for_view_range(
-            branch_view=branch_view,
-            start=start,
-            end=start + ratio,
-        )
-    if spec.kind == Dsv4CompressionKind.CSA:
-        previous = (
-            _branch_token_ranges_for_view_range(
-                branch_view=branch_view,
-                start=start - ratio,
-                end=start,
-            )
-            if int(start) > 0
-            else ()
-        )
-        current = _branch_token_ranges_for_view_range(
-            branch_view=branch_view,
-            start=start,
-            end=start + ratio,
-        )
-        return (*previous, *current)
-    raise RuntimeError(f"Unsupported DSV4 compression kind: {spec.kind}")
-
-
-def _branch_token_ranges_for_view_range(
-    *,
-    branch_view: Dsv4BranchView,
-    start: int,
-    end: int,
-) -> tuple[range, ...]:
-    start_int = int(start)
-    end_int = int(end)
-    prefix_count = int(branch_view.prefix_token_count)
-    if start_int < 0 or end_int < start_int or end_int > branch_view.size():
-        raise RuntimeError(
-            "DSV4 branch-view token range is outside the branch view: "
-            f"branch={branch_view.branch_stream_id}, range=({start}, {end}), "
-            f"size={branch_view.size()}"
-        )
-    if end_int <= prefix_count:
-        return (
-            range(
-                int(branch_view.prefix_start) + start_int,
-                int(branch_view.prefix_start) + end_int,
-            ),
-        )
-    if start_int >= prefix_count:
-        if branch_view.suffix_start is None:
-            raise RuntimeError(
-                f"DSV4 branch view {branch_view.branch_stream_id} has no suffix"
-            )
-        suffix_offset = start_int - prefix_count
-        return (
-            range(
-                int(branch_view.suffix_start) + suffix_offset,
-                int(branch_view.suffix_start) + end_int - prefix_count,
-            ),
-        )
-    if branch_view.suffix_start is None:
-        raise RuntimeError(
-            f"DSV4 branch view {branch_view.branch_stream_id} has no suffix"
-        )
-    return (
-        range(int(branch_view.prefix_start) + start_int, int(branch_view.prefix_end)),
-        range(
-            int(branch_view.suffix_start),
-            int(branch_view.suffix_start) + end_int - prefix_count,
-        ),
     )
 
 
@@ -2876,23 +2598,3 @@ def _first_compression_start_with_closure_at_or_after(
         raise RuntimeError(f"DSV4 compression ratio must be positive, got {ratio}")
     lower_bound = max(0, int(min_closure_view_pos) - int(ratio) + 1)
     return ((lower_bound + int(ratio) - 1) // int(ratio)) * int(ratio)
-
-
-def _owner_for_token(
-    *,
-    raw_token_owner_ranks: tuple[int, ...],
-    raw_token_local_offsets: tuple[int, ...],
-    token_id: int,
-) -> tuple[int, int]:
-    token_int = int(token_id)
-    if token_int < 0 or token_int >= len(raw_token_owner_ranks):
-        raise RuntimeError(f"DSV4 token {token_id} has no CP owner")
-    owner_rank = int(raw_token_owner_ranks[token_int])
-    if owner_rank < 0:
-        raise RuntimeError(f"DSV4 token {token_id} has no CP owner")
-    if token_int >= len(raw_token_local_offsets):
-        raise RuntimeError(f"DSV4 token {token_id} has no local offset")
-    owner_local_offset = int(raw_token_local_offsets[token_int])
-    if owner_local_offset < 0:
-        raise RuntimeError(f"DSV4 token {token_id} has no local offset")
-    return owner_rank, owner_local_offset

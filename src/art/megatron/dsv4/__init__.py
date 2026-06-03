@@ -105,7 +105,6 @@ from .types import (
     Dsv4AttentionForwardResult,
     Dsv4AttentionGradientResult,
     Dsv4BranchView,
-    Dsv4CompressedEntry,
     Dsv4CompressedKvForwardResult,
     Dsv4CompressedKvGradientResult,
     Dsv4CompressedLayout,

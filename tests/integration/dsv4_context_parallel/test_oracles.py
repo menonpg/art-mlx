@@ -13,6 +13,7 @@ from torch.distributed import destroy_process_group, init_process_group
 import torch.multiprocessing as mp
 
 from art.megatron.dsv4 import (
+    Dsv4BranchView,
     Dsv4CompressedLayout,
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
@@ -111,15 +112,15 @@ def test_dense_oracle_rejects_sibling_compressed_leakage_from_bad_topk() -> None
     attn_sink = torch.randn(2, dtype=torch.float64)
     topk = torch.full((18, 3), -1, dtype=torch.long)
     query_token_id = 12
-    sibling_entry_id = next(
-        entry.entry_id
-        for entry in layout.entries
-        if entry.branch_stream_id == 2 and not entry.shared_prefix_entry
+    sibling_entry_id = _first_matching_entry_id(
+        layout,
+        branch_stream_id=2,
+        shared_prefix_entry=False,
     )
-    visible_entry_id = next(
-        entry.entry_id
-        for entry in layout.entries
-        if entry.branch_stream_id == 1 and not entry.shared_prefix_entry
+    visible_entry_id = _first_matching_entry_id(
+        layout,
+        branch_stream_id=1,
+        shared_prefix_entry=False,
     )
     topk[query_token_id] = torch.tensor([sibling_entry_id, visible_entry_id, -1])
     without_sibling = topk.clone()
@@ -987,15 +988,8 @@ def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     max_visible = max(
         sum(
             1
-            for entry in layout.entries
-            if (
-                int(entry.branch_stream_id) == int(branch.branch_stream_id)
-                or (
-                    entry.shared_prefix_entry
-                    and int(entry.prefix_stream_id) == int(branch.prefix_stream_id)
-                )
-            )
-            and int(entry.closure_view_pos) <= int(token.view_pos)
+            for entry_id in range(layout.entry_count())
+            if _entry_visible_to_token(layout, entry_id, branch, int(token.view_pos))
         )
         for branch in layout.branch_views
         for token in branch.tokens
@@ -1004,19 +998,48 @@ def _all_visible_topk(layout: Dsv4CompressedLayout) -> torch.Tensor:
     for branch in layout.branch_views:
         for token in branch.tokens:
             visible = [
-                int(entry.entry_id)
-                for entry in layout.entries
-                if (
-                    int(entry.branch_stream_id) == int(branch.branch_stream_id)
-                    or (
-                        entry.shared_prefix_entry
-                        and int(entry.prefix_stream_id) == int(branch.prefix_stream_id)
-                    )
+                entry_id
+                for entry_id in range(layout.entry_count())
+                if _entry_visible_to_token(
+                    layout, entry_id, branch, int(token.view_pos)
                 )
-                and int(entry.closure_view_pos) <= int(token.view_pos)
             ]
             topk[int(token.packed_token_id), : len(visible)] = torch.tensor(visible)
     return topk
+
+
+def _first_matching_entry_id(
+    layout: Dsv4CompressedLayout,
+    *,
+    branch_stream_id: int,
+    shared_prefix_entry: bool,
+) -> int:
+    for entry_id in range(layout.entry_count()):
+        if int(layout.entry_branch_stream_ids[entry_id]) == int(
+            branch_stream_id
+        ) and bool(layout.entry_shared_prefix_flags[entry_id]) == bool(
+            shared_prefix_entry
+        ):
+            return entry_id
+    raise RuntimeError("No matching DSV4 compressed entry")
+
+
+def _entry_visible_to_token(
+    layout: Dsv4CompressedLayout,
+    entry_id: int,
+    branch: Dsv4BranchView,
+    token_view_pos: int,
+) -> bool:
+    entry_int = int(entry_id)
+    same_branch = int(layout.entry_branch_stream_ids[entry_int]) == int(
+        branch.branch_stream_id
+    )
+    shared_prefix = bool(layout.entry_shared_prefix_flags[entry_int]) and int(
+        layout.entry_prefix_stream_ids[entry_int]
+    ) == int(branch.prefix_stream_id)
+    return (same_branch or shared_prefix) and int(
+        layout.entry_closure_view_positions[entry_int]
+    ) <= int(token_view_pos)
 
 
 def _layout(kind: Dsv4CompressionKind, rank_count: int = 2) -> Dsv4CompressedLayout:

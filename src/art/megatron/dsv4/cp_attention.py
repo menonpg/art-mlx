@@ -2431,9 +2431,7 @@ def _compressed_owner_spaces(
 
 
 def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
-    if layout.compressed_entry_owner_ranks:
-        return layout.compressed_entry_owner_ranks
-    return tuple(int(entry.owner_rank) for entry in layout.entries)
+    return layout.compressed_entry_owner_ranks
 
 
 def _common_backward_rank_parts(

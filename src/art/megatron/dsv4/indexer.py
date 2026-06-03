@@ -10,7 +10,6 @@ import torch
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
 from .types import (
     Dsv4BranchView,
-    Dsv4CompressedEntry,
     Dsv4CompressedLayout,
     Dsv4IndexerKvExchangePeerPlan,
     Dsv4IndexerStagePlan,
@@ -1082,15 +1081,11 @@ def _compressed_entry_owner_rank(
     entry_int = int(entry_id)
     if entry_int < 0 or entry_int >= layout.entry_count():
         raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
-    if layout.compressed_entry_owner_ranks:
-        return int(layout.compressed_entry_owner_ranks[entry_int])
-    return int(layout.entries[entry_int].owner_rank)
+    return int(layout.compressed_entry_owner_ranks[entry_int])
 
 
 def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:
-    if layout.compressed_entry_owner_ranks:
-        return layout.compressed_entry_owner_ranks
-    return tuple(int(entry.owner_rank) for entry in layout.entries)
+    return layout.compressed_entry_owner_ranks
 
 
 def _normalize_indexer_peer_ids(
@@ -1175,38 +1170,15 @@ def _entry_visibility_tensors(
     shared: list[bool] = []
     for entry_id in candidate_entry_ids:
         entry_int = _validate_entry_id(layout=layout, entry_id=int(entry_id))
-        if layout.entry_branch_stream_ids:
-            branch.append(int(layout.entry_branch_stream_ids[entry_int]))
-            prefix.append(int(layout.entry_prefix_stream_ids[entry_int]))
-            pos.append(int(layout.entry_closure_view_positions[entry_int]))
-            shared.append(bool(layout.entry_shared_prefix_flags[entry_int]))
-        else:
-            entry = layout.entries[entry_int]
-            branch.append(int(entry.branch_stream_id))
-            prefix.append(int(entry.prefix_stream_id))
-            pos.append(int(entry.closure_view_pos))
-            shared.append(bool(entry.shared_prefix_entry))
+        branch.append(int(layout.entry_branch_stream_ids[entry_int]))
+        prefix.append(int(layout.entry_prefix_stream_ids[entry_int]))
+        pos.append(int(layout.entry_closure_view_positions[entry_int]))
+        shared.append(bool(layout.entry_shared_prefix_flags[entry_int]))
     return (
         torch.tensor(branch, device=device, dtype=torch.long),
         torch.tensor(prefix, device=device, dtype=torch.long),
         torch.tensor(pos, device=device, dtype=torch.long),
         torch.tensor(shared, device=device, dtype=torch.bool),
-    )
-
-
-def _entry_visible_to_query(
-    *,
-    entry: Dsv4CompressedEntry,
-    query_branch_stream_id: int,
-    query_prefix_stream_id: int,
-    query_view_pos: int,
-) -> bool:
-    same_branch = int(entry.branch_stream_id) == int(query_branch_stream_id)
-    shared_prefix = bool(entry.shared_prefix_entry) and int(
-        entry.prefix_stream_id
-    ) == int(query_prefix_stream_id)
-    return (same_branch or shared_prefix) and int(entry.closure_view_pos) <= int(
-        query_view_pos
     )
 
 
@@ -1219,22 +1191,15 @@ def _entry_id_visible_to_query(
     query_view_pos: int,
 ) -> bool:
     entry_int = _validate_entry_id(layout=layout, entry_id=entry_id)
-    if layout.entry_branch_stream_ids:
-        same_branch = int(layout.entry_branch_stream_ids[entry_int]) == int(
-            query_branch_stream_id
-        )
-        shared_prefix = bool(layout.entry_shared_prefix_flags[entry_int]) and int(
-            layout.entry_prefix_stream_ids[entry_int]
-        ) == int(query_prefix_stream_id)
-        return (same_branch or shared_prefix) and int(
-            layout.entry_closure_view_positions[entry_int]
-        ) <= int(query_view_pos)
-    return _entry_visible_to_query(
-        entry=layout.entries[entry_int],
-        query_branch_stream_id=query_branch_stream_id,
-        query_prefix_stream_id=query_prefix_stream_id,
-        query_view_pos=query_view_pos,
+    same_branch = int(layout.entry_branch_stream_ids[entry_int]) == int(
+        query_branch_stream_id
     )
+    shared_prefix = bool(layout.entry_shared_prefix_flags[entry_int]) and int(
+        layout.entry_prefix_stream_ids[entry_int]
+    ) == int(query_prefix_stream_id)
+    return (same_branch or shared_prefix) and int(
+        layout.entry_closure_view_positions[entry_int]
+    ) <= int(query_view_pos)
 
 
 def _validate_entry_id(*, layout: Dsv4CompressedLayout, entry_id: int) -> int:

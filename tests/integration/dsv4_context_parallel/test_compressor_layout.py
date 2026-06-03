@@ -41,37 +41,24 @@ def test_csa_layout_reuses_shared_prefix_and_adds_branch_entries() -> None:
         range(13, 18)
     )
 
-    assert layout.entry_ids_by_branch_stream == {
-        0: (0, 1),
-        1: (0, 1, 2),
-        2: (0, 1, 3),
-    }
     assert layout.entry_ids_by_owner_rank == ((0, 1), (2, 3))
-
-    assert len(layout.entries) == 4
-    assert layout.entries[0].dependency_token_ids == (0, 1, 2, 3)
-    assert layout.entries[0].closure_token_id == 3
-    assert layout.entries[0].shared_prefix_entry
-    assert layout.entries[0].owner_rank == 0
-    assert layout.entries[0].remote_dependency_token_ids == ()
-
-    assert layout.entries[1].dependency_token_ids == (0, 1, 2, 3, 4, 5, 6, 7)
-    assert layout.entries[1].closure_token_id == 7
-    assert layout.entries[1].shared_prefix_entry
-    assert layout.entries[1].owner_rank == 0
-    assert layout.entries[1].remote_dependency_token_ids == ()
-
-    assert layout.entries[2].dependency_token_ids == (4, 5, 6, 7, 8, 9, 10, 11)
-    assert layout.entries[2].closure_token_id == 11
-    assert not layout.entries[2].shared_prefix_entry
-    assert layout.entries[2].owner_rank == 1
-    assert layout.entries[2].remote_dependency_token_ids == (4, 5, 6, 7)
-
-    assert layout.entries[3].dependency_token_ids == (4, 5, 6, 7, 13, 14, 15, 16)
-    assert layout.entries[3].closure_token_id == 16
-    assert not layout.entries[3].shared_prefix_entry
-    assert layout.entries[3].owner_rank == 1
-    assert layout.entries[3].remote_dependency_token_ids == (4, 5, 6, 7)
+    assert layout.compressed_entry_owner_ranks == (0, 0, 1, 1)
+    assert layout.entry_branch_stream_ids == (0, 0, 1, 2)
+    assert layout.entry_prefix_stream_ids == (0, 0, 0, 0)
+    assert layout.entry_closure_view_positions == (3, 7, 11, 11)
+    assert layout.entry_shared_prefix_flags == (True, True, False, False)
+    assert layout.entry_dependency_start_view_positions == (0, 4, 8, 8)
+    assert layout.dependency_token_ids_by_owner_rank == (
+        tuple(range(8)),
+        tuple(range(4, 12)) + tuple(range(13, 17)),
+    )
+    assert layout.entry_ids_by_closure_token == {
+        3: (0,),
+        7: (1,),
+        11: (2,),
+        16: (3,),
+    }
+    assert layout.closure_token_ids == (3, 7, 11, 16)
 
     assert len(layout.halo_transfers) == 1
     halo = layout.halo_transfers[0]
@@ -89,26 +76,17 @@ def test_hca_layout_drops_incomplete_tails_and_reuses_prefix_entries() -> None:
         spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.HCA, ratio=4),
     )
 
-    assert layout.entry_ids_by_branch_stream == {
-        0: (0, 1),
-        1: (0, 1, 2),
-        2: (0, 1, 3),
-    }
-    assert [entry.dependency_token_ids for entry in layout.entries] == [
-        (0, 1, 2, 3),
-        (4, 5, 6, 7),
-        (8, 9, 10, 11),
-        (13, 14, 15, 16),
-    ]
-    assert [entry.closure_token_id for entry in layout.entries] == [3, 7, 11, 16]
-    assert [entry.shared_prefix_entry for entry in layout.entries] == [
-        True,
-        True,
-        False,
-        False,
-    ]
-    assert layout.entries[2].remote_dependency_token_ids == ()
-    assert layout.entries[3].remote_dependency_token_ids == ()
+    assert layout.entry_count() == 4
+    assert layout.compressed_entry_owner_ranks == (0, 0, 1, 1)
+    assert layout.entry_branch_stream_ids == (0, 0, 1, 2)
+    assert layout.entry_closure_view_positions == (3, 7, 11, 11)
+    assert layout.entry_shared_prefix_flags == (True, True, False, False)
+    assert layout.entry_dependency_start_view_positions == (0, 4, 8, 8)
+    assert layout.dependency_token_ids_by_owner_rank == (
+        tuple(range(8)),
+        tuple(range(8, 12)) + tuple(range(13, 17)),
+    )
+    assert layout.closure_token_ids == (3, 7, 11, 16)
     assert layout.halo_transfers == ()
 
 
