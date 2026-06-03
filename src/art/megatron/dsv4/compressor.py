@@ -160,8 +160,8 @@ class _Dsv4LayoutBuildResult(BaseModel):
     entry_shared_prefix_flags: tuple[bool, ...]
     entry_dependency_start_view_positions: tuple[int, ...]
     dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...]
-    entry_ids_by_closure_token: dict[int, tuple[int, ...]]
     closure_token_ids: tuple[int, ...]
+    closure_entry_ids: tuple[int, ...]
 
 
 class Dsv4CompressedKvForwardWork(BaseModel):
@@ -308,8 +308,8 @@ def _build_dsv4_compressed_layout_from_parts(
         entry_shared_prefix_flags=built.entry_shared_prefix_flags,
         entry_dependency_start_view_positions=built.entry_dependency_start_view_positions,
         dependency_token_ids_by_owner_rank=built.dependency_token_ids_by_owner_rank,
-        entry_ids_by_closure_token=built.entry_ids_by_closure_token,
         closure_token_ids=built.closure_token_ids,
+        closure_entry_ids=built.closure_entry_ids,
     )
 
 
@@ -1814,8 +1814,7 @@ def _build_compact_entries(
     dependency_ranges_by_owner: list[list[tuple[int, int]]] = [
         [] for _ in range(int(rank_count))
     ]
-    entry_ids_by_closure: dict[int, list[int]] = defaultdict(list)
-    closure_tokens: set[int] = set()
+    entry_id_by_closure: dict[int, int] = {}
     halo_by_peer: dict[tuple[int, int], dict[int, set[int]]] = defaultdict(
         lambda: defaultdict(set)
     )
@@ -1826,6 +1825,8 @@ def _build_compact_entries(
             else 0
         )
         prefix_token_count = int(branch_view.prefix_token_count)
+        prefix_start = int(branch_view.prefix_start)
+        suffix_start = int(branch_view.suffix_start or 0)
         branch_len = int(branch_view.size())
         branch_shared_prefix_entry = branch_view.suffix_stream_id is None
         run_owner_rank: int | None = None
@@ -1840,17 +1841,18 @@ def _build_compact_entries(
         next_entry_id = branch_first_entry_id
         for start in range(branch_first_start, branch_len - ratio + 1, ratio):
             closure_view_pos = start + ratio - 1
-            closure_token_id = _fast_branch_token_id_at(
-                branch_view=branch_view,
-                view_pos=closure_view_pos,
+            closure_token_id = (
+                prefix_start + closure_view_pos
+                if closure_view_pos < prefix_token_count
+                else suffix_start + closure_view_pos - prefix_token_count
             )
-            owner_rank = int(raw_token_owner_ranks[int(closure_token_id)])
+            owner_rank = raw_token_owner_ranks[closure_token_id]
             entry_id = next_entry_id
             next_entry_id += 1
             if run_owner_rank is None:
                 run_owner_rank = owner_rank
                 run_first_entry_id = entry_id
-                run_first_start = int(start)
+                run_first_start = start
             elif owner_rank != run_owner_rank:
                 _append_compact_entry_metadata_run(
                     first_entry_id=run_first_entry_id,
@@ -1880,10 +1882,9 @@ def _build_compact_entries(
                 )
                 run_owner_rank = owner_rank
                 run_first_entry_id = entry_id
-                run_first_start = int(start)
-            run_last_start = int(start)
-            entry_ids_by_closure[int(closure_token_id)].append(entry_id)
-            closure_tokens.add(int(closure_token_id))
+                run_first_start = start
+            run_last_start = start
+            entry_id_by_closure[closure_token_id] = entry_id
         if run_owner_rank is not None:
             _append_compact_entry_metadata_run(
                 first_entry_id=run_first_entry_id,
@@ -1933,8 +1934,7 @@ def _build_compact_entries(
         shared_prefix_flags=shared_prefix_flags,
         dependency_start_view_positions=dependency_start_view_positions,
         dependency_ranges_by_owner=dependency_ranges_by_owner,
-        entry_ids_by_closure=entry_ids_by_closure,
-        closure_tokens=closure_tokens,
+        entry_id_by_closure=entry_id_by_closure,
         halo_by_peer=halo_by_peer,
     )
 
@@ -2289,10 +2289,15 @@ def _compact_layout_build_result(
     shared_prefix_flags: list[bool],
     dependency_start_view_positions: list[int],
     dependency_ranges_by_owner: list[list[tuple[int, int]]],
-    entry_ids_by_closure: dict[int, list[int]],
-    closure_tokens: set[int],
+    entry_id_by_closure: dict[int, int],
     halo_by_peer: dict[tuple[int, int], dict[int, set[int]]],
 ) -> _Dsv4LayoutBuildResult:
+    if len(entry_id_by_closure) != len(owner_ranks):
+        raise RuntimeError("DSV4 compressed entries must have unique closure tokens")
+    closure_items = sorted(entry_id_by_closure.items())
+    closure_tokens, closure_entries = (
+        zip(*closure_items, strict=True) if closure_items else ((), ())
+    )
     halo_transfers: list[Dsv4HaloTransfer] = []
     for (source_rank, target_rank), token_to_entries in sorted(halo_by_peer.items()):
         halo_transfers.append(
@@ -2327,11 +2332,8 @@ def _compact_layout_build_result(
             _expand_merged_token_ranges(token_ranges)
             for token_ranges in dependency_ranges_by_owner
         ),
-        entry_ids_by_closure_token={
-            token_id: tuple(entry_ids)
-            for token_id, entry_ids in entry_ids_by_closure.items()
-        },
-        closure_token_ids=tuple(sorted(closure_tokens)),
+        closure_token_ids=closure_tokens,
+        closure_entry_ids=closure_entries,
     )
 
 

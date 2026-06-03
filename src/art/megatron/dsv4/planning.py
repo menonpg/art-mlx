@@ -211,36 +211,32 @@ def _prepare_dsv4_context_parallel_state_impl(
 
 
 def _runtime_plan_from_cp_state(cp_state: ArtContextParallelState):
-    from art.megatron.context_parallel.builder import build_shared_prefix_attention_spec
-    from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
+    from art.megatron.context_parallel import runtime as cp_runtime
 
-    spec = build_shared_prefix_attention_spec(
-        group_ids=cp_state.group_ids.unsqueeze(0),
-        parent_ids=cp_state.parent_ids.unsqueeze(0),
+    original_seq_len = int(cp_state.rank_plan.original_seq_len)
+    runtime_plan = cp_runtime._RUNTIME_PLAN_CACHE.get(
+        (
+            cp_runtime._json_cache_key(cp_state.runtime_key.model_dump(mode="json")),
+            original_seq_len,
+        )
     )
-    runtime_plan = get_or_build_runtime_plan(
-        spec,
-        topology=cp_state.runtime_key.topology,
-        config=cp_state.config,
-        runtime_key=cp_state.runtime_key,
-        original_seq_len=int(cp_state.rank_plan.original_seq_len),
-    )
+    if runtime_plan is None:
+        raise RuntimeError(
+            "DSV4 CP planning requires the normal CP runtime plan prepared in the same host-ahead planning pass"
+        )
     local_rank = int(cp_state.rank_plan.rank)
     if local_rank >= len(runtime_plan.rank_plans):
         raise RuntimeError(
             "DSV4 CP planning local rank is outside runtime plan: "
             f"{local_rank} >= {len(runtime_plan.rank_plans)}"
         )
-    local_stage_ids = tuple(
+    if tuple(
         int(stage.stage_index) for stage in cp_state.rank_plan.stage_plans
-    )
-    planned_stage_ids = tuple(
+    ) != tuple(
         int(stage.stage_index)
         for stage in runtime_plan.rank_plans[local_rank].stage_plans
-    )
-    if local_stage_ids != planned_stage_ids:
+    ):
         raise RuntimeError(
-            "DSV4 CP planning reconstructed a runtime plan inconsistent with "
-            f"the provided rank plan: {planned_stage_ids} vs {local_stage_ids}"
+            "DSV4 CP planning reconstructed a runtime plan inconsistent with the provided rank plan"
         )
     return runtime_plan

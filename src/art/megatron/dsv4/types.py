@@ -300,8 +300,8 @@ class Dsv4CompressedLayout(Dsv4FrozenModel):
     entry_shared_prefix_flags: tuple[bool, ...] = ()
     entry_dependency_start_view_positions: tuple[int, ...] = ()
     dependency_token_ids_by_owner_rank: tuple[tuple[int, ...], ...] = ()
-    entry_ids_by_closure_token: dict[int, tuple[int, ...]] = Field(default_factory=dict)
     closure_token_ids: tuple[int, ...] = ()
+    closure_entry_ids: tuple[int, ...] = ()
 
     def entry_count(self) -> int:
         return int(self.compressed_entry_count)

@@ -100,19 +100,20 @@ def stage_candidate_entry_ids(
     if not global_k_ranges:
         return ()
     if layout.entry_count() and (
-        not layout.entry_ids_by_closure_token or not layout.closure_token_ids
+        not layout.closure_token_ids or not layout.closure_entry_ids
     ):
         raise RuntimeError(
             "DSV4 compressed layout is missing closure-token entry index"
         )
     candidates: list[int] = []
     closure_tokens = layout.closure_token_ids
+    closure_entry_ids = layout.closure_entry_ids
     for range_ in global_k_ranges:
         start = bisect_left(closure_tokens, int(range_.start))
         end = bisect_left(closure_tokens, int(range_.end))
-        for token_id in closure_tokens[start:end]:
-            candidates.extend(layout.entry_ids_by_closure_token.get(token_id, ()))
-    return tuple(sorted(candidates))
+        candidates.extend(closure_entry_ids[start:end])
+    candidates.sort()
+    return tuple(candidates)
 
 
 def build_dsv4_indexer_kv_exchange_peer_plans(
@@ -1004,13 +1005,16 @@ def _ids_by_owner_rank_from_table(
     name: str,
 ) -> tuple[tuple[int, ...], ...]:
     by_rank: list[list[int]] = [[] for _ in range(rank_count)]
-    seen: set[int] = set()
+    owner_count = len(owner_ranks)
+    previous: int | None = None
     for id_ in ids:
         id_int = int(id_)
-        if id_int in seen:
-            raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
-        seen.add(id_int)
-        if id_int < 0 or id_int >= len(owner_ranks):
+        if previous is not None and id_int <= previous:
+            raise RuntimeError(
+                f"DSV4 {name} contains duplicate id or unsorted id {id_int}"
+            )
+        previous = id_int
+        if id_int < 0 or id_int >= owner_count:
             raise RuntimeError(f"DSV4 {name} id {id_int} is outside layout owner table")
         rank = int(owner_ranks[id_int])
         if rank < 0 or rank >= int(rank_count):
@@ -1035,17 +1039,18 @@ def _build_local_indexer_kv_exchange_peer_plans(
         name=f"rank{rank_int}_candidate_entry_ids",
     )
     send: list[list[int]] = [[] for _ in range(rank_count)]
+    owner_count = len(owner_ranks)
     for peer_rank, candidate_ids in enumerate(candidate_entry_ids_by_rank):
-        seen: set[int] = set()
+        previous: int | None = None
         for id_ in candidate_ids:
             entry_id = int(id_)
-            if entry_id in seen:
+            if previous is not None and entry_id <= previous:
                 raise RuntimeError(
                     f"DSV4 rank{peer_rank}_candidate_entry_ids contains duplicate "
-                    f"id {entry_id}"
+                    f"id or unsorted id {entry_id}"
                 )
-            seen.add(entry_id)
-            if entry_id < 0 or entry_id >= len(owner_ranks):
+            previous = entry_id
+            if entry_id < 0 or entry_id >= owner_count:
                 raise RuntimeError(
                     f"DSV4 rank{peer_rank}_candidate_entry_ids id {entry_id} "
                     "is outside layout owner table"

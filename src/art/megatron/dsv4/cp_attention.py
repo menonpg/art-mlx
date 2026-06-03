@@ -2215,9 +2215,8 @@ def _id_space_from_stage_peer_plans_for_rank(
     tuple[tuple[int, ...], ...],
     tuple[int, ...],
 ]:
-    ids: list[int] = []
-    owners: list[int] = []
-    recv: list[list[int]] = [[] for _ in range(rank_count)]
+    ids_by_owner_out: list[list[Sequence[int]]] = [[] for _ in range(rank_count)]
+    recv: list[list[Sequence[int]]] = [[] for _ in range(rank_count)]
     rank_int = int(rank)
     send_attr = _stage_peer_send_attr_for_recv_attr(recv_attr)
     for slot_plans in peer_plans_by_slot:
@@ -2231,16 +2230,31 @@ def _id_space_from_stage_peer_plans_for_rank(
         ):
             raise RuntimeError("DSV4 backward peer-plan peer count mismatch")
         for owner_rank, owner_ids in enumerate(ids_by_owner):
-            for id_ in owner_ids:
-                ids.append(int(id_))
-                owners.append(owner_rank)
+            if owner_ids:
+                ids_by_owner_out[owner_rank].append(owner_ids)
         for peer_rank, peer_ids in enumerate(ids_by_peer_sent):
-            recv[peer_rank].extend(int(id_) for id_ in peer_ids)
-    ids_tuple, owners_tuple = _dedupe_ids_and_owners(ids=ids, owners=owners)
-    recv_ids = tuple(tuple(dict.fromkeys(peer_ids).keys()) for peer_ids in recv)
+            if peer_ids:
+                recv[peer_rank].append(peer_ids)
+    ids: list[int] = []
+    owners: list[int] = []
+    for owner_rank, owner_sequences in enumerate(ids_by_owner_out):
+        if len(owner_sequences) == 1:
+            owner_ids = tuple(owner_sequences[0])
+            ids.extend(owner_ids)
+            owners.extend([owner_rank] * len(owner_ids))
+            continue
+        owner_ids = tuple(dict.fromkeys(chain.from_iterable(owner_sequences)).keys())
+        ids.extend(owner_ids)
+        owners.extend([owner_rank] * len(owner_ids))
+    recv_ids = tuple(
+        tuple(peer_sequences[0])
+        if len(peer_sequences) == 1
+        else tuple(dict.fromkeys(chain.from_iterable(peer_sequences)).keys())
+        for peer_sequences in recv
+    )
     return (
-        ids_tuple,
-        owners_tuple,
+        tuple(ids),
+        tuple(owners),
         recv_ids,
         tuple(dict.fromkeys(chain.from_iterable(recv_ids)).keys()),
     )
@@ -2252,22 +2266,6 @@ def _stage_peer_send_attr_for_recv_attr(recv_attr: str) -> str:
     if recv_attr == "recv_compressed_entry_ids_by_peer":
         return "send_compressed_entry_ids_by_peer"
     raise RuntimeError(f"Unsupported DSV4 stage peer recv attr: {recv_attr}")
-
-
-def _dedupe_ids_and_owners(
-    *,
-    ids: Sequence[int],
-    owners: Sequence[int],
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    seen: set[int] = set()
-    out_ids: list[int] = []
-    out_owners: list[int] = []
-    for id_, owner in zip(ids, owners, strict=True):
-        if id_ not in seen:
-            seen.add(id_)
-            out_ids.append(id_)
-            out_owners.append(owner)
-    return tuple(out_ids), tuple(out_owners)
 
 
 def _append_stage_ranges(

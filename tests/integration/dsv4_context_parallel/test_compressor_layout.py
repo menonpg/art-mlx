@@ -53,13 +53,8 @@ def test_csa_layout_reuses_shared_prefix_and_adds_branch_entries() -> None:
         tuple(range(8)),
         tuple(range(4, 12)) + tuple(range(13, 17)),
     )
-    assert layout.entry_ids_by_closure_token == {
-        3: (0,),
-        7: (1,),
-        11: (2,),
-        16: (3,),
-    }
     assert layout.closure_token_ids == (3, 7, 11, 16)
+    assert layout.closure_entry_ids == (0, 1, 2, 3)
 
     assert len(layout.halo_transfers) == 1
     halo = layout.halo_transfers[0]
@@ -88,6 +83,7 @@ def test_hca_layout_drops_incomplete_tails_and_reuses_prefix_entries() -> None:
         tuple(range(8, 12)) + tuple(range(13, 17)),
     )
     assert layout.closure_token_ids == (3, 7, 11, 16)
+    assert layout.closure_entry_ids == (0, 1, 2, 3)
     assert layout.halo_transfers == ()
 
 
