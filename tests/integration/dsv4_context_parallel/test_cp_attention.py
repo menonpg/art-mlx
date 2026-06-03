@@ -40,11 +40,19 @@ from art.megatron.dsv4 import (
     launch_dsv4_attention_backward_from_stage_plan_slots,
     launch_dsv4_attention_forward_from_stage_plan_groups,
     launch_dsv4_csa_attention_forward_from_stage_plan_slots,
+    launch_dsv4_csa_projected_attention_forward_from_compression_work,
     launch_dsv4_csa_projected_attention_forward_from_context_parallel_state,
+    launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work,
     launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_csa_projected_compression_forward,
+    launch_dsv4_csa_projected_compression_forward_from_context_parallel_state,
     launch_dsv4_hca_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_projected_attention_forward_from_compression_work,
     launch_dsv4_hca_projected_attention_forward_from_context_parallel_state,
+    launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work,
     launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_projected_compression_forward,
+    launch_dsv4_hca_projected_compression_forward_from_context_parallel_state,
     launch_dsv4_projected_attention_backward_from_context_parallel_state,
     launch_dsv4_projected_attention_backward_from_stage_plan_slots,
     launch_exchanged_dsv4_attention_backward,
@@ -624,6 +632,86 @@ def test_csa_projected_attention_wraps_compression_indexer_and_backward(
     assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
 
 
+def test_csa_projected_compression_can_bind_attention_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_bwd",
+        _fake_backward_for_bridge,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
+    slots = _single_rank_slots()
+    main_kv, main_gate, main_bias = _projected_inputs(width=6)
+    indexer_kv, indexer_gate, indexer_bias = _projected_inputs(width=4)
+
+    compression = launch_dsv4_csa_projected_compression_forward(
+        layout=layout,
+        rank=0,
+        main_projected_kv=main_kv,
+        main_projected_gate=main_gate,
+        main_positional_bias=main_bias,
+        main_token_ids=tuple(range(8)),
+        indexer_projected_kv=indexer_kv,
+        indexer_projected_gate=indexer_gate,
+        indexer_positional_bias=indexer_bias,
+        indexer_token_ids=tuple(range(8)),
+        group=None,
+        async_op=True,
+    )
+    compression.wait()
+
+    forward = launch_dsv4_csa_projected_attention_forward_from_compression_work(
+        compression_work=compression,
+        stage_plan_slots=slots,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        indexer_q=torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=torch.float64),
+        indexer_weights=torch.ones(2, 1, dtype=torch.float64),
+        indexer_topk=2,
+        attn_sink=torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64)),
+        group=None,
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+
+    assert forward.compression_kind == Dsv4CompressionKind.CSA
+    assert forward.main_compressed.compressed_entry_ids == (0, 1)
+    assert forward.indexer_compressed is not None
+    torch.testing.assert_close(
+        forward.main_compressed.compressed_kv,
+        compress_projected_kv(
+            layout=layout,
+            projected_kv=main_kv,
+            projected_gate=main_gate,
+            positional_bias=main_bias,
+        ),
+    )
+    backward = launch_dsv4_projected_attention_backward_from_stage_plan_slots(
+        layout=layout,
+        rank=0,
+        stage_plan_slots=slots,
+        forward_result=forward,
+        grad_out=torch.ones_like(forward.attention.out),
+        group=None,
+        async_op=True,
+    ).wait_post_process()
+
+    torch.testing.assert_close(
+        backward.attention.dcompressed_kv,
+        _kv_rows((28.0, 29.0)),
+    )
+    assert not bool(backward.main_compressor.dprojected_kv.abs().sum().eq(0).item())
+
+
 def test_hca_projected_attention_wraps_compression_and_backward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -711,6 +799,79 @@ def test_hca_projected_attention_wraps_compression_and_backward(
         atol=1e-6,
     )
     assert not bool(backward.main_compressor.dprojected_gate.abs().sum().eq(0).item())
+
+
+def test_hca_projected_compression_from_context_state_can_bind_attention_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cp_attention.sparse_kernel,
+        "dsv4_sparse_fwd",
+        _fake_forward_for_replay,
+    )
+    layout = _single_rank_layout(Dsv4CompressionKind.HCA)
+    slots = _single_rank_slots()
+    context_state = _context_state(hca_layout=layout, slots=slots)
+    projected_kv, projected_gate, positional_bias = _projected_inputs(width=3)
+
+    compression = (
+        launch_dsv4_hca_projected_compression_forward_from_context_parallel_state(
+            context_state=context_state,
+            projected_kv=projected_kv,
+            projected_gate=projected_gate,
+            positional_bias=positional_bias,
+            token_ids=tuple(range(8)),
+            async_op=True,
+        )
+    )
+    compression.wait()
+    forward = launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work(
+        context_state=context_state,
+        compression_work=compression,
+        query=torch.zeros(2, 2, 3, dtype=torch.float64),
+        query_token_ids=(3, 7),
+        raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+        raw_token_ids=tuple(range(8)),
+        attn_sink=torch.log(torch.tensor([5.0, 7.0], dtype=torch.float64)),
+        async_op=True,
+        scale=0.25,
+        window_size=4,
+    ).wait_post_process()
+
+    assert forward.compression_kind == Dsv4CompressionKind.HCA
+    assert forward.indexer_compressed is None
+    assert forward.main_compressed.compressed_entry_ids == (0, 1)
+    assert not bool(forward.attention.out.abs().sum().eq(0).item())
+
+
+def test_projected_attention_rejects_wrong_prelaunched_compression_kind() -> None:
+    projected_kv, projected_gate, positional_bias = _projected_inputs(width=3)
+    compression = launch_dsv4_hca_projected_compression_forward(
+        layout=_single_rank_layout(Dsv4CompressionKind.HCA),
+        rank=0,
+        projected_kv=projected_kv,
+        projected_gate=projected_gate,
+        positional_bias=positional_bias,
+        token_ids=tuple(range(8)),
+        group=None,
+        async_op=True,
+    )
+
+    with pytest.raises(RuntimeError, match="compression kind mismatch"):
+        launch_dsv4_csa_projected_attention_forward_from_compression_work(
+            compression_work=compression,
+            stage_plan_slots=_single_rank_slots(),
+            query=torch.zeros(2, 2, 3, dtype=torch.float64),
+            query_token_ids=(3, 7),
+            raw_kv=torch.zeros(8, 3, dtype=torch.float64),
+            raw_token_ids=tuple(range(8)),
+            indexer_q=torch.zeros(2, 1, 2, dtype=torch.float64),
+            indexer_weights=torch.ones(2, 1, dtype=torch.float64),
+            indexer_topk=2,
+            attn_sink=torch.zeros(2, dtype=torch.float64),
+            group=None,
+            async_op=True,
+        )
 
 
 def test_projected_attention_aligns_float_compressed_grad_for_bf16_forward(
