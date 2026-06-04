@@ -5,6 +5,7 @@ from functools import wraps
 import gc
 import hashlib
 import json
+import os
 from typing import Any, cast
 import warnings
 
@@ -47,7 +48,13 @@ _CP4_SEARCH_PROBE_IMPROVEMENT_MS = 1.0
 _PLAN_CACHE_MAX_ENTRIES = 128
 
 StagePiece = tuple[TokenRange, TokenRange, AttnMaskKind, int | None]
-StageSliceKey = tuple[int, int, int, int, int, str, int]
+StageSliceIntersections = tuple[
+    AttnSlice, list[tuple[int, TokenRange]], list[tuple[int, TokenRange]]
+]
+
+
+def _token_range(start: int, end: int) -> TokenRange:
+    return TokenRange(start=int(start), end=int(end))
 
 
 class _PlanningBundle(BaseModel):
@@ -207,12 +214,13 @@ def _planner_metadata_matches(
 
 
 def _planner_runtime_hardware() -> str | None:
-    if not torch.cuda.is_available():
-        return None
-    try:
-        return str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    except Exception:
-        return str(torch.cuda.get_device_name(0))
+    """Return host-supplied hardware provenance without touching CUDA state.
+
+    CP planning runs in the CPU lookahead window. Querying CUDA here can lazily
+    initialize the driver and consume the overlap budget, so runtime hardware
+    must be provided by the caller or launch environment if it is needed.
+    """
+    return os.environ.get("ART_CP_RUNTIME_HARDWARE")
 
 
 def _planner_best_effort_warning_message(provenance: PlannerProvenance) -> str:
@@ -438,9 +446,7 @@ def _build_chunk_ranges(
 ) -> tuple[TokenRange, ...]:
     ranges: list[TokenRange] = []
     for start in range(0, valid_tokens, chunk_size):
-        ranges.append(
-            TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
-        )
+        ranges.append(_token_range(start, min(start + chunk_size, valid_tokens)))
     return tuple(ranges)
 
 
@@ -467,8 +473,36 @@ def _indexed_intersections(
         start = max(base_start, int(candidate.start))
         end = min(base_end, int(candidate.end))
         if end > start:
-            intersections.append((index, TokenRange(start=start, end=end)))
+            intersections.append((index, _token_range(start, end)))
     return intersections
+
+
+def _stage_slice_intersections(
+    row_spec: PackedRowAttentionSpec,
+    *,
+    chunk_ranges: tuple[TokenRange, ...],
+) -> tuple[StageSliceIntersections, ...]:
+    chunk_starts = tuple(int(range_.start) for range_ in chunk_ranges)
+    chunk_ends = tuple(int(range_.end) for range_ in chunk_ranges)
+    intersections: list[StageSliceIntersections] = []
+    for slice_ in row_spec.slices:
+        q_parts = _indexed_intersections(
+            slice_.q_range,
+            chunk_ranges,
+            candidate_starts=chunk_starts,
+            candidate_ends=chunk_ends,
+        )
+        if not q_parts:
+            continue
+        k_parts = _indexed_intersections(
+            slice_.k_range,
+            chunk_ranges,
+            candidate_starts=chunk_starts,
+            candidate_ends=chunk_ends,
+        )
+        if k_parts:
+            intersections.append((slice_, q_parts, k_parts))
+    return tuple(intersections)
 
 
 def _slice_pair_count(
@@ -840,9 +874,8 @@ def _build_chunk_pair_program(
 
 
 def _collect_rank_stage_pieces(
-    row_spec: PackedRowAttentionSpec,
     *,
-    chunk_ranges: tuple[TokenRange, ...],
+    slice_intersections: tuple[StageSliceIntersections, ...],
     owners: tuple[int, ...],
     wave_assignment: tuple[int, ...],
     target_rank: int,
@@ -862,27 +895,8 @@ def _collect_rank_stage_pieces(
     send_request_ranges: list[list[list[TokenRange]]] = [
         [[] for _ in range(cp_size)] for _ in range(wave_count)
     ]
-    chunk_starts = tuple(int(range_.start) for range_ in chunk_ranges)
-    chunk_ends = tuple(int(range_.end) for range_ in chunk_ranges)
 
-    for slice_ in row_spec.slices:
-        q_parts = _indexed_intersections(
-            slice_.q_range,
-            chunk_ranges,
-            candidate_starts=chunk_starts,
-            candidate_ends=chunk_ends,
-        )
-        if not q_parts:
-            continue
-        k_parts = _indexed_intersections(
-            slice_.k_range,
-            chunk_ranges,
-            candidate_starts=chunk_starts,
-            candidate_ends=chunk_ends,
-        )
-        if not k_parts:
-            continue
-
+    for slice_, q_parts, k_parts in slice_intersections:
         target_q_parts = [
             (q_chunk_index, q_piece)
             for q_chunk_index, q_piece in q_parts
@@ -1171,10 +1185,10 @@ def _merge_chunk_ranges_from_mask(
         if int(range_.start) <= current_end:
             current_end = max(current_end, int(range_.end))
             continue
-        merged.append(TokenRange(start=current_start, end=current_end))
+        merged.append(_token_range(current_start, current_end))
         current_start = int(range_.start)
         current_end = int(range_.end)
-    merged.append(TokenRange(start=current_start, end=current_end))
+    merged.append(_token_range(current_start, current_end))
     return tuple(merged)
 
 
@@ -1780,7 +1794,7 @@ def _stage_local_buffer_ranges(
         size = int(range_.size())
         if size <= 0:
             continue
-        local_ranges.append(TokenRange(start=cursor, end=cursor + size))
+        local_ranges.append(_token_range(cursor, cursor + size))
         cursor += size
     return tuple(local_ranges)
 
@@ -1789,7 +1803,19 @@ def _token_index_tensor_for_ranges(
     ranges: tuple[TokenRange, ...],
     padded_len: int,
 ) -> torch.Tensor:
-    indices = torch.full((int(padded_len),), -1, dtype=torch.int64)
+    if len(ranges) == 1:
+        range_ = ranges[0]
+        size = int(range_.size())
+        if size == int(padded_len):
+            return torch.arange(int(range_.start), int(range_.end), dtype=torch.int64)
+        indices = torch.empty((int(padded_len),), dtype=torch.int64)
+        indices[:size] = torch.arange(
+            int(range_.start), int(range_.end), dtype=torch.int64
+        )
+        indices[size:] = -1
+        return indices
+    indices = torch.empty((int(padded_len),), dtype=torch.int64)
+    indices.fill_(-1)
     cursor = 0
     for range_ in ranges:
         size = int(range_.size())
@@ -1836,7 +1862,7 @@ def _build_stage_from_pieces(
         * int(block_size)
     )
     owner_local_q_ranges: tuple[TokenRange, ...] = tuple()
-    localized_slices: list[AttnSlice] = []
+    localized_slice_parts: list[StagePiece] = []
     mask_metadata: ExactMaskMetadata | None = None
     q_remap_cache: dict[tuple[int, int], TokenRange] = {}
     k_remap_cache: dict[tuple[int, int], TokenRange] = {}
@@ -1847,7 +1873,6 @@ def _build_stage_from_pieces(
         )
     q_token_indices = _token_index_tensor_for_ranges(global_q_ranges, q_len)
     k_token_indices = _token_index_tensor_for_ranges(global_k_ranges, k_len)
-    last_slice_key: StageSliceKey | None = None
     for q_piece, k_piece, piece_mask_kind, family_index in sorted(
         pieces,
         key=lambda piece: (
@@ -1869,33 +1894,56 @@ def _build_stage_from_pieces(
         if localized_k is None:
             localized_k = _remap_subrange(k_piece, global_k_ranges)
             k_remap_cache[k_key] = localized_k
-        slice_key = (
-            0,
-            int(localized_q.start),
-            int(localized_q.end),
-            int(localized_k.start),
-            int(localized_k.end),
-            piece_mask_kind.value,
-            -1 if family_index is None else int(family_index),
-        )
-        if slice_key != last_slice_key:
-            localized_slices.append(
-                AttnSlice.model_construct(
-                    q_range=localized_q,
-                    k_range=localized_k,
-                    mask_kind=piece_mask_kind,
-                    row_index=0,
-                    family_index=family_index,
-                )
+        if localized_slice_parts:
+            last_q, last_k, last_mask_kind, last_family = localized_slice_parts[-1]
+            if (
+                last_q.start == localized_q.start
+                and last_q.end == localized_q.end
+                and last_k.start == localized_k.start
+                and last_k.end == localized_k.end
+                and last_mask_kind is piece_mask_kind
+                and last_family == family_index
+            ):
+                continue
+            if (
+                last_q.start == localized_q.start
+                and last_q.end == localized_q.end
+                and last_k.end == localized_k.start
+                and last_family == family_index
+            ):
+                merged_mask_kind = None
+                if last_mask_kind is piece_mask_kind:
+                    merged_mask_kind = last_mask_kind
+                elif (
+                    last_mask_kind is AttnMaskKind.FULL
+                    and piece_mask_kind is AttnMaskKind.CAUSAL
+                ):
+                    merged_mask_kind = AttnMaskKind.CAUSAL
+                if merged_mask_kind is not None:
+                    localized_slice_parts[-1] = (
+                        last_q,
+                        _token_range(last_k.start, localized_k.end),
+                        merged_mask_kind,
+                        last_family,
+                    )
+                    continue
+        localized_slice_parts.append(
+            (
+                localized_q,
+                localized_k,
+                piece_mask_kind,
+                family_index,
             )
-            last_slice_key = slice_key
-    if localized_slices:
+        )
+    if localized_slice_parts:
         mask_metadata = ExactMaskMetadata.model_construct(
             q_token_indices=q_token_indices,
             k_token_indices=k_token_indices,
             cache_key=_exact_mask_metadata_cache_key(
-                q_token_indices=q_token_indices,
-                k_token_indices=k_token_indices,
+                q_ranges=global_q_ranges,
+                k_ranges=global_k_ranges,
+                q_len=q_len,
+                k_len=k_len,
             ),
         )
     return StagePlan.model_construct(
@@ -1904,7 +1952,16 @@ def _build_stage_from_pieces(
         source_ranks=source_ranks,
         is_local_stage=is_local_stage,
         wave_index=wave_index,
-        slices=tuple(localized_slices),
+        slices=tuple(
+            AttnSlice.model_construct(
+                q_range=q_range,
+                k_range=k_range,
+                mask_kind=mask_kind,
+                row_index=0,
+                family_index=family_index,
+            )
+            for q_range, k_range, mask_kind, family_index in localized_slice_parts
+        ),
         global_q_ranges=global_q_ranges,
         global_k_ranges=global_k_ranges,
         owner_local_q_ranges=owner_local_q_ranges,
@@ -1922,6 +1979,7 @@ def _build_rank_runtime_plan(
     *,
     row_spec: PackedRowAttentionSpec,
     chunk_ranges: tuple[TokenRange, ...],
+    slice_intersections: tuple[StageSliceIntersections, ...] | None = None,
     owners: tuple[int, ...],
     wave_assignment: tuple[int, ...],
     token_layout_index: TokenLayoutIndex,
@@ -1947,8 +2005,9 @@ def _build_rank_runtime_plan(
         recv_request_ranges,
         send_request_ranges,
     ) = _collect_rank_stage_pieces(
-        row_spec,
-        chunk_ranges=chunk_ranges,
+        slice_intersections=slice_intersections
+        if slice_intersections is not None
+        else _stage_slice_intersections(row_spec, chunk_ranges=chunk_ranges),
         owners=owners,
         wave_assignment=wave_assignment,
         target_rank=target_rank,
@@ -2029,9 +2088,8 @@ def _build_rank_runtime_plan(
         stage_k_len = _ranges_size(global_k_ranges)
         remote_buffer_range = None
         if stage_k_len > 0:
-            remote_buffer_range = TokenRange(
-                start=remote_cursor,
-                end=remote_cursor + stage_k_len,
+            remote_buffer_range = _token_range(
+                remote_cursor, remote_cursor + stage_k_len
             )
             remote_cursor += stage_k_len
         source_ranks = tuple(
@@ -2586,6 +2644,10 @@ def _build_rank_runtime_plan_for_spec(
     return _build_rank_runtime_plan(
         row_spec=row_spec,
         chunk_ranges=chunk_ranges,
+        slice_intersections=_stage_slice_intersections(
+            row_spec,
+            chunk_ranges=chunk_ranges,
+        ),
         owners=owners,
         wave_assignment=wave_assignment,
         token_layout_index=token_layout_index,
@@ -2614,10 +2676,15 @@ def _build_runtime_plan(
         owners=owners,
         cp_size=cp_size,
     )
+    slice_intersections = _stage_slice_intersections(
+        row_spec,
+        chunk_ranges=chunk_ranges,
+    )
     rank_plans = [
         _build_rank_runtime_plan(
             row_spec=row_spec,
             chunk_ranges=chunk_ranges,
+            slice_intersections=slice_intersections,
             owners=owners,
             wave_assignment=wave_assignment,
             token_layout_index=token_layout_index,
@@ -2696,7 +2763,7 @@ def _split_row_by_cost(
     block_size: int,
 ) -> tuple[TokenRange | None, ...]:
     if cp_size == 1:
-        return (TokenRange(start=0, end=row_spec.valid_tokens),)
+        return (_token_range(0, row_spec.valid_tokens),)
     if row_spec.valid_tokens == 0:
         return tuple(None for _ in range(cp_size))
 
@@ -2745,7 +2812,7 @@ def _split_row_by_cost(
         if end <= start:
             ranges.append(None)
         else:
-            ranges.append(TokenRange(start=start, end=end))
+            ranges.append(_token_range(start, end))
     return tuple(ranges)
 
 
@@ -2760,7 +2827,7 @@ def _intersections(
         start = max(base_range.start, owner_range.start)
         end = min(base_range.end, owner_range.end)
         if end > start:
-            intersections.append((rank, TokenRange(start=start, end=end)))
+            intersections.append((rank, _token_range(start, end)))
     return intersections
 
 
@@ -2782,14 +2849,24 @@ def _resolve_stage_mask_kind(
 def _merge_ranges(ranges: list[TokenRange]) -> tuple[TokenRange, ...]:
     if not ranges:
         return tuple()
-    sorted_ranges = sorted(ranges, key=lambda range_: (range_.start, range_.end))
-    merged: list[TokenRange] = [sorted_ranges[0]]
-    for range_ in sorted_ranges[1:]:
-        last = merged[-1]
-        if range_.start <= last.end:
-            merged[-1] = TokenRange(start=last.start, end=max(last.end, range_.end))
+    sorted_ranges = sorted(
+        {
+            (int(range_.start), int(range_.end))
+            for range_ in ranges
+            if int(range_.end) > int(range_.start)
+        }
+    )
+    if not sorted_ranges:
+        return tuple()
+    current_start, current_end = sorted_ranges[0]
+    merged: list[TokenRange] = []
+    for start, end in sorted_ranges[1:]:
+        if int(start) <= int(current_end):
+            current_end = max(int(current_end), int(end))
             continue
-        merged.append(range_)
+        merged.append(_token_range(current_start, current_end))
+        current_start, current_end = start, end
+    merged.append(_token_range(current_start, current_end))
     return tuple(merged)
 
 
@@ -2800,9 +2877,9 @@ def _remap_subrange(
     stage_offset = 0
     for merged_range in merged_ranges:
         if subrange.start >= merged_range.start and subrange.end <= merged_range.end:
-            return TokenRange(
-                start=stage_offset + subrange.start - merged_range.start,
-                end=stage_offset + subrange.end - merged_range.start,
+            return _token_range(
+                stage_offset + subrange.start - merged_range.start,
+                stage_offset + subrange.end - merged_range.start,
             )
         stage_offset += merged_range.size()
     raise RuntimeError(
@@ -2811,25 +2888,16 @@ def _remap_subrange(
     )
 
 
-def _tensor_sha1(tensor: torch.Tensor) -> str:
-    cpu_tensor = tensor.detach().contiguous().to(device="cpu", dtype=torch.int64)
-    return hashlib.sha1(cpu_tensor.numpy().tobytes()).hexdigest()
-
-
 def _exact_mask_metadata_cache_key(
     *,
-    q_token_indices: torch.Tensor,
-    k_token_indices: torch.Tensor,
+    q_ranges: tuple[TokenRange, ...],
+    k_ranges: tuple[TokenRange, ...],
+    q_len: int,
+    k_len: int,
 ) -> str:
-    return json.dumps(
-        {
-            "q_token_indices_sha1": _tensor_sha1(q_token_indices),
-            "k_token_indices_sha1": _tensor_sha1(k_token_indices),
-            "q_len": int(q_token_indices.numel()),
-            "k_len": int(k_token_indices.numel()),
-        },
-        sort_keys=True,
-    )
+    q_key = ",".join(f"{range_.start}:{range_.end}" for range_ in q_ranges)
+    k_key = ",".join(f"{range_.start}:{range_.end}" for range_ in k_ranges)
+    return f"q{int(q_len)}[{q_key}]|k{int(k_len)}[{k_key}]"
 
 
 def _build_token_uids(

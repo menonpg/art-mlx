@@ -1284,9 +1284,17 @@ def _stage_token_dim(tensor: torch.Tensor) -> int:
 
 
 def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int], ...]:
-    return tuple(
-        sorted((int(stream.start), int(stream.end)) for stream in layout.streams)
-    )
+    ranges = sorted((int(stream.start), int(stream.end)) for stream in layout.streams)
+    if not ranges:
+        return ()
+    merged = [list(ranges[0])]
+    for start, end in ranges[1:]:
+        current = merged[-1]
+        if int(start) <= int(current[1]):
+            current[1] = max(int(current[1]), int(end))
+        else:
+            merged.append([int(start), int(end)])
+    return tuple((int(start), int(end)) for start, end in merged)
 
 
 def _raw_token_owner_rank(*, layout: Dsv4CompressedLayout, token_id: int) -> int:
