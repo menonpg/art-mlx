@@ -12,7 +12,9 @@ _QWEN3_DENSE_HANDLER_KEY = "qwen3_dense"
 _QWEN3_MOE_HANDLER_KEY = "qwen3_moe"
 _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
 _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
+_GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
+_WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
 
 _DENSE_TARGET_MODULES = (
@@ -26,6 +28,7 @@ _DENSE_TARGET_MODULES = (
 )
 
 _QWEN3_MOE_TARGET_MODULES = (*_DENSE_TARGET_MODULES, "experts")
+_GEMMA4_MOE_TARGET_MODULES = (*_DENSE_TARGET_MODULES, "experts")
 
 _QWEN3_5_DENSE_TARGET_MODULES = (
     "q_proj",
@@ -126,13 +129,29 @@ QWEN3_5_MOE_SPEC = ModelSupportSpec(
     ),
 )
 
+GEMMA4_MOE_SPEC = ModelSupportSpec(
+    key="gemma4_moe",
+    handler_key=_GEMMA4_MOE_HANDLER_KEY,
+    is_moe=True,
+    model_names=(
+        "google/gemma-4-26B-A4B",
+        "google/gemma-4-26B-A4B-it",
+    ),
+    default_target_modules=_GEMMA4_MOE_TARGET_MODULES,
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    dependency_floor=DependencyFloor(
+        transformers="5.6.2",
+        megatron_bridge="8802c854c13b31a94968a393ff558a70b85ed840",
+    ),
+)
+
 VALIDATED_MODEL_SUPPORT_SPECS = (
     QWEN3_MOE_SPEC,
     QWEN3_DENSE_SPEC,
     QWEN3_5_MOE_SPEC,
     QWEN3_5_DENSE_SPEC,
 )
-PROBE_ONLY_MODEL_SUPPORT_SPECS = ()
+PROBE_ONLY_MODEL_SUPPORT_SPECS = (GEMMA4_MOE_SPEC,)
 _ALL_MODEL_SUPPORT_SPECS = (
     DEFAULT_DENSE_SPEC,
     *VALIDATED_MODEL_SUPPORT_SPECS,
@@ -170,6 +189,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.qwen3_5",
         "QWEN3_5_MOE_HANDLER",
     ),
+    _GEMMA4_MOE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.gemma4",
+        "GEMMA4_MOE_HANDLER",
+    ),
 }
 _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
     "qwen3_5_dense": (
@@ -180,6 +203,10 @@ _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.qwen3_5",
         "ensure_qwen35_text_only_bridge_registered",
     ),
+    "gemma4_moe": (
+        "art.megatron.model_support.handlers.gemma4",
+        "ensure_gemma4_text_only_bridge_registered",
+    ),
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
 _REGISTERED_BRIDGE_KEYS: set[str] = set()
@@ -189,6 +216,7 @@ QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
 QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
 QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)
 QWEN3_5_MODELS = QWEN3_5_DENSE_MODELS | QWEN3_5_MOE_MODELS
+GEMMA4_MOE_MODELS = frozenset(GEMMA4_MOE_SPEC.model_names)
 
 
 class UnsupportedModelArchitectureError(ValueError):
