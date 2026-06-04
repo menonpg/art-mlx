@@ -296,16 +296,23 @@ def _analytic_attn_sink_grad(
     grad_out: torch.Tensor,
     global_lse_log2: torch.Tensor,
 ) -> torch.Tensor:
-    delta = (global_out.float() * grad_out.float()).sum(dim=-1)
-    global_lse = global_lse_log2.float() * _LN2
     sink = attn_sink.float().reshape(1, 1, -1)
-    finite = torch.isfinite(global_lse) & torch.isfinite(sink)
-    p_sink = torch.where(
-        finite,
-        torch.exp(sink - global_lse),
-        torch.zeros_like(global_lse),
-    )
-    return -(delta * p_sink).sum(dim=(0, 1)).to(dtype=attn_sink.dtype)
+    grad = torch.zeros_like(attn_sink, dtype=torch.float32)
+    batch, query_count, head_count, head_dim = global_out.shape
+    denom = max(1, int(batch) * int(head_count) * int(head_dim))
+    query_step = max(1, min(int(query_count), (1 << 26) // denom))
+    for start in range(0, int(query_count), query_step):
+        end = min(int(query_count), start + int(query_step))
+        delta = (global_out[:, start:end].float() * grad_out[:, start:end].float()).sum(
+            dim=-1
+        )
+        global_lse = global_lse_log2[:, start:end].float() * _LN2
+        finite = torch.isfinite(global_lse) & torch.isfinite(sink)
+        p_sink = torch.where(
+            finite, torch.exp(sink - global_lse), torch.zeros_like(global_lse)
+        )
+        grad.sub_((delta * p_sink).sum(dim=(0, 1)))
+    return grad.to(dtype=attn_sink.dtype)
 
 
 def _require_same_device(
