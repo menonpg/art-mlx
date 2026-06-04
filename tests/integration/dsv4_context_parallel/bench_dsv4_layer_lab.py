@@ -854,6 +854,7 @@ def _time_planning_case(
         dsv4_start = time.perf_counter()
         prepare_dsv4_context_parallel_state(
             cp_state=cp_state,
+            attention_spec=_spec,
             csa_ratio=int(csa_ratio),
             hca_ratio=int(hca_ratio),
             include_csa=include_csa,
@@ -920,6 +921,7 @@ def _runtime_worker(
         dsv4_start = time.perf_counter()
         context_state = prepare_dsv4_context_parallel_state(
             cp_state=cp_state,
+            attention_spec=_spec,
             csa_ratio=int(config.csa_ratio),
             hca_ratio=int(config.hca_ratio),
             include_csa="csa" in config.kinds,

@@ -2725,11 +2725,16 @@ def _build_runtime_token_layout_index(
 
 
 def _row_signature(row_spec: PackedRowAttentionSpec) -> str:
-    payload = {
-        "valid_tokens": row_spec.valid_tokens,
-        "slices": [slice_.model_dump(mode="json") for slice_ in row_spec.slices],
-    }
-    return json.dumps(payload, sort_keys=True)
+    parts = [str(int(row_spec.valid_tokens))]
+    append = parts.append
+    for slice_ in row_spec.slices:
+        family_index = -1 if slice_.family_index is None else int(slice_.family_index)
+        append(
+            f"{int(slice_.row_index)}:{int(slice_.q_range.start)}:"
+            f"{int(slice_.q_range.end)}:{int(slice_.k_range.start)}:"
+            f"{int(slice_.k_range.end)}:{slice_.mask_kind.value}:{family_index}"
+        )
+    return "|".join(parts)
 
 
 def _range_key(range_: TokenRange) -> tuple[int, int]:

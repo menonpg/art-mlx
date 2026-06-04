@@ -32,6 +32,7 @@ else:
 def prepare_dsv4_context_parallel_state(
     *,
     cp_state: ArtContextParallelState,
+    attention_spec: Any | None = None,
     csa_ratio: int = 4,
     hca_ratio: int = 128,
     include_csa: bool = True,
@@ -45,6 +46,7 @@ def prepare_dsv4_context_parallel_state(
     try:
         return _prepare_dsv4_context_parallel_state_impl(
             cp_state=cp_state,
+            attention_spec=attention_spec,
             csa_ratio=csa_ratio,
             hca_ratio=hca_ratio,
             include_csa=include_csa,
@@ -59,6 +61,7 @@ def prepare_dsv4_context_parallel_state(
 def _prepare_dsv4_context_parallel_state_impl(
     *,
     cp_state: ArtContextParallelState,
+    attention_spec: Any | None,
     csa_ratio: int,
     hca_ratio: int,
     include_csa: bool,
@@ -113,6 +116,7 @@ def _prepare_dsv4_context_parallel_state_impl(
             build_dsv4_compressed_layouts_from_cp_state(
                 state=cp_state,
                 specs=tuple(layout_specs),
+                attention_spec=attention_spec,
             ),
             strict=True,
         )

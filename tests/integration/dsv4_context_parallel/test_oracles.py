@@ -925,7 +925,7 @@ def _real_planner_dsv4_context_state(
         prepare_megatron_context_parallel_state,
     )
 
-    cp_state, _rank_plan, _spec, _pad = prepare_megatron_context_parallel_state(
+    cp_state, _rank_plan, spec, _pad = prepare_megatron_context_parallel_state(
         micro=_real_planner_micro() if micro is None else micro,
         topology=ParallelTopology(cp=int(world_size)),
         config=ContextParallelConfig(block_size=4, planner_chunk_size=4),
@@ -934,6 +934,7 @@ def _real_planner_dsv4_context_state(
     )
     return prepare_dsv4_context_parallel_state(
         cp_state=cp_state,
+        attention_spec=spec,
         hca_ratio=int(hca_ratio),
         include_csa=include_csa,
         include_hca=include_hca,

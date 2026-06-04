@@ -396,16 +396,15 @@ def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans_for_layouts(
     has_queries = tuple(
         _ranges_have_tokens(stage_plan.global_q_ranges) for stage_plan in stage_plans
     )
-    raw_valid_ranges = _layout_stream_ranges(layout_tuple[0])
-    raw_valid_starts = tuple(start for start, _end in raw_valid_ranges)
     recv_raw = tuple(
-        _stage_raw_token_ids_by_owner_rank(
+        _stage_raw_token_ids_by_stage_plan_sources(
             layout=layout_tuple[0],
-            ranges=stage_plan.global_k_ranges if has_queries[rank] else (),
+            stage_plan=stage_plan,
+            rank=rank,
             rank_count=rank_count,
-            valid_ranges=raw_valid_ranges,
-            valid_range_starts=raw_valid_starts,
         )
+        if has_queries[rank]
+        else tuple(tuple() for _ in range(rank_count))
         for rank, stage_plan in enumerate(stage_plans)
     )
     send_raw = _transpose_peer_ids(recv_raw)
@@ -878,59 +877,61 @@ def _stage_raw_token_ids(
     return tuple(token_ids)
 
 
-def _stage_raw_token_ids_by_owner_rank(
+def _stage_raw_token_ids_by_stage_plan_sources(
     *,
     layout: Dsv4CompressedLayout,
-    ranges: Sequence[TokenRangeLike],
+    stage_plan: Any,
+    rank: int,
     rank_count: int,
-    valid_ranges: Sequence[tuple[int, int]] | None = None,
-    valid_range_starts: Sequence[int] | None = None,
 ) -> tuple[tuple[int, ...], ...]:
     by_rank: list[list[int]] = [[] for _ in range(int(rank_count))]
-    intersections: list[tuple[int, int]] = []
-    if valid_ranges is None:
-        valid_ranges = _layout_stream_ranges(layout)
-    if valid_range_starts is None:
-        valid_range_starts = tuple(start for start, _end in valid_ranges)
-    owner_ranks = layout.raw_token_owner_ranks
-    owner_count = len(owner_ranks)
-    owner_changes = layout.raw_token_owner_change_positions
-    for range_ in ranges:
-        range_start = int(range_.start)
-        range_end = int(range_.end)
-        range_index = bisect_left(valid_range_starts, range_start)
-        if range_index:
-            range_index -= 1
-        for stream_start, stream_end in valid_ranges[range_index:]:
-            if stream_start >= range_end:
-                break
-            start = max(range_start, stream_start)
-            end = min(range_end, stream_end)
-            if start < end:
-                intersections.append((start, end))
-    for start, end in _merge_stage_id_ranges(intersections):
-        current = int(start)
-        end_int = int(end)
-        if current < 0 or end_int > owner_count:
-            raise RuntimeError(
-                f"DSV4 stage raw token range {current}:{end_int} is outside owner table"
-            )
-        while current < end_int:
-            rank = int(owner_ranks[current])
-            if rank < 0 or rank >= int(rank_count):
-                raise RuntimeError(
-                    f"DSV4 stage raw token id {current} has invalid owner rank {rank}"
-                )
-            change_index = bisect_left(owner_changes, current + 1)
-            next_change = (
-                int(owner_changes[change_index])
-                if change_index < len(owner_changes)
-                else end_int
-            )
-            segment_end = min(end_int, next_change)
-            by_rank[rank].extend(range(current, segment_end))
-            current = segment_end
+    ranges = tuple(stage_plan.global_k_ranges)
+    if not ranges:
+        return tuple(tuple() for _ in range(int(rank_count)))
+    if not hasattr(stage_plan, "is_local_stage") or not hasattr(
+        stage_plan,
+        "kv_fetch_plan",
+    ):
+        return _ids_by_owner_rank_from_table(
+            ids=_stage_raw_token_ids(layout=layout, ranges=ranges),
+            rank_count=rank_count,
+            owner_ranks=layout.raw_token_owner_ranks,
+            name="stage_plan_raw_token_ids",
+        )
+    if bool(stage_plan.is_local_stage):
+        _extend_token_ids_from_ranges(by_rank[int(rank)], ranges)
+        return tuple(tuple(ids) for ids in by_rank)
+    fetch_plan = stage_plan.kv_fetch_plan
+    if fetch_plan is None:
+        raise RuntimeError("DSV4 remote stage raw planning requires a KV fetch plan")
+    range_index = 0
+    range_offset = 0
+    for peer_rank, split in enumerate(fetch_plan.recv_splits):
+        remaining = int(split)
+        while remaining > 0:
+            if range_index >= len(ranges):
+                raise RuntimeError("DSV4 stage raw split exceeds global K ranges")
+            range_ = ranges[range_index]
+            start = int(range_.start) + int(range_offset)
+            available = int(range_.end) - start
+            take = min(available, remaining)
+            if take <= 0:
+                raise RuntimeError("DSV4 stage raw split found an empty K range")
+            by_rank[peer_rank].extend(range(start, start + take))
+            remaining -= take
+            if take == available:
+                range_index += 1
+                range_offset = 0
+            else:
+                range_offset += take
+    if range_index != len(ranges) or range_offset != 0:
+        raise RuntimeError("DSV4 stage raw K ranges exceed recv splits")
     return tuple(tuple(ids) for ids in by_rank)
+
+
+def _extend_token_ids_from_ranges(target: list[int], ranges: Sequence[Any]) -> None:
+    for range_ in ranges:
+        target.extend(range(int(range_.start), int(range_.end)))
 
 
 def _merge_stage_id_ranges(

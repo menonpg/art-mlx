@@ -600,6 +600,7 @@ def _stacked_worker(
         dsv4_start = time.perf_counter()
         context_state = prepare_dsv4_context_parallel_state(
             cp_state=cp_state,
+            attention_spec=_spec,
             csa_ratio=int(config.csa_ratio),
             hca_ratio=int(config.hca_ratio),
             include_csa="csa" in config.layer_kinds,

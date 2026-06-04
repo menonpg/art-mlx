@@ -307,26 +307,34 @@ def build_dsv4_compressed_layouts_from_cp_state(
     *,
     state: ArtContextParallelState,
     specs: Sequence[Dsv4CompressionSpec],
+    attention_spec: Any | None = None,
 ) -> tuple[Dsv4CompressedLayout, ...]:
     if not specs:
         return ()
-    group_ids = (
-        state.group_ids.unsqueeze(0) if state.group_ids.ndim == 1 else state.group_ids
-    )
-    parent_ids = (
-        state.parent_ids.unsqueeze(0)
-        if state.parent_ids.ndim == 1
-        else state.parent_ids
-    )
-    if group_ids.device.type != "cpu" or parent_ids.device.type != "cpu":
-        raise RuntimeError("DSV4 compression planning requires CPU metadata tensors")
     for spec in specs:
         if int(spec.ratio) <= 0:
             raise RuntimeError(
                 f"DSV4 compression ratio must be positive, got {spec.ratio}"
             )
-    group_row, parent_row = _validate_metadata(group_ids, parent_ids)
-    streams = _build_streams(group_row=group_row, parent_row=parent_row)
+    if attention_spec is None:
+        group_ids = (
+            state.group_ids.unsqueeze(0)
+            if state.group_ids.ndim == 1
+            else state.group_ids
+        )
+        parent_ids = (
+            state.parent_ids.unsqueeze(0)
+            if state.parent_ids.ndim == 1
+            else state.parent_ids
+        )
+        if group_ids.device.type != "cpu" or parent_ids.device.type != "cpu":
+            raise RuntimeError(
+                "DSV4 compression planning requires CPU metadata tensors"
+            )
+        group_row, parent_row = _validate_metadata(group_ids, parent_ids)
+        streams = _build_streams(group_row=group_row, parent_row=parent_row)
+    else:
+        streams = _build_streams_from_attention_spec(attention_spec)
     branch_views = _build_branch_views(streams)
     raw_token_owner_ranks, owner_change_positions = _build_token_ownership_parts(
         state.rank_plan.token_layout_index
@@ -1332,6 +1340,66 @@ def _build_streams(
         )
     _validate_stream_graph(streams)
     return tuple(streams)
+
+
+def _build_streams_from_attention_spec(
+    attention_spec: Any,
+) -> tuple[Dsv4StreamSpec, ...]:
+    if len(attention_spec.rows) != 1:
+        raise RuntimeError("DSV4 CP compression expects one shared-prefix row")
+    families: dict[int, dict[str, Any]] = {}
+    for slice_ in attention_spec.rows[0].slices:
+        family = int(-1 if slice_.family_index is None else slice_.family_index)
+        if family < 0:
+            raise RuntimeError("DSV4 CP compression requires family-indexed slices")
+        data = families.setdefault(
+            family,
+            {"prefix": None, "self_ranges": [], "completions": []},
+        )
+        q_range = (int(slice_.q_range.start), int(slice_.q_range.end))
+        k_range = (int(slice_.k_range.start), int(slice_.k_range.end))
+        if getattr(slice_.mask_kind, "value", slice_.mask_kind) == "full":
+            prefix_range = k_range
+            if data["prefix"] is not None and data["prefix"] != prefix_range:
+                raise RuntimeError(
+                    "DSV4 CP compression found inconsistent prefix slices"
+                )
+            data["prefix"] = prefix_range
+            data["completions"].append(q_range)
+        elif q_range == k_range:
+            data["self_ranges"].append(q_range)
+    streams: list[Dsv4StreamSpec] = []
+    next_stream_id = 0
+    for family in sorted(families):
+        data = families[family]
+        prefix_range = data["prefix"] or next(iter(data["self_ranges"]), None)
+        if prefix_range is None:
+            raise RuntimeError(
+                f"DSV4 CP compression missing prefix for family {family}"
+            )
+        prefix_id = next_stream_id
+        next_stream_id += 1
+        streams.append(
+            Dsv4StreamSpec.model_construct(
+                stream_id=prefix_id,
+                kind=Dsv4StreamKind.PREFIX,
+                parent_stream_id=None,
+                start=prefix_range[0],
+                end=prefix_range[1],
+            )
+        )
+        for start, end in sorted(set(data["completions"])):
+            streams.append(
+                Dsv4StreamSpec.model_construct(
+                    stream_id=next_stream_id,
+                    kind=Dsv4StreamKind.COMPLETION,
+                    parent_stream_id=prefix_id,
+                    start=start,
+                    end=end,
+                )
+            )
+            next_stream_id += 1
+    return tuple(sorted(streams, key=lambda stream: int(stream.start)))
 
 
 def _scan_runs(
