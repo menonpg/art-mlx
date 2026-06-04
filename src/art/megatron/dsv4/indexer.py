@@ -426,66 +426,6 @@ def compute_indexer_stage_topk(
 
 
 @torch.compiler.disable
-def launch_dsv4_indexer_kv_exchange(
-    *,
-    layout: Dsv4CompressedLayout,
-    query_token_ids: Sequence[int],
-    candidate_entry_ids: Sequence[int],
-    indexer_q: torch.Tensor,
-    indexer_weights: torch.Tensor,
-    indexer_kv: torch.Tensor,
-    indexer_kv_entry_ids: Sequence[int],
-    send_entry_ids_by_peer: Sequence[Sequence[int]],
-    recv_entry_ids_by_peer: Sequence[Sequence[int]],
-    topk: int,
-    group: Any,
-    async_op: bool,
-    score_scale: float = 1.0,
-) -> Dsv4IndexerKvExchangeWork:
-    query_ids = tuple(int(token_id) for token_id in query_token_ids)
-    candidate_ids = tuple(int(entry_id) for entry_id in candidate_entry_ids)
-    _row_by_id(candidate_ids, name="candidate_entry_ids")
-    local_entry_ids = tuple(int(entry_id) for entry_id in indexer_kv_entry_ids)
-    if len(local_entry_ids) != int(indexer_kv.shape[-2]):
-        raise RuntimeError(
-            "DSV4 indexer_kv_entry_ids length must match KV rows, got "
-            f"{len(local_entry_ids)} vs {int(indexer_kv.shape[-2])}"
-        )
-    _row_by_id(local_entry_ids, name="indexer_kv_entry_ids")
-    rank_count = _indexer_peer_count(send_entry_ids_by_peer, recv_entry_ids_by_peer)
-    send_ids = _normalize_indexer_peer_ids(
-        send_entry_ids_by_peer,
-        rank_count=rank_count,
-        name="send_entry_ids_by_peer",
-    )
-    recv_ids = _normalize_indexer_peer_ids(
-        recv_entry_ids_by_peer,
-        rank_count=rank_count,
-        name="recv_entry_ids_by_peer",
-    )
-    return Dsv4IndexerKvExchangeWork(
-        layout=layout,
-        query_token_ids=query_ids,
-        candidate_entry_ids=candidate_ids,
-        indexer_q=indexer_q,
-        indexer_weights=indexer_weights,
-        topk=int(topk),
-        score_scale=float(score_scale),
-        recv_entry_ids_by_peer=recv_ids,
-        tensor_work=launch_dsv4_tensor_exchange(
-            tensor=indexer_kv,
-            tensor_ids=local_entry_ids,
-            plan=Dsv4TensorExchangePlan(
-                send_ids_by_peer=send_ids,
-                recv_ids_by_peer=recv_ids,
-            ),
-            group=group,
-            async_op=async_op,
-        ),
-    )
-
-
-@torch.compiler.disable
 def launch_planned_dsv4_indexer_kv_exchange(
     *,
     layout: Dsv4CompressedLayout,
@@ -509,22 +449,35 @@ def launch_planned_dsv4_indexer_kv_exchange(
         peer_plans=peer_plans,
     )
     plan = plans[rank_int]
-    return launch_dsv4_indexer_kv_exchange(
+    query_ids = tuple(int(token_id) for token_id in query_token_ids)
+    candidate_ids = tuple(int(id_) for id_ in candidate_entry_ids_by_rank[rank_int])
+    local_entry_ids = tuple(int(entry_id) for entry_id in indexer_kv_entry_ids)
+    if len(local_entry_ids) != int(indexer_kv.shape[-2]):
+        raise RuntimeError(
+            "DSV4 indexer KV id count must match KV rows, got "
+            f"{len(local_entry_ids)} vs {int(indexer_kv.shape[-2])}"
+        )
+    _row_by_id(candidate_ids, name="candidate_entry_ids")
+    _row_by_id(local_entry_ids, name="indexer_kv_entry_ids")
+    return Dsv4IndexerKvExchangeWork(
         layout=layout,
-        query_token_ids=query_token_ids,
-        candidate_entry_ids=tuple(
-            int(id_) for id_ in candidate_entry_ids_by_rank[rank_int]
-        ),
+        query_token_ids=query_ids,
+        candidate_entry_ids=candidate_ids,
         indexer_q=indexer_q,
         indexer_weights=indexer_weights,
-        indexer_kv=indexer_kv,
-        indexer_kv_entry_ids=indexer_kv_entry_ids,
-        send_entry_ids_by_peer=plan.send_entry_ids_by_peer,
-        recv_entry_ids_by_peer=plan.recv_entry_ids_by_peer,
         topk=topk,
-        group=group,
-        async_op=async_op,
         score_scale=score_scale,
+        recv_entry_ids_by_peer=plan.recv_entry_ids_by_peer,
+        tensor_work=launch_dsv4_tensor_exchange(
+            tensor=indexer_kv,
+            tensor_ids=local_entry_ids,
+            plan=Dsv4TensorExchangePlan(
+                send_ids_by_peer=plan.send_entry_ids_by_peer,
+                recv_ids_by_peer=plan.recv_entry_ids_by_peer,
+            ),
+            group=group,
+            async_op=async_op,
+        ),
     )
 
 

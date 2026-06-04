@@ -238,37 +238,31 @@ def test_indexer_kv_exchange_peer_plan_uses_compressed_ownership() -> None:
 def test_planned_indexer_exchange_uses_prepared_peer_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    layout = _layout()
-    candidates_by_rank = ((0, 1, 2), (1, 3))
+    layout = _single_rank_layout()
+    candidates_by_rank = (tuple(range(layout.entry_count())),)
     prepared = build_dsv4_indexer_kv_exchange_peer_plans(
         layout=layout,
         candidate_entry_ids_by_rank=candidates_by_rank,
     )
-    captured: dict[str, object] = {}
 
     def fail_rebuild(**_kwargs: object) -> object:
         raise AssertionError("indexer peer plan should be prepared")
-
-    def fake_launch(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return object()
 
     monkeypatch.setattr(
         indexer_module,
         "build_dsv4_indexer_kv_exchange_peer_plans",
         fail_rebuild,
     )
-    monkeypatch.setattr(indexer_module, "launch_dsv4_indexer_kv_exchange", fake_launch)
 
     result = launch_planned_dsv4_indexer_kv_exchange(
         layout=layout,
-        rank=1,
+        rank=0,
         candidate_entry_ids_by_rank=candidates_by_rank,
         query_token_ids=(11,),
         indexer_q=torch.empty(1, 2, 4),
         indexer_weights=torch.empty(1, 2),
-        indexer_kv=torch.empty(0, 4),
-        indexer_kv_entry_ids=(),
+        indexer_kv=torch.empty(layout.entry_count(), 4),
+        indexer_kv_entry_ids=tuple(range(layout.entry_count())),
         topk=2,
         group=None,
         async_op=False,
@@ -276,8 +270,7 @@ def test_planned_indexer_exchange_uses_prepared_peer_plan(
     )
 
     assert result is not None
-    assert captured["send_entry_ids_by_peer"] == prepared[1].send_entry_ids_by_peer
-    assert captured["recv_entry_ids_by_peer"] == prepared[1].recv_entry_ids_by_peer
+    assert result.recv_entry_ids_by_peer == prepared[0].recv_entry_ids_by_peer
 
 
 def test_indexer_stage_plan_derives_queries_and_candidates_from_art_stage_plan() -> (
@@ -495,6 +488,18 @@ def _layout() -> Dsv4CompressedLayout:
                 ((8, 18, 0),),
             ),
             token_counts_by_rank=(8, 10),
+        ),
+        spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
+    )
+
+
+def _single_rank_layout() -> Dsv4CompressedLayout:
+    return build_dsv4_compressed_layout(
+        group_ids=torch.tensor([[0] * 8 + [1] * 5 + [2] * 5 + [-1] * 2]),
+        parent_ids=torch.tensor([[0] * 8 + [0] * 5 + [0] * 5 + [-1] * 2]),
+        token_layout_index=_LayoutIndex(
+            ownership_ranges_by_rank=(((0, 18, 0),),),
+            token_counts_by_rank=(18,),
         ),
         spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
     )

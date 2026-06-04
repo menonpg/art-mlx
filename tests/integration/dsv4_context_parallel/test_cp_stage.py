@@ -12,7 +12,6 @@ from art.megatron.dsv4 import (
     build_dsv4_compressed_layout,
     build_dsv4_stage_inputs,
     build_dsv4_stage_inputs_from_stage_plan,
-    build_dsv4_stage_kv_exchange_peer_plans,
     build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
     build_dsv4_stage_plan_slots,
     launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot,
@@ -194,30 +193,12 @@ def test_stage_inputs_filter_padding_tokens_from_cp_k_ranges() -> None:
 
 def test_stage_kv_exchange_peer_plan_uses_layout_ownership() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
-    stages = (
-        build_dsv4_stage_inputs(
-            layout=layout,
-            compression_kind=layout.spec.kind,
-            stage_index=0,
-            query_token_ids=(7,),
-            global_k_ranges=(_Range(start=4, end=13),),
-            global_topk=torch.tensor([[1, 2]], dtype=torch.long),
-            window_size=4,
-        ),
-        build_dsv4_stage_inputs(
-            layout=layout,
-            compression_kind=layout.spec.kind,
-            stage_index=0,
-            query_token_ids=(16,),
-            global_k_ranges=(_Range(start=8, end=20),),
-            global_topk=torch.tensor([[3, 2]], dtype=torch.long),
-            window_size=4,
-        ),
-    )
-
-    plans = build_dsv4_stage_kv_exchange_peer_plans(
+    plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
         layout=layout,
-        stage_inputs_by_rank=stages,
+        stage_plans_by_rank=(
+            _stage_plan(stage_index=0, q_ranges=((7, 8),), k_ranges=((4, 13),)),
+            _stage_plan(stage_index=0, q_ranges=((16, 17),), k_ranges=((8, 20),)),
+        ),
     )
 
     assert plans[0].recv_raw_token_ids_by_peer == (
@@ -307,51 +288,22 @@ def test_stage_kv_exchange_plan_from_stage_plans_does_not_need_topk() -> None:
             k_ranges=((8, 18),),
         ),
     )
-    topk_dependent_stages = (
-        build_dsv4_stage_inputs_from_stage_plan(
-            layout=layout,
-            stage_plan=stage_plans[0],
-            compression_kind=Dsv4CompressionKind.CSA,
-            global_topk=torch.tensor([[[1, 2]]], dtype=torch.long),
-            topk_query_token_ids=(7,),
-            window_size=4,
-        ),
-        build_dsv4_stage_inputs_from_stage_plan(
-            layout=layout,
-            stage_plan=stage_plans[1],
-            compression_kind=Dsv4CompressionKind.CSA,
-            global_topk=torch.tensor([[[3, 2], [0, 1]]], dtype=torch.long),
-            topk_query_token_ids=(11, 16),
-            window_size=4,
-        ),
-    )
-
-    from_stage_inputs = build_dsv4_stage_kv_exchange_peer_plans(
-        layout=layout,
-        stage_inputs_by_rank=topk_dependent_stages,
-    )
     from_stage_plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
         layout=layout,
         stage_plans_by_rank=stage_plans,
     )
 
-    assert from_stage_plans == from_stage_inputs
+    assert from_stage_plans[0].recv_compressed_entry_ids_by_peer == ((1,), (2,))
+    assert from_stage_plans[1].recv_compressed_entry_ids_by_peer == ((), (2, 3))
 
 
 def test_stage_slot_exchange_uses_prepared_peer_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    layout = _layout(Dsv4CompressionKind.CSA)
+    layout = _single_rank_layout(Dsv4CompressionKind.CSA)
     slot = build_dsv4_stage_plan_slots(
         stage_plans_by_rank=(
             (_stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),),
-            (
-                _stage_plan(
-                    stage_index=5,
-                    q_ranges=((11, 12),),
-                    k_ranges=((8, 18),),
-                ),
-            ),
         )
     )[0]
     local_stage_inputs = build_dsv4_stage_inputs(
@@ -367,48 +319,37 @@ def test_stage_slot_exchange_uses_prepared_peer_plan(
         layout=layout,
         stage_plans_by_rank=slot.stage_plans_by_rank,
     )
-    captured: dict[str, object] = {}
 
     def fail_rebuild(**_kwargs: object) -> object:
         raise AssertionError("stage peer plan should be prepared")
-
-    def fake_launch(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return object()
 
     monkeypatch.setattr(
         cp_stage,
         "build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans",
         fail_rebuild,
     )
-    monkeypatch.setattr(cp_stage, "launch_dsv4_stage_kv_exchange", fake_launch)
 
     result = launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
         layout=layout,
-        rank=1,
+        rank=0,
         stage_plan_slot=slot,
         local_stage_inputs=local_stage_inputs,
-        query=torch.empty(1, 0, 1, 4),
-        query_token_ids=(),
-        raw_kv=torch.empty(0, 4),
-        raw_token_ids=(),
-        compressed_kv=torch.empty(0, 4),
-        compressed_entry_ids=(),
+        query=_query_rows((7,)),
+        query_token_ids=(7,),
+        raw_kv=_kv_rows(tuple(range(18))),
+        raw_token_ids=tuple(range(18)),
+        compressed_kv=_kv_rows(tuple(range(layout.entry_count()))),
+        compressed_entry_ids=tuple(range(layout.entry_count())),
         group=None,
         async_op=False,
         peer_plans=prepared,
     )
 
     assert result is not None
+    assert result.recv_raw_token_ids_by_peer == prepared[0].recv_raw_token_ids_by_peer
     assert (
-        captured["send_raw_token_ids_by_peer"] == prepared[1].send_raw_token_ids_by_peer
-    )
-    assert (
-        captured["recv_raw_token_ids_by_peer"] == prepared[1].recv_raw_token_ids_by_peer
-    )
-    assert (
-        captured["send_compressed_entry_ids_by_peer"]
-        == prepared[1].send_compressed_entry_ids_by_peer
+        result.recv_compressed_entry_ids_by_peer
+        == prepared[0].recv_compressed_entry_ids_by_peer
     )
 
 

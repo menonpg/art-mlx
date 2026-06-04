@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 import torch
@@ -273,82 +273,6 @@ def build_dsv4_stage_inputs_from_stage_plan(
     )
 
 
-def build_dsv4_stage_kv_exchange_peer_plans(
-    *,
-    layout: Dsv4CompressedLayout,
-    stage_inputs_by_rank: Sequence[Dsv4StageInputs],
-) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
-    rank_count = len(layout.entry_ids_by_owner_rank)
-    if len(stage_inputs_by_rank) != rank_count:
-        raise RuntimeError(
-            "DSV4 stage exchange planning requires one stage input per rank, got "
-            f"{len(stage_inputs_by_rank)} vs {rank_count}"
-        )
-    return _build_stage_kv_exchange_peer_plans_from_ids(
-        layout=layout,
-        raw_token_ids_by_rank=tuple(
-            stage.raw_token_ids for stage in stage_inputs_by_rank
-        ),
-        compressed_entry_ids_by_rank=tuple(
-            stage.compressed_entry_ids for stage in stage_inputs_by_rank
-        ),
-    )
-
-
-def _build_stage_kv_exchange_peer_plans_from_ids(
-    *,
-    layout: Dsv4CompressedLayout,
-    raw_token_ids_by_rank: Sequence[Sequence[int]],
-    compressed_entry_ids_by_rank: Sequence[Sequence[int]],
-) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
-    rank_count = len(layout.entry_ids_by_owner_rank)
-    if len(raw_token_ids_by_rank) != rank_count:
-        raise RuntimeError(
-            "DSV4 stage raw exchange planning requires one id list per rank, got "
-            f"{len(raw_token_ids_by_rank)} vs {rank_count}"
-        )
-    if len(compressed_entry_ids_by_rank) != rank_count:
-        raise RuntimeError(
-            "DSV4 stage compressed exchange planning requires one id list per rank, "
-            f"got {len(compressed_entry_ids_by_rank)} vs {rank_count}"
-        )
-    recv_raw = tuple(
-        _ids_by_owner_rank(
-            ids=raw_token_ids,
-            rank_count=rank_count,
-            owner_rank=lambda token_id: _raw_token_owner_rank(
-                layout=layout,
-                token_id=token_id,
-            ),
-            name=f"rank{rank}_raw_token_ids",
-        )
-        for rank, raw_token_ids in enumerate(raw_token_ids_by_rank)
-    )
-    recv_compressed = tuple(
-        _ids_by_owner_rank(
-            ids=compressed_entry_ids,
-            rank_count=rank_count,
-            owner_rank=lambda entry_id: _compressed_entry_owner_rank(
-                layout=layout,
-                entry_id=entry_id,
-            ),
-            name=f"rank{rank}_compressed_entry_ids",
-        )
-        for rank, compressed_entry_ids in enumerate(compressed_entry_ids_by_rank)
-    )
-    send_raw = _transpose_peer_ids(recv_raw)
-    send_compressed = _transpose_peer_ids(recv_compressed)
-    return tuple(
-        Dsv4StageKvExchangePeerPlan.model_construct(
-            send_raw_token_ids_by_peer=send_raw[rank],
-            send_compressed_entry_ids_by_peer=send_compressed[rank],
-            recv_raw_token_ids_by_peer=recv_raw[rank],
-            recv_compressed_entry_ids_by_peer=recv_compressed[rank],
-        )
-        for rank in range(rank_count)
-    )
-
-
 def build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
     *,
     layout: Dsv4CompressedLayout,
@@ -565,40 +489,6 @@ def materialize_dsv4_stage_tensors(
     )
 
 
-@torch.compiler.disable
-def launch_dsv4_stage_kv_exchange(
-    *,
-    stage_inputs: Dsv4StageInputs,
-    query: torch.Tensor,
-    query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    compressed_kv: torch.Tensor,
-    compressed_entry_ids: Sequence[int],
-    send_raw_token_ids_by_peer: Sequence[Sequence[int]],
-    send_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
-    recv_raw_token_ids_by_peer: Sequence[Sequence[int]],
-    recv_compressed_entry_ids_by_peer: Sequence[Sequence[int]],
-    group: Any,
-    async_op: bool,
-) -> Dsv4StageKvExchangeWork:
-    return _launch_dsv4_stage_kv_exchange_impl(
-        stage_inputs=stage_inputs,
-        query=query,
-        query_token_ids=query_token_ids,
-        raw_kv=raw_kv,
-        raw_token_ids=raw_token_ids,
-        compressed_kv=compressed_kv,
-        compressed_entry_ids=compressed_entry_ids,
-        send_raw_token_ids_by_peer=send_raw_token_ids_by_peer,
-        send_compressed_entry_ids_by_peer=send_compressed_entry_ids_by_peer,
-        recv_raw_token_ids_by_peer=recv_raw_token_ids_by_peer,
-        recv_compressed_entry_ids_by_peer=recv_compressed_entry_ids_by_peer,
-        group=group,
-        async_op=async_op,
-    )
-
-
 def _launch_dsv4_stage_kv_exchange_impl(
     *,
     stage_inputs: Dsv4StageInputs | None,
@@ -680,46 +570,6 @@ def _launch_dsv4_stage_kv_exchange_impl(
 
 
 @torch.compiler.disable
-def launch_planned_dsv4_stage_kv_exchange(
-    *,
-    layout: Dsv4CompressedLayout,
-    rank: int,
-    stage_inputs_by_rank: Sequence[Dsv4StageInputs],
-    query: torch.Tensor,
-    query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    compressed_kv: torch.Tensor,
-    compressed_entry_ids: Sequence[int],
-    group: Any,
-    async_op: bool,
-    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None = None,
-) -> Dsv4StageKvExchangeWork:
-    rank_int = _validate_rank(rank=rank, rank_count=len(layout.entry_ids_by_owner_rank))
-    plans = _stage_kv_peer_plans_or_build(
-        layout=layout,
-        stage_inputs_by_rank=stage_inputs_by_rank,
-        peer_plans=peer_plans,
-    )
-    plan = plans[rank_int]
-    return launch_dsv4_stage_kv_exchange(
-        stage_inputs=stage_inputs_by_rank[rank_int],
-        query=query,
-        query_token_ids=query_token_ids,
-        raw_kv=raw_kv,
-        raw_token_ids=raw_token_ids,
-        compressed_kv=compressed_kv,
-        compressed_entry_ids=compressed_entry_ids,
-        send_raw_token_ids_by_peer=plan.send_raw_token_ids_by_peer,
-        send_compressed_entry_ids_by_peer=plan.send_compressed_entry_ids_by_peer,
-        recv_raw_token_ids_by_peer=plan.recv_raw_token_ids_by_peer,
-        recv_compressed_entry_ids_by_peer=plan.recv_compressed_entry_ids_by_peer,
-        group=group,
-        async_op=async_op,
-    )
-
-
-@torch.compiler.disable
 def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
     *,
     layout: Dsv4CompressedLayout,
@@ -748,7 +598,7 @@ def launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
         peer_plans=peer_plans,
     )
     plan = plans[rank_int]
-    return launch_dsv4_stage_kv_exchange(
+    return _launch_dsv4_stage_kv_exchange_impl(
         stage_inputs=local_stage_inputs,
         query=query,
         query_token_ids=query_token_ids,
@@ -802,23 +652,6 @@ def launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot(
         recv_compressed_entry_ids_by_peer=plan.recv_compressed_entry_ids_by_peer,
         group=group,
         async_op=async_op,
-    )
-
-
-def _stage_kv_peer_plans_or_build(
-    *,
-    layout: Dsv4CompressedLayout,
-    stage_inputs_by_rank: Sequence[Dsv4StageInputs],
-    peer_plans: Sequence[Dsv4StageKvExchangePeerPlan] | None,
-) -> tuple[Dsv4StageKvExchangePeerPlan, ...]:
-    if peer_plans is None:
-        return build_dsv4_stage_kv_exchange_peer_plans(
-            layout=layout,
-            stage_inputs_by_rank=stage_inputs_by_rank,
-        )
-    return _validate_stage_kv_peer_plan_count(
-        layout=layout,
-        peer_plans=peer_plans,
     )
 
 
@@ -1032,27 +865,6 @@ def _empty_query_topk(*, global_topk: torch.Tensor, query_count: int) -> torch.T
         "DSV4 global topk must have shape [Q,K] or [B,Q,K], got "
         f"{tuple(global_topk.shape)}"
     )
-
-
-def _ids_by_owner_rank(
-    *,
-    ids: Sequence[int],
-    rank_count: int,
-    owner_rank: Callable[[int], int],
-    name: str,
-) -> tuple[tuple[int, ...], ...]:
-    by_rank: list[list[int]] = [[] for _ in range(rank_count)]
-    seen: set[int] = set()
-    for id_ in ids:
-        id_int = int(id_)
-        if id_int in seen:
-            raise RuntimeError(f"DSV4 {name} contains duplicate id {id_int}")
-        seen.add(id_int)
-        rank = int(owner_rank(id_int))
-        if rank < 0 or rank >= int(rank_count):
-            raise RuntimeError(f"DSV4 {name} id {id_int} has invalid owner rank {rank}")
-        by_rank[rank].append(id_int)
-    return tuple(tuple(peer_ids) for peer_ids in by_rank)
 
 
 def _ids_by_owner_rank_from_table(
@@ -1296,27 +1108,6 @@ def _layout_stream_ranges(layout: Dsv4CompressedLayout) -> tuple[tuple[int, int]
         else:
             merged.append([int(start), int(end)])
     return tuple((int(start), int(end)) for start, end in merged)
-
-
-def _raw_token_owner_rank(*, layout: Dsv4CompressedLayout, token_id: int) -> int:
-    token_int = int(token_id)
-    if token_int < 0 or token_int >= len(layout.raw_token_owner_ranks):
-        raise RuntimeError(f"DSV4 raw token {token_int} has no CP owner")
-    rank = int(layout.raw_token_owner_ranks[token_int])
-    if rank < 0:
-        raise RuntimeError(f"DSV4 raw token {token_int} has no CP owner")
-    return rank
-
-
-def _compressed_entry_owner_rank(
-    *,
-    layout: Dsv4CompressedLayout,
-    entry_id: int,
-) -> int:
-    entry_int = int(entry_id)
-    if entry_int < 0 or entry_int >= layout.entry_count():
-        raise RuntimeError(f"DSV4 compressed entry {entry_int} is outside layout")
-    return int(layout.compressed_entry_owner_ranks[entry_int])
 
 
 def _compressed_owner_rank_table(layout: Dsv4CompressedLayout) -> tuple[int, ...]:

@@ -15,8 +15,9 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     build_dsv4_compressed_layout,
     build_dsv4_stage_inputs,
-    build_dsv4_stage_kv_exchange_peer_plans,
-    launch_planned_dsv4_stage_kv_exchange,
+    build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
+    build_dsv4_stage_plan_slots,
+    launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
 )
 
 
@@ -32,6 +33,14 @@ class _Range(BaseModel):
 
     start: int
     end: int
+
+
+class _StagePlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage_index: int
+    global_q_ranges: tuple[_Range, ...]
+    global_k_ranges: tuple[_Range, ...]
 
 
 def test_stage_kv_exchange_materializes_fused_raw_and_compressed_stage(
@@ -62,6 +71,18 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
     )
     try:
         layout = _layout()
+        slot = build_dsv4_stage_plan_slots(
+            stage_plans_by_rank=(
+                (_stage_plan(stage_index=9, q_ranges=((7, 8),), k_ranges=((4, 13),)),),
+                (
+                    _stage_plan(
+                        stage_index=9,
+                        q_ranges=((11, 12),),
+                        k_ranges=((4, 13),),
+                    ),
+                ),
+            ),
+        )[0]
         stages = tuple(
             build_dsv4_stage_inputs(
                 layout=layout,
@@ -76,10 +97,11 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
         )
         stage = stages[rank]
         query_ids = stage.query_token_ids
-        peer_plan = build_dsv4_stage_kv_exchange_peer_plans(
+        peer_plans = build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans(
             layout=layout,
-            stage_inputs_by_rank=stages,
-        )[rank]
+            stage_plans_by_rank=slot.stage_plans_by_rank,
+        )
+        peer_plan = peer_plans[rank]
         assert peer_plan.recv_raw_token_ids_by_peer == (
             (4, 5, 6, 7),
             (8, 9, 10, 11, 12),
@@ -95,10 +117,11 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
             local_compressed_ids,
             local_compressed_ids,
         )
-        work = launch_planned_dsv4_stage_kv_exchange(
+        work = launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
             layout=layout,
             rank=rank,
-            stage_inputs_by_rank=stages,
+            stage_plan_slot=slot,
+            local_stage_inputs=stage,
             query=_query_rows(query_ids),
             query_token_ids=query_ids,
             raw_kv=_kv_rows(local_raw_ids),
@@ -107,6 +130,7 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
             compressed_entry_ids=local_compressed_ids,
             group=cast(Any, torch.distributed).group.WORLD,
             async_op=True,
+            peer_plans=peer_plans,
         )
         materialized = work.wait_post_process()
 
@@ -195,4 +219,17 @@ def _layout() -> Dsv4CompressedLayout:
             token_counts_by_rank=(8, 10),
         ),
         spec=Dsv4CompressionSpec(kind=Dsv4CompressionKind.CSA, ratio=4),
+    )
+
+
+def _stage_plan(
+    *,
+    stage_index: int,
+    q_ranges: tuple[tuple[int, int], ...],
+    k_ranges: tuple[tuple[int, int], ...],
+) -> _StagePlan:
+    return _StagePlan(
+        stage_index=stage_index,
+        global_q_ranges=tuple(_Range(start=start, end=end) for start, end in q_ranges),
+        global_k_ranges=tuple(_Range(start=start, end=end) for start, end in k_ranges),
     )
