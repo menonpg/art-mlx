@@ -501,6 +501,23 @@ def test_distributed_projected_hca_ratio128_cp8_empty_rank_matches_packed_oracle
         init_path.unlink()
 
 
+def test_distributed_projected_csa_cp8_empty_rank_matches_packed_oracle(
+    tmp_path: Path,
+) -> None:
+    init_path = tmp_path / "dsv4_projected_csa_cp8_empty_rank_oracle_gloo"
+    if init_path.exists():
+        init_path.unlink()
+    mp.start_processes(
+        _distributed_projected_csa_cp8_empty_rank_oracle_worker,
+        args=(8, str(init_path)),
+        nprocs=8,
+        join=True,
+        start_method="spawn",
+    )
+    if init_path.exists():
+        init_path.unlink()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.device_count() < 2
