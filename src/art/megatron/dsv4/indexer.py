@@ -105,17 +105,13 @@ def stage_candidate_entry_ids(
     candidates: list[int] = []
     closure_tokens = layout.closure_token_ids
     closure_entry_ids = layout.closure_entry_ids
-    previous_end: int | None = None
     for range_ in global_k_ranges:
         range_start = int(range_.start)
         range_end = int(range_.end)
-        if previous_end is not None and range_start < previous_end:
-            raise RuntimeError("DSV4 stage K ranges must be sorted and non-overlapping")
-        previous_end = range_end
         start = bisect_left(closure_tokens, range_start)
         end = bisect_left(closure_tokens, range_end)
         candidates.extend(closure_entry_ids[start:end])
-    return tuple(candidates)
+    return tuple(dict.fromkeys(sorted(candidates)))
 
 
 def build_dsv4_indexer_kv_exchange_peer_plans(

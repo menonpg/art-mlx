@@ -71,6 +71,10 @@ def test_indexer_visibility_respects_shared_prefix_and_sibling_boundaries() -> N
         layout=layout,
         global_k_ranges=(_Range(start=13, end=18),),
     ) == (3,)
+    assert stage_candidate_entry_ids(
+        layout=layout,
+        global_k_ranges=(_Range(start=8, end=18), _Range(start=0, end=13)),
+    ) == (0, 1, 2, 3)
 
 
 def test_indexer_scores_match_reference_formula_and_visibility() -> None:
