@@ -1778,7 +1778,6 @@ def _run_runtime_stage_attention_forward(
             compressed_list_size=int(config.indexer_topk)
             if compression_kind == Dsv4CompressionKind.CSA
             else None,
-            materialize_compressed_metadata=compression_kind != Dsv4CompressionKind.CSA,
         )
         stage_works.append(
             launch_dsv4_stage_kv_exchange_from_stage_plan_slot(

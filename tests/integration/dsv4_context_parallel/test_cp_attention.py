@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+from projected_helpers import (
+    launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
+    launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
+)
 from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
@@ -33,21 +37,19 @@ from art.megatron.dsv4 import (
     accumulate_materialized_dsv4_attention_backward,
     build_dsv4_attention_backward_plan_from_stage_plan_slots,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_inputs,
     build_dsv4_stage_plan_slots,
-    build_stage_local_topk_for_csa,
     compress_projected_kv,
     compute_single_sink_grad,
     launch_dsv4_attention_backward_from_stage_plan_slots,
     launch_dsv4_csa_attention_forward_from_stage_plan_slots,
     launch_dsv4_csa_projected_attention_forward_from_compression_work,
     launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_compression_work,
-    launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots,
     launch_dsv4_csa_projected_compression_forward,
     launch_dsv4_csa_projected_compression_forward_from_context_parallel_state,
     launch_dsv4_hca_attention_forward_from_stage_plan_slots,
     launch_dsv4_hca_projected_attention_forward_from_compression_work,
     launch_dsv4_hca_projected_attention_forward_from_context_parallel_state_and_compression_work,
-    launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots,
     launch_dsv4_hca_projected_compression_forward,
     launch_dsv4_hca_projected_compression_forward_from_context_parallel_state,
     launch_dsv4_projected_attention_backward_from_context_parallel_state,

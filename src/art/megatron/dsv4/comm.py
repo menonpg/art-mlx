@@ -2,18 +2,16 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import PrivateAttr
 import torch
 import torch.distributed as dist
 
-from .types import Dsv4TensorExchangePlan, Dsv4TensorIdBuffer
+from .types import Dsv4TensorExchangePlan, Dsv4TensorIdBuffer, Dsv4WorkModel
 
 _DIST = cast(Any, dist)
 
 
-class Dsv4TensorExchangeWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4TensorExchangeWork(Dsv4WorkModel):
     recv_buffer: torch.Tensor
     recv_ids_by_peer: tuple[tuple[int, ...], ...]
     handle: Any | None

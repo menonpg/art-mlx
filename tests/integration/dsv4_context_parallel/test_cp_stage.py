@@ -10,16 +10,14 @@ from art.megatron.dsv4 import (
     Dsv4CompressionSpec,
     Dsv4StageKeyKind,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_inputs,
     build_dsv4_stage_inputs_from_stage_plan,
     build_dsv4_stage_kv_exchange_peer_plans,
     build_dsv4_stage_kv_exchange_peer_plans_from_stage_plans,
     build_dsv4_stage_plan_slots,
-    build_stage_local_topk_for_csa,
-    build_stage_local_topk_for_hca,
     launch_dsv4_stage_kv_exchange_deferred_from_stage_plan_slot,
     launch_dsv4_stage_kv_exchange_from_stage_plan_slot,
     materialize_dsv4_stage_tensors,
-    raw_swa_token_ids_for_query,
 )
 import art.megatron.dsv4.cp_stage as cp_stage
 
@@ -50,19 +48,19 @@ def test_raw_swa_visibility_uses_branch_views_not_physical_siblings() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
     candidates = tuple(range(18))
 
-    assert raw_swa_token_ids_for_query(
+    assert cp_stage._visible_raw_swa_token_ids(
         layout=layout,
         query_token_id=7,
         candidate_token_ids=candidates,
         window_size=4,
     ) == (4, 5, 6, 7)
-    assert raw_swa_token_ids_for_query(
+    assert cp_stage._visible_raw_swa_token_ids(
         layout=layout,
         query_token_id=8,
         candidate_token_ids=candidates,
         window_size=4,
     ) == (5, 6, 7, 8)
-    assert raw_swa_token_ids_for_query(
+    assert cp_stage._visible_raw_swa_token_ids(
         layout=layout,
         query_token_id=14,
         candidate_token_ids=candidates,
@@ -72,8 +70,9 @@ def test_raw_swa_visibility_uses_branch_views_not_physical_siblings() -> None:
 
 def test_csa_stage_inputs_remap_raw_and_selected_compressed_keys() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
-    stage = build_stage_local_topk_for_csa(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=3,
         query_token_ids=(8, 11, 16),
         global_k_ranges=(_Range(start=8, end=13),),
@@ -96,8 +95,6 @@ def test_csa_stage_inputs_remap_raw_and_selected_compressed_keys() -> None:
         Dsv4StageKeyKind.COMPRESSED,
     )
     assert stage.key_global_ids == (8, 9, 10, 11, 12, 2)
-    assert stage.raw_token_ids_by_query == ((8,), (8, 9, 10, 11), ())
-    assert stage.compressed_entry_ids_by_query == ((), (2,), ())
     assert stage.topk_stage_local.shape == (1, 3, 7)
     assert stage.topk_stage_local[0, 0].tolist() == [0, -1, -1, -1, -1, -1, -1]
     assert stage.topk_stage_local[0, 1].tolist() == [0, 1, 2, 3, 5, -1, -1]
@@ -106,8 +103,9 @@ def test_csa_stage_inputs_remap_raw_and_selected_compressed_keys() -> None:
 
 def test_csa_stage_inputs_preserve_batch_specific_topk() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
-    stage = build_stage_local_topk_for_csa(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=4,
         query_token_ids=(11,),
         global_k_ranges=(_Range(start=8, end=13), _Range(start=13, end=18)),
@@ -123,7 +121,6 @@ def test_csa_stage_inputs_preserve_batch_specific_topk() -> None:
 
     assert stage.raw_token_ids == tuple(range(8, 18))
     assert stage.compressed_entry_ids == (2, 3)
-    assert stage.compressed_entry_ids_by_query == ((2,),)
     assert stage.topk_stage_local.shape == (2, 1, 6)
     assert stage.topk_stage_local[0, 0].tolist() == [0, 1, 2, 3, 10, -1]
     assert stage.topk_stage_local[1, 0].tolist() == [0, 1, 2, 3, 10, -1]
@@ -133,18 +130,17 @@ def test_csa_stage_inputs_tensorized_remap_filters_duplicates_without_metadata()
     None
 ):
     layout = _layout(Dsv4CompressionKind.CSA)
-    stage = build_stage_local_topk_for_csa(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=4,
         query_token_ids=(11,),
         global_k_ranges=(_Range(start=8, end=13), _Range(start=13, end=18)),
         global_topk=torch.tensor([[[2, 2, 3, 2, -1]]], dtype=torch.long),
         window_size=4,
-        materialize_compressed_metadata=False,
     )
 
     assert stage.compressed_entry_ids == (2, 3)
-    assert stage.compressed_entry_ids_by_query == ((),)
     assert stage.topk_stage_local.shape == (1, 1, 9)
     assert stage.topk_stage_local[0, 0].tolist() == [
         0,
@@ -161,8 +157,9 @@ def test_csa_stage_inputs_tensorized_remap_filters_duplicates_without_metadata()
 
 def test_hca_stage_inputs_include_all_visible_compressed_entries() -> None:
     layout = _layout(Dsv4CompressionKind.HCA)
-    stage = build_stage_local_topk_for_hca(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=5,
         query_token_ids=(8, 11, 16),
         global_k_ranges=(_Range(start=8, end=13),),
@@ -171,8 +168,6 @@ def test_hca_stage_inputs_include_all_visible_compressed_entries() -> None:
 
     assert stage.raw_token_ids == (8, 9, 10, 11, 12)
     assert stage.compressed_entry_ids == (2,)
-    assert stage.raw_token_ids_by_query == ((8,), (8, 9, 10, 11), ())
-    assert stage.compressed_entry_ids_by_query == ((), (2,), ())
     assert stage.topk_stage_local.shape == (1, 3, 5)
     assert stage.topk_stage_local[0, 0].tolist() == [0, -1, -1, -1, -1]
     assert stage.topk_stage_local[0, 1].tolist() == [0, 1, 2, 3, 5]
@@ -181,8 +176,9 @@ def test_hca_stage_inputs_include_all_visible_compressed_entries() -> None:
 
 def test_stage_inputs_filter_padding_tokens_from_cp_k_ranges() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
-    stage = build_stage_local_topk_for_csa(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=6,
         query_token_ids=(16,),
         global_k_ranges=(_Range(start=16, end=20),),
@@ -199,16 +195,18 @@ def test_stage_inputs_filter_padding_tokens_from_cp_k_ranges() -> None:
 def test_stage_kv_exchange_peer_plan_uses_layout_ownership() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
     stages = (
-        build_stage_local_topk_for_csa(
+        build_dsv4_stage_inputs(
             layout=layout,
+            compression_kind=layout.spec.kind,
             stage_index=0,
             query_token_ids=(7,),
             global_k_ranges=(_Range(start=4, end=13),),
             global_topk=torch.tensor([[1, 2]], dtype=torch.long),
             window_size=4,
         ),
-        build_stage_local_topk_for_csa(
+        build_dsv4_stage_inputs(
             layout=layout,
+            compression_kind=layout.spec.kind,
             stage_index=0,
             query_token_ids=(16,),
             global_k_ranges=(_Range(start=8, end=20),),
@@ -356,8 +354,9 @@ def test_stage_slot_exchange_uses_prepared_peer_plan(
             ),
         )
     )[0]
-    local_stage_inputs = build_stage_local_topk_for_csa(
+    local_stage_inputs = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=5,
         query_token_ids=(7,),
         global_k_ranges=(_Range(start=4, end=13),),
@@ -420,8 +419,9 @@ def test_deferred_stage_slot_exchange_binds_stage_inputs_later() -> None:
             (_stage_plan(stage_index=5, q_ranges=((7, 8),), k_ranges=((4, 13),)),),
         )
     )[0]
-    stage_inputs = build_stage_local_topk_for_csa(
+    stage_inputs = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=5,
         query_token_ids=(7,),
         global_k_ranges=(_Range(start=4, end=13),),
@@ -461,8 +461,9 @@ def test_deferred_stage_slot_exchange_binds_stage_inputs_later() -> None:
 
 def test_materialize_stage_tensors_uses_explicit_id_maps() -> None:
     layout = _layout(Dsv4CompressionKind.CSA)
-    stage = build_stage_local_topk_for_csa(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=6,
         query_token_ids=(8, 11, 16),
         global_k_ranges=(_Range(start=8, end=13),),
@@ -508,8 +509,9 @@ def test_materialize_stage_tensors_preserves_batch_topk_and_expands_singletons()
     None
 ):
     layout = _layout(Dsv4CompressionKind.CSA)
-    stage = build_stage_local_topk_for_csa(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=7,
         query_token_ids=(11,),
         global_k_ranges=(_Range(start=8, end=13), _Range(start=13, end=18)),
@@ -542,8 +544,9 @@ def test_materialize_stage_tensors_preserves_batch_topk_and_expands_singletons()
 
 def test_materialize_stage_tensors_rejects_missing_ids() -> None:
     layout = _layout(Dsv4CompressionKind.HCA)
-    stage = build_stage_local_topk_for_hca(
+    stage = build_dsv4_stage_inputs(
         layout=layout,
+        compression_kind=layout.spec.kind,
         stage_index=8,
         query_token_ids=(11,),
         global_k_ranges=(_Range(start=8, end=13),),

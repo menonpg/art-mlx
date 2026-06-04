@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict
 import torch
 
 from .comm import Dsv4TensorExchangeWork, launch_dsv4_tensor_exchange
@@ -15,6 +14,7 @@ from .types import (
     Dsv4IndexerStagePlan,
     Dsv4TensorExchangePlan,
     Dsv4TopkResult,
+    Dsv4WorkModel,
 )
 
 _INVALID_INDEX = -1
@@ -26,9 +26,7 @@ class TokenRangeLike(Protocol):
     end: int
 
 
-class Dsv4IndexerKvExchangeWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4IndexerKvExchangeWork(Dsv4WorkModel):
     layout: Dsv4CompressedLayout
     query_token_ids: tuple[int, ...]
     candidate_entry_ids: tuple[int, ...]
@@ -67,9 +65,7 @@ class Dsv4IndexerKvExchangeWork(BaseModel):
         )
 
 
-class Dsv4ExchangedIndexerTopkWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4ExchangedIndexerTopkWork(Dsv4WorkModel):
     stage_works: tuple[Any, ...]
     query_token_ids: tuple[int, ...]
     topk: int
@@ -244,11 +240,24 @@ def build_indexer_visibility_mask(
         candidate_entry_ids=candidate_entry_ids,
         device=device,
     )
+    return _indexer_mask_from_visibility_parts(
+        query_visibility=(query_branch, query_prefix, query_pos),
+        entry_visibility=(entry_branch, entry_prefix, entry_pos, entry_shared),
+    )
+
+
+def _indexer_mask_from_visibility_parts(
+    *,
+    query_visibility: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    entry_visibility: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    query_branch, query_prefix, query_pos = query_visibility
+    entry_branch, entry_prefix, entry_pos, entry_shared = entry_visibility
     same_branch = query_branch.unsqueeze(1) == entry_branch.unsqueeze(0)
     same_prefix = query_prefix.unsqueeze(1) == entry_prefix.unsqueeze(0)
-    shared_prefix = entry_shared.unsqueeze(0) & same_prefix
-    closed = entry_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
-    return (same_branch | shared_prefix) & closed
+    return (same_branch | (entry_shared.unsqueeze(0) & same_prefix)) & (
+        entry_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
+    )
 
 
 def compute_indexer_scores(
@@ -323,6 +332,17 @@ def compute_indexer_topk(
     id_parts: list[torch.Tensor] = []
     for q_start in range(0, int(q.shape[1]), q_step):
         q_end = min(int(q.shape[1]), q_start + q_step)
+        q_visibility = (
+            _query_visibility_tensors(
+                layout=layout,
+                query_token_ids=query_token_ids[q_start:q_end],
+                device=q.device,
+            )
+            if visibility_mask is None
+            and layout is not None
+            and query_token_ids is not None
+            else None
+        )
         current_scores, current_ids = _empty_topk(
             scores=template[:, q_start:q_end], topk=int(topk)
         )
@@ -338,13 +358,15 @@ def compute_indexer_topk(
                     device=q.device, dtype=torch.bool
                 )
                 if visibility_mask is not None
-                else build_indexer_visibility_mask(
-                    layout=layout,
-                    query_token_ids=query_token_ids[q_start:q_end],
-                    candidate_entry_ids=ids[k_start:k_end],
-                    device=q.device,
+                else _indexer_mask_from_visibility_parts(
+                    query_visibility=q_visibility,
+                    entry_visibility=_entry_visibility_tensors(
+                        layout=cast(Dsv4CompressedLayout, layout),
+                        candidate_entry_ids=ids[k_start:k_end],
+                        device=q.device,
+                    ),
                 )
-                if layout is not None and query_token_ids is not None
+                if q_visibility is not None
                 else None
             )
             scores = compute_indexer_scores(

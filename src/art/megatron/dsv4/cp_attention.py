@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Sequence
 from itertools import chain
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import PrivateAttr
 import torch
 import torch.distributed as dist
 
@@ -47,14 +48,13 @@ from .types import (
     Dsv4StageKvExchangePeerPlan,
     Dsv4StagePlanSlot,
     Dsv4TensorExchangePlan,
+    Dsv4WorkModel,
 )
 
 _DIST = cast(Any, dist)
 
 
-class Dsv4GradientOwnerExchangeWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4GradientOwnerExchangeWork(Dsv4WorkModel):
     rank: int
     rank_count: int
     recv_query_token_ids_by_peer: tuple[tuple[int, ...], ...]
@@ -141,9 +141,7 @@ class Dsv4GradientOwnerExchangeWork(BaseModel):
         return tuple(buckets)
 
 
-class Dsv4SinkGradientReduceWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4SinkGradientReduceWork(Dsv4WorkModel):
     d_attn_sink: torch.Tensor
     handle: Any | None
     _wait_complete: bool = PrivateAttr(default=False)
@@ -160,9 +158,7 @@ class Dsv4SinkGradientReduceWork(BaseModel):
         return self.d_attn_sink
 
 
-class Dsv4ExchangedAttentionForwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4ExchangedAttentionForwardWork(Dsv4WorkModel):
     stage_works: tuple[Any, ...]
     query_token_ids: tuple[int, ...]
     attn_sink: torch.Tensor
@@ -185,9 +181,7 @@ class Dsv4ExchangedAttentionForwardWork(BaseModel):
         )
 
 
-class Dsv4ExchangedAttentionBackwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4ExchangedAttentionBackwardWork(Dsv4WorkModel):
     local_gradients: Dsv4AttentionGradientResult
     owner_work: Any
     sink_work: Any | None = None
@@ -223,9 +217,7 @@ class Dsv4ExchangedAttentionBackwardWork(BaseModel):
         )
 
 
-class Dsv4ProjectedCompressionForwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4ProjectedCompressionForwardWork(Dsv4WorkModel):
     compression_kind: Dsv4CompressionKind
     layout: Dsv4CompressedLayout
     rank: int
@@ -238,9 +230,7 @@ class Dsv4ProjectedCompressionForwardWork(BaseModel):
             self.indexer_compression_work.wait()
 
 
-class Dsv4ProjectedAttentionForwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4ProjectedAttentionForwardWork(Dsv4WorkModel):
     compression_kind: Dsv4CompressionKind
     layout: Dsv4CompressedLayout
     rank: int
@@ -390,9 +380,7 @@ class Dsv4ProjectedAttentionForwardWork(BaseModel):
         return self._attention_work
 
 
-class Dsv4ProjectedAttentionBackwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4ProjectedAttentionBackwardWork(Dsv4WorkModel):
     attention_work: Dsv4ExchangedAttentionBackwardWork
     forward_result: Dsv4ProjectedAttentionForwardResult
     group: Any
@@ -717,7 +705,6 @@ def _launch_dsv4_csa_attention_forward_from_topk_work(
                 window_size=window_size,
                 raw_list_size=raw_list_size,
                 compressed_list_size=compressed_list_size,
-                materialize_compressed_metadata=False,
             )
         )
         for stage_work, slot in zip(deferred_stage_works, slots, strict=True)
@@ -1105,79 +1092,6 @@ def launch_dsv4_hca_projected_attention_forward_from_compression_work(
 
 
 @torch.compiler.disable
-def launch_dsv4_csa_projected_attention_forward_from_stage_plan_slots(
-    *,
-    layout: Dsv4CompressedLayout,
-    rank: int,
-    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
-    query: torch.Tensor,
-    query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    main_projected_kv: torch.Tensor,
-    main_projected_gate: torch.Tensor,
-    main_positional_bias: torch.Tensor,
-    main_token_ids: Sequence[int],
-    indexer_projected_kv: torch.Tensor,
-    indexer_projected_gate: torch.Tensor,
-    indexer_positional_bias: torch.Tensor,
-    indexer_token_ids: Sequence[int],
-    indexer_q: torch.Tensor,
-    indexer_weights: torch.Tensor,
-    indexer_topk: int,
-    attn_sink: torch.Tensor,
-    group: Any,
-    async_op: bool,
-    indexer_stage_plans: Sequence[Dsv4IndexerStagePlan] | None = None,
-    indexer_kv_peer_plans_by_stage: Sequence[Sequence[Dsv4IndexerKvExchangePeerPlan]]
-    | None = None,
-    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
-    | None = None,
-    indexer_score_scale: float = 1.0,
-    scale: float | None = None,
-    window_size: int = 128,
-    raw_list_size: int | None = None,
-    compressed_list_size: int | None = None,
-) -> Dsv4ProjectedAttentionForwardWork:
-    compression_work = launch_dsv4_csa_projected_compression_forward(
-        layout=layout,
-        rank=rank,
-        main_projected_kv=main_projected_kv,
-        main_projected_gate=main_projected_gate,
-        main_positional_bias=main_positional_bias,
-        main_token_ids=main_token_ids,
-        indexer_projected_kv=indexer_projected_kv,
-        indexer_projected_gate=indexer_projected_gate,
-        indexer_positional_bias=indexer_positional_bias,
-        indexer_token_ids=indexer_token_ids,
-        group=group,
-        async_op=async_op,
-    )
-    return launch_dsv4_csa_projected_attention_forward_from_compression_work(
-        compression_work=compression_work,
-        stage_plan_slots=stage_plan_slots,
-        query=query,
-        query_token_ids=query_token_ids,
-        raw_kv=raw_kv,
-        raw_token_ids=raw_token_ids,
-        indexer_q=indexer_q,
-        indexer_weights=indexer_weights,
-        indexer_topk=indexer_topk,
-        attn_sink=attn_sink,
-        group=group,
-        async_op=async_op,
-        indexer_stage_plans=indexer_stage_plans,
-        indexer_kv_peer_plans_by_stage=indexer_kv_peer_plans_by_stage,
-        stage_kv_peer_plans_by_slot=stage_kv_peer_plans_by_slot,
-        indexer_score_scale=indexer_score_scale,
-        scale=scale,
-        window_size=window_size,
-        raw_list_size=raw_list_size,
-        compressed_list_size=compressed_list_size,
-    )
-
-
-@torch.compiler.disable
 def launch_dsv4_csa_projected_compression_forward_from_context_parallel_state(
     *,
     context_state: Dsv4ContextParallelState,
@@ -1263,58 +1177,6 @@ def launch_dsv4_csa_projected_attention_forward_from_context_parallel_state_and_
         indexer_kv_peer_plans_by_stage=plan.csa_indexer_kv_peer_plans_by_stage or None,
         stage_kv_peer_plans_by_slot=plan.csa_stage_kv_peer_plans_by_slot or None,
         indexer_score_scale=indexer_score_scale,
-        scale=scale,
-        window_size=window_size,
-        raw_list_size=raw_list_size,
-        compressed_list_size=compressed_list_size,
-    )
-
-
-@torch.compiler.disable
-def launch_dsv4_hca_projected_attention_forward_from_stage_plan_slots(
-    *,
-    layout: Dsv4CompressedLayout,
-    rank: int,
-    stage_plan_slots: Sequence[Dsv4StagePlanSlot],
-    query: torch.Tensor,
-    query_token_ids: Sequence[int],
-    raw_kv: torch.Tensor,
-    raw_token_ids: Sequence[int],
-    projected_kv: torch.Tensor,
-    projected_gate: torch.Tensor,
-    positional_bias: torch.Tensor,
-    token_ids: Sequence[int],
-    attn_sink: torch.Tensor,
-    group: Any,
-    async_op: bool,
-    stage_kv_peer_plans_by_slot: Sequence[Sequence[Dsv4StageKvExchangePeerPlan]]
-    | None = None,
-    scale: float | None = None,
-    window_size: int = 128,
-    raw_list_size: int | None = None,
-    compressed_list_size: int | None = None,
-) -> Dsv4ProjectedAttentionForwardWork:
-    compression_work = launch_dsv4_hca_projected_compression_forward(
-        layout=layout,
-        rank=rank,
-        projected_kv=projected_kv,
-        projected_gate=projected_gate,
-        positional_bias=positional_bias,
-        token_ids=token_ids,
-        group=group,
-        async_op=async_op,
-    )
-    return launch_dsv4_hca_projected_attention_forward_from_compression_work(
-        compression_work=compression_work,
-        stage_plan_slots=stage_plan_slots,
-        query=query,
-        query_token_ids=query_token_ids,
-        raw_kv=raw_kv,
-        raw_token_ids=raw_token_ids,
-        attn_sink=attn_sink,
-        group=group,
-        async_op=async_op,
-        stage_kv_peer_plans_by_slot=stage_kv_peer_plans_by_slot,
         scale=scale,
         window_size=window_size,
         raw_list_size=raw_list_size,
@@ -1703,6 +1565,16 @@ def launch_exchanged_dsv4_attention_backward(
         raw_token_ids=raw_token_ids,
         compressed_entry_ids=compressed_entry_ids,
     )
+    # Keep same-process-group collectives in one rank-consistent order. The sink
+    # vector is tiny, so completing it before the owner all-to-all avoids NCCL
+    # cross-stream all-reduce/all-to-all interleaving without meaningful cost.
+    sink_work = launch_dsv4_attn_sink_gradient_reduce(
+        d_attn_sink=local_gradients.d_attn_sink,
+        rank=rank,
+        rank_count=rank_count,
+        group=group,
+        async_op=False,
+    )
     owner_work = launch_dsv4_gradient_owner_bucket_exchange(
         gradients=local_gradients,
         query_owner_ranks=query_owner_ranks,
@@ -1711,13 +1583,6 @@ def launch_exchanged_dsv4_attention_backward(
         recv_query_token_ids_by_peer=recv_query_token_ids_by_peer,
         recv_raw_token_ids_by_peer=recv_raw_token_ids_by_peer,
         recv_compressed_entry_ids_by_peer=recv_compressed_entry_ids_by_peer,
-        rank=rank,
-        rank_count=rank_count,
-        group=group,
-        async_op=async_op,
-    )
-    sink_work = launch_dsv4_attn_sink_gradient_reduce(
-        d_attn_sink=local_gradients.d_attn_sink,
         rank=rank,
         rank_count=rank_count,
         group=group,
@@ -2004,7 +1869,6 @@ def _launch_dsv4_stage_from_slot(
         window_size=window_size,
         raw_list_size=raw_list_size,
         compressed_list_size=compressed_list_size,
-        materialize_compressed_metadata=compression_kind != Dsv4CompressionKind.CSA,
     )
     return launch_dsv4_stage_kv_exchange_from_stage_plan_slot(
         layout=layout,
@@ -2547,12 +2411,14 @@ def accumulate_materialized_dsv4_attention_backward(
         ):
             raise ValueError("all DSV4 replay dkv_stage tensors must share shape")
 
-        q_indices = _query_indices_for_stage(
-            stage_query_ids=record.materialized_stage.query_token_ids,
-            query_index=query_index,
-            device=dq.device,
+        _index_add_ids(
+            target=dq,
+            target_ids=query_ids,
+            source_ids=record.materialized_stage.query_token_ids,
+            source=record.dq_stage.to(dtype=target_dtype),
+            id_index=query_index,
+            name="query_token_ids",
         )
-        dq.index_add_(1, q_indices, record.dq_stage.to(dtype=target_dtype))
 
         raw_ids_stage, compressed_ids_stage = _stage_raw_and_compressed_key_ids(
             record.materialized_stage,
@@ -2560,30 +2426,24 @@ def accumulate_materialized_dsv4_attention_backward(
         raw_count = len(raw_ids_stage)
         compressed_count = len(compressed_ids_stage)
         if raw_count:
-            raw_indices = _indices_for_ids(
-                ids=raw_ids_stage,
+            _index_add_ids(
+                target=draw_kv,
+                target_ids=raw_ids,
+                source_ids=raw_ids_stage,
+                source=record.dkv_stage[:, :raw_count].to(dtype=target_dtype),
                 id_index=raw_index,
                 name="raw_token_ids",
-                device=draw_kv.device,
-            )
-            draw_kv.index_add_(
-                1,
-                raw_indices,
-                record.dkv_stage[:, :raw_count].to(dtype=target_dtype),
             )
         if compressed_count:
-            compressed_indices = _indices_for_ids(
-                ids=compressed_ids_stage,
-                id_index=compressed_index,
-                name="compressed_entry_ids",
-                device=dcompressed_kv.device,
-            )
-            dcompressed_kv.index_add_(
-                1,
-                compressed_indices,
-                record.dkv_stage[:, raw_count : raw_count + compressed_count].to(
+            _index_add_ids(
+                target=dcompressed_kv,
+                target_ids=compressed_ids,
+                source_ids=compressed_ids_stage,
+                source=record.dkv_stage[:, raw_count : raw_count + compressed_count].to(
                     dtype=target_dtype
                 ),
+                id_index=compressed_index,
+                name="compressed_entry_ids",
             )
 
     return Dsv4AttentionGradientResult(
@@ -3217,6 +3077,49 @@ def _query_indices_for_stage(
         device=device,
         dtype=torch.long,
     )
+
+
+def _index_add_ids(
+    *,
+    target: torch.Tensor,
+    target_ids: tuple[int, ...],
+    source_ids: Sequence[int],
+    source: torch.Tensor,
+    id_index: dict[int, int],
+    name: str,
+) -> None:
+    span = _contiguous_id_span(target_ids=target_ids, source_ids=source_ids)
+    if span is not None:
+        start, end = span
+        target[:, start:end].add_(source)
+        return
+    target.index_add_(
+        1,
+        _indices_for_ids(
+            ids=source_ids,
+            id_index=id_index,
+            name=name,
+            device=target.device,
+        ),
+        source,
+    )
+
+
+def _contiguous_id_span(
+    *,
+    target_ids: tuple[int, ...],
+    source_ids: Sequence[int],
+) -> tuple[int, int] | None:
+    ids = tuple(int(id_) for id_ in source_ids)
+    if not ids:
+        return (0, 0)
+    if ids == target_ids:
+        return (0, len(ids))
+    start = bisect_left(target_ids, ids[0])
+    end = start + len(ids)
+    if end <= len(target_ids) and target_ids[start:end] == ids:
+        return (start, end)
+    return None
 
 
 def _indices_for_ids(

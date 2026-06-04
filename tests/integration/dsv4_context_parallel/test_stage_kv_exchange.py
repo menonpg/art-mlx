@@ -14,8 +14,8 @@ from art.megatron.dsv4 import (
     Dsv4CompressionKind,
     Dsv4CompressionSpec,
     build_dsv4_compressed_layout,
+    build_dsv4_stage_inputs,
     build_dsv4_stage_kv_exchange_peer_plans,
-    build_stage_local_topk_for_csa,
     launch_planned_dsv4_stage_kv_exchange,
 )
 
@@ -63,8 +63,9 @@ def _stage_kv_exchange_worker(rank: int, world_size: int, init_path: str) -> Non
     try:
         layout = _layout()
         stages = tuple(
-            build_stage_local_topk_for_csa(
+            build_dsv4_stage_inputs(
                 layout=layout,
+                compression_kind=layout.spec.kind,
                 stage_index=9,
                 query_token_ids=query_ids,
                 global_k_ranges=(_Range(start=4, end=13),),

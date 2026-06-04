@@ -35,6 +35,10 @@ class Dsv4TensorModel(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
 
+class Dsv4WorkModel(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
 class Dsv4CompressionSpec(Dsv4FrozenModel):
     kind: Dsv4CompressionKind
     ratio: int
@@ -46,9 +50,6 @@ class Dsv4StreamSpec(Dsv4FrozenModel):
     parent_stream_id: int | None
     start: int
     end: int
-
-    def size(self) -> int:
-        return int(self.end) - int(self.start)
 
 
 class Dsv4BranchView(Dsv4FrozenModel):
@@ -151,8 +152,6 @@ class Dsv4StageInputs(Dsv4TensorModel):
     compressed_entry_ids: tuple[int, ...]
     key_kinds: tuple[Dsv4StageKeyKind, ...]
     key_global_ids: tuple[int, ...]
-    raw_token_ids_by_query: tuple[tuple[int, ...], ...]
-    compressed_entry_ids_by_query: tuple[tuple[int, ...], ...]
     topk_stage_local: torch.Tensor
 
 

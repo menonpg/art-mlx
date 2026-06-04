@@ -1785,6 +1785,25 @@ def _stage_local_buffer_ranges(
     return tuple(local_ranges)
 
 
+def _token_index_tensor_for_ranges(
+    ranges: tuple[TokenRange, ...],
+    padded_len: int,
+) -> torch.Tensor:
+    indices = torch.full((int(padded_len),), -1, dtype=torch.int64)
+    cursor = 0
+    for range_ in ranges:
+        size = int(range_.size())
+        if size <= 0:
+            continue
+        indices[cursor : cursor + size] = torch.arange(
+            int(range_.start),
+            int(range_.end),
+            dtype=torch.int64,
+        )
+        cursor += size
+    return indices
+
+
 def _build_stage_from_pieces(
     *,
     stage_index: int,
@@ -1821,16 +1840,13 @@ def _build_stage_from_pieces(
     mask_metadata: ExactMaskMetadata | None = None
     q_remap_cache: dict[tuple[int, int], TokenRange] = {}
     k_remap_cache: dict[tuple[int, int], TokenRange] = {}
-    source_index_cache: dict[tuple[int, int], torch.Tensor] = {}
-    assigned_q_keys: set[tuple[int, int]] = set()
-    assigned_k_keys: set[tuple[int, int]] = set()
 
     if global_q_ranges:
         owner_local_q_ranges = tuple(
             _remap_subrange(range_, host_local_ranges) for range_ in global_q_ranges
         )
-    q_token_indices = torch.full((q_len,), -1, dtype=torch.int64)
-    k_token_indices = torch.full((k_len,), -1, dtype=torch.int64)
+    q_token_indices = _token_index_tensor_for_ranges(global_q_ranges, q_len)
+    k_token_indices = _token_index_tensor_for_ranges(global_k_ranges, k_len)
     last_slice_key: StageSliceKey | None = None
     for q_piece, k_piece, piece_mask_kind, family_index in sorted(
         pieces,
@@ -1853,18 +1869,6 @@ def _build_stage_from_pieces(
         if localized_k is None:
             localized_k = _remap_subrange(k_piece, global_k_ranges)
             k_remap_cache[k_key] = localized_k
-        q_source_indices = source_index_cache.get(q_key)
-        if q_source_indices is None:
-            q_source_indices = torch.arange(
-                q_piece.start, q_piece.end, dtype=torch.int64
-            )
-            source_index_cache[q_key] = q_source_indices
-        k_source_indices = source_index_cache.get(k_key)
-        if k_source_indices is None:
-            k_source_indices = torch.arange(
-                k_piece.start, k_piece.end, dtype=torch.int64
-            )
-            source_index_cache[k_key] = k_source_indices
         slice_key = (
             0,
             int(localized_q.start),
@@ -1876,7 +1880,7 @@ def _build_stage_from_pieces(
         )
         if slice_key != last_slice_key:
             localized_slices.append(
-                AttnSlice(
+                AttnSlice.model_construct(
                     q_range=localized_q,
                     k_range=localized_k,
                     mask_kind=piece_mask_kind,
@@ -1885,24 +1889,8 @@ def _build_stage_from_pieces(
                 )
             )
             last_slice_key = slice_key
-        if q_key not in assigned_q_keys:
-            _set_stage_token_indices(
-                target_indices=q_token_indices,
-                stage_range=localized_q,
-                source_range=q_piece,
-                source_indices=q_source_indices,
-            )
-            assigned_q_keys.add(q_key)
-        if k_key not in assigned_k_keys:
-            _set_stage_token_indices(
-                target_indices=k_token_indices,
-                stage_range=localized_k,
-                source_range=k_piece,
-                source_indices=k_source_indices,
-            )
-            assigned_k_keys.add(k_key)
     if localized_slices:
-        mask_metadata = ExactMaskMetadata(
+        mask_metadata = ExactMaskMetadata.model_construct(
             q_token_indices=q_token_indices,
             k_token_indices=k_token_indices,
             cache_key=_exact_mask_metadata_cache_key(
@@ -1910,7 +1898,7 @@ def _build_stage_from_pieces(
                 k_token_indices=k_token_indices,
             ),
         )
-    return StagePlan(
+    return StagePlan.model_construct(
         stage_index=stage_index,
         source_rank=source_rank,
         source_ranks=source_ranks,
@@ -1982,12 +1970,12 @@ def _build_rank_runtime_plan(
             _remap_subrange(range_, host_local_ranges)
             for range_ in local_global_k_ranges
         ),
-        kv_fetch_plan=KvFetchPlan(
+        kv_fetch_plan=KvFetchPlan.model_construct(
             send_splits=tuple(0 for _ in range(cp_size)),
             recv_splits=tuple(0 for _ in range(cp_size)),
             send_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
         ),
-        dkv_reduce_plan=DkvReducePlan(
+        dkv_reduce_plan=DkvReducePlan.model_construct(
             send_splits=tuple(0 for _ in range(cp_size)),
             recv_splits=tuple(0 for _ in range(cp_size)),
             recv_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
@@ -2061,12 +2049,12 @@ def _build_rank_runtime_plan(
             host_local_ranges=host_local_ranges,
             global_k_ranges=global_k_ranges,
             local_k_ranges=local_k_ranges,
-            kv_fetch_plan=KvFetchPlan(
+            kv_fetch_plan=KvFetchPlan.model_construct(
                 send_splits=send_splits,
                 recv_splits=recv_splits,
                 send_ranges_by_peer=send_ranges_by_peer,
             ),
-            dkv_reduce_plan=DkvReducePlan(
+            dkv_reduce_plan=DkvReducePlan.model_construct(
                 send_splits=recv_splits,
                 recv_splits=send_splits,
                 recv_ranges_by_peer=send_ranges_by_peer,
@@ -2083,7 +2071,7 @@ def _build_rank_runtime_plan(
     aggregate_send_splits = tuple(
         _ranges_size(peer_ranges) for peer_ranges in aggregate_send_ranges
     )
-    return RankRuntimePlan(
+    return RankRuntimePlan.model_construct(
         rank=target_rank,
         original_seq_len=original_seq_len,
         token_layout_index=token_layout_index,
@@ -2092,12 +2080,12 @@ def _build_rank_runtime_plan(
         local_token_count=local_token_count,
         stage_plans=tuple(stage_plans),
         backward_stage_indices=tuple(backward_stage_indices + [0]),
-        remote_kv_fetch_plan=KvFetchPlan(
+        remote_kv_fetch_plan=KvFetchPlan.model_construct(
             send_splits=aggregate_send_splits,
             recv_splits=tuple(aggregate_recv_splits),
             send_ranges_by_peer=aggregate_send_ranges,
         ),
-        remote_dkv_reduce_plan=DkvReducePlan(
+        remote_dkv_reduce_plan=DkvReducePlan.model_construct(
             send_splits=tuple(aggregate_recv_splits),
             recv_splits=aggregate_send_splits,
             recv_ranges_by_peer=aggregate_send_ranges,
@@ -2679,43 +2667,6 @@ def _row_signature(row_spec: PackedRowAttentionSpec) -> str:
 
 def _range_key(range_: TokenRange) -> tuple[int, int]:
     return (int(range_.start), int(range_.end))
-
-
-def _set_stage_token_indices(
-    *,
-    target_indices: torch.Tensor,
-    stage_range: TokenRange,
-    source_range: TokenRange,
-    source_indices: torch.Tensor,
-) -> None:
-    if stage_range.size() != source_range.size():
-        raise RuntimeError(
-            "Stage-local and packed-sequence token ranges must have matched sizes, got "
-            f"{stage_range} vs {source_range}"
-        )
-
-    current_indices = target_indices[stage_range.start : stage_range.end]
-    if not bool(
-        torch.logical_or(current_indices == -1, current_indices == source_indices)
-        .all()
-        .item()
-    ):
-        mismatch = torch.nonzero(
-            torch.logical_not(
-                torch.logical_or(
-                    current_indices == -1, current_indices == source_indices
-                )
-            ),
-            as_tuple=False,
-        ).flatten()
-        mismatch_offset = int(mismatch[0].item())
-        mismatch_index = int(stage_range.start) + mismatch_offset
-        raise RuntimeError(
-            "Stage mask token index mismatch at stage index "
-            f"{mismatch_index}: {int(current_indices[mismatch_offset].item())} vs "
-            f"{int(source_indices[mismatch_offset].item())}"
-        )
-    current_indices.copy_(source_indices)
 
 
 def _token_costs(row_spec: PackedRowAttentionSpec) -> list[float]:

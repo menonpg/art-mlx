@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import PrivateAttr
 import torch
 import torch.distributed as dist
 
@@ -24,6 +24,8 @@ from .types import (
     Dsv4StreamKind,
     Dsv4StreamSpec,
     Dsv4TensorExchangePlan,
+    Dsv4TensorModel,
+    Dsv4WorkModel,
 )
 
 _DIST = cast(Any, dist)
@@ -41,9 +43,7 @@ class TokenLayoutIndexLike(Protocol):
     token_counts_by_rank: tuple[int, ...]
 
 
-class Dsv4CompressionHaloExchangeWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4CompressionHaloExchangeWork(Dsv4WorkModel):
     rank: int
     projected_dim: int
     incoming_transfers: tuple[Dsv4HaloTransfer, ...]
@@ -92,9 +92,7 @@ class Dsv4CompressionHaloExchangeWork(BaseModel):
         return tuple(payloads)
 
 
-class Dsv4CompressionHaloGradientExchangeWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4CompressionHaloGradientExchangeWork(Dsv4WorkModel):
     rank: int
     projected_dim: int
     incoming_transfers: tuple[Dsv4HaloTransfer, ...]
@@ -147,9 +145,7 @@ class Dsv4CompressionHaloGradientExchangeWork(BaseModel):
         return tuple(payloads)
 
 
-class _Dsv4LayoutBuildResult(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
+class _Dsv4LayoutBuildResult(Dsv4TensorModel):
     compressed_entry_count: int
     halo_transfers: tuple[Dsv4HaloTransfer, ...]
     entry_ids_by_owner_rank: tuple[tuple[int, ...], ...]
@@ -163,9 +159,7 @@ class _Dsv4LayoutBuildResult(BaseModel):
     closure_entry_ids: tuple[int, ...]
 
 
-class Dsv4CompressedKvForwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4CompressedKvForwardWork(Dsv4WorkModel):
     layout: Dsv4CompressedLayout
     rank: int
     projected_kv: torch.Tensor
@@ -207,9 +201,7 @@ class Dsv4CompressedKvForwardWork(BaseModel):
         )
 
 
-class Dsv4CompressedKvBackwardWork(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+class Dsv4CompressedKvBackwardWork(Dsv4WorkModel):
     rank: int
     local_gradient: Dsv4ProjectedTokenBuffer
     dpositional_bias: torch.Tensor

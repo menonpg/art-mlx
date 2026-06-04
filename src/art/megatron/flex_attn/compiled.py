@@ -15,12 +15,11 @@ from art.megatron.flex_attn.flash_dlse_patch import apply_flash_flex_dlse_patch
 apply_flash_flex_dlse_patch()
 
 
-# Integration tests patch this module in-process when they need a non-default
-# backend. Production ART uses FLASH except on SM100/SM110, where current FA4
-# FLASH block-sparse coverage is not sufficient for CP attention.
+# Tests may patch the backend; SM100/SM110 use TRITON until FA4 coverage is sufficient.
 _FORCED_FLEX_BACKEND = "FLASH"
 _FLASH_LSE_RESCALE = math.log(2.0)
 SparseBlockSize: TypeAlias = int | tuple[int, int]
+_FORCED_FLEX_KERNEL_OPTIONS = cast(FlexKernelOptions, {"BACKEND": _FORCED_FLEX_BACKEND})
 
 
 def normalize_flex_lse(lse: torch.Tensor) -> torch.Tensor:
@@ -29,27 +28,12 @@ def normalize_flex_lse(lse: torch.Tensor) -> torch.Tensor:
     return lse / _FLASH_LSE_RESCALE
 
 
-_FORCED_FLEX_KERNEL_OPTIONS = cast(
-    FlexKernelOptions,
-    {"BACKEND": _FORCED_FLEX_BACKEND},
-)
-
-
-def _cuda_device_major(device: torch.device) -> int | None:
-    if device.type != "cuda":
-        return None
+def _runtime_flex_backend(device: torch.device) -> str:
+    if _FORCED_FLEX_BACKEND != "FLASH" or device.type != "cuda":
+        return _FORCED_FLEX_BACKEND
     with torch.cuda.device(device):
         major, _minor = torch.cuda.get_device_capability(device)
-    return int(major)
-
-
-def _runtime_flex_backend(device: torch.device) -> str:
-    if _FORCED_FLEX_BACKEND != "FLASH":
-        return _FORCED_FLEX_BACKEND
-    major = _cuda_device_major(device)
-    if major in {10, 11}:
-        return "TRITON"
-    return _FORCED_FLEX_BACKEND
+    return "TRITON" if major in {10, 11} else _FORCED_FLEX_BACKEND
 
 
 def _runtime_flex_kernel_options(device: torch.device) -> FlexKernelOptions:
@@ -76,12 +60,10 @@ def flash_sparse_block_size_for_head_dim(
 ) -> tuple[int, int]:
     if _runtime_flex_backend(device) != "FLASH":
         return (128, 128)
-    if device.type != "cuda":
-        return (128, 128)
-    major = _cuda_device_major(device)
+    with torch.cuda.device(device):
+        major, _minor = torch.cuda.get_device_capability(device)
     if major != 9:
         return (128, 128)
-    del head_dim_v
     if int(head_dim) <= 128:
         return (128, 128)
     if int(head_dim) <= 192:
