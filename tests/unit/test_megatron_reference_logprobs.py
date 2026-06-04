@@ -137,7 +137,9 @@ def test_calculate_megatron_logprobs_replays_routes(monkeypatch) -> None:
         model_chunks=[chunk],
         model_support_handler=_Handler(),
         inputs=_packed_inputs(),
-        moe_routing_replay_controller=controller,
+        moe_routing_replay_controller=cast(
+            megatron_train.MoeRoutingReplayController, controller
+        ),
         step_index=2,
         sample_index=5,
         global_grad_accumulation_sequences=8,
