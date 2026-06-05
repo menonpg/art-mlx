@@ -169,6 +169,9 @@ def test_get_model_config_qwen3_5_moe_target_modules(base_model: str):
             "in_proj_z",
             "out_proj",
             "experts",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ]
 
 
