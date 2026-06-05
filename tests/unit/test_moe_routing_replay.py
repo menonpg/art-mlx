@@ -18,6 +18,7 @@ from art.megatron.routing_replay import (
     TopologyAwareLocalTokenIndexer,
     build_router_key_from_module_name,
 )
+from art.megatron.training.trace import _routing_replay_token_uid_sets
 
 
 def _make_route(
@@ -121,6 +122,15 @@ class _FakeParallelState:
 
     def get_tensor_model_parallel_rank(self) -> int:
         return self._tp_rank
+
+
+class _FakeGdnExecutionPlan:
+    attention_token_indices = (0, 1, 2, 3)
+    gdn_token_indices = (0, 2)
+
+
+class _FakeAttentionState:
+    gdn_execution_plan = _FakeGdnExecutionPlan()
 
 
 class _FakeRouterReplay:
@@ -240,6 +250,26 @@ def _expected_routing_map(route: RouterCallRoute) -> torch.Tensor:
     rows = torch.arange(route.num_global_tokens).unsqueeze(1)
     routing_map[rows, route.expert_indices.to(torch.long)] = True
     return routing_map
+
+
+def test_routing_replay_token_uid_sets_keep_full_attention_layout_with_gdn_plan() -> (
+    None
+):
+    token_uids = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int64)
+
+    token_uid_sets = _routing_replay_token_uid_sets(
+        token_uids,
+        attention_state=_FakeAttentionState(),
+    )
+
+    assert torch.equal(
+        token_uid_sets["attention"],
+        torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64),
+    )
+    assert torch.equal(
+        token_uid_sets["gdn"],
+        torch.tensor([0, 2], dtype=torch.int64),
+    )
 
 
 def test_build_router_key_from_compiled_module_name() -> None:
