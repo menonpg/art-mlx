@@ -30,7 +30,7 @@ backend = [
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
     "wandb==0.25.0",
-    "transformers==5.2.0",
+    "transformers==5.6.2",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
     "trl==0.20.0",
@@ -80,7 +80,7 @@ tinker = [
     "tinker-cookbook>=0.4.1,<0.5",
     "tinker>=0.21.0,<0.22",
     "torch>=2.11.0",
-    "transformers==5.2.0",
+    "transformers==5.6.2",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
 ]
@@ -151,13 +151,13 @@ markers = [
 [tool.uv]
 required-version = ">=0.11.7"
 override-dependencies = [
-    "flashinfer-python==0.6.1",
+    "flashinfer-python==0.6.8.post1",
     "megatron-core==0.17.0",
     "numpy<2",
     "nvidia-resiliency-ext<0.5",
     "quack-kernels==0.3.7",
     "transformer-engine==2.11.0",
-    "transformers==5.2.0",
+    "transformers==5.6.2",
     "torch==2.11.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers"]
@@ -275,7 +275,7 @@ torch = { index = "pytorch-cu128" }
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
 deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
-megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e049cc00c24d03e2ae45d2608c7a44e2d2364e3d" }
+megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 panza = { git = "https://github.com/corbt/panza.git" }
 transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch" }
 
