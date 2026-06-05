@@ -271,7 +271,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
 deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
