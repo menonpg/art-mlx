@@ -73,6 +73,7 @@ def create_identity_lora(
     base_model: str,
     lora_path: str,
     rank: int | None = None,
+    target_modules: list[str] | None = None,
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
@@ -98,7 +99,7 @@ def create_identity_lora(
 
     if random_state is not None:
         torch.manual_seed(random_state)
-    target_modules = default_target_modules(base_model)
+    target_modules = target_modules or default_target_modules(base_model)
     handler = get_model_support_handler(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -427,11 +428,16 @@ class MegatronService:
             self.base_model,
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
+        lora_config = self.config.get("lora_config", {})
+        rank = int(lora_config.get("rank", default_lora_rank_for_handler(handler)))
+        target_modules = lora_config.get("target_modules") or default_target_modules(
+            self.base_model
+        )
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=default_lora_rank_for_handler(handler),
+            r=rank,
             lora_alpha=LORA_ALPHA,
-            target_modules=default_target_modules(self.base_model),
+            target_modules=target_modules,
             bias="none",
         )
 
@@ -448,9 +454,13 @@ class MegatronService:
         return True
 
     def _create_identity_lora(self, lora_path: str) -> None:
+        lora_config = self.config.get("lora_config", {})
+        rank = lora_config.get("rank")
         create_identity_lora(
             self.base_model,
             lora_path,
+            rank=int(rank) if rank is not None else None,
+            target_modules=lora_config.get("target_modules"),
             random_state=self._megatron_random_state(),
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )

@@ -49,6 +49,27 @@ class _FakeAsyncioProcess:
         return 0
 
 
+def test_megatron_default_lora_adapter_config_uses_model_lora_config(
+    tmp_path: Path,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+
+    config = service._default_lora_adapter_config()
+
+    assert config.r == 8
+    assert config.target_modules == {"q_proj", "down_proj"}
+
+
 @pytest.mark.asyncio
 async def test_megatron_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
