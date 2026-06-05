@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 from openai._types import NOT_GIVEN
@@ -17,12 +17,20 @@ from .._backend_training import (
 )
 from ..backend import AnyTrainableModel, Backend
 from ..metrics_taxonomy import (
+    SFT_GRADIENT_STEP_KEY,
+    SFT_METRIC_PREFIX,
+    SFT_WANDB_GRADIENT_STEP_KEY,
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
     summarize_trajectory_groups,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
+from ..types import (
+    ServerlessTrainResult,
+    SFTMetricLoggingConfig,
+    TrainConfig,
+    TrainSFTConfig,
+)
 from ..utils.record_provenance import record_provenance
 
 if TYPE_CHECKING:
@@ -87,6 +95,9 @@ class ServerlessBackend(Backend):
         client = Client(api_key=api_key, base_url=base_url)
         self._base_url = str(client.base_url)
         self._client = client
+
+    def logs_sft_metrics_remotely(self) -> bool:
+        return True
 
     async def close(self) -> None:
         await self._client.close()  # ty:ignore[possibly-missing-attribute]
@@ -607,6 +618,20 @@ class ServerlessBackend(Backend):
             )
             sft_config["batch_size"] = batch_size
         sft_config["learning_rate"] = config.learning_rate
+        metric_logging = cast(
+            SFTMetricLoggingConfig,
+            dict(dev_config.get("metric_logging", {}) or {}),
+        )
+        if metric_logging.get("enabled"):
+            metric_logging.setdefault("entity", model.entity)
+            metric_logging.setdefault("project", model.project)
+            metric_logging.setdefault("run_id", model.run_id or model.name)
+            metric_logging.setdefault("run_name", model.name)
+            metric_logging.setdefault("metric_prefix", SFT_METRIC_PREFIX)
+            metric_logging.setdefault("step_metric", SFT_WANDB_GRADIENT_STEP_KEY)
+            metric_logging.setdefault("gradient_step_key", SFT_GRADIENT_STEP_KEY)
+            metric_logging.setdefault("summary_split", "train")
+            sft_config["metric_logging"] = metric_logging
 
         sft_training_job = await self._client.sft_training_jobs.create(
             model_id=model.id,

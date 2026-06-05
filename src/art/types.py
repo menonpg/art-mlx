@@ -6,6 +6,7 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 import pydantic
 from pydantic import SkipValidation
+from typing_extensions import TypedDict
 
 Message = Annotated[ChatCompletionMessageParam, SkipValidation]
 MessageOrChoice = Message | Choice
@@ -23,6 +24,20 @@ class TrainConfig(pydantic.BaseModel):
 class TrainSFTConfig(pydantic.BaseModel):
     learning_rate: float | list[float] = 5e-5  # Single value or per-batch list
     batch_size: int | Literal["auto"] = "auto"
+
+
+class SFTMetricLoggingConfig(TypedDict, total=False):
+    enabled: bool
+    entity: str | None
+    project: str
+    run_id: str
+    run_name: str
+    metric_prefix: str
+    step_metric: str
+    gradient_step_key: str
+    summary_split: str
+    metric_log_interval: int
+    target_training_step: int
 
 
 Verbosity = Literal[0, 1, 2]

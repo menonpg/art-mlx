@@ -352,6 +352,8 @@ async def train_sft_from_file(
     _config: "DevTrainSFTConfig | None" = None,
     verbose: bool = False,
     shuffle_buffer_size: int = 10000,
+    log_metrics: bool = True,
+    metric_log_interval: int = 1,
 ) -> None:
     """
     Train a model using supervised fine-tuning from a JSONL file.
@@ -375,6 +377,10 @@ async def train_sft_from_file(
         verbose: Whether to print verbose output. Default: False
         shuffle_buffer_size: Size of shuffle buffer. Default: 10000.
                              Larger values give better shuffling but use more memory.
+        log_metrics: Whether to log SFT optimizer metrics. Default: True.
+        metric_log_interval: Log every Nth SFT gradient step. The first and
+                             final observed gradient step are always logged.
+                             Default: 1.
 
     Example:
         await train_sft_from_file(
@@ -449,4 +455,6 @@ async def train_sft_from_file(
         config,
         _config=_config,
         verbose=verbose,
+        log_metrics=log_metrics,
+        metric_log_interval=metric_log_interval,
     )
