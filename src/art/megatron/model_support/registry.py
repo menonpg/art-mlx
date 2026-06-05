@@ -49,6 +49,9 @@ _QWEN3_5_MOE_TARGET_MODULES = (
     "in_proj_z",
     "out_proj",
     "experts",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 )
 
 DEFAULT_DENSE_SPEC = ModelSupportSpec(
