@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -5,13 +7,15 @@ from itertools import takewhile
 import json
 import math
 import random
-from typing import Any, Generator, Literal, cast
+from typing import TYPE_CHECKING, Any, Generator, Literal, cast
 
 from openai.types.chat.chat_completion import Choice
 from PIL import Image
 import torch
-from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from ..types import MessagesAndChoices

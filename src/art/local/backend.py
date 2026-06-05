@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 import gc
 import hashlib
@@ -9,7 +11,7 @@ import shutil
 import socket
 import time
 from types import TracebackType
-from typing import Any, AsyncIterator, Iterable, Literal, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 logger = logging.getLogger(__name__)
@@ -22,10 +24,12 @@ import numpy as np
 import polars as pl
 import torch
 from tqdm import auto as tqdm
-from transformers import AutoImageProcessor, AutoTokenizer
-from transformers.image_processing_utils import BaseImageProcessor
+from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -66,7 +70,13 @@ from ..preprocessing.tokenize import (
     tokenize_trajectory_groups,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
+from ..types import (
+    LocalTrainResult,
+    MegatronTopologyConfig,
+    Message,
+    TrainConfig,
+    TrainSFTConfig,
+)
 from ..utils import format_message, get_model_step
 from .adapter_leases import (
     AdapterLeaseManager,
@@ -410,6 +420,16 @@ class LocalBackend(Backend):
         async with pin_inference_step(model.name, step), manager.lease(step):
             yield
 
+    @asynccontextmanager
+    async def adapter_retention_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with manager.lease(step):
+            yield
+
     async def prune_model_adapters(
         self,
         model: AnyTrainableModel,
@@ -491,6 +511,8 @@ class LocalBackend(Backend):
             self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
+                from transformers import AutoImageProcessor
+
                 self._image_processors[model.base_model] = (
                     AutoImageProcessor.from_pretrained(model.base_model, use_fast=True)
                 )
@@ -704,6 +726,7 @@ class LocalBackend(Backend):
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
+        megatron_topology: MegatronTopologyConfig | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -764,6 +787,9 @@ class LocalBackend(Backend):
             packed_sequence_length: Packed sequence length to use for training.
                 When unset, Unsloth keeps the current max-length-rounded-to-2048
                 behavior. Required for Megatron.
+            megatron_topology: Parallel topology for Megatron training. When
+                provided, ART uses it to configure Megatron TP/CP/EP/PP/VPP/ETP
+                before launching the Megatron runtime.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -824,6 +850,7 @@ class LocalBackend(Backend):
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
+            megatron_topology=megatron_topology,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )

@@ -19,8 +19,12 @@ from art.megatron.model_support.registry import (
 )
 from art.megatron.model_support.spec import (
     ArchitectureReport,
-    MinimalLayerCoverageReport,
     NativeVllmLoraStatus,
+)
+
+from ..artifacts import pinned_git_state
+from .validation_spec import (
+    MinimalLayerCoverageReport,
     ValidationReport,
     ValidationStageResult,
 )
@@ -33,6 +37,7 @@ SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
 LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
 ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
+WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -106,6 +111,7 @@ def initialize_validation_report(
     )
     handler = get_model_support_handler_for_spec(spec)
     return ValidationReport(
+        git=pinned_git_state(WORKFLOW_ARTIFACT_SUITE_NAME).model_dump(mode="json"),
         base_model=base_model,
         model_key=spec.key,
         dependency_versions=detect_dependency_versions(),
@@ -151,6 +157,7 @@ def _inspect_architecture_for_workflow(
     # of inheriting visible GPU count and tripping model-specific TP limits.
     with _temporary_env(
         ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE="1",
+        ART_MEGATRON_CONTEXT_PARALLEL_SIZE="1",
         ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE="1",
         ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE="1",
     ):
@@ -348,6 +355,7 @@ def run_hf_parity_stage(
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    case_config = hf_parity.hf_parity_case_config(case_config)
     report = hf_parity.run_hf_parity(case_config=case_config)
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     artifact_dir = str(

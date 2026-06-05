@@ -1,9 +1,12 @@
 from enum import Enum
-from typing import Literal, NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
+
+if TYPE_CHECKING:
+    from ..types import MegatronTopologyConfig
 
 RolloutWeightsMode = Literal["lora", "merged"]
 
@@ -135,6 +138,7 @@ class InternalModelConfig(TypedDict, total=False):
         chat_template_content_format: vLLM chat template content format.
         chat_template_tool_schema_format: Tool schema rendering format used for
             local training tokenization.
+        megatron_topology: Fixed Megatron parallel topology for this model.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -152,6 +156,7 @@ class InternalModelConfig(TypedDict, total=False):
     chat_template_path: str
     chat_template_content_format: str
     chat_template_tool_schema_format: Literal["default", "vllm_openai"]
+    megatron_topology: "MegatronTopologyConfig | dict[str, int | None]"
     allow_unvalidated_arch: bool
 
 

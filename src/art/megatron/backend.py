@@ -1,9 +1,9 @@
 from mp_actors import move_to_child_process
 
-from ...local.backend import LocalBackend
-from ...local.service import ModelService
-from ...model import TrainableModel
-from ...utils.output_dirs import get_model_dir
+from ..local.backend import LocalBackend
+from ..local.service import ModelService
+from ..model import TrainableModel
+from ..utils.output_dirs import get_model_dir
 
 
 class MegatronBackend(LocalBackend):
@@ -22,11 +22,10 @@ class MegatronBackend(LocalBackend):
         self._requires_explicit_packed_sequence_length = True
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
-        self._default_chat_template_tool_schema_format = "vllm_openai"
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
-        from ...dev.get_model_config import get_model_config
-        from ..service import MegatronService
+        from ..dev.get_model_config import get_model_config
+        from .service import MegatronService
 
         if model.name not in self._services:
             config = get_model_config(

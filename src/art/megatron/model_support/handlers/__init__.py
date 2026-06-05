@@ -1,33 +1,64 @@
-from art.megatron.model_support.handlers.default_dense import (
-    DEFAULT_DENSE_HANDLER,
-    DefaultDenseHandler,
-    DefaultMoeHandler,
-)
-from art.megatron.model_support.handlers.qwen3_5 import (
-    QWEN3_5_DENSE_HANDLER,
-    QWEN3_5_MOE_HANDLER,
-    Qwen35DenseHandler,
-    Qwen35MoeHandler,
-)
-from art.megatron.model_support.handlers.qwen3_dense import (
-    QWEN3_DENSE_HANDLER,
-    Qwen3DenseHandler,
-)
-from art.megatron.model_support.handlers.qwen3_moe import (
-    QWEN3_MOE_HANDLER,
-    Qwen3MoeHandler,
-)
+from __future__ import annotations
 
-__all__ = [
-    "DEFAULT_DENSE_HANDLER",
-    "DefaultDenseHandler",
-    "DefaultMoeHandler",
-    "QWEN3_5_DENSE_HANDLER",
-    "Qwen35DenseHandler",
-    "QWEN3_DENSE_HANDLER",
-    "Qwen3DenseHandler",
-    "QWEN3_MOE_HANDLER",
-    "Qwen3MoeHandler",
-    "QWEN3_5_MOE_HANDLER",
-    "Qwen35MoeHandler",
-]
+from importlib import import_module
+from typing import Any
+
+_LAZY_EXPORTS = {
+    "DEFAULT_DENSE_HANDLER": (
+        "art.megatron.model_support.handlers.default_dense",
+        "DEFAULT_DENSE_HANDLER",
+    ),
+    "DefaultDenseHandler": (
+        "art.megatron.model_support.handlers.default_dense",
+        "DefaultDenseHandler",
+    ),
+    "DefaultMoeHandler": (
+        "art.megatron.model_support.handlers.default_dense",
+        "DefaultMoeHandler",
+    ),
+    "QWEN3_DENSE_HANDLER": (
+        "art.megatron.model_support.handlers.qwen3_dense",
+        "QWEN3_DENSE_HANDLER",
+    ),
+    "Qwen3DenseHandler": (
+        "art.megatron.model_support.handlers.qwen3_dense",
+        "Qwen3DenseHandler",
+    ),
+    "QWEN3_MOE_HANDLER": (
+        "art.megatron.model_support.handlers.qwen3_moe",
+        "QWEN3_MOE_HANDLER",
+    ),
+    "Qwen3MoeHandler": (
+        "art.megatron.model_support.handlers.qwen3_moe",
+        "Qwen3MoeHandler",
+    ),
+    "QWEN3_5_DENSE_HANDLER": (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "QWEN3_5_DENSE_HANDLER",
+    ),
+    "Qwen35DenseHandler": (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "Qwen35DenseHandler",
+    ),
+    "QWEN3_5_MOE_HANDLER": (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "QWEN3_5_MOE_HANDLER",
+    ),
+    "Qwen35MoeHandler": (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "Qwen35MoeHandler",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attribute_name = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+__all__ = list(_LAZY_EXPORTS)

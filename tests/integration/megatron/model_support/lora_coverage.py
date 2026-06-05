@@ -132,6 +132,9 @@ def _covered_exported_target_modules(
         if ".mlp.experts.linear_fc2" in base_name:
             covered.update({"experts", "down_proj"})
             continue
+        if ".mlp.experts.linear_fc" in base_name:
+            covered.add("experts")
+            continue
         if ".linear_fc1.weight" in base_name:
             covered.update({"gate_proj", "up_proj"})
             continue

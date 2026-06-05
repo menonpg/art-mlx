@@ -45,8 +45,12 @@ try:
     import transformers
 
     try:
-        from .transformers.patches import patch_preprocess_mask_arguments
+        from .transformers.patches import (
+            disable_broken_torchvision_for_transformers,
+            patch_preprocess_mask_arguments,
+        )
 
+        disable_broken_torchvision_for_transformers()
         patch_preprocess_mask_arguments()
     except Exception:
         pass
@@ -65,6 +69,7 @@ from .serverless import ServerlessBackend
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import (
     LocalTrainResult,
+    MegatronTopologyConfig,
     Messages,
     MessagesAndChoices,
     ServerlessTrainResult,
@@ -87,6 +92,7 @@ __all__ = [
     "LocalBackend",
     "LocalTrainResult",
     "LoRAConfig",
+    "MegatronTopologyConfig",
     "ServerlessBackend",
     "ServerlessTrainResult",
     "Messages",

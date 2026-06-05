@@ -1,10 +1,19 @@
-import importlib
+from importlib import import_module
 
 from art.megatron.model_support.spec import (
     DependencyFloor,
     ModelSupportHandler,
     ModelSupportSpec,
+    NativeVllmLoraStatus,
 )
+
+_DEFAULT_DENSE_HANDLER_KEY = "default_dense"
+_QWEN3_DENSE_HANDLER_KEY = "qwen3_dense"
+_QWEN3_MOE_HANDLER_KEY = "qwen3_moe"
+_QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
+_QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
+_VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
+_DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
 
 _DENSE_TARGET_MODULES = (
     "q_proj",
@@ -44,14 +53,15 @@ _QWEN3_5_MOE_TARGET_MODULES = (
 
 DEFAULT_DENSE_SPEC = ModelSupportSpec(
     key="default_dense",
-    handler_key="default_dense",
+    handler_key=_DEFAULT_DENSE_HANDLER_KEY,
     default_target_modules=_DENSE_TARGET_MODULES,
-    native_vllm_lora_status="disabled",
+    native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
 )
 
 QWEN3_MOE_SPEC = ModelSupportSpec(
     key="qwen3_moe",
-    handler_key="qwen3_moe",
+    handler_key=_QWEN3_MOE_HANDLER_KEY,
+    is_moe=True,
     model_names=(
         "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-30B-A3B-Base",
@@ -59,12 +69,12 @@ QWEN3_MOE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3-235B-A22B-Instruct-2507",
     ),
     default_target_modules=_QWEN3_MOE_TARGET_MODULES,
-    native_vllm_lora_status="validated",
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
 )
 
 QWEN3_DENSE_SPEC = ModelSupportSpec(
     key="qwen3_dense",
-    handler_key="qwen3_dense",
+    handler_key=_QWEN3_DENSE_HANDLER_KEY,
     model_names=(
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-0.6B-Base",
@@ -82,19 +92,19 @@ QWEN3_DENSE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3-32B-Base",
     ),
     default_target_modules=_DENSE_TARGET_MODULES,
-    native_vllm_lora_status="validated",
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
 )
 
 QWEN3_5_DENSE_SPEC = ModelSupportSpec(
     key="qwen3_5_dense",
-    handler_key="qwen3_5_dense",
+    handler_key=_QWEN3_5_DENSE_HANDLER_KEY,
     model_names=(
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.6-27B",
     ),
     default_target_modules=_QWEN3_5_DENSE_TARGET_MODULES,
-    native_vllm_lora_status="validated",
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     ),
@@ -102,14 +112,15 @@ QWEN3_5_DENSE_SPEC = ModelSupportSpec(
 
 QWEN3_5_MOE_SPEC = ModelSupportSpec(
     key="qwen3_5_moe",
-    handler_key="qwen3_5_moe",
+    handler_key=_QWEN3_5_MOE_HANDLER_KEY,
+    is_moe=True,
     model_names=(
         "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-397B-A17B",
         "Qwen/Qwen3.6-35B-A3B",
     ),
     default_target_modules=_QWEN3_5_MOE_TARGET_MODULES,
-    native_vllm_lora_status="validated",
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         megatron_bridge="e049cc00c24d03e2ae45d2608c7a44e2d2364e3d",
     ),
@@ -138,14 +149,40 @@ _UNVALIDATED_ARCH_SPECS_BY_MODEL = {
     for spec in PROBE_ONLY_MODEL_SUPPORT_SPECS
     for model_name in spec.model_names
 }
-_HANDLER_EXPORTS_BY_KEY = {
-    "default_dense": ("default_dense", "DEFAULT_DENSE_HANDLER"),
-    "qwen3_dense": ("qwen3_dense", "QWEN3_DENSE_HANDLER"),
-    "qwen3_moe": ("qwen3_moe", "QWEN3_MOE_HANDLER"),
-    "qwen3_5_dense": ("qwen3_5", "QWEN3_5_DENSE_HANDLER"),
-    "qwen3_5_moe": ("qwen3_5", "QWEN3_5_MOE_HANDLER"),
+_HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
+    _DEFAULT_DENSE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.default_dense",
+        "DEFAULT_DENSE_HANDLER",
+    ),
+    _QWEN3_DENSE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.qwen3_dense",
+        "QWEN3_DENSE_HANDLER",
+    ),
+    _QWEN3_MOE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.qwen3_moe",
+        "QWEN3_MOE_HANDLER",
+    ),
+    _QWEN3_5_DENSE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "QWEN3_5_DENSE_HANDLER",
+    ),
+    _QWEN3_5_MOE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "QWEN3_5_MOE_HANDLER",
+    ),
 }
-_MOE_HANDLER_KEYS = {"qwen3_moe", "qwen3_5_moe"}
+_BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
+    "qwen3_5_dense": (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "ensure_qwen35_text_only_bridge_registered",
+    ),
+    "qwen3_5_moe": (
+        "art.megatron.model_support.handlers.qwen3_5",
+        "ensure_qwen35_text_only_bridge_registered",
+    ),
+}
+_HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
+_REGISTERED_BRIDGE_KEYS: set[str] = set()
 
 QWEN3_DENSE_MODELS = frozenset(QWEN3_DENSE_SPEC.model_names)
 QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
@@ -191,11 +228,35 @@ def get_model_support_handler(
 def get_model_support_handler_for_spec(
     spec: ModelSupportSpec,
 ) -> ModelSupportHandler:
-    module_name, export_name = _HANDLER_EXPORTS_BY_KEY[spec.handler_key]
-    return getattr(
-        importlib.import_module(f"art.megatron.model_support.handlers.{module_name}"),
-        export_name,
-    )
+    if handler := _HANDLERS_BY_KEY.get(spec.handler_key):
+        return handler
+    try:
+        module_name, attribute_name = _HANDLER_IMPORTS[spec.handler_key]
+    except KeyError as exc:
+        raise KeyError(
+            f"No model support handler registered for {spec.handler_key}"
+        ) from exc
+    handler = getattr(import_module(module_name), attribute_name)
+    if handler.key != spec.handler_key:
+        raise RuntimeError(
+            f"Model support handler {module_name}.{attribute_name} has key "
+            f"{handler.key!r}; expected {spec.handler_key!r}."
+        )
+    _HANDLERS_BY_KEY[spec.handler_key] = handler
+    return handler
+
+
+def ensure_model_support_bridge_registered_for_spec(
+    spec: ModelSupportSpec,
+) -> None:
+    if spec.key in _REGISTERED_BRIDGE_KEYS:
+        return
+    bridge_registration = _BRIDGE_REGISTRATION_IMPORTS.get(spec.key)
+    if bridge_registration is not None:
+        module_name, attribute_name = bridge_registration
+        ensure_registered = getattr(import_module(module_name), attribute_name)
+        ensure_registered()
+    _REGISTERED_BRIDGE_KEYS.add(spec.key)
 
 
 def default_target_modules_for_model(
@@ -241,13 +302,10 @@ def model_uses_expert_parallel(
     *,
     allow_unvalidated_arch: bool = False,
 ) -> bool:
-    return (
-        get_model_support_spec(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        ).handler_key
-        in _MOE_HANDLER_KEYS
-    )
+    return get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    ).is_moe
 
 
 def is_model_support_registered(base_model: str) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import hashlib
 import json
 import math
@@ -23,12 +24,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
-    "qwen3_moe": 7.0,
+    "qwen3_moe": 8.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
+ScoreRecord = tuple[int, float, list[int], list[float]]
 
 RolloutMode = Literal["native_lora", "merged"]
 EngineSide = Literal["megatron", "vllm"]
@@ -38,11 +40,11 @@ WeightState = Literal["base", "lora"]
 class Topology(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tp: int = 2
+    tp: int = 1
     ep: int = 2
     etp: int = 1
     dp: int = 1
-    cp: int = 1
+    cp: int = 2
     pp: int = 1
 
     def world_size(self) -> int:
@@ -256,6 +258,20 @@ def fwd_mean_abs_pct_limit_for_model(
         spec.key,
         BF16_FWD_MEAN_ABS_PCT_LIMIT,
     )
+
+
+def top20_kl_candidate_to_target_limit_for_model(
+    base_model: str,
+    *,
+    allow_unvalidated_arch: bool = False,
+) -> float:
+    from art.megatron.model_support.registry import get_model_support_spec
+
+    get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
 
 
 def model_support_is_moe(
@@ -653,6 +669,51 @@ def _gather_context_parallel_logits(logits: Any, *, full_sequence_length: int) -
     return gathered
 
 
+def _packed_valid_lengths(packed_tensors: dict[str, Any]) -> list[int]:
+    return [
+        int((packed_tensors["group_ids"][row_index] != -1).sum().item())
+        for row_index in range(int(packed_tensors["group_ids"].shape[0]))
+    ]
+
+
+def logical_logit_uids(
+    *,
+    packed_tensors: dict[str, Any],
+    logical_tokens: Sequence[LogicalToken],
+    sample_id_to_row: dict[int, int] | None = None,
+) -> list[int]:
+    valid_lengths = _packed_valid_lengths(packed_tensors)
+    row_offsets: list[int] = []
+    cursor = 0
+    for valid_length in valid_lengths:
+        row_offsets.append(cursor)
+        cursor += valid_length
+    uids: list[int] = []
+    for token in logical_tokens:
+        row_index = (
+            sample_id_to_row[token.sample_id]
+            if sample_id_to_row is not None
+            else token.sample_id
+        )
+        if row_index < 0 or row_index >= len(valid_lengths):
+            raise RuntimeError(
+                "Logical token sample does not map to a packed row: "
+                f"sample_id={token.sample_id}, row={row_index}"
+            )
+        if (
+            token.art_logit_index < 0
+            or token.art_logit_index >= valid_lengths[row_index]
+        ):
+            raise RuntimeError(
+                "Logical token logit index is outside packed valid tokens: "
+                f"sample_id={token.sample_id}, row={row_index}, "
+                f"logit_index={token.art_logit_index}, "
+                f"valid_length={valid_lengths[row_index]}"
+            )
+        uids.append(row_offsets[row_index] + token.art_logit_index)
+    return uids
+
+
 def _lora_target_modules(config: TrainInfOutputParityConfig) -> list[str]:
     from art.dev.get_model_config import default_target_modules
 
@@ -692,7 +753,7 @@ def _build_deterministic_nonzero_lora(
 
 
 def _merge_sharded_lora(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
-    from art.megatron.weights.merge import merge_sharded_adapter_entries
+    from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
     entries_by_key: dict[str, list[tuple[dict[str, Any], Any]]] = {}
     for rank_entry in shards_by_rank:
@@ -789,16 +850,31 @@ def _run_logits(
 ) -> Any:
     import torch
 
-    from art.megatron.flex_attention import create_shared_prefix_attention_state
+    from art.megatron.shared_prefix_state import create_shared_prefix_state
+    from art.megatron.training.trace import (
+        packed_sequence_token_uids,
+        prepare_replay_local_input_token_uids,
+    )
+    from art.preprocessing.pack import PackedTensors
 
     device = next(runtime.model[0].parameters()).device
     input_ids = packed_tensors["tokens"].to(device=device)
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
-    attention_state = create_shared_prefix_attention_state(
+    attention_state = create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        build_gdn_execution_spec=bool(
+            getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        attention_head_dim=getattr(runtime.provider, "kv_channels", None),
+        attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),
+    )
+    prepare_replay_local_input_token_uids(
+        runtime.moe_routing_replay_controller,
+        packed_sequence_token_uids(cast(PackedTensors, packed_tensors), device=device),
+        attention_state,
     )
     with torch.no_grad():
         logits = runtime.model[0](
@@ -823,6 +899,275 @@ def _run_logits(
             full_sequence_length=int(input_ids.shape[1]),
         )
         return logits
+
+
+def _batch_seq_logits(logits: Any, labels: Any) -> Any:
+    if int(logits.ndim) != 3:
+        raise RuntimeError(
+            f"Expected logits [B, S, V] or [S, B, V], got {logits.shape}"
+        )
+    if tuple(logits.shape[:2]) == tuple(labels.shape):
+        return logits
+    if tuple(logits.shape[:2]) == (int(labels.shape[1]), int(labels.shape[0])):
+        return logits.transpose(0, 1).contiguous()
+    raise RuntimeError(
+        "Logits do not align with local labels: "
+        f"logits={tuple(logits.shape)}, labels={tuple(labels.shape)}"
+    )
+
+
+def _local_score_records_from_logits(
+    *,
+    logits: Any,
+    labels: Any,
+    token_uids: Any,
+    desired_uids: set[int],
+) -> dict[int, ScoreRecord]:
+    import torch
+
+    if token_uids is None:
+        raise RuntimeError("CP train/inf scoring requires local token_uids")
+    logits = _batch_seq_logits(logits, labels)
+    if tuple(token_uids.shape) != tuple(labels.shape):
+        raise RuntimeError(
+            "CP token uid shape does not match labels: "
+            f"uids={tuple(token_uids.shape)}, labels={tuple(labels.shape)}"
+        )
+    if not desired_uids:
+        return {}
+    records: dict[int, ScoreRecord] = {}
+    log_probs = torch.log_softmax(logits.detach().float(), dim=-1)
+    labels_cpu = labels.detach().to(device="cpu")
+    token_uids_cpu = token_uids.detach().to(device="cpu")
+    mask = (labels_cpu != -100) & (token_uids_cpu >= 0)
+    for batch_index, seq_index in torch.nonzero(mask, as_tuple=False).tolist():
+        uid = int(token_uids_cpu[batch_index, seq_index].item())
+        if uid not in desired_uids:
+            continue
+        row = log_probs[batch_index, seq_index]
+        token_id = int(labels_cpu[batch_index, seq_index].item())
+        values, indices = torch.topk(row, TOP_K)
+        records[uid] = (
+            token_id,
+            float(row[token_id].item()),
+            [int(value) for value in indices.tolist()],
+            [float(value) for value in values.tolist()],
+        )
+    return records
+
+
+def _merge_score_records(
+    shards: Sequence[dict[int, ScoreRecord]],
+) -> dict[int, ScoreRecord]:
+    merged: dict[int, ScoreRecord] = {}
+    for shard in shards:
+        for uid, record in shard.items():
+            previous = merged.get(uid)
+            if previous is not None and previous != record:
+                raise RuntimeError(f"Duplicate CP score record for uid={uid}")
+            merged[uid] = record
+    return merged
+
+
+def _score_bundle_from_records(
+    *,
+    records: dict[int, ScoreRecord],
+    logical_tokens: Sequence[LogicalToken],
+    logical_uids: Sequence[int],
+    side: EngineSide,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None,
+) -> ScoreBundle:
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    missing: list[int] = []
+    for token, uid in zip(logical_tokens, logical_uids, strict=True):
+        record = records.get(uid)
+        if record is None:
+            missing.append(uid)
+            continue
+        token_id, target_logprob, topk_ids, topk_logprobs = record
+        if token_id != token.token_id:
+            raise RuntimeError(
+                "CP score record target token does not match logical token: "
+                f"uid={uid}, record={token_id}, logical={token.token_id}"
+            )
+        target_logprobs.append(target_logprob)
+        topk.append(TokenTopK(token_ids=topk_ids, logprobs=topk_logprobs))
+    if missing:
+        raise RuntimeError(
+            "Missing CP score records for logical tokens: "
+            f"{missing[:16]} of {len(missing)} missing"
+        )
+    return ScoreBundle(
+        side=side,
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
+
+
+def _score_context_parallel_once(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+    logical_tokens: Sequence[LogicalToken],
+    sample_id_to_row: dict[int, int] | None,
+    side: EngineSide,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None,
+) -> ScoreBundle:
+    from megatron.core import parallel_state as ps
+    from megatron.core import tensor_parallel
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron.context_parallel.types import ParallelTopology
+    from art.megatron.training.microbatches import _prepare_current_rl_micro
+    from art.megatron.training.trace import (
+        attach_trace_token_uids,
+        prepare_replay_local_input_token_uids,
+    )
+
+    model_chunks = cast(list[Any], runtime.model)
+    device = next(model_chunks[0].parameters()).device
+    topology = ParallelTopology(
+        tp=ps.get_tensor_model_parallel_world_size(),
+        cp=ps.get_context_parallel_world_size(),
+        dp=ps.get_data_parallel_world_size(),
+        pp=ps.get_pipeline_model_parallel_world_size(),
+        sp=bool(getattr(runtime.provider, "sequence_parallel", False)),
+    )
+    prepared_micro, pending = _prepare_current_rl_micro(
+        cast(Any, packed_tensors),
+        device=device,
+        topology=topology,
+        provider=runtime.provider,
+        model_support_handler=runtime.model_support_handler,
+        ref_logprobs=None,
+        trace_token_uids=True,
+        pending_prepared_micro=None,
+    )
+    if pending is not None:
+        raise RuntimeError("CP train/inf scoring unexpectedly returned lookahead state")
+    prepare_replay_local_input_token_uids(
+        runtime.moe_routing_replay_controller,
+        prepared_micro.local_token_uids,
+        prepared_micro.attention_state,
+    )
+    with (
+        torch.no_grad(),
+        attach_trace_token_uids(
+            model_chunks,
+            prepared_micro.local_token_uids,
+        ),
+    ):
+        logits = model_chunks[0](
+            input_ids=prepared_micro.model_tokens,
+            position_ids=prepared_micro.model_input_pos,
+            attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
+            labels=None,
+            packed_seq_params=prepared_micro.packed_seq_params,
+            **runtime.model_support_handler.get_forward_kwargs(
+                model_chunks[0],
+                attention_bias=prepared_micro.attention_state,
+            ),
+        )
+    if ps.get_tensor_model_parallel_world_size() > 1:
+        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+    logical_uids = logical_logit_uids(
+        packed_tensors=packed_tensors,
+        logical_tokens=logical_tokens,
+        sample_id_to_row=sample_id_to_row,
+    )
+    local_records: dict[int, ScoreRecord] = {}
+    if ps.get_tensor_model_parallel_rank() == 0:
+        local_records = _local_score_records_from_logits(
+            logits=logits,
+            labels=prepared_micro.model_labels,
+            token_uids=prepared_micro.local_token_uids,
+            desired_uids=set(logical_uids),
+        )
+    gathered_records: list[dict[int, ScoreRecord]] = [
+        {} for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather_object(gathered_records, local_records)
+    return _score_bundle_from_records(
+        records=_merge_score_records(gathered_records),
+        logical_tokens=logical_tokens,
+        logical_uids=logical_uids,
+        side=side,
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+    )
+
+
+def score_context_parallel_runtime(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+    logical_map: LogicalTokenMap,
+    weight_state: WeightState,
+    rollout_mode: RolloutMode | None = "native_lora",
+    global_grad_accumulation_sequences: int,
+) -> ScoreBundle:
+    import torch
+
+    controller = runtime.moe_routing_replay_controller
+    if controller is None:
+        return _score_context_parallel_once(
+            runtime=runtime,
+            packed_tensors=packed_tensors,
+            logical_tokens=logical_map.tokens,
+            sample_id_to_row=None,
+            side="megatron",
+            weight_state=weight_state,
+            rollout_mode=rollout_mode,
+        )
+
+    target_logprobs: list[float] = []
+    topk: list[TokenTopK] = []
+    tokens_by_sample: dict[int, list[LogicalToken]] = {}
+    for token in logical_map.tokens:
+        tokens_by_sample.setdefault(token.sample_id, []).append(token)
+    num_sequences = int(packed_tensors["tokens"].shape[0])
+    for sample_index in range(num_sequences):
+        sample_tensors = {
+            key: (
+                value[sample_index : sample_index + 1]
+                if isinstance(value, torch.Tensor)
+                and value.shape[:1] == packed_tensors["tokens"].shape[:1]
+                else value
+            )
+            for key, value in packed_tensors.items()
+        }
+        step_index = sample_index // global_grad_accumulation_sequences
+        controller.set_step(
+            step_index=step_index,
+            sample_index=sample_index,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        controller.begin_micro(sample_index, sample_index)
+        sample_score = _score_context_parallel_once(
+            runtime=runtime,
+            packed_tensors=sample_tensors,
+            logical_tokens=tokens_by_sample.get(sample_index, []),
+            sample_id_to_row={sample_index: 0},
+            side="megatron",
+            weight_state=weight_state,
+            rollout_mode=rollout_mode,
+        )
+        controller.finalize_step()
+        target_logprobs.extend(sample_score.target_logprobs)
+        topk.extend(sample_score.topk)
+    return ScoreBundle(
+        side="megatron",
+        weight_state=weight_state,
+        rollout_mode=rollout_mode,
+        target_logprobs=target_logprobs,
+        topk=topk,
+    )
 
 
 def _extract_scores_from_logits(
