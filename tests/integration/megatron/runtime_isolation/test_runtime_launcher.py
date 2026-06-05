@@ -1,17 +1,13 @@
-import importlib.util
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
+from art import vllm_runtime as runtime
+
 ROOT = Path(__file__).resolve().parents[4]
-spec = importlib.util.spec_from_file_location(
-    "art_vllm_runtime_launcher", ROOT / "src" / "art" / "vllm_runtime.py"
-)
-assert spec is not None and spec.loader is not None
-runtime = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(runtime)
 
 
 def test_get_vllm_runtime_project_root_defaults_to_repo_subdir(monkeypatch) -> None:
@@ -292,7 +288,7 @@ async def test_wait_for_vllm_runtime_polls_http_health(monkeypatch) -> None:
 
     monkeypatch.setattr(runtime.httpx, "AsyncClient", lambda: FakeClient())
     await runtime.wait_for_vllm_runtime(
-        process=FakeProcess(),
+        process=cast(Any, FakeProcess()),
         host="127.0.0.1",
         port=8123,
         timeout=12.0,

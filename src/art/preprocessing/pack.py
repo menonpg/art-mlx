@@ -7,6 +7,12 @@ import torch
 from typing_extensions import NotRequired, TypedDict, Unpack
 
 from ..types import Verbosity
+from .moe_routing import (
+    MoeRoutingPackStats,
+    PackedMoeRoutingReplay,
+    TokenRoute,
+    count_route_slot_conflicts,
+)
 from .tokenize import TokenizedResult
 
 
@@ -21,6 +27,7 @@ class PackedTensors(TypedDict):
     weights: torch.Tensor
     pixel_values: list[torch.Tensor | None]
     image_grid_thw: list[torch.Tensor | None]
+    moe_routing_replay: PackedMoeRoutingReplay | None
 
 
 class DiskPackedTensors(TypedDict):
@@ -39,6 +46,7 @@ def packed_tensors_from_tokenized_results(
     advantage_balance: float = 0.0,
     verbosity: Verbosity = 1,
     pack_results: bool = True,
+    include_moe_routing: bool = False,
 ) -> PackedTensors:
     # TODO: This function could potentially be optimized with vectorized operations
     token_ids: list[list[int]] = [[]]
@@ -51,12 +59,19 @@ def packed_tensors_from_tokenized_results(
     weights: list[list[float]] = [[]]
     pixel_values: list[list[torch.Tensor]] = [[]]
     image_grid_thw: list[list[torch.Tensor]] = [[]]
+    moe_routes: list[list[TokenRoute | None]] = [[]]
+    moe_routing_pack_stats = MoeRoutingPackStats()
 
     for result in tokenized_results:
         if len(result.token_ids) > seq_len and not truncate_long_results:
             if verbosity > 1:
                 print("Result is too long, skipping")
             continue
+        if include_moe_routing and result.moe_routed_experts is None:
+            raise RuntimeError(
+                "MoE routing replay from trajectories was requested, but a "
+                "tokenized result has no aligned routed experts"
+            )
         result_without_prompt = result.without_prompt()
         if sum(result_without_prompt.assistant_mask) == 0:
             if verbosity > 1:
@@ -82,8 +97,16 @@ def packed_tensors_from_tokenized_results(
             weights.append([])
             pixel_values.append([])
             image_grid_thw.append([])
+            moe_routes.append([])
         group_id = random.randint(-(2**63), 2**63 - 1)
         if result.prompt_id in group_ids[-1]:
+            if include_moe_routing:
+                _record_shared_prefix_route_conflicts(
+                    existing_group_ids=group_ids[-1],
+                    existing_routes=moe_routes[-1],
+                    result=result,
+                    stats=moe_routing_pack_stats,
+                )
             result = result_without_prompt
         token_ids[-1].extend(result.token_ids)
         group_ids[-1].extend(
@@ -100,6 +123,9 @@ def packed_tensors_from_tokenized_results(
             pixel_values[-1].append(result.pixel_values)
         if result.image_grid_thw is not None:
             image_grid_thw[-1].append(result.image_grid_thw)
+        if include_moe_routing:
+            assert result.moe_routed_experts is not None
+            moe_routes[-1].extend(result.moe_routed_experts)
         if truncate_long_results:
             token_ids[-1] = token_ids[-1][:seq_len]
             group_ids[-1] = group_ids[-1][:seq_len]
@@ -109,6 +135,8 @@ def packed_tensors_from_tokenized_results(
             logprobs[-1] = logprobs[-1][:seq_len]
             advantages[-1] = advantages[-1][:seq_len]
             weights[-1] = weights[-1][:seq_len]
+            if include_moe_routing:
+                moe_routes[-1] = moe_routes[-1][:seq_len]
 
     permutation = list(range(len(token_ids)))
     random.shuffle(permutation)
@@ -122,6 +150,7 @@ def packed_tensors_from_tokenized_results(
     weights = [weights[i] for i in permutation]
     pixel_values = [pixel_values[i] for i in permutation]
     image_grid_thw = [image_grid_thw[i] for i in permutation]
+    moe_routes = [moe_routes[i] for i in permutation]
 
     def pad(values: list[list], pad_value) -> list[list]:
         max_len = seq_len
@@ -158,7 +187,7 @@ def packed_tensors_from_tokenized_results(
         * weights_tensor[assistant_mask_tensor]
     ).mean()
 
-    return {
+    packed_tensors: PackedTensors = {
         "tokens": torch.tensor(pad(token_ids, pad_token_id)),
         "group_ids": torch.tensor(pad(group_ids, -1)),
         "parent_ids": torch.tensor(pad(parent_ids, -1)),
@@ -173,7 +202,110 @@ def packed_tensors_from_tokenized_results(
         "image_grid_thw": [
             torch.concat(tensors) if tensors else None for tensors in image_grid_thw
         ],
+        "moe_routing_replay": None,
     }
+    if include_moe_routing:
+        (
+            route_tensor,
+            route_mask,
+            num_layers,
+            topk,
+            num_experts,
+        ) = _tensorize_moe_routes(moe_routes, seq_len)
+        moe_routing_pack_stats.packed_tokens = int(route_mask.sum().item())
+        packed_tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
+            expert_indices=route_tensor,
+            token_mask=route_mask,
+            num_layers=num_layers,
+            topk=topk,
+            num_experts=num_experts,
+            pack_stats=moe_routing_pack_stats,
+        )
+    return packed_tensors
+
+
+def _record_shared_prefix_route_conflicts(
+    *,
+    existing_group_ids: list[int],
+    existing_routes: list[TokenRoute | None],
+    result: TokenizedResult,
+    stats: MoeRoutingPackStats,
+) -> None:
+    assert result.moe_routed_experts is not None
+    prefix_positions = [
+        index
+        for index, group_id in enumerate(existing_group_ids)
+        if group_id == result.prompt_id
+    ]
+    if len(prefix_positions) != result.prompt_length:
+        raise RuntimeError(
+            "Shared-prefix route comparison could not find the existing packed "
+            f"prefix rows: prompt_length={result.prompt_length}, "
+            f"existing_rows={len(prefix_positions)}"
+        )
+    for prefix_offset, packed_index in enumerate(prefix_positions):
+        route = result.moe_routed_experts[prefix_offset]
+        existing = existing_routes[packed_index]
+        if route is None or existing is None:
+            raise RuntimeError("Shared-prefix MoE route is missing")
+        compared, conflicts = count_route_slot_conflicts(existing, route)
+        stats.shared_prefix_rows += 1
+        stats.shared_prefix_compared_slots += compared
+        stats.shared_prefix_conflict_slots += conflicts
+        stats.shared_prefix_conflict_rows += int(conflicts > 0)
+
+
+def _tensorize_moe_routes(
+    routes_by_sequence: list[list[TokenRoute | None]],
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+    first_route = next(
+        (
+            route
+            for sequence_routes in routes_by_sequence
+            for route in sequence_routes
+            if route is not None
+        ),
+        None,
+    )
+    if first_route is None:
+        raise RuntimeError("No MoE routes were packed")
+    num_layers = len(first_route)
+    topk = len(first_route[0])
+    max_expert_id = 0
+    dense_routes: list[list[TokenRoute]] = []
+    route_masks: list[list[bool]] = []
+    zero_route: TokenRoute = [[0 for _ in range(topk)] for _ in range(num_layers)]
+    for sequence_routes in routes_by_sequence:
+        dense_sequence: list[TokenRoute] = []
+        mask_sequence: list[bool] = []
+        for route in sequence_routes:
+            if route is None:
+                dense_sequence.append(zero_route)
+                mask_sequence.append(False)
+                continue
+            if len(route) != num_layers or any(
+                len(layer_route) != topk for layer_route in route
+            ):
+                raise RuntimeError("Packed MoE routes must have one rectangular shape")
+            max_expert_id = max(
+                max_expert_id,
+                max(int(expert_id) for layer in route for expert_id in layer),
+            )
+            dense_sequence.append(route)
+            mask_sequence.append(True)
+        while len(dense_sequence) < seq_len:
+            dense_sequence.append(zero_route)
+            mask_sequence.append(False)
+        dense_routes.append(dense_sequence[:seq_len])
+        route_masks.append(mask_sequence[:seq_len])
+    return (
+        torch.tensor(dense_routes, dtype=torch.int32),
+        torch.tensor(route_masks, dtype=torch.bool),
+        num_layers,
+        topk,
+        max_expert_id + 1,
+    )
 
 
 def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensors:

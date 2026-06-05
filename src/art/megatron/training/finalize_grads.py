@@ -60,6 +60,28 @@ def _resolve_reduce_op(op: GradSyncOp) -> Any:
     raise RuntimeError(f"Unknown grad sync op: {op}")
 
 
+def flush_param_grads_to_main_grads(model_chunks: Iterable[torch.nn.Module]) -> None:
+    """Fallback for direct jobs when DDP post-hooks leave grads in param.grad.
+
+    Megatron's distributed optimizer reads gradients from `main_grad`, which is
+    normally populated by DDP backward post-hooks. Some direct ART runtimes can
+    reach finalize/step with gradients still in `param.grad`, so copy them over
+    using the same guard Megatron uses in its hook implementation.
+    """
+    for chunk in model_chunks:
+        for param in chunk.parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            if not hasattr(param, "main_grad"):
+                continue
+            main_grad = cast(torch.Tensor, param.main_grad)
+            if not getattr(param, "grad_added_to_main_grad", False) or getattr(
+                param, "zero_out_wgrad", False
+            ):
+                main_grad.add_(param.grad.to(dtype=main_grad.dtype))
+            param.grad = None
+
+
 def finalize_model_grads_extended(
     model: list[MegatronModule],
     num_tokens: torch.Tensor | None = None,

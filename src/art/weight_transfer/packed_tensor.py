@@ -20,6 +20,14 @@ def packed_broadcast_producer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
 ) -> None:
+    """Pack and broadcast tensors on side streams with stable ring buffers.
+
+    The caller owns producer-side ordering: source tensors must already be on the
+    active CUDA device, must not be mutated while this function may read them,
+    and any prior writer streams must be ordered before entry. Each ring-buffer
+    slot is synchronized before reuse, and the function returns only after every
+    side-stream broadcast has completed.
+    """
     target_packed_tensor_size = buffer_size_bytes
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
@@ -70,6 +78,14 @@ def packed_broadcast_consumer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
 ) -> None:
+    """Receive packed tensors on side streams and unpack views for a callback.
+
+    The tensors passed to ``post_unpack_func`` are backed by the current packed
+    receive buffer. The callback must copy into durable storage before returning
+    if it needs to keep them, and it must add its own stream waits or lifetime
+    recording if it launches consumers outside the active side stream.
+    """
+
     def unpack_tensor(
         packed_tensor: torch.Tensor,
         names: list[str],

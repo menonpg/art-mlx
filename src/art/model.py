@@ -22,6 +22,7 @@ from .metrics_taxonomy import (
     build_data_metrics_from_summary,
     summarize_trajectory_groups,
 )
+from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
@@ -56,6 +57,20 @@ def _merge_extra_body_defaults(
     return merged
 
 
+def _attach_response_moe_routing_metadata(response: Any) -> None:
+    choices = getattr(response, "choices", None)
+    model_dump = getattr(response, "model_dump", None)
+    if not choices or not callable(model_dump):
+        return
+    response_payload = model_dump(mode="python")
+    for choice_index, choice in enumerate(choices):
+        attach_moe_routing_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
+
+
 class _OpenAIChatCompletionsProxy:
     def __init__(
         self,
@@ -74,6 +89,7 @@ class _OpenAIChatCompletionsProxy:
                 kwargs.get("extra_body"),
             )
         response = await self._completions.create(*args, **kwargs)
+        _attach_response_moe_routing_metadata(response)
         self._record_costs(response)
         return response
 
@@ -1012,6 +1028,7 @@ class Model(
 
 class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateType]):
     base_model: str
+    lora_config: dev.LoRAConfig | None = None
     # Override discriminator field for FastAPI serialization
     trainable: bool = True
 
@@ -1029,6 +1046,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         run_id: str | None = None,
         config: ModelConfig | None = None,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1042,6 +1060,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             id=id,
             config=config,
             base_model=base_model,
+            lora_config=lora_config,
             base_path=base_path,
             report_metrics=report_metrics,
             **kwargs,
@@ -1109,6 +1128,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         id: str | None = None,
         config: None = None,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,
@@ -1124,6 +1144,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         id: str | None = None,
         config: ModelConfig,
         base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
         base_path: str = ".art",
         report_metrics: list[str] | None = None,
         _internal_config: dev.InternalModelConfig | None = None,

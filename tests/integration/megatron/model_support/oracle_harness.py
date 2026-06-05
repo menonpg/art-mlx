@@ -16,22 +16,43 @@ from rich.console import Console
 from rich.table import Table
 import torch
 
+from art.megatron.routing_replay import ROUTER_KEY_FORMAT_VERSION
+from art.megatron.training.streaming_weight_offload import StreamingWeightOffloadConfig
+
+from ..artifacts import GitRepoState, pinned_git_state
+from ..metrics import DEFAULT_MEAN_ABS_PCT_THRESHOLD, mean_abs_pct_from_sums
 from .forward_trace import ForwardTraceCapture
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_correctness")
+LIVE_TRAINING_LOG_PATH = REPO_ROOT / ".local" / "live_training.log"
 ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
 
 REGENERATE_ENV = "ART_REGENERATE_ORACLE"
 SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
+ORACLE_BASE_MODEL_ENV = "ART_ORACLE_BASE_MODEL"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
+ORACLE_ARTIFACT_SUITE_NAME = "Megatron oracle artifacts"
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
 SensitivityMutation = str
+FlexBackend = Literal[
+    "FLASH",
+    "TRITON",
+    "TRITON_LEGACY",
+    "TRITON_LEGACY_INNER_FP32",
+    "TRITON_LEGACY_FULL_FP32",
+]
+TEST_DEFAULT_FLEX_BACKEND: FlexBackend = "TRITON"
 
 DEFAULT_SENSITIVITY_MUTATION = "skip_finalize"
+CP_ATTENTION_SENSITIVITY_MUTATIONS = (
+    "attn_kv_fetch_pack_on_comm_stream",
+    "attn_skip_nested_grad_sanitize",
+    "attn_skip_flash_lse_normalize",
+)
 SHARED_SENSITIVITY_MUTATIONS = (
     DEFAULT_SENSITIVITY_MUTATION,
     "fwd_skip_o_proj_tp_reduce",
@@ -42,6 +63,7 @@ SHARED_SENSITIVITY_MUTATIONS = (
     "save_drop_nonzero_ranked_tp_shards",
     "save_duplicate_replicated_entries",
     "dp_grad_accumulation_seqs",
+    *CP_ATTENTION_SENSITIVITY_MUTATIONS,
 )
 RL_ONLY_SENSITIVITY_MUTATIONS = ("dp_local_token_normalization",)
 SFT_ONLY_SENSITIVITY_MUTATIONS = ("sft_local_token_normalization",)
@@ -66,10 +88,14 @@ REQUIRED_PACKED_TENSOR_FILES = (
     "weights.pt",
 )
 NON_FINITE_METRIC_VALUE = 1e30
+ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT = DEFAULT_MEAN_ABS_PCT_THRESHOLD
+ROUTER_SCORE_MEAN_ABS_PCT_LIMIT = 2e-4
+FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT = 3e-4
+FORWARD_EXPERT_LORA_TRACE_NOISE_REASON = "forward_expert_lora_trace_noise"
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
     r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<proj>gate_proj|up_proj|gate_up_proj|down_proj)\."
 )
 LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
 PHASE_PRINT_ORDER = {
@@ -81,6 +107,10 @@ PHASE_PRINT_ORDER = {
     "grads": 5,
     "deltas": 6,
 }
+
+
+def _format_elapsed(seconds: float) -> str:
+    return f"{seconds:.1f}s"
 
 
 def oracle_output_slug(
@@ -110,8 +140,7 @@ def objective_supports_sensitivity_mutation(
     is_moe: bool = True,
 ) -> bool:
     return mutation in supported_sensitivity_mutations_for_objective(
-        objective,
-        is_moe=is_moe,
+        objective, is_moe=is_moe
     )
 
 
@@ -129,6 +158,17 @@ def selected_oracle_objectives() -> list[OracleObjective]:
         f"Unsupported {ORACLE_OBJECTIVE_ENV} value '{raw}'. "
         f"Supported values: {supported}."
     )
+
+
+def _resolve_test_flex_backend(
+    case_config: "OracleCaseConfig",
+    flex_backend: FlexBackend | None,
+) -> FlexBackend | None:
+    if flex_backend is not None:
+        return flex_backend
+    if case_config.precision == "fp32":
+        return TEST_DEFAULT_FLEX_BACKEND
+    return None
 
 
 class Topology(BaseModel):
@@ -176,26 +216,34 @@ class Topology(BaseModel):
 
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
-    Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
+    Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
+    Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
     Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
+    Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
 ]
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
 DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+CP_ATTENTION_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
 DENSE_SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
 DENSE_DP_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=1, etp=1, dp=2, sp=False)
+DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY = Topology(
+    tp=1, ep=1, etp=1, dp=1, cp=2, sp=False
+)
 SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
     mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
+}
+SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
+    mutation: CP_ATTENTION_SENSITIVITY_TOPOLOGY
+    for mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS
 }
 SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
     tp=2, ep=1, etp=2, dp=1, sp=True
@@ -210,23 +258,15 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
 }
 
 
-def oracle_topology(*, is_moe: bool = True) -> Topology:
-    return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
-
-
-def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
-    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
-
-
 class PackedTensorConfig(BaseModel):
     """Controls synthetic packed tensor generation used by oracle harness runs."""
 
     num_sequences: int = 4
-    sequence_length: int = 256
-    prefill_tokens: int = 64
+    sequence_length: int = 1024
+    prefill_tokens: int = 256
     completion_branches_per_prefix: int = Field(default=2, ge=1)
     decode_tokens_jitter: int = Field(default=32, ge=0)
-    decode_tokens: int = 64
+    decode_tokens: int = 128
     packing_mode: Literal["stop_early", "truncate"] = "stop_early"
     vocab_high: int = 8192
 
@@ -287,7 +327,6 @@ class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
     base_model: str
-    is_moe: bool = True
     precision: Literal["bf16", "fp32"] = "fp32"
     num_layers: int = 4
     seed: int = 20260304
@@ -299,6 +338,15 @@ class OracleCaseConfig(BaseModel):
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
     allow_unvalidated_arch: bool = False
+
+    @property
+    def is_moe(self) -> bool:
+        from art.megatron.model_support import model_uses_expert_parallel
+
+        return model_uses_expert_parallel(
+            self.base_model,
+            allow_unvalidated_arch=self.allow_unvalidated_arch,
+        )
 
 
 class DiskPackedTensorsSpec(BaseModel):
@@ -323,6 +371,7 @@ class CaseArtifacts(BaseModel):
 class WorkerRunRequest(BaseModel):
     """Defines one distributed worker invocation for generating variant artifacts."""
 
+    git: GitRepoState
     case_id: str
     objective: OracleObjective
     case_config: OracleCaseConfig
@@ -334,6 +383,12 @@ class WorkerRunRequest(BaseModel):
     moe_routing_replay_path: str | None = None
     moe_routing_replay_strict: bool = True
     capture_moe_routing_bundle_path: str | None = None
+    flex_backend: FlexBackend | None = None
+    offload_between_jobs: bool = True
+    streaming_weight_offload: StreamingWeightOffloadConfig = Field(
+        default_factory=StreamingWeightOffloadConfig
+    )
+    use_fp32_lora_reference: bool = True
 
 
 class StepTrace(BaseModel):
@@ -342,6 +397,9 @@ class StepTrace(BaseModel):
     step_index: int
     loss: float
     probs_corr: float
+    micro_sample_indices: list[int | None] = Field(default_factory=list)
+    micro_losses: list[float] = Field(default_factory=list)
+    debug_files: dict[str, str] = Field(default_factory=dict)
     output_file: str
     grads_file: str
     deltas_file: str
@@ -351,6 +409,7 @@ class StepTrace(BaseModel):
 class RunManifest(BaseModel):
     """Records run metadata and per-step trace references for one topology output."""
 
+    git: GitRepoState
     case_id: str
     objective: OracleObjective
     base_model: str
@@ -360,6 +419,11 @@ class RunManifest(BaseModel):
     seed: int
     num_steps: int
     packed_tensors: DiskPackedTensorsSpec
+    offload_between_jobs: bool = True
+    streaming_weight_offload: StreamingWeightOffloadConfig = Field(
+        default_factory=StreamingWeightOffloadConfig
+    )
+    use_fp32_lora_reference: bool = True
     steps: list[StepTrace]
 
 
@@ -388,7 +452,7 @@ class VariantSpec(BaseModel):
     """Declares how to execute and evaluate one candidate variant against the oracle."""
 
     name: str
-    objective: OracleObjective
+    objective: OracleObjective = "rl"
     topology: Topology
     pass_fn_by_phase: dict[str, PhasePassFn] = Field(
         default_factory=dict,
@@ -400,6 +464,11 @@ class VariantSpec(BaseModel):
     mutation: SensitivityMutation | None = None
     expected_signal: Literal["pass", "fail"] = "pass"
     force_regenerate: bool = True
+    flex_backend: FlexBackend | None = None
+    offload_between_jobs: bool = True
+    streaming_weight_offload: StreamingWeightOffloadConfig = Field(
+        default_factory=StreamingWeightOffloadConfig
+    )
 
     def resolved_output_slug(self) -> str:
         """Resolves the artifact slug for this run, including mutation suffix when present."""
@@ -417,6 +486,7 @@ class VariantSpec(BaseModel):
 class VariantReport(BaseModel):
     """Captures full comparison output for one variant run."""
 
+    git: GitRepoState
     case_id: str
     variant: str
     topology: str
@@ -464,7 +534,7 @@ class DiffAccumulator:
         ref = reference_stack.detach().float()
         cand = candidate_stack.detach().float()
         layer_count = int(ref.shape[0])
-        metrics = {
+        averaged_metrics = {
             k: 0.0
             for k in [
                 "numel",
@@ -479,8 +549,14 @@ class DiffAccumulator:
             layer_accumulator = DiffAccumulator()
             layer_accumulator.update(ref[layer_index], cand[layer_index])
             layer_summary = layer_accumulator.as_summary()
-            metrics = {k: metrics[k] + layer_summary[k] for k in metrics.keys()}
-        return {k: _finite_metric(metrics[k] / layer_count) for k in metrics.keys()}
+            averaged_metrics = {
+                k: averaged_metrics[k] + layer_summary[k]
+                for k in averaged_metrics.keys()
+            }
+        return {
+            k: _finite_metric(averaged_metrics[k] / layer_count)
+            for k in averaged_metrics.keys()
+        }
 
     def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
         """Adds router top-k id mismatch counts into the accumulator."""
@@ -522,7 +598,6 @@ class DiffAccumulator:
         mean_abs = self.abs_sum / self.numel
         typical_abs = self.ref_abs_sum / self.numel
         candidate_abs = self.candidate_abs_sum / self.numel
-        mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
         return {
             "numel": _finite_metric(float(self.numel), default=0.0),
             "mean_abs_diff": _finite_metric(mean_abs),
@@ -531,7 +606,9 @@ class DiffAccumulator:
             ),
             "typical_abs_scale": _finite_metric(typical_abs, default=0.0),
             "candidate_abs_scale": _finite_metric(candidate_abs, default=0.0),
-            "mean_abs_pct": _finite_metric(mean_abs_pct),
+            "mean_abs_pct": _finite_metric(
+                mean_abs_pct_from_sums(self.abs_sum, self.ref_abs_sum, self.numel)
+            ),
             "topk_mismatch_fraction": _finite_metric(topk_fraction, default=1.0),
             "top1_mismatch_fraction": _finite_metric(top1_fraction, default=1.0),
         }
@@ -589,24 +666,12 @@ def selected_sensitivity_mutations_for_objective(
     mutations: list[SensitivityMutation],
     *,
     is_moe: bool = True,
-    max_world_size: int | None = None,
 ) -> list[SensitivityMutation]:
     return [
         mutation
         for mutation in mutations
-        if objective_supports_sensitivity_mutation(
-            objective,
-            mutation,
-            is_moe=is_moe,
-        )
-        and (
-            max_world_size is None
-            or sensitivity_topology_for_mutation(
-                mutation,
-                is_moe=is_moe,
-            ).world_size()
-            <= max_world_size
-        )
+        if mutation
+        in supported_sensitivity_mutations_for_objective(objective, is_moe=is_moe)
     ]
 
 
@@ -623,6 +688,8 @@ def sensitivity_topology_for_mutation(
             "sft_local_token_normalization",
         }:
             return DENSE_DP_SENSITIVITY_TOPOLOGY
+        if mutation in CP_ATTENTION_SENSITIVITY_MUTATIONS:
+            return DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY
         return DENSE_SENSITIVITY_TOPOLOGY
     return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
 
@@ -633,8 +700,6 @@ def sensitivity_required_world_size(
     is_moe: bool = True,
 ) -> int:
     """Returns the max world-size required by a selected mutation set."""
-    if not mutations:
-        return 0
     return max(
         sensitivity_topology_for_mutation(mutation, is_moe=is_moe).world_size()
         for mutation in mutations
@@ -651,11 +716,15 @@ def keep_topology_artifacts() -> bool:
     return _truthy(os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV))
 
 
-def case_config(
-    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
-) -> OracleCaseConfig:
+DEFAULT_ORACLE_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
+
+
+def case_config(base_model: str | None = None) -> OracleCaseConfig:
     """Builds the deterministic default oracle case config."""
-    return OracleCaseConfig(base_model=base_model)
+    return OracleCaseConfig(
+        base_model=base_model
+        or os.environ.get(ORACLE_BASE_MODEL_ENV, DEFAULT_ORACLE_BASE_MODEL)
+    )
 
 
 def available_gpu_count() -> int:
@@ -663,6 +732,16 @@ def available_gpu_count() -> int:
     import torch
 
     return int(torch.cuda.device_count())
+
+
+def oracle_topology(*, is_moe: bool = True) -> Topology:
+    """Returns the canonical single-rank oracle topology for a model family."""
+    return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
+
+
+def selected_suite_topologies(*, is_moe: bool = True) -> list[Topology]:
+    """Returns the correctness topology list for a model family."""
+    return list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES)
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
@@ -690,6 +769,24 @@ def _read_json(path: Path) -> dict[str, Any]:
     """Loads a JSON object from disk."""
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _current_git_state() -> GitRepoState:
+    return pinned_git_state(ORACLE_ARTIFACT_SUITE_NAME)
+
+
+def _manifest_matches_current_commit(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        payload = _read_json(path)
+    except Exception:
+        return False
+    git_payload = payload.get("git")
+    return (
+        isinstance(git_payload, dict)
+        and git_payload.get("commit") == _current_git_state().commit
+    )
 
 
 def _build_packed_tensors(
@@ -868,7 +965,10 @@ def _build_packed_tensors(
                 )
                 weights[sequence_index, cursor:completion_end] = 1.0
                 cursor = completion_end
+                if completion_take < completion_length:
+                    break
 
+    # Ensure paired cross-DP rows are never token-identical across valid tokens.
     half = config.num_sequences // 2
     if half > 0 and config.num_sequences % 2 == 0:
         valid_lengths = (group_ids != -1).sum(dim=1)
@@ -955,12 +1055,31 @@ def _prune_topology_artifacts(path: Path) -> None:
     if keep_topology_artifacts() or not path.exists():
         return
     for child in path.iterdir():
-        if child.name in {"variant_report.json", "run_request.json", "worker.log"}:
+        if child.name in {
+            "manifest.json",
+            "variant_report.json",
+            "run_request.json",
+            "worker.log",
+        }:
             continue
         if child.is_dir():
             shutil.rmtree(child)
             continue
         child.unlink()
+
+
+def _prune_case_artifacts(case_dir: Path) -> None:
+    """Drops reusable generated inputs after tests have written reports."""
+    if keep_topology_artifacts() or not case_dir.exists():
+        return
+    for name in ("packed_tensors", "packed_tensors.json", "shared_init"):
+        path = case_dir / name
+        if not path.exists():
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def _load_manifest(topology_dir: Path) -> RunManifest:
@@ -1039,6 +1158,13 @@ def _expert_agnostic_param_key(param: str) -> str:
     return f"{param[:start]}__expert_avg__{param[end:]}"
 
 
+def _is_forward_expert_lora_trace(param: str) -> bool:
+    """Returns whether one forward-trace row is an expert LoRA internal."""
+    return ".mlp.experts." in param and (
+        ".lora." in param or ".gate_lora." in param or ".up_lora." in param
+    )
+
+
 def _stacked_layers(
     pairs: list[tuple[str, Any, Any]],
 ) -> list[tuple[str, Any, Any]]:
@@ -1084,25 +1210,195 @@ class VariantRunner:
     def __init__(
         self,
         *,
-        objective: OracleObjective,
+        objective: OracleObjective = "rl",
         case_config: OracleCaseConfig,
+        oracle_flex_backend: FlexBackend | None = None,
+        variant_flex_backend: FlexBackend | None = None,
+        oracle_topology_override: Topology | None = None,
+        oracle_slug_override: str | None = None,
+        oracle_offload_between_jobs: bool = True,
+        oracle_streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
+        use_fp32_lora_reference: bool = True,
         console: Console | None = None,
     ) -> None:
         self.objective = objective
         self.case_config = case_config
+        self.git = _current_git_state()
         self.case_artifacts = ensure_case_artifacts(case_config)
         self.case_id = self.case_artifacts.case_id
         self.case_dir = Path(self.case_artifacts.case_dir)
-        self.oracle_topology = oracle_topology(is_moe=case_config.is_moe)
-        self.oracle_slug = oracle_output_slug(objective, self.oracle_topology)
+        self.oracle_topology = oracle_topology_override or oracle_topology(
+            is_moe=case_config.is_moe
+        )
+        self.oracle_slug = oracle_slug_override or oracle_output_slug(
+            objective, self.oracle_topology
+        )
         self.oracle_dir = self.case_dir / self.oracle_slug
         self.oracle_routing_bundle_dir = (
             self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
         )
+        self.oracle_offload_between_jobs = oracle_offload_between_jobs
+        self.oracle_streaming_weight_offload = (
+            oracle_streaming_weight_offload or StreamingWeightOffloadConfig()
+        )
+        self.use_fp32_lora_reference = use_fp32_lora_reference
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
+        self.oracle_flex_backend = _resolve_test_flex_backend(
+            case_config, oracle_flex_backend
+        )
+        self.variant_flex_backend = _resolve_test_flex_backend(
+            case_config, variant_flex_backend
+        )
         self.console = console or Console(width=140)
         self._oracle_initialized = False
         self._oracle_regenerated = False
+        self._sample_valid_lengths_cache: tuple[int, ...] | None = None
+
+    def _sample_valid_lengths(self) -> tuple[int, ...]:
+        if self._sample_valid_lengths_cache is not None:
+            return self._sample_valid_lengths_cache
+        from art.megatron.context_parallel.builder import (
+            build_shared_prefix_attention_spec,
+        )
+        from art.preprocessing.pack import packed_tensors_from_dir
+
+        packed_tensors = packed_tensors_from_dir(
+            **self.case_artifacts.packed_tensors.model_dump(exclude_none=True)
+        )
+        group_ids = packed_tensors["group_ids"]
+        parent_ids = packed_tensors["parent_ids"]
+        self._sample_valid_lengths_cache = tuple(
+            int(
+                build_shared_prefix_attention_spec(
+                    group_ids=group_ids[row_index : row_index + 1],
+                    parent_ids=parent_ids[row_index : row_index + 1],
+                )
+                .rows[0]
+                .valid_tokens
+            )
+            for row_index in range(int(group_ids.shape[0]))
+        )
+        return self._sample_valid_lengths_cache
+
+    def _step_micro_sample_indices(self, step: StepTrace) -> list[int | None]:
+        base_sample_index = (
+            step.step_index * self.case_config.grad_accumulation_sequences
+        )
+        expected = [
+            sample_index
+            if sample_index < self.case_artifacts.packed_tensors.num_sequences
+            else None
+            for sample_index in range(
+                base_sample_index,
+                base_sample_index + self.case_config.grad_accumulation_sequences,
+            )
+        ]
+        if step.micro_sample_indices and len(step.micro_sample_indices) == len(
+            expected
+        ):
+            return list(step.micro_sample_indices)
+        return expected
+
+    def _load_output_tensor_map(
+        self,
+        topology_dir: Path,
+        step: StepTrace,
+    ) -> dict[str, torch.Tensor]:
+        tensor = _load_output_tensor(topology_dir, step)
+        if isinstance(tensor, list):
+            outputs = tensor
+        elif isinstance(tensor, torch.Tensor) and tensor.ndim >= 1:
+            outputs = [tensor[index] for index in range(int(tensor.shape[0]))]
+        else:
+            return {"logprobs": tensor}
+
+        sample_indices = self._step_micro_sample_indices(step)
+        valid_lengths = self._sample_valid_lengths()
+        output_map: dict[str, torch.Tensor] = {}
+        for output_index, output in enumerate(outputs):
+            key = f"logprobs.micro_{output_index:03d}"
+            if not isinstance(output, torch.Tensor):
+                output_map[key] = output
+                continue
+            if output_index < len(sample_indices):
+                sample_index = sample_indices[output_index]
+                if isinstance(sample_index, int):
+                    valid_length = int(valid_lengths[sample_index])
+                    target_length = max(valid_length - 1, 0)
+                    if output.ndim > 0 and int(output.shape[-1]) > target_length:
+                        output = output[..., :target_length].contiguous()
+            output_map[key] = output
+        return output_map
+
+    @staticmethod
+    def _load_loss_tensor_map(step: StepTrace) -> dict[str, torch.Tensor]:
+        return {"loss": torch.tensor([step.loss], dtype=torch.float32)}
+
+    def _trim_trace_padding(
+        self,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        valid_lengths = self._sample_valid_lengths()
+        sequence_length = int(self.case_config.packed_tensors.sequence_length)
+        if sequence_length <= 0:
+            return trace
+
+        for calls in trace.values():
+            for call in calls:
+                sample_index = call.get("micro_sample_index")
+                if not isinstance(sample_index, int):
+                    continue
+                valid_length = int(valid_lengths[sample_index])
+                if valid_length >= sequence_length:
+                    continue
+                row_token_uids = call.get("row_token_uids")
+                if (
+                    isinstance(row_token_uids, torch.Tensor)
+                    and row_token_uids.ndim == 1
+                ):
+                    local_token_uids = torch.remainder(row_token_uids, sequence_length)
+                    keep_rows = torch.nonzero(
+                        (row_token_uids >= 0) & (local_token_uids < valid_length),
+                        as_tuple=False,
+                    ).reshape(-1)
+                    if int(keep_rows.numel()) > 0 and int(keep_rows.numel()) < int(
+                        row_token_uids.numel()
+                    ):
+                        call["row_token_uids"] = row_token_uids.index_select(
+                            0, keep_rows
+                        ).contiguous()
+                        for key in (
+                            "primary_output",
+                            "router_topk_scores",
+                            "router_topk_ids",
+                        ):
+                            tensor = call.get(key)
+                            if (
+                                isinstance(tensor, torch.Tensor)
+                                and tensor.ndim > 0
+                                and int(tensor.shape[0]) == int(row_token_uids.numel())
+                            ):
+                                call[key] = tensor.index_select(
+                                    0, keep_rows
+                                ).contiguous()
+                        continue
+                for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
+                    tensor = call.get(key)
+                    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                        continue
+                    leading_dim = int(tensor.shape[0])
+                    if leading_dim <= valid_length:
+                        continue
+                    if leading_dim % sequence_length == 0:
+                        row_multiplier = leading_dim // sequence_length
+                        target_rows = valid_length * row_multiplier
+                    elif leading_dim <= sequence_length:
+                        target_rows = valid_length
+                    else:
+                        continue
+                    if 0 < target_rows < leading_dim:
+                        call[key] = tensor[:target_rows].contiguous()
+        return trace
 
     def _run_topology(
         self,
@@ -1113,15 +1409,23 @@ class VariantRunner:
         replay_bundle_dir: Path | None,
         capture_bundle_dir: Path | None,
         regenerate: bool,
+        flex_backend: FlexBackend | None = None,
+        offload_between_jobs: bool = True,
+        streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
     ) -> Path:
         """Executes one topology worker run and returns its output directory."""
         topology_dir = self.case_dir / output_slug
         manifest_path = topology_dir / "manifest.json"
-        if manifest_path.exists() and not regenerate:
+        if (
+            manifest_path.exists()
+            and not regenerate
+            and _manifest_matches_current_commit(manifest_path)
+        ):
             return topology_dir
         _replace_topology_dir(topology_dir)
         run_case_config = self.case_config
         request = WorkerRunRequest(
+            git=self.git,
             case_id=self.case_id,
             objective=self.objective,
             case_config=run_case_config,
@@ -1137,6 +1441,12 @@ class VariantRunner:
             capture_moe_routing_bundle_path=(
                 None if capture_bundle_dir is None else str(capture_bundle_dir)
             ),
+            flex_backend=flex_backend,
+            offload_between_jobs=offload_between_jobs,
+            streaming_weight_offload=(
+                streaming_weight_offload or StreamingWeightOffloadConfig()
+            ),
+            use_fp32_lora_reference=self.use_fp32_lora_reference,
         )
         from .oracle_worker import run_worker_subprocess
 
@@ -1152,15 +1462,32 @@ class VariantRunner:
             self.shared_init_path.unlink()
         bundle_manifest = self.oracle_routing_bundle_dir / "manifest.json"
         oracle_manifest = self.oracle_dir / "manifest.json"
+        capture_manifest = (
+            self.case_dir / f"{self.oracle_slug}__oracle_capture" / "manifest.json"
+        )
+        bundle_format_current = False
+        if bundle_manifest.exists():
+            try:
+                bundle_format_current = (
+                    _read_json(bundle_manifest).get("format_version")
+                    == ROUTER_KEY_FORMAT_VERSION
+                )
+            except Exception:
+                bundle_format_current = False
         need_capture = (
             regenerate
             or not bundle_manifest.exists()
+            or not bundle_format_current
             or not self.shared_init_path.exists()
+            or not _manifest_matches_current_commit(capture_manifest)
         )
         run_oracle_topology = partial(
             self._run_topology,
             topology=self.oracle_topology,
             mutation=None,
+            flex_backend=self.oracle_flex_backend,
+            offload_between_jobs=self.oracle_offload_between_jobs,
+            streaming_weight_offload=self.oracle_streaming_weight_offload,
             regenerate=True,
         )
         if self.case_config.is_moe and need_capture:
@@ -1173,6 +1500,7 @@ class VariantRunner:
             regenerate
             or not oracle_manifest.exists()
             or not self.shared_init_path.exists()
+            or not _manifest_matches_current_commit(oracle_manifest)
         ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
@@ -1198,6 +1526,9 @@ class VariantRunner:
             topology=variant.topology,
             output_slug=output_slug,
             mutation=variant.mutation,
+            flex_backend=variant.flex_backend or self.variant_flex_backend,
+            offload_between_jobs=variant.offload_between_jobs,
+            streaming_weight_offload=variant.streaming_weight_offload,
             replay_bundle_dir=(
                 self.oracle_routing_bundle_dir if self.case_config.is_moe else None
             ),
@@ -1324,7 +1655,8 @@ class VariantRunner:
                 summary = accumulator.as_summary()
             elif layer_averaged:
                 summary = DiffAccumulator.layer_averaged_summary(
-                    reference_aligned, aligned_candidate
+                    reference_aligned,
+                    aligned_candidate,
                 )
             else:
                 accumulator = DiffAccumulator()
@@ -1430,6 +1762,57 @@ class VariantRunner:
             phase_entry[row.param] = row.model_dump(mode="json")
         return step_summaries
 
+    @staticmethod
+    def _step_phase_rows(
+        rows: list[MetricRow], step_index: int, phase: str
+    ) -> list[MetricRow]:
+        return [
+            row for row in rows if row.step_index == step_index and row.phase == phase
+        ]
+
+    @classmethod
+    def _phase_rows_pass(
+        cls, rows: list[MetricRow], step_index: int, phase: str
+    ) -> bool:
+        phase_rows = cls._step_phase_rows(rows, step_index, phase)
+        return bool(phase_rows) and all(row.pass_signal for row in phase_rows)
+
+    @classmethod
+    def _router_topk_exact(cls, rows: list[MetricRow], step_index: int) -> bool:
+        topk_rows = cls._step_phase_rows(rows, step_index, "router_topk_ids")
+        return bool(topk_rows) and all(
+            row.pass_signal
+            and row.topk_mismatch_fraction == 0.0
+            and row.top1_mismatch_fraction == 0.0
+            for row in topk_rows
+        )
+
+    @classmethod
+    def _apply_forward_expert_lora_trace_noise_passes(
+        cls, rows: list[MetricRow]
+    ) -> None:
+        """Reclassifies proven near-null expert LoRA forward trace noise only."""
+        steps = {row.step_index for row in rows}
+        gate_by_step = {
+            step: (
+                cls._phase_rows_pass(rows, step, "outputs")
+                and cls._phase_rows_pass(rows, step, "router_scores")
+                and cls._router_topk_exact(rows, step)
+            )
+            for step in steps
+        }
+        for row in rows:
+            if row.pass_signal:
+                continue
+            if row.phase != "forward" or not _is_forward_expert_lora_trace(row.param):
+                continue
+            if not gate_by_step.get(row.step_index, False):
+                continue
+            if row.relative_l2 > FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT:
+                continue
+            row.pass_signal = True
+            row.failure_reasons = [FORWARD_EXPERT_LORA_TRACE_NOISE_REASON]
+
     def compare_variant(self, variant: VariantSpec) -> VariantReport:
         """Compares one candidate variant against its reference topology."""
         reference_slug = variant.resolved_reference_slug()
@@ -1488,19 +1871,23 @@ class VariantRunner:
             reference_manifest.steps, topology_manifest.steps
         ):
             step_index = reference_step.step_index
-            reference_trace = _load_forward_trace(reference_dir, step_index)
-            topology_trace = _load_forward_trace(topology_dir, step_index)
+            reference_trace = self._trim_trace_padding(
+                _load_forward_trace(reference_dir, step_index)
+            )
+            topology_trace = self._trim_trace_padding(
+                _load_forward_trace(topology_dir, step_index)
+            )
             map_phase_inputs = [
                 (
                     "outputs",
-                    {"logprobs": _load_output_tensor(reference_dir, reference_step)},
-                    {"logprobs": _load_output_tensor(topology_dir, topology_step)},
+                    self._load_output_tensor_map(reference_dir, reference_step),
+                    self._load_output_tensor_map(topology_dir, topology_step),
                     False,
                 ),
                 (
                     "losses",
-                    {"loss": torch.tensor([reference_step.loss], dtype=torch.float32)},
-                    {"loss": torch.tensor([topology_step.loss], dtype=torch.float32)},
+                    self._load_loss_tensor_map(reference_step),
+                    self._load_loss_tensor_map(topology_step),
                     False,
                 ),
                 (
@@ -1546,10 +1933,12 @@ class VariantRunner:
                         router_ids=router_ids,
                     )
                 )
+        self._apply_forward_expert_lora_trace_noise_passes(rows)
         pass_count = sum(1 for row in rows if row.pass_signal)
         fail_count = len(rows) - pass_count
         signal: Literal["pass", "fail"] = "pass" if fail_count == 0 else "fail"
         return VariantReport(
+            git=self.git,
             case_id=self.case_id,
             variant=variant.name,
             topology=topology_slug,
@@ -1678,6 +2067,7 @@ class VariantRunner:
                 )
         finally:
             self._prune_reference_artifacts()
+            _prune_case_artifacts(self.case_dir)
         return reports
 
 
@@ -1687,17 +2077,21 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-    fwd_out = MetricThresholdRule(
-        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
-        minimums=non_zero_scales,
+    fwd_out_loss = MetricThresholdRule(
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT}
     )
-    loss = MetricThresholdRule(
-        limits={"relative_l2": 2e-2, "mean_abs_pct": 2.0},
+    fwd_out = MetricThresholdRule(
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT},
         minimums=non_zero_scales,
     )
     grads_deltas = MetricThresholdRule(
-        limits={"mean_abs_pct": 3.0},
+        limits={"mean_abs_pct": ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT},
         minimums=non_zero_scales,
+    )
+    router_scores_rule = MetricThresholdRule(
+        # Production RouterReplay replays top-k ids and gathers probabilities from
+        # live candidate scores, so scores are close but not bit-exact.
+        limits={"mean_abs_pct": ROUTER_SCORE_MEAN_ABS_PCT_LIMIT}
     )
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay
@@ -1707,13 +2101,10 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
             }
         )
     )
-    return {
-        "forward": fwd_out,
-        "outputs": fwd_out,
-        "losses": loss,
-    } | {
+    return {"forward": fwd_out, "outputs": fwd_out, "losses": fwd_out_loss} | {
         "grads": grads_deltas,
         "deltas": grads_deltas,
+        "router_scores": router_scores_rule,
         "router_topk_ids": router_topk_rule,
     }
 
@@ -1721,8 +2112,9 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
 def _suite_variants(
     objective: OracleObjective,
     *,
-    is_moe: bool,
+    is_moe: bool = True,
     max_world_size: int | None = None,
+    variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
     phase_pass = _default_phase_pass_fns()
@@ -1736,6 +2128,7 @@ def _suite_variants(
                 objective=objective,
                 topology=topology,
                 pass_fn_by_phase=phase_pass,
+                flex_backend=variant_flex_backend,
             )
         )
     return variants
@@ -1745,17 +2138,25 @@ def run_suite(
     *,
     case_config: OracleCaseConfig,
     max_world_size: int | None = None,
+    oracle_flex_backend: FlexBackend | None = None,
+    variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     reports: list[VariantReport] = []
     for objective in selected_oracle_objectives():
-        runner = VariantRunner(objective=objective, case_config=case_config)
+        runner = VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            variant_flex_backend=variant_flex_backend,
+        )
         reports.extend(
             runner.run_suite(
                 _suite_variants(
                     objective,
                     is_moe=case_config.is_moe,
                     max_world_size=max_world_size,
+                    variant_flex_backend=variant_flex_backend,
                 )
             )
         )
@@ -1767,57 +2168,58 @@ def run_sensitivity_suite(
     case_config: OracleCaseConfig,
     mutations: list[SensitivityMutation],
     max_world_size: int | None = None,
+    oracle_flex_backend: FlexBackend | None = None,
+    variant_flex_backend: FlexBackend | None = None,
 ) -> list[VariantReport]:
     """Runs a list of sensitivity mutations and expects each to fail."""
     phase_pass = _default_phase_pass_fns()
     reports: list[VariantReport] = []
     ran_any_variants = False
-    matched_any_objective = False
     for objective in selected_oracle_objectives():
-        runner = VariantRunner(objective=objective, case_config=case_config)
-        objective_supported_mutations = selected_sensitivity_mutations_for_objective(
-            objective,
-            mutations,
-            is_moe=case_config.is_moe,
-        )
-        matched_any_objective = matched_any_objective or bool(
-            objective_supported_mutations
+        runner = VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            variant_flex_backend=variant_flex_backend,
         )
         objective_mutations = selected_sensitivity_mutations_for_objective(
             objective,
             mutations,
             is_moe=case_config.is_moe,
-            max_world_size=max_world_size,
         )
         if not objective_mutations:
             continue
-        variants = [
-            VariantSpec(
-                name=f"{objective}_sensitivity_{mutation}",
-                objective=objective,
-                topology=sensitivity_topology_for_mutation(
-                    mutation,
-                    is_moe=case_config.is_moe,
-                ),
-                mutation=mutation,
-                expected_signal="fail",
-                pass_fn_by_phase=phase_pass,
+        variants = []
+        for mutation in objective_mutations:
+            topology = sensitivity_topology_for_mutation(
+                mutation,
+                is_moe=case_config.is_moe,
             )
-            for mutation in objective_mutations
-        ]
+            if max_world_size is not None and topology.world_size() > max_world_size:
+                continue
+            variants.append(
+                VariantSpec(
+                    name=f"{objective}_sensitivity_{mutation}",
+                    objective=objective,
+                    topology=topology,
+                    mutation=mutation,
+                    expected_signal="fail",
+                    pass_fn_by_phase=phase_pass,
+                    flex_backend=variant_flex_backend,
+                )
+            )
+        if not variants:
+            continue
         ran_any_variants = True
         reports.extend(runner.run_suite(variants))
-    if ran_any_variants or (max_world_size is not None and matched_any_objective):
+    if ran_any_variants:
         return reports
     requested = ", ".join(mutations)
-    supported_by_objective = []
-    for objective in selected_oracle_objectives():
-        objective_supported = supported_sensitivity_mutations_for_objective(
-            objective,
-            is_moe=case_config.is_moe,
-        )
-        supported_by_objective.append(f"{objective}: {', '.join(objective_supported)}")
-    supported = ", ".join(supported_by_objective)
+    supported = ", ".join(
+        f"{objective}: "
+        f"{', '.join(supported_sensitivity_mutations_for_objective(objective, is_moe=case_config.is_moe))}"
+        for objective in selected_oracle_objectives()
+    )
     raise ValueError(
         "No sensitivity variants matched the selected objectives. "
         f"Requested mutations: {requested}. Supported by objective: {supported}."

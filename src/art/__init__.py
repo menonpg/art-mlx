@@ -45,8 +45,12 @@ try:
     import transformers
 
     try:
-        from .transformers.patches import patch_preprocess_mask_arguments
+        from .transformers.patches import (
+            disable_broken_torchvision_for_transformers,
+            patch_preprocess_mask_arguments,
+        )
 
+        disable_broken_torchvision_for_transformers()
         patch_preprocess_mask_arguments()
     except Exception:
         pass
@@ -58,12 +62,14 @@ from . import dev
 from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
+from .dev import LoRAConfig
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .serverless import ServerlessBackend
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import (
     LocalTrainResult,
+    MegatronTopologyConfig,
     Messages,
     MessagesAndChoices,
     ServerlessTrainResult,
@@ -85,6 +91,8 @@ __all__ = [
     "Backend",
     "LocalBackend",
     "LocalTrainResult",
+    "LoRAConfig",
+    "MegatronTopologyConfig",
     "ServerlessBackend",
     "ServerlessTrainResult",
     "Messages",

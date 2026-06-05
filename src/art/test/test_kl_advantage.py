@@ -2,7 +2,7 @@
 
 import torch
 
-from art.loss import Loss, loss_fn, shift_tensor
+from art.loss import LossInputs, loss_fn, shift_tensor
 
 
 def _make_inputs(
@@ -40,9 +40,13 @@ def test_kl_advantage_no_effect_when_disabled():
     ref_logprobs = torch.full((1, 8), -1.0)  # different from new_logprobs
 
     loss_no_kl = loss_fn(
-        inputs, new_logprobs, ref_logprobs, None, {"kl_penalty_coef": 0.0}
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.0},
     )
-    loss_without_ref = loss_fn(inputs, new_logprobs, None, None, {})
+    loss_without_ref = loss_fn(LossInputs(inputs=inputs), new_logprobs, None, None, {})
 
     assert loss_no_kl.kl_policy_ref is None
     assert loss_without_ref.kl_policy_ref is None
@@ -56,7 +60,13 @@ def test_kl_advantage_enabled():
     new_logprobs = torch.zeros(1, 8)
     ref_logprobs = torch.full((1, 8), -0.5)
 
-    loss = loss_fn(inputs, new_logprobs, ref_logprobs, None, {"kl_penalty_coef": 0.1})
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.1},
+    )
 
     assert loss.kl_policy_ref is not None
     assert loss.kl_policy_ref.item() > 0  # KL should be positive when logprobs differ
@@ -76,7 +86,7 @@ def test_kl_advantage_zero_mean_penalty():
 
     # Compute what the penalty should be
     kl_per_token = (new_logprobs - ref_logprobs).detach() * assistant_mask
-    avg_kl = kl_per_token.sum() / (assistant_mask.sum() + 1e-6)
+    avg_kl = kl_per_token.sum() / (assistant_mask.sum() + 1e-18)
     kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
 
     # Sum of penalty across tokens should be ~0
@@ -103,7 +113,13 @@ def test_kl_advantage_direction():
     new_logprobs[0, 5] = -0.1
     ref_logprobs[0, 5] = -0.1  # no gap = low KL
 
-    loss = loss_fn(inputs, new_logprobs, ref_logprobs, None, {"kl_penalty_coef": 1.0})
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 1.0},
+    )
 
     # The metric should exist
     assert loss.kl_policy_ref is not None
@@ -114,7 +130,13 @@ def test_kl_advantage_does_not_affect_when_no_ref():
     inputs = _make_inputs()
     new_logprobs = torch.zeros(1, 8)
 
-    loss = loss_fn(inputs, new_logprobs, None, None, {"kl_penalty_coef": 0.5})
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        None,
+        None,
+        {"kl_penalty_coef": 0.5},
+    )
     assert loss.kl_policy_ref is None
 
 
@@ -138,21 +160,21 @@ def test_kl_advantage_can_use_sample_logprobs() -> None:
         shifted_logprobs,
     )
     expected_sample_kl = ((sampled_logprobs - ref_logprobs) * assistant_mask).sum() / (
-        assistant_mask.sum() + 1e-6
+        assistant_mask.sum() + 1e-18
     )
     expected_current_kl = ((new_logprobs - ref_logprobs) * assistant_mask).sum() / (
-        assistant_mask.sum() + 1e-6
+        assistant_mask.sum() + 1e-18
     )
 
     sample_loss = loss_fn(
-        inputs,
+        LossInputs(inputs=inputs),
         new_logprobs,
         ref_logprobs,
         None,
         {"kl_penalty_coef": 0.5, "kl_penalty_source": "sample"},
     )
     learner_loss = loss_fn(
-        inputs,
+        LossInputs(inputs=inputs),
         new_logprobs,
         ref_logprobs,
         None,

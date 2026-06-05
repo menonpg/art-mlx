@@ -13,15 +13,19 @@ import re
 import subprocess
 import sys
 
+PROJECT_VERSION_RE = re.compile(
+    r'(?ms)^(\[project\]\s+.*?^version = ")(\d+\.\d+\.\d+)(")'
+)
+
 
 def get_current_version():
     """Extract current version from pyproject.toml."""
     pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
     content = pyproject_path.read_text()
-    match = re.search(r'version = "(\d+\.\d+\.\d+)"', content)
+    match = PROJECT_VERSION_RE.search(content)
     if not match:
-        raise ValueError("Could not find version in pyproject.toml")
-    return match.group(1)
+        raise ValueError("Could not find [project] version in pyproject.toml")
+    return match.group(2)
 
 
 def bump_version(current_version, bump_type):
@@ -43,10 +47,11 @@ def update_version(new_version):
     pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
     content = pyproject_path.read_text()
 
-    # Update version
-    new_content = re.sub(
-        r'version = "\d+\.\d+\.\d+"', f'version = "{new_version}"', content
+    new_content, count = PROJECT_VERSION_RE.subn(
+        rf"\g<1>{new_version}\3", content, count=1
     )
+    if count != 1:
+        raise ValueError("Could not update [project] version in pyproject.toml")
 
     pyproject_path.write_text(new_content)
 

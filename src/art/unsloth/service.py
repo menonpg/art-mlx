@@ -6,7 +6,6 @@ from functools import cached_property
 import logging
 import os
 import socket
-import subprocess
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
 import torch
@@ -23,16 +22,11 @@ from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,
-    managed_process_cmd,
-    terminate_popen_process_group,
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
+    ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
-    build_vllm_runtime_server_cmd,
-    get_vllm_runtime_nccl_so_path,
-    get_vllm_runtime_working_dir,
-    wait_for_vllm_runtime,
 )
 from ..weight_transfer import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
@@ -49,6 +43,20 @@ from .train import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _peft_args_from_lora_config(lora_config: dev.LoRAConfig) -> dict[str, Any]:
+    aliases = {
+        "rank": "r",
+        "alpha": "lora_alpha",
+        "dropout": "lora_dropout",
+        "init_weights": "init_lora_weights",
+    }
+    return {
+        "r": 8,
+        "lora_alpha": 16,
+        **{aliases.get(k, k): v for k, v in lora_config.items()},
+    }
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
@@ -128,14 +136,11 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
-    # Dedicated mode subprocess state
-    _vllm_process: subprocess.Popen | None = field(default=None, repr=False)  # type: ignore[type-arg]
-    _vllm_log_file: Any = field(default=None, repr=False)
-    _vllm_log_path: str | None = None
-    _vllm_host: str = "127.0.0.1"
-    _vllm_port: int = 0
-    _vllm_api_key: str | None = None
-    _vllm_nccl_so_path: str | None = None
+    _vllm_runtime: ManagedVllmRuntime = field(
+        default_factory=ManagedVllmRuntime,
+        init=False,
+        repr=False,
+    )
     _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
@@ -171,7 +176,27 @@ class UnslothService:
 
     @property
     def _vllm_base_url(self) -> str:
-        return f"http://{self._vllm_host}:{self._vllm_port}"
+        return self._vllm_runtime.base_url
+
+    @property
+    def _vllm_host(self) -> str:
+        return self._vllm_runtime.host
+
+    @property
+    def _vllm_port(self) -> int:
+        return self._vllm_runtime.port
+
+    @_vllm_port.setter
+    def _vllm_port(self, port: int) -> None:
+        self._vllm_runtime.port = port
+
+    @property
+    def _vllm_api_key(self) -> str | None:
+        return self._vllm_runtime.api_key
+
+    @property
+    def _vllm_nccl_so_path(self) -> str | None:
+        return self._vllm_runtime.nccl_so_path
 
     def _runtime_cuda_visible_devices(self) -> str:
         if self.is_dedicated:
@@ -242,96 +267,31 @@ class UnslothService:
     ) -> tuple[str, int]:
         self._raise_if_child_failed()
         server_args = self._runtime_server_args(config)
-        api_key = server_args.get("api_key")
-        self._vllm_api_key = api_key if isinstance(api_key, str) else None
-        self._vllm_nccl_so_path = (
-            str(get_vllm_runtime_nccl_so_path())
-            if self.rollout_weights_mode == "merged"
-            else None
-        )
-        cmd = build_vllm_runtime_server_cmd(
-            VllmRuntimeLaunchConfig(
+        location = await self._vllm_runtime.start(
+            launch_config=VllmRuntimeLaunchConfig(
                 base_model=self.base_model,
                 port=port,
-                host=self._vllm_host,
+                host=self._vllm_runtime.host,
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
                 served_model_name=f"{self.model_name}@{self._latest_step}",
                 rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
-            )
-        )
-        self._lifecycle.install_parent_cleanup(self.close)
-
-        log_dir = os.path.join(self.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        self._vllm_log_path = os.path.join(log_dir, "vllm-runtime.log")
-        self._vllm_log_file = open(self._vllm_log_path, "w", buffering=1)
-
-        self._vllm_process = subprocess.Popen(
-            managed_process_cmd(cmd),
-            cwd=str(get_vllm_runtime_working_dir()),
-            env=os.environ.copy(),
-            stdout=self._vllm_log_file,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            start_new_session=True,
-        )
-        self._vllm_port = port
-
-        import httpx
-
-        timeout = float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
-        async with httpx.AsyncClient() as client:
-            try:
-                await wait_for_vllm_runtime(
-                    process=self._vllm_process,
-                    host=self._vllm_host,
-                    port=self._vllm_port,
-                    timeout=timeout,
-                )
-            except TimeoutError as exc:
-                self.close()
-                raise TimeoutError(
-                    f"vLLM subprocess did not become ready within {timeout}s. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-            except RuntimeError as exc:
-                returncode = self._vllm_process.returncode
-                self.close()
-                raise RuntimeError(
-                    f"vLLM subprocess exited with code {returncode}. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-
-            try:
-                resp = await client.get(
-                    f"http://{self._vllm_host}:{self._vllm_port}/v1/models",
-                    **self._runtime_request_kwargs(),
-                    timeout=5.0,
-                )
-                resp.raise_for_status()
-            except httpx.HTTPError as exc:
-                self.close()
-                raise RuntimeError(
-                    "vLLM passed /health but /v1/models was not reachable. "
-                    f"Check logs at {log_dir}/vllm-runtime.log"
-                ) from exc
-
-        assert self._vllm_process is not None
-        assert self._vllm_log_path is not None
-        self._child_processes.watch_popen(
-            "vLLM runtime",
-            self._vllm_process,
-            log_path=self._vllm_log_path,
+            ),
+            output_dir=self.output_dir,
+            child_processes=self._child_processes,
+            install_parent_cleanup=lambda: self._lifecycle.install_parent_cleanup(
+                self.close
+            ),
+            cleanup_on_error=self.close,
         )
         logger.info(
             "vLLM runtime ready on port %d (GPUs: %s)",
             port,
             self._runtime_cuda_visible_devices(),
         )
-        return self._vllm_host, self._vllm_port
+        return location
 
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
@@ -603,18 +563,18 @@ class UnslothService:
         """Terminate vLLM subprocess if running."""
         if not self._lifecycle.begin_close():
             return
+        weight_transfer_group = self._weight_transfer_group
         self._weight_transfer_group = None
         try:
-            self._child_processes.close()
-            if self._vllm_process is not None:
-                terminate_popen_process_group(self._vllm_process)
-                self._vllm_process = None
-            if self._vllm_log_file is not None:
-                self._vllm_log_file.close()
-                self._vllm_log_file = None
-            self._vllm_log_path = None
-            self._vllm_nccl_so_path = None
-            self._loaded_adapter_steps.clear()
+            try:
+                if weight_transfer_group is not None:
+                    close = getattr(weight_transfer_group, "close", None)
+                    if close is not None:
+                        close()
+            finally:
+                self._child_processes.close()
+                self._vllm_runtime.close()
+                self._loaded_adapter_steps.clear()
         finally:
             self._lifecycle.restore_parent_cleanup()
 
@@ -874,6 +834,8 @@ class UnslothService:
         init_args["model_name"] = checkpoint_dir or self.base_model
         return create_unsloth_train_context(
             init_args=init_args,
-            peft_args=cast(dict[str, Any], self.config.get("peft_args", {})),
+            peft_args=_peft_args_from_lora_config(
+                cast(dev.BackendModelConfig, self.config).get("lora_config", {})
+            ),
             trainer_args=cast(dict[str, Any], self.config.get("trainer_args", {})),
         )

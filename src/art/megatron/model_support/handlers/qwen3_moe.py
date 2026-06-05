@@ -3,7 +3,10 @@ from typing import Any, Sequence
 
 import torch
 
-from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
+from art.megatron.model_support.handlers.default_dense import (
+    DefaultMoeHandler,
+    _compile_workaround_flags_for_provider,
+)
 from art.megatron.model_support.handlers.qwen3_common import (
     install_qwen3_text_preprocess_patch,
 )
@@ -12,16 +15,11 @@ from art.megatron.model_support.spec import CompileWorkaroundConfig
 _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
+    "deepep_dispatch_combine",
     "deepep_permute_restore",
+    "te_triton_permute_with_mask_map",
 )
-_QWEN3_FUSED_MOE_KEY_RE = re.compile(
-    r"^(?P<prefix>.*\.mlp\.experts)\."
-    r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
-)
-_QWEN3_EXPERT_MOE_KEY_RE = re.compile(
-    r"^.*\.mlp\.experts\.\d+\."
-    r"(?:gate_proj|up_proj|down_proj)\.lora_[AB]\.weight$"
-)
+_QWEN3_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
 
 
 class Qwen3MoeHandler(DefaultMoeHandler):
@@ -43,11 +41,26 @@ class Qwen3MoeHandler(DefaultMoeHandler):
         self,
         provider: Any,
     ) -> CompileWorkaroundConfig:
-        del provider
-        return CompileWorkaroundConfig(flags=_QWEN3_MOE_COMPILE_WORKAROUND_FLAGS)
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(
+                provider,
+                _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS,
+            ),
+            unconditional_flags=_QWEN3_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS,
+        )
 
 
 QWEN3_MOE_HANDLER = Qwen3MoeHandler()
+
+
+_QWEN3_FUSED_MOE_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\."
+    r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
+)
+_QWEN3_EXPERT_MOE_KEY_RE = re.compile(
+    r"^.*\.mlp\.experts\.\d+\."
+    r"(?:gate_proj|up_proj|down_proj)\.lora_[AB]\.weight$"
+)
 
 
 def _qwen3_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
@@ -98,12 +111,39 @@ def _expand_fused_moe_lora(
             f"{prefix}: gate/up lora_A shape {tuple(gate_up_a.shape)} "
             f"is not divisible by rank {rank}"
         )
+    num_experts = gate_up_a.shape[0] // rank
+    expected_rank_cols = num_experts * rank
+    if (
+        gate_up_b.shape[1] == expected_rank_cols
+        and down_b.shape[1] == expected_rank_cols
+        and gate_up_a.shape[1] == 2 * down_b.shape[0]
+        and down_a.shape == (expected_rank_cols, gate_up_b.shape[0])
+    ):
+        expanded: dict[str, torch.Tensor] = {}
+        intermediate = down_b.shape[0]
+        for expert in range(num_experts):
+            rows = slice(expert * rank, (expert + 1) * rank)
+            gate_a, up_a = gate_up_a[rows].split(intermediate, dim=1)
+            expert_prefix = f"{prefix}.{expert}"
+            expanded[f"{expert_prefix}.gate_proj.lora_A.weight"] = _clone(
+                gate_up_b[:, rows].T
+            )
+            expanded[f"{expert_prefix}.gate_proj.lora_B.weight"] = _clone(gate_a.T)
+            expanded[f"{expert_prefix}.up_proj.lora_A.weight"] = _clone(
+                gate_up_b[:, rows].T
+            )
+            expanded[f"{expert_prefix}.up_proj.lora_B.weight"] = _clone(up_a.T)
+            expanded[f"{expert_prefix}.down_proj.lora_A.weight"] = _clone(
+                down_b[:, rows].T
+            )
+            expanded[f"{expert_prefix}.down_proj.lora_B.weight"] = _clone(
+                down_a[rows].T
+            )
+        return expanded
     if gate_up_b.shape[0] % 2 != 0:
         raise RuntimeError(
             f"{prefix}: gate/up lora_B rows {gate_up_b.shape[0]} are not even"
         )
-    num_experts = gate_up_a.shape[0] // rank
-    expected_rank_cols = num_experts * rank
     intermediate = gate_up_b.shape[0] // 2
     if gate_up_b.shape[1] != expected_rank_cols:
         raise RuntimeError(

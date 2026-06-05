@@ -1,9 +1,9 @@
 from mp_actors import move_to_child_process
 
-from ...local.backend import LocalBackend
-from ...local.service import ModelService
-from ...model import TrainableModel
-from ...utils.output_dirs import get_model_dir
+from ..local.backend import LocalBackend
+from ..local.service import ModelService
+from ..model import TrainableModel
+from ..utils.output_dirs import get_model_dir
 
 
 class MegatronBackend(LocalBackend):
@@ -12,28 +12,34 @@ class MegatronBackend(LocalBackend):
         *,
         in_process: bool = False,
         path: str | None = None,
+        enable_expert_replay: bool = True,
     ) -> None:
-        super().__init__(in_process=in_process, path=path)
+        super().__init__(
+            in_process=in_process,
+            path=path,
+            enable_expert_replay=enable_expert_replay,
+        )
         self._requires_explicit_packed_sequence_length = True
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
-        self._default_chat_template_tool_schema_format = "vllm_openai"
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
-        from ...dev.get_model_config import get_model_config
-        from ..service import MegatronService
+        from ..dev.get_model_config import get_model_config
+        from .service import MegatronService
 
         if model.name not in self._services:
             config = get_model_config(
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             self._services[model.name] = MegatronService(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
+                enable_expert_replay=self._enable_expert_replay,
             )
             if not self._in_process:
                 self._services[model.name] = move_to_child_process(

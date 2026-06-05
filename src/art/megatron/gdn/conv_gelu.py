@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -84,226 +84,6 @@ def _packed_conv_token_metadata_kernel(
     start = tl.load(cu_seqlens + segment).to(tl.int64)
     tl.store(token_segment + token, segment, mask=mask)
     tl.store(token_local_t + token, token - start, mask=mask)
-
-
-@triton.jit
-def _conv_gelu_fwd_kernel(
-    qkv,
-    conv_initial,
-    weight,
-    bias,
-    lengths,
-    out,
-    final,
-    C: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    OUTPUT_FINAL: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-):
-    pid_t = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    b = tl.program_id(2)
-    tail: tl.constexpr = K - 1
-    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-    c = offs_c[:, None]
-    t = offs_t[None, :]
-    b64 = b.to(tl.int64)
-    c64 = c.to(tl.int64)
-    t64 = t.to(tl.int64)
-    offs_c64 = offs_c.to(tl.int64)
-    mask = (offs_c[:, None] < C) & (offs_t[None, :] < T)
-    acc = tl.zeros((BLOCK_C, BLOCK_T), dtype=tl.float32)
-    if HAS_BIAS:
-        acc += tl.load(bias + offs_c, mask=offs_c < C, other=0.0)[:, None].to(
-            tl.float32
-        )
-    for j in tl.static_range(0, K):
-        ext = t + j
-        ext64 = ext.to(tl.int64)
-        from_initial = ext < tail
-        init_idx = (b64 * C + c64) * tail + ext64
-        qkv_idx = (b64 * C + c64) * T + (ext64 - tail)
-        x_init = tl.load(conv_initial + init_idx, mask=mask & from_initial, other=0.0)
-        x_qkv = tl.load(qkv + qkv_idx, mask=mask & ~from_initial, other=0.0)
-        w = tl.load(weight + offs_c * K + j, mask=offs_c < C, other=0.0).to(tl.float32)
-        acc += (x_init + x_qkv).to(tl.float32) * w[:, None]
-    tl.store(out + (b64 * C + c64) * T + t64, _gelu(acc), mask=mask)
-
-    if OUTPUT_FINAL:
-        length = tl.load(lengths + b)
-        for r in tl.static_range(0, tail):
-            ext = length + r
-            ext64 = ext.to(tl.int64)
-            from_initial = ext < tail
-            init_idx = (b64 * C + offs_c64) * tail + ext64
-            qkv_idx = (b64 * C + offs_c64) * T + (ext64 - tail)
-            x_init = tl.load(
-                conv_initial + init_idx,
-                mask=(pid_t == 0) & (offs_c < C) & from_initial,
-                other=0.0,
-            )
-            x_qkv = tl.load(
-                qkv + qkv_idx,
-                mask=(pid_t == 0) & (offs_c < C) & ~from_initial,
-                other=0.0,
-            )
-            tl.store(
-                final + (b64 * C + offs_c64) * tail + r,
-                x_init + x_qkv,
-                mask=(pid_t == 0) & (offs_c < C),
-            )
-
-
-@triton.jit
-def _conv_gelu_grad_preact_kernel(
-    qkv,
-    conv_initial,
-    weight,
-    bias,
-    grad_out,
-    grad_preact,
-    C: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-):
-    pid_t = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    b = tl.program_id(2)
-    tail: tl.constexpr = K - 1
-    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-    c = offs_c[:, None]
-    t = offs_t[None, :]
-    b64 = b.to(tl.int64)
-    c64 = c.to(tl.int64)
-    t64 = t.to(tl.int64)
-    mask = (offs_c[:, None] < C) & (offs_t[None, :] < T)
-    acc = tl.zeros((BLOCK_C, BLOCK_T), dtype=tl.float32)
-    if HAS_BIAS:
-        acc += tl.load(bias + offs_c, mask=offs_c < C, other=0.0)[:, None].to(
-            tl.float32
-        )
-    for j in tl.static_range(0, K):
-        ext = t + j
-        ext64 = ext.to(tl.int64)
-        from_initial = ext < tail
-        init_idx = (b64 * C + c64) * tail + ext64
-        qkv_idx = (b64 * C + c64) * T + (ext64 - tail)
-        x_init = tl.load(conv_initial + init_idx, mask=mask & from_initial, other=0.0)
-        x_qkv = tl.load(qkv + qkv_idx, mask=mask & ~from_initial, other=0.0)
-        w = tl.load(weight + offs_c * K + j, mask=offs_c < C, other=0.0).to(tl.float32)
-        acc += (x_init + x_qkv).to(tl.float32) * w[:, None]
-    out_idx = (b64 * C + c64) * T + t64
-    go = tl.load(grad_out + out_idx, mask=mask, other=0.0).to(tl.float32)
-    tl.store(grad_preact + out_idx, go * _gelu_grad(acc), mask=mask)
-
-
-@triton.jit
-def _conv_gelu_bwd_input_kernel(
-    grad_preact,
-    weight,
-    lengths,
-    grad_final,
-    grad_qkv,
-    grad_initial,
-    C: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    HAS_FINAL_GRAD: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    BLOCK_E: tl.constexpr,
-):
-    pid_e = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    b = tl.program_id(2)
-    tail: tl.constexpr = K - 1
-    ext_len: tl.constexpr = T + K - 1
-    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    offs_e = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
-    c = offs_c[:, None]
-    e = offs_e[None, :]
-    b64 = b.to(tl.int64)
-    c64 = c.to(tl.int64)
-    e64 = e.to(tl.int64)
-    mask = (offs_c[:, None] < C) & (offs_e[None, :] < ext_len)
-    acc = tl.zeros((BLOCK_C, BLOCK_E), dtype=tl.float32)
-    for j in tl.static_range(0, K):
-        t = e - j
-        t64 = t.to(tl.int64)
-        valid = mask & (t >= 0) & (t < T)
-        gz = tl.load(grad_preact + (b64 * C + c64) * T + t64, mask=valid, other=0.0)
-        w = tl.load(weight + offs_c * K + j, mask=offs_c < C, other=0.0).to(tl.float32)
-        acc += gz.to(tl.float32) * w[:, None]
-    if HAS_FINAL_GRAD:
-        length = tl.load(lengths + b)
-        r = e - length
-        r64 = r.to(tl.int64)
-        valid_final = mask & (r >= 0) & (r < tail)
-        gf = tl.load(
-            grad_final + (b64 * C + c64) * tail + r64,
-            mask=valid_final,
-            other=0.0,
-        )
-        acc += gf.to(tl.float32)
-
-    init_mask = mask & (e < tail)
-    qkv_mask = mask & (e >= tail)
-    tl.store(grad_initial + (b64 * C + c64) * tail + e64, acc, mask=init_mask)
-    tl.store(grad_qkv + (b64 * C + c64) * T + (e64 - tail), acc, mask=qkv_mask)
-
-
-@triton.jit
-def _conv_gelu_bwd_weight_kernel(
-    qkv,
-    conv_initial,
-    grad_preact,
-    grad_weight,
-    grad_bias,
-    C: tl.constexpr,
-    B: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_BT: tl.constexpr,
-):
-    c = tl.program_id(0)
-    tail: tl.constexpr = K - 1
-    bt_total: tl.constexpr = B * T
-    offsets = tl.arange(0, BLOCK_BT)
-    bias_acc = tl.zeros((BLOCK_BT,), dtype=tl.float32)
-    for j in tl.static_range(0, K):
-        weight_acc = tl.zeros((BLOCK_BT,), dtype=tl.float32)
-        for start in range(0, bt_total, BLOCK_BT):
-            bt = start + offsets
-            mask = bt < bt_total
-            b = bt // T
-            t = bt - b * T
-            b64 = b.to(tl.int64)
-            t64 = t.to(tl.int64)
-            c64 = c.to(tl.int64)
-            gz = tl.load(grad_preact + (b64 * C + c64) * T + t64, mask=mask, other=0.0)
-            ext = t + j
-            ext64 = ext.to(tl.int64)
-            from_initial = ext < tail
-            init_idx = (b64 * C + c64) * tail + ext64
-            qkv_idx = (b64 * C + c64) * T + (ext64 - tail)
-            x_init = tl.load(
-                conv_initial + init_idx, mask=mask & from_initial, other=0.0
-            )
-            x_qkv = tl.load(qkv + qkv_idx, mask=mask & ~from_initial, other=0.0)
-            weight_acc += gz.to(tl.float32) * (x_init + x_qkv).to(tl.float32)
-            if HAS_BIAS and j == 0:
-                bias_acc += gz.to(tl.float32)
-        tl.store(grad_weight + c * K + j, tl.sum(weight_acc, axis=0))
-    if HAS_BIAS:
-        tl.store(grad_bias + c, tl.sum(bias_acc, axis=0))
 
 
 @triton.jit(do_not_specialize=["TOTAL_TOKENS"])
@@ -635,141 +415,16 @@ def _packed_conv_bwd_bias_reduce_kernel(
     tl.store(grad_bias + offs_c, tl.sum(bias_acc, axis=0), mask=c_mask)
 
 
-class _VarlenCausalConvGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        qkv: Tensor,
-        conv_initial: Tensor,
-        weight: Tensor,
-        bias: Tensor | None,
-        lengths: Tensor,
-        output_final_state: bool,
-    ) -> tuple[Tensor, Tensor | None]:
-        _validate_inputs(qkv, conv_initial, weight, bias, lengths)
-        qkv = qkv.contiguous()
-        conv_initial = conv_initial.contiguous()
-        weight = weight.contiguous()
-        bias_tensor = (
-            bias.contiguous()
-            if bias is not None
-            else torch.empty((0,), device=qkv.device, dtype=qkv.dtype)
-        )
-        lengths = lengths.contiguous()
-        batch, channels, max_len = qkv.shape
-        kernel_width = int(weight.shape[1])
-        out = torch.empty_like(qkv)
-        final = (
-            torch.empty(
-                (batch, channels, kernel_width - 1),
-                device=qkv.device,
-                dtype=qkv.dtype,
-            )
-            if output_final_state
-            else None
-        )
-        block_c, block_t, num_warps = _tile_config(channels, max_len)
-        grid = (triton.cdiv(max_len, block_t), triton.cdiv(channels, block_c), batch)
-        cast(Any, _conv_gelu_fwd_kernel)[grid](
-            qkv,
-            conv_initial,
-            weight,
-            bias_tensor,
-            lengths,
-            out,
-            out if final is None else final,
-            channels,
-            max_len,
-            kernel_width,
-            HAS_BIAS=bias is not None,
-            OUTPUT_FINAL=output_final_state,
-            BLOCK_C=block_c,
-            BLOCK_T=block_t,
-            num_warps=num_warps,
-        )
-        ctx.save_for_backward(qkv, conv_initial, weight, bias_tensor, lengths)
-        ctx.has_bias = bias is not None
-        ctx.output_final_state = bool(output_final_state)
-        ctx.tile = (block_c, block_t, num_warps)
-        return out, final
-
-    @staticmethod
-    def backward(
-        ctx: Any, *grad_outputs: Any
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, None, None]:
-        grad_out, grad_final = grad_outputs
-        qkv, conv_initial, weight, bias, lengths = ctx.saved_tensors
-        grad_out = grad_out.contiguous()
-        grad_final_tensor = (
-            grad_final.contiguous()
-            if grad_final is not None
-            else torch.empty((0,), device=qkv.device, dtype=qkv.dtype)
-        )
-        batch, channels, max_len = qkv.shape
-        kernel_width = int(weight.shape[1])
-        grad_qkv = torch.empty_like(qkv)
-        grad_initial = torch.empty_like(conv_initial)
-        grad_weight = torch.empty_like(weight)
-        grad_bias = torch.empty_like(bias) if bool(ctx.has_bias) else None
-        grad_preact = torch.empty(qkv.shape, device=qkv.device, dtype=torch.float32)
-        block_c, block_t, num_warps = ctx.tile
-        grid_t = (
-            triton.cdiv(max_len, block_t),
-            triton.cdiv(channels, block_c),
-            batch,
-        )
-        cast(Any, _conv_gelu_grad_preact_kernel)[grid_t](
-            qkv,
-            conv_initial,
-            weight,
-            bias,
-            grad_out,
-            grad_preact,
-            channels,
-            max_len,
-            kernel_width,
-            HAS_BIAS=bool(ctx.has_bias),
-            BLOCK_C=block_c,
-            BLOCK_T=block_t,
-            num_warps=num_warps,
-        )
-        ext_len = max_len + kernel_width - 1
-        grid_e = (
-            triton.cdiv(ext_len, block_t),
-            triton.cdiv(channels, block_c),
-            batch,
-        )
-        cast(Any, _conv_gelu_bwd_input_kernel)[grid_e](
-            grad_preact,
-            weight,
-            lengths,
-            grad_final_tensor,
-            grad_qkv,
-            grad_initial,
-            channels,
-            max_len,
-            kernel_width,
-            HAS_FINAL_GRAD=grad_final is not None,
-            BLOCK_C=block_c,
-            BLOCK_E=block_t,
-            num_warps=num_warps,
-        )
-        reduce_block = 1024
-        cast(Any, _conv_gelu_bwd_weight_kernel)[(channels,)](
-            qkv,
-            conv_initial,
-            grad_preact,
-            grad_weight,
-            grad_bias if grad_bias is not None else grad_weight,
-            channels,
-            batch,
-            max_len,
-            kernel_width,
-            HAS_BIAS=bool(ctx.has_bias),
-            BLOCK_BT=reduce_block,
-            num_warps=8,
-        )
-        return grad_qkv, grad_initial, grad_weight, grad_bias, None, None
+_packed_conv_token_metadata_kernel_any: Any = _packed_conv_token_metadata_kernel
+_packed_conv_fwd_kernel_any: Any = _packed_conv_fwd_kernel
+_packed_conv_final_kernel_any: Any = _packed_conv_final_kernel
+_packed_conv_grad_preact_weight_partial_kernel_any: Any = (
+    _packed_conv_grad_preact_weight_partial_kernel
+)
+_packed_conv_bwd_input_kernel_any: Any = _packed_conv_bwd_input_kernel
+_packed_conv_bwd_weight_reduce_kernel_any: Any = _packed_conv_bwd_weight_reduce_kernel
+_packed_conv_bwd_bias_reduce_kernel_any: Any = _packed_conv_bwd_bias_reduce_kernel
+_packed_conv_bwd_initial_kernel_any: Any = _packed_conv_bwd_initial_kernel
 
 
 class _PackedVarlenCausalConv(torch.autograd.Function):
@@ -822,7 +477,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
         token_local_t = torch.empty_like(token_segment)
         if total_tokens > 0:
             metadata_block_n = 256
-            cast(Any, _packed_conv_token_metadata_kernel)[
+            _packed_conv_token_metadata_kernel_any[
                 (triton.cdiv(total_tokens, metadata_block_n),)
             ](
                 cu_seqlens,
@@ -834,7 +489,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 BLOCK_N=metadata_block_n,
                 num_warps=4,
             )
-            cast(Any, _packed_conv_fwd_kernel)[
+            _packed_conv_fwd_kernel_any[
                 (triton.cdiv(total_tokens, block_n), triton.cdiv(channels, block_c))
             ](
                 conv_in,
@@ -855,7 +510,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
             )
         if final is not None and kernel_width > 1 and segments > 0:
             block_r = _tail_block(kernel_width - 1)
-            cast(Any, _packed_conv_final_kernel)[
+            _packed_conv_final_kernel_any[
                 (
                     triton.cdiv(kernel_width - 1, block_r),
                     triton.cdiv(channels, block_c),
@@ -889,9 +544,12 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: Any, *grad_outputs: Any
+        ctx: Any, *grad_outputs: Tensor | None
     ) -> tuple[Tensor, None, Tensor, Tensor, Tensor | None, None, None]:
-        grad_out, grad_final = grad_outputs
+        if len(grad_outputs) != 2 or grad_outputs[0] is None:
+            raise RuntimeError("expected output gradient for packed causal conv")
+        grad_out = grad_outputs[0]
+        grad_final = grad_outputs[1]
         (
             conv_in,
             cu_seqlens,
@@ -939,7 +597,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 token_tiles,
                 channel_tiles,
             )
-            cast(Any, _packed_conv_grad_preact_weight_partial_kernel)[grid_n](
+            _packed_conv_grad_preact_weight_partial_kernel_any[grid_n](
                 conv_in,
                 token_segment,
                 token_local_t,
@@ -960,7 +618,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 BLOCK_C=block_c,
                 num_warps=num_warps,
             )
-            cast(Any, _packed_conv_bwd_input_kernel)[grid_n](
+            _packed_conv_bwd_input_kernel_any[grid_n](
                 cu_seqlens,
                 token_segment,
                 weight,
@@ -975,9 +633,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 BLOCK_C=block_c,
                 num_warps=num_warps,
             )
-            cast(Any, _packed_conv_bwd_weight_reduce_kernel)[
-                (channel_tiles, kernel_width)
-            ](
+            _packed_conv_bwd_weight_reduce_kernel_any[(channel_tiles, kernel_width)](
                 grad_weight_partial,
                 grad_weight,
                 channels,
@@ -989,7 +645,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 num_warps=4,
             )
             if grad_bias is not None:
-                cast(Any, _packed_conv_bwd_bias_reduce_kernel)[(channel_tiles,)](
+                _packed_conv_bwd_bias_reduce_kernel_any[(channel_tiles,)](
                     grad_bias_partial,
                     grad_bias,
                     channels,
@@ -1006,7 +662,7 @@ class _PackedVarlenCausalConv(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
         if kernel_width > 1 and segments > 0:
             block_r = _tail_block(kernel_width - 1)
-            cast(Any, _packed_conv_bwd_initial_kernel)[
+            _packed_conv_bwd_initial_kernel_any[
                 (
                     triton.cdiv(kernel_width - 1, block_r),
                     triton.cdiv(channels, block_c),
@@ -1079,60 +735,6 @@ def packed_varlen_causal_conv_gelu(
     )
 
 
-def varlen_causal_conv_gelu(
-    qkv: Tensor,
-    conv_initial: Tensor,
-    weight: Tensor,
-    bias: Tensor | None,
-    lengths: Tensor,
-    *,
-    output_final_state: bool = True,
-) -> tuple[Tensor, Tensor | None]:
-    """Run ART GDN's prepared-varlen causal depthwise conv followed by GELU.
-
-    Inputs use the existing prepared GDN layout: ``qkv`` is ``[segments, channels,
-    max_len]`` with padded positions already zeroed, ``conv_initial`` is
-    ``[segments, channels, kernel_width - 1]``, and ``lengths`` contains each
-    segment's real token count. The dense output intentionally matches the
-    current production conv path over the padded tensor; callers can keep using
-    the existing real-token mask after this fused operation.
-    """
-
-    return _VarlenCausalConvGelu.apply(
-        qkv, conv_initial, weight, bias, lengths, output_final_state
-    )
-
-
-def gdn_varlen_causal_conv_gelu(
-    gdn: Any,
-    qkv: Tensor,
-    conv_initial: Tensor,
-    lengths: Tensor,
-    *,
-    output_final_state: bool = True,
-) -> tuple[Tensor, Tensor | None]:
-    if str(getattr(gdn, "activation", "")) != "gelu":
-        raise ValueError(
-            "fused varlen causal conv is only defined for GDN GELU activation, "
-            f"got {getattr(gdn, 'activation', None)!r}"
-        )
-    return varlen_causal_conv_gelu(
-        qkv,
-        conv_initial,
-        gdn.conv1d.weight.squeeze(1),
-        gdn.conv1d.bias,
-        lengths,
-        output_final_state=output_final_state,
-    )
-
-
-def _tile_config(channels: int, max_len: int) -> tuple[int, int, int]:
-    del channels
-    if max_len >= 512:
-        return 2, 128, 4
-    return 4, 64, 4
-
-
 def _packed_tile_config(channels: int) -> tuple[int, int, int]:
     del channels
     return 128, 16, 4
@@ -1168,57 +770,6 @@ def _assert_valid_cu_seqlens(cu_seqlens: Tensor, total_tokens: int) -> None:
     torch._assert_async(cu_seqlens[-1] == total_tokens)
     if cu_seqlens.numel() > 1:
         torch._assert_async(torch.all(cu_seqlens[1:] >= cu_seqlens[:-1]))
-
-
-def _validate_inputs(
-    qkv: Tensor,
-    conv_initial: Tensor,
-    weight: Tensor,
-    bias: Tensor | None,
-    lengths: Tensor,
-) -> None:
-    if not qkv.is_cuda:
-        raise ValueError("qkv must be a CUDA tensor")
-    if qkv.ndim != 3:
-        raise ValueError(f"qkv must be [segments, channels, max_len], got {qkv.shape}")
-    if conv_initial.ndim != 3:
-        raise ValueError(
-            "conv_initial must be [segments, channels, kernel_width - 1], "
-            f"got {conv_initial.shape}"
-        )
-    if weight.ndim != 2:
-        raise ValueError(f"weight must be [channels, kernel_width], got {weight.shape}")
-    batch, channels, _ = qkv.shape
-    kernel_width = int(weight.shape[1])
-    if kernel_width < 1:
-        raise ValueError("kernel_width must be at least 1")
-    if tuple(conv_initial.shape) != (batch, channels, kernel_width - 1):
-        raise ValueError(
-            "conv_initial shape must match qkv and weight tail, got "
-            f"qkv={tuple(qkv.shape)} conv_initial={tuple(conv_initial.shape)} "
-            f"weight={tuple(weight.shape)}"
-        )
-    if int(weight.shape[0]) != channels:
-        raise ValueError(
-            f"weight channels {int(weight.shape[0])} must match qkv channels {channels}"
-        )
-    if bias is not None and tuple(bias.shape) != (channels,):
-        raise ValueError(f"bias must be [channels], got {tuple(bias.shape)}")
-    if tuple(lengths.shape) != (batch,):
-        raise ValueError(f"lengths must be [segments], got {tuple(lengths.shape)}")
-    if lengths.device != qkv.device:
-        raise ValueError("lengths must be on the same CUDA device as qkv")
-    if lengths.dtype not in (torch.int32, torch.int64):
-        raise ValueError(f"lengths must be int32 or int64, got {lengths.dtype}")
-    for name, tensor in (
-        ("conv_initial", conv_initial),
-        ("weight", weight),
-        ("bias", bias),
-    ):
-        if tensor is not None and tensor.device != qkv.device:
-            raise ValueError(f"{name} must be on the same CUDA device as qkv")
-        if tensor is not None and tensor.dtype != qkv.dtype:
-            raise ValueError(f"{name} dtype {tensor.dtype} must match qkv {qkv.dtype}")
 
 
 def _validate_packed_inputs(

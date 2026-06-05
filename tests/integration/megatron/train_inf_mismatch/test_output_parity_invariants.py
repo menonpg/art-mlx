@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from . import workflow_stage
 from .output_parity import (
+    TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     EngineSide,
     ScoreBundle,
@@ -19,7 +20,9 @@ from .output_parity import (
     compare_rollout,
     compare_topk,
     config_from_env,
+    fwd_mean_abs_pct_limit_for_model,
 )
+from .real_path import RealPathConfig, _delete_adapter_safetensors_on_pass
 
 
 def test_logical_map_flattens_shared_prefix_branches() -> None:
@@ -34,6 +37,11 @@ def test_logical_map_flattens_shared_prefix_branches() -> None:
     assert [prompt.token_ids for prompt in logical_map.prompts] == [
         [10, 11, 12, 13, 14],
         [10, 11, 12, 15, 16],
+    ]
+    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [2, 2]
+    assert [prompt.scored_token_start_index for prompt in logical_map.prompts] == [
+        3,
+        3,
     ]
     assert [token.token_id for token in logical_map.tokens] == [13, 14, 15, 16]
     assert [token.art_logit_index for token in logical_map.tokens] == [2, 3, 5, 6]
@@ -117,6 +125,39 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
     assert report.base.mean_abs_pct > 0
     assert report.lora.mean_abs_pct > 0
     assert report.delta.mean_abs_pct > 0
+
+
+def test_real_path_default_generates_16_tokens_per_rollout() -> None:
+    assert RealPathConfig().max_completion_tokens == 16
+
+
+def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    active_lora = run_dir / "real_path_active_lora"
+    checkpoint = run_dir / "art_path" / "models" / "m" / "checkpoints" / "0000"
+    active_lora.mkdir(parents=True)
+    checkpoint.mkdir(parents=True)
+    for directory in (active_lora, checkpoint):
+        (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+        (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+    score_path = run_dir / "real_path_vllm_lora_scores.json"
+    score_path.write_text("{}", encoding="utf-8")
+
+    _delete_adapter_safetensors_on_pass(run_dir, passed=False)
+
+    assert len(list(run_dir.rglob("adapter_model.safetensors"))) == 2
+
+    _delete_adapter_safetensors_on_pass(run_dir, passed=True)
+
+    assert list(run_dir.rglob("adapter_model.safetensors")) == []
+    assert len(list(run_dir.rglob("adapter_config.json"))) == 2
+    assert score_path.exists()
+
+
+def test_architecture_specific_real_path_limits() -> None:
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 7.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
+    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
 
 def test_compare_topk_reports_restricted_intersection_kl() -> None:
@@ -215,3 +256,4 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
 
     assert report.passed is True
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
+    assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"

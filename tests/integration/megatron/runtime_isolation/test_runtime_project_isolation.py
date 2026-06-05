@@ -42,6 +42,46 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
         assert route in source
 
 
+def test_runtime_patch_always_returns_token_ids(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json, os; "
+                "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
+                "apply_vllm_runtime_patches(); "
+                "from vllm.entrypoints.openai.chat_completion import protocol; "
+                "request = protocol.ChatCompletionRequest("
+                "model='m', messages=[{'role': 'user', 'content': 'x'}]"
+                "); "
+                "print(json.dumps({"
+                "'logprobs': request.logprobs, "
+                "'top_logprobs': request.top_logprobs, "
+                "'return_token_ids': request.return_token_ids"
+                "}))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "route_token_ids_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "route_token_ids_stderr.txt").write_text(result.stderr)
+    assert json.loads(result.stdout.strip()) == {
+        "logprobs": True,
+        "top_logprobs": 0,
+        "return_token_ids": True,
+    }
+
+
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject

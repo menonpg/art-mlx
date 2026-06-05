@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from art.megatron.service import MegatronService
+from art.types import MegatronTopologyConfig
 from art.unsloth.service import UnslothService
 
 
@@ -178,7 +179,42 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
 
     assert location == ("127.0.0.1", 8000)
     start_vllm.assert_awaited_once()
-    sync_merged.assert_awaited_once_with(lora_path="/tmp/lora", step=0)
+    sync_merged.assert_awaited_once_with(
+        lora_path="/tmp/lora",
+        step=0,
+        megatron_topology=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_megatron_dedicated_merged_start_uses_configured_topology(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "trainer_gpu_ids": [0],
+            "inference_gpu_ids": [1],
+            "rollout_weights_mode": "merged",
+            "megatron_topology": {"tp": 1, "cp": 2, "ep": 2, "etp": 1},
+        },
+        output_dir=str(tmp_path),
+    )
+    start_vllm = AsyncMock(return_value=("127.0.0.1", 8000))
+    sync_merged = AsyncMock()
+    monkeypatch.setattr(service, "_resolve_active_lora_path", lambda: "/tmp/lora")
+    monkeypatch.setattr(service, "_start_vllm_subprocess", start_vllm)
+    monkeypatch.setattr(service, "_sync_dedicated_merged_weights", sync_merged)
+
+    await service.start_openai_server(None)
+
+    sync_merged.assert_awaited_once_with(
+        lora_path="/tmp/lora",
+        step=0,
+        megatron_topology=MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
+    )
 
 
 @pytest.mark.asyncio

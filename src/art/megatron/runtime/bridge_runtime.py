@@ -22,6 +22,31 @@ from megatron.core.utils import get_model_config
 import torch
 
 
+class ExpertTensorSlice:
+    __slots__ = ("global_start", "global_stop", "tensor")
+
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        *,
+        global_start: int,
+        global_stop: int,
+    ) -> None:
+        self.tensor = tensor
+        self.global_start = int(global_start)
+        self.global_stop = int(global_stop)
+
+    def get(self, global_expert: int) -> torch.Tensor:
+        global_expert = int(global_expert)
+        if not self.global_start <= global_expert < self.global_stop:
+            raise RuntimeError(
+                "expert slice cache miss for global expert "
+                f"{global_expert}; cached range is "
+                f"[{self.global_start}, {self.global_stop})"
+            )
+        return self.tensor[global_expert - self.global_start]
+
+
 def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type != "cpu" or not torch.cuda.is_available():
         return tensor
@@ -43,7 +68,16 @@ def _iter_hf_param_names(hf_param: Any) -> Iterable[str]:
 def _needs_local_hf_prefetch(task: Any) -> bool:
     if task is None or task.megatron_module is None:
         return False
+    if _needs_expert_slice_prefetch(task):
+        return False
     mapping = task.mapping
+    # ART Qwen3.5 expert mappings slice the full HF expert tensor before
+    # delegating to the inner TP mapping, so every ETP rank needs the source.
+    if type(mapping).__name__ in {
+        "_ArtExpertMLPGateUpProjMapping",
+        "_ArtExpertMLPDownProjMapping",
+    }:
+        return True
     tp_size = int(getattr(mapping, "tp_size", 1))
     if tp_size <= 1:
         return True
@@ -52,21 +86,91 @@ def _needs_local_hf_prefetch(task: Any) -> bool:
     return int(getattr(mapping, "tp_rank", 0)) == 0
 
 
+def _needs_expert_slice_prefetch(task: Any) -> bool:
+    mapping = task.mapping
+    return (
+        int(getattr(mapping, "ep_size", 1)) > 1
+        and bool(getattr(mapping, "is_expert", False))
+        and bool(getattr(mapping, "is_grouped_export", False))
+        and isinstance(getattr(mapping, "hf_param", None), str)
+    )
+
+
+def _expert_slice_range(task: Any) -> tuple[int, int]:
+    mapping = task.mapping
+    config = getattr(task.megatron_module, "config", None)
+    num_experts = int(getattr(config, "num_moe_experts", 0) or 0)
+    ep_size = int(getattr(mapping, "ep_size", 1))
+    ep_rank = int(getattr(mapping, "ep_rank", 0))
+    if num_experts <= 0 or ep_size <= 1 or num_experts % ep_size != 0:
+        raise RuntimeError(
+            "cannot slice fused expert HF weights with "
+            f"num_experts={num_experts}, ep_size={ep_size}"
+        )
+    experts_per_rank = num_experts // ep_size
+    start = ep_rank * experts_per_rank
+    return start, start + experts_per_rank
+
+
+def _load_hf_tensor_slice(
+    hf_state_dict: Mapping[str, torch.Tensor],
+    key: str,
+    *,
+    start: int,
+    stop: int,
+) -> torch.Tensor:
+    source = getattr(hf_state_dict, "source", None)
+    if source is None or not hasattr(source, "key_to_filename_map"):
+        raise RuntimeError(
+            "fused expert EP loading requires a safetensors-backed HF state "
+            f"dict for key {key!r}"
+        )
+    key_to_filename = source.key_to_filename_map
+    if key not in key_to_filename:
+        raise KeyError(f"HF tensor key {key!r} not found in safetensors index")
+    from safetensors import safe_open
+
+    file_path = source.path / key_to_filename[key]
+    with safe_open(file_path, framework="pt", device="cpu") as handle:
+        tensor_slice = handle.get_slice(key)
+        shape = tuple(int(dim) for dim in tensor_slice.get_shape())
+        if not shape or start < 0 or stop > shape[0] or start >= stop:
+            raise RuntimeError(
+                f"invalid expert slice [{start}, {stop}) for {key!r} with shape {shape}"
+            )
+        index = (slice(start, stop),) + (slice(None),) * (len(shape) - 1)
+        return tensor_slice[index]
+
+
 def load_unique_hf_keys_once(
     tasks: Iterable[Any],
     hf_state_dict: Mapping[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | ExpertTensorSlice]:
+    task_list = list(tasks)
     keys = sorted(
         {
             key
-            for task in tasks
+            for task in task_list
             if _needs_local_hf_prefetch(task)
             for key in _iter_hf_param_names(task.mapping.hf_param)
         }
     )
-    if not keys:
-        return {}
-    if hasattr(hf_state_dict, "__getitem__"):
+    expert_slice_ranges: dict[str, tuple[int, int]] = {}
+    for task in task_list:
+        if task is None or task.megatron_module is None:
+            continue
+        if not _needs_expert_slice_prefetch(task):
+            continue
+        start, stop = _expert_slice_range(task)
+        key = cast(str, task.mapping.hf_param)
+        previous = expert_slice_ranges.get(key)
+        expert_slice_ranges[key] = (
+            (start, stop)
+            if previous is None
+            else (min(previous[0], start), max(previous[1], stop))
+        )
+    cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
+    if keys and hasattr(hf_state_dict, "__getitem__"):
         hf_state_dict_getter = cast(Any, hf_state_dict)
         loaded = (
             hf_state_dict_getter[keys]
@@ -75,23 +179,39 @@ def load_unique_hf_keys_once(
         )
     else:
         loaded = {key: hf_state_dict[key] for key in keys}
-    return {
-        key: _pin_cpu_tensor(value)
-        for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
-    }
+    cache.update(
+        {
+            key: _pin_cpu_tensor(value)
+            for key, value in cast(Mapping[str, torch.Tensor], loaded).items()
+        }
+    )
+    for key, (start, stop) in expert_slice_ranges.items():
+        cache[key] = ExpertTensorSlice(
+            _pin_cpu_tensor(
+                _load_hf_tensor_slice(
+                    hf_state_dict,
+                    key,
+                    start=start,
+                    stop=stop,
+                )
+            ),
+            global_start=start,
+            global_stop=stop,
+        )
+    return cache
 
 
-class _CachedStateLookup(Mapping[str, torch.Tensor]):
+class _CachedStateLookup(Mapping[str, torch.Tensor | ExpertTensorSlice]):
     def __init__(
         self,
         *,
-        cache: Mapping[str, torch.Tensor],
+        cache: Mapping[str, torch.Tensor | ExpertTensorSlice],
         source: Mapping[str, torch.Tensor],
     ) -> None:
         self._cache = cache
         self._source = source
 
-    def __getitem__(self, key: str) -> torch.Tensor:
+    def __getitem__(self, key: str) -> torch.Tensor | ExpertTensorSlice:
         if key in self._cache:
             return self._cache[key]
         return _pin_cpu_tensor(self._source[key])
@@ -331,7 +451,7 @@ def _optimized_load_weights_hf_to_megatron(
         if task is None or task.megatron_module is None:
             continue
         hf_weights = self.maybe_modify_loaded_hf_weight(
-            task.mapping.hf_param, cached_state
+            task.mapping.hf_param, cast(Mapping[str, torch.Tensor], cached_state)
         )
         converted_weights = task.mapping.hf_to_megatron(
             hf_weights, task.megatron_module
@@ -371,6 +491,9 @@ def _optimized_load_weights_hf_to_megatron(
 def install_art_bridge_runtime_patches() -> None:
     from megatron.bridge.models import model_provider as model_provider_module
 
+    _patch_router_gating_linear_empty_input()
+    _patch_bias_swiglu_empty_input()
+    _patch_moe_unpermute_empty_input()
     if not getattr(
         model_provider_module.get_model, "__art_meta_materialization__", False
     ):
@@ -398,3 +521,132 @@ def install_art_bridge_runtime_patches() -> None:
             "load_weights_hf_to_megatron",
             _optimized_load_weights_hf_to_megatron,
         )
+
+
+def _patch_router_gating_linear_empty_input() -> None:
+    from megatron.core.transformer.moe import moe_utils, router
+
+    if getattr(moe_utils.router_gating_linear, "__art_empty_safe__", False):
+        return
+
+    original_router_gating_linear = moe_utils.router_gating_linear
+
+    def _router_gating_linear_empty_safe(
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        router_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if int(inp.numel()) != 0:
+            return original_router_gating_linear(inp, weight, bias, router_dtype)
+        zero = inp.to(router_dtype).sum() * 0.0 + weight.to(router_dtype).sum() * 0.0
+        if bias is not None:
+            zero = zero + bias.to(router_dtype).sum() * 0.0
+        return zero.expand(*inp.shape[:-1], int(weight.shape[0]))
+
+    setattr(_router_gating_linear_empty_safe, "__art_empty_safe__", True)
+    setattr(moe_utils, "router_gating_linear", _router_gating_linear_empty_safe)
+    setattr(router, "router_gating_linear", _router_gating_linear_empty_safe)
+
+
+def _patch_bias_swiglu_empty_input() -> None:
+    from megatron.core.fusions import fused_bias_swiglu
+    from megatron.core.transformer import mlp
+    from megatron.core.transformer.moe import experts, shared_experts
+
+    if getattr(fused_bias_swiglu.bias_swiglu_impl, "__art_empty_safe__", False):
+        return
+
+    original_bias_swiglu_impl = fused_bias_swiglu.bias_swiglu_impl
+    original_weighted_bias_swiglu_impl = fused_bias_swiglu.weighted_bias_swiglu_impl
+
+    def _empty_swiglu_output(
+        input: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output_shape = (*input.shape[:-1], int(input.shape[-1]) // 2)
+        zero = input.sum() * 0.0
+        if bias is not None:
+            zero = zero + bias.to(dtype=input.dtype).sum() * 0.0
+        if weights is not None:
+            zero = zero + weights.to(dtype=input.dtype).sum() * 0.0
+        return zero.expand(output_shape).clone()
+
+    def _bias_swiglu_empty_safe(
+        input: torch.Tensor,
+        bias: torch.Tensor | None,
+        fp8_input_store: bool = False,
+        cpu_offload_input: bool = False,
+    ) -> torch.Tensor:
+        if int(input.numel()) != 0:
+            return original_bias_swiglu_impl(
+                input, bias, fp8_input_store, cpu_offload_input
+            )
+        return _empty_swiglu_output(input, bias=bias)
+
+    def _weighted_bias_swiglu_empty_safe(
+        input: torch.Tensor,
+        bias: torch.Tensor | None,
+        weights: torch.Tensor,
+        fp8_input_store: bool = False,
+    ) -> torch.Tensor:
+        if int(input.numel()) != 0:
+            return original_weighted_bias_swiglu_impl(
+                input, bias, weights, fp8_input_store
+            )
+        return _empty_swiglu_output(input, bias=bias, weights=weights)
+
+    setattr(_bias_swiglu_empty_safe, "__art_empty_safe__", True)
+    setattr(_weighted_bias_swiglu_empty_safe, "__art_empty_safe__", True)
+    setattr(fused_bias_swiglu, "bias_swiglu_impl", _bias_swiglu_empty_safe)
+    setattr(
+        fused_bias_swiglu,
+        "weighted_bias_swiglu_impl",
+        _weighted_bias_swiglu_empty_safe,
+    )
+    setattr(mlp, "bias_swiglu_impl", _bias_swiglu_empty_safe)
+    setattr(mlp, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_empty_safe)
+    setattr(experts, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_empty_safe)
+    setattr(shared_experts, "bias_swiglu_impl", _bias_swiglu_empty_safe)
+
+
+def _patch_moe_unpermute_empty_input() -> None:
+    from megatron.core.transformer.moe import moe_utils, token_dispatcher
+
+    if getattr(moe_utils.unpermute, "__art_empty_safe__", False):
+        return
+
+    original_unpermute = moe_utils.unpermute
+
+    def _unpermute_empty_safe(
+        permuted_tokens: torch.Tensor,
+        sorted_indices: torch.Tensor,
+        restore_shape: torch.Size,
+        probs: torch.Tensor | None = None,
+        routing_map: torch.Tensor | None = None,
+        fused: bool = False,
+        drop_and_pad: bool = False,
+        pad_offsets: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if int(permuted_tokens.numel()) != 0:
+            return original_unpermute(
+                permuted_tokens,
+                sorted_indices,
+                restore_shape,
+                probs=probs,
+                routing_map=routing_map,
+                fused=fused,
+                drop_and_pad=drop_and_pad,
+                pad_offsets=pad_offsets,
+            )
+        zero = (
+            permuted_tokens.sum() * 0.0 + sorted_indices.sum().to(permuted_tokens) * 0.0
+        )
+        if probs is not None:
+            zero = zero + probs.to(dtype=permuted_tokens.dtype).sum() * 0.0
+        return zero.expand(tuple(int(dim) for dim in restore_shape)).clone()
+
+    setattr(_unpermute_empty_safe, "__art_empty_safe__", True)
+    setattr(moe_utils, "unpermute", _unpermute_empty_safe)
+    setattr(token_dispatcher, "unpermute", _unpermute_empty_safe)
