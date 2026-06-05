@@ -17,9 +17,6 @@ from .._backend_training import (
 )
 from ..backend import AnyTrainableModel, Backend
 from ..metrics_taxonomy import (
-    SFT_GRADIENT_STEP_KEY,
-    SFT_METRIC_PREFIX,
-    SFT_WANDB_GRADIENT_STEP_KEY,
     TRAIN_GRADIENT_STEPS_KEY,
     build_training_summary_metrics,
     summarize_trajectory_groups,
@@ -623,14 +620,6 @@ class ServerlessBackend(Backend):
             dict(dev_config.get("metric_logging", {}) or {}),
         )
         if metric_logging.get("enabled"):
-            metric_logging.setdefault("entity", model.entity)
-            metric_logging.setdefault("project", model.project)
-            metric_logging.setdefault("run_id", model.run_id or model.name)
-            metric_logging.setdefault("run_name", model.name)
-            metric_logging.setdefault("metric_prefix", SFT_METRIC_PREFIX)
-            metric_logging.setdefault("step_metric", SFT_WANDB_GRADIENT_STEP_KEY)
-            metric_logging.setdefault("gradient_step_key", SFT_GRADIENT_STEP_KEY)
-            metric_logging.setdefault("summary_split", "train")
             sft_config["metric_logging"] = metric_logging
 
         sft_training_job = await self._client.sft_training_jobs.create(

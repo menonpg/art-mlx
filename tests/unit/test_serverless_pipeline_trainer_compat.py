@@ -271,9 +271,3 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     assert metric_logging["enabled"] is True
     assert metric_logging["metric_log_interval"] == 5
     assert metric_logging["target_training_step"] == 1
-    assert metric_logging["entity"] == "entity"
-    assert metric_logging["project"] == "pipeline-tests"
-    assert metric_logging["run_id"] == "canonical-run-id"
-    assert metric_logging["run_name"] == "serverless-sft-config-payload"
-    assert metric_logging["metric_prefix"] == "sft"
-    assert metric_logging["step_metric"] == "sft/gradient_step"

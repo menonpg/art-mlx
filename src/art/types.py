@@ -28,14 +28,6 @@ class TrainSFTConfig(pydantic.BaseModel):
 
 class SFTMetricLoggingConfig(TypedDict, total=False):
     enabled: bool
-    entity: str | None
-    project: str
-    run_id: str
-    run_name: str
-    metric_prefix: str
-    step_metric: str
-    gradient_step_key: str
-    summary_split: str
     metric_log_interval: int
     target_training_step: int
 

@@ -1235,8 +1235,6 @@ class TestTrainSFTMetricsAggregation:
         metric_logging = backend.dev_config["metric_logging"]
         assert metric_logging["enabled"] is True
         assert metric_logging["target_training_step"] == 1
-        assert metric_logging["metric_prefix"] == "sft"
-        assert metric_logging["step_metric"] == "sft/gradient_step"
 
 
 class TestGradientStepMetrics:

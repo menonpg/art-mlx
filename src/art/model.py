@@ -1270,20 +1270,11 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             metric_logging_config: SFTMetricLoggingConfig = {
                 "enabled": True,
                 "metric_log_interval": metric_log_interval,
-                "metric_prefix": SFT_METRIC_PREFIX,
-                "step_metric": SFT_WANDB_GRADIENT_STEP_KEY,
-                "gradient_step_key": SFT_GRADIENT_STEP_KEY,
-                "summary_split": "train",
-                "run_name": self.name,
-                "run_id": self.run_id or self.name,
-                "project": self.project,
             }
             if backend_logs_sft_metrics:
                 metric_logging_config["target_training_step"] = (
                     await self.get_step()
                 ) + 1
-            if self.entity is not None:
-                metric_logging_config["entity"] = self.entity
             _config["metric_logging"] = metric_logging_config
         else:
             _config["metric_logging"] = {"enabled": False}
