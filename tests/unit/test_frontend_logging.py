@@ -1165,12 +1165,10 @@ class TestTrainSFTMetricsAggregation:
         )
 
     @pytest.mark.asyncio
-    async def test_train_sft_metric_log_interval_keeps_first_and_last(
-        self, tmp_path: Path
-    ):
-        """Verify train_sft can throttle SFT metric rows."""
+    async def test_train_sft_logs_every_gradient_step(self, tmp_path: Path):
+        """Verify train_sft logs every SFT optimizer metric row."""
         model = TrainableModel(
-            name="test-sft-interval",
+            name="test-sft-every-step",
             project="test-project",
             base_model="gpt-4",
             base_path=str(tmp_path),
@@ -1186,13 +1184,21 @@ class TestTrainSFTMetricsAggregation:
         mock_backend._get_step = AsyncMock(side_effect=[0, 1])
         model._backend = mock_backend
 
-        await model.train_sft([], metric_log_interval=3)
+        await model.train_sft([])
 
-        history_path = tmp_path / "test-project/models/test-sft-interval/history.jsonl"
+        history_path = (
+            tmp_path / "test-project/models/test-sft-every-step/history.jsonl"
+        )
         rows = [json.loads(line) for line in history_path.read_text().splitlines()]
         sft_rows = [row for row in rows if "sft/gradient_step" in row]
 
-        assert [row["sft/gradient_step"] for row in sft_rows] == [1.0, 3.0, 5.0]
+        assert [row["sft/gradient_step"] for row in sft_rows] == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+        ]
         assert len([row for row in rows if "loss/train" in row]) == 1
 
     @pytest.mark.asyncio

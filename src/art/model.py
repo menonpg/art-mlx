@@ -1239,7 +1239,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         _config: dev.TrainSFTConfig | None = None,
         verbose: bool = False,
         log_metrics: bool = True,
-        metric_log_interval: int = 1,
     ) -> None:
         """
         Supervised fine-tune the model with an iterable of trajectories.
@@ -1252,13 +1251,9 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
                 not yet part of the public API. Use at your own risk.
             verbose: Whether to print verbose output.
             log_metrics: Whether to log SFT optimizer metrics. Defaults to True.
-            metric_log_interval: Log every Nth SFT gradient step. The first and
-                final observed gradient step are always logged. Defaults to 1.
         """
         if config is None:
             config = TrainSFTConfig()
-        if metric_log_interval < 1:
-            raise ValueError("metric_log_interval must be >= 1")
 
         backend = self.backend()
         backend_logs_sft_metrics = (
@@ -1269,7 +1264,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         if log_metrics:
             metric_logging_config: SFTMetricLoggingConfig = {
                 "enabled": True,
-                "metric_log_interval": metric_log_interval,
             }
             if backend_logs_sft_metrics:
                 metric_logging_config["target_training_step"] = (
@@ -1283,8 +1277,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # Collect all metrics and aggregate them at the end for the checkpoint summary.
         training_metrics: list[dict[str, float]] = []
         local_sft_checkpoint_step: int | None = None
-        pending_sft_metric_log: tuple[int, dict[str, float]] | None = None
-        last_logged_sft_gradient_step = 0
         trainer_started = time.monotonic()
         async for metrics in backend._train_sft(
             self,
@@ -1298,31 +1290,12 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             if log_metrics and not backend_logs_sft_metrics:
                 if local_sft_checkpoint_step is None:
                     local_sft_checkpoint_step = await self.get_step() + 1
-                if gradient_step == 1 or gradient_step % metric_log_interval == 0:
-                    await self._log_sft_metric_sample(
-                        metrics,
-                        checkpoint_step=local_sft_checkpoint_step,
-                        gradient_step=gradient_step,
-                    )
-                    last_logged_sft_gradient_step = gradient_step
-                    pending_sft_metric_log = None
-                else:
-                    pending_sft_metric_log = (gradient_step, metrics)
+                await self._log_sft_metric_sample(
+                    metrics,
+                    checkpoint_step=local_sft_checkpoint_step,
+                    gradient_step=gradient_step,
+                )
         trainer_elapsed = time.monotonic() - trainer_started
-
-        if (
-            log_metrics
-            and not backend_logs_sft_metrics
-            and pending_sft_metric_log is not None
-            and pending_sft_metric_log[0] != last_logged_sft_gradient_step
-        ):
-            if local_sft_checkpoint_step is None:
-                local_sft_checkpoint_step = await self.get_step() + 1
-            await self._log_sft_metric_sample(
-                pending_sft_metric_log[1],
-                checkpoint_step=local_sft_checkpoint_step,
-                gradient_step=pending_sft_metric_log[0],
-            )
 
         # Log aggregated training metrics once at the checkpoint step. For
         # remote-logging backends, the remote SFT job owns this row too.

@@ -28,7 +28,6 @@ class TrainSFTConfig(pydantic.BaseModel):
 
 class SFTMetricLoggingConfig(TypedDict, total=False):
     enabled: bool
-    metric_log_interval: int
     target_training_step: int
 
 

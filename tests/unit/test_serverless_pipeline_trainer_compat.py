@@ -257,7 +257,6 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
                     {
                         "metric_logging": {
                             "enabled": True,
-                            "metric_log_interval": 5,
                             "target_training_step": 1,
                         },
                     },
@@ -269,5 +268,4 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     assert config["learning_rate"] == [1e-4]
     assert config["batch_size"] == 2
     assert metric_logging["enabled"] is True
-    assert metric_logging["metric_log_interval"] == 5
     assert metric_logging["target_training_step"] == 1
