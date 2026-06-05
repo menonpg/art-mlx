@@ -1,5 +1,7 @@
 from collections.abc import Sequence
+import json
 import math
+import os
 import re
 from typing import Any, Literal, NamedTuple, cast
 
@@ -33,6 +35,8 @@ from .kernels.cute_grouped_lora_quack import (
 MOE_LORA_RANK = 1
 DENSE_LORA_RANK = 8
 LORA_ALPHA = 32
+MEGATRON_LORA_RANK_ENV = "ART_MEGATRON_LORA_RANK"
+MEGATRON_LORA_TARGET_MODULES_ENV = "ART_MEGATRON_LORA_TARGET_MODULES"
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
 ShardDomain = Literal["tp", "expert_tp"]
@@ -192,6 +196,26 @@ def _linear_disables_tensor_parallel_comm(linear: Any) -> bool:
 
 def default_lora_rank_for_handler(handler: Any) -> int:
     return MOE_LORA_RANK if bool(getattr(handler, "is_moe", False)) else DENSE_LORA_RANK
+
+
+def _configured_lora_rank(provider: Any, handler: Any) -> int:
+    rank = getattr(provider, "_art_lora_rank", None)
+    if rank is None:
+        rank = os.environ.get(MEGATRON_LORA_RANK_ENV)
+    if rank is None:
+        return default_lora_rank_for_handler(handler)
+    return int(rank)
+
+
+def _configured_lora_target_modules(provider: Any, spec: Any) -> list[str]:
+    target_modules = getattr(provider, "_art_lora_target_modules", None)
+    if target_modules is None and (
+        raw_target_modules := os.environ.get(MEGATRON_LORA_TARGET_MODULES_ENV)
+    ):
+        target_modules = json.loads(raw_target_modules)
+    if target_modules is None:
+        target_modules = spec.default_target_modules
+    return [str(target_module) for target_module in target_modules]
 
 
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
@@ -1687,8 +1711,8 @@ def apply_lora_adapters(
     provider = cast(Any, provider)
     handler = provider._art_model_support_handler
     spec = provider._art_model_support_spec
-    target_modules = list(spec.default_target_modules)
-    rank = default_lora_rank_for_handler(handler)
+    target_modules = _configured_lora_target_modules(provider, spec)
+    rank = _configured_lora_rank(provider, handler)
     handler.apply_lora_adapters(
         model,
         provider,

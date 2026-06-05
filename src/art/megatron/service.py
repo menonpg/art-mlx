@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import gc
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -32,7 +33,12 @@ from ..vllm_runtime import (
     ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
 )
-from .lora import LORA_ALPHA, default_lora_rank_for_handler
+from .lora import (
+    LORA_ALPHA,
+    MEGATRON_LORA_RANK_ENV,
+    MEGATRON_LORA_TARGET_MODULES_ENV,
+    default_lora_rank_for_handler,
+)
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
@@ -730,6 +736,11 @@ class MegatronService:
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
+        lora_config = self.config.get("lora_config", {})
+        if (rank := lora_config.get("rank")) is not None:
+            env[MEGATRON_LORA_RANK_ENV] = str(int(rank))
+        if target_modules := lora_config.get("target_modules"):
+            env[MEGATRON_LORA_TARGET_MODULES_ENV] = json.dumps(list(target_modules))
         if megatron_topology is not None:
             for env_name in self._megatron_topology_env_names():
                 env.pop(env_name, None)
