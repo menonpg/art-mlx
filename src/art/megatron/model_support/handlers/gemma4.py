@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import copy
 import re
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import torch
 
@@ -287,7 +287,7 @@ def _patch_gemma4_router_for_mcore() -> None:
             routing_probs = routing_probs * self.per_expert_scale.unsqueeze(0)
         return routing_probs, routing_map
 
-    gemma4_provider.Gemma4TopKRouter.routing = _art_gemma4_router_routing
+    setattr(gemma4_provider.Gemma4TopKRouter, "routing", _art_gemma4_router_routing)
     _GEMMA4_ROUTER_PATCHED = True
 
 
@@ -616,10 +616,11 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
         ) -> None:
             super().__init__(megatron_param, q, k, v)
             self._global_layer_indices = global_layer_indices
-            self._export_hf_param = dict(self.hf_param)
+            self._export_hf_param = dict(cast(dict[str, str], self.hf_param))
 
         def resolve(self, captures: tuple[str, ...]) -> Any:
             megatron_param, hf_param = self._resolve_names(captures)
+            hf_param = cast(dict[str, str], hf_param)
             resolved = type(self)(
                 megatron_param,
                 hf_param["q"],
@@ -629,8 +630,9 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
             )
             layer_index = _megatron_layer_index(megatron_param)
             if layer_index in self._global_layer_indices:
-                resolved.hf_param = dict(resolved.hf_param)
-                resolved.hf_param["v"] = resolved.hf_param["k"]
+                resolved_hf_param = dict(cast(dict[str, str], resolved.hf_param))
+                resolved_hf_param["v"] = resolved_hf_param["k"]
+                resolved.hf_param = resolved_hf_param
             return resolved
 
         def megatron_to_hf(
@@ -733,7 +735,7 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
             converted_weights_dict: Any,
             hf_state_dict: Any,
         ) -> Any:
-            return Gemma4VLBridge.maybe_modify_converted_hf_weight(
+            return cast(Any, Gemma4VLBridge).maybe_modify_converted_hf_weight(
                 self,
                 task,
                 converted_weights_dict,
@@ -758,13 +760,13 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
             if isinstance(hf_param, dict) and "gate" in hf_param:
                 gate_name = hf_param["gate"]
                 if "mlp.gate_proj" in gate_name:
-                    return Gemma4VLBridge._fuse_shared_expert_prenorm(
+                    return cast(Any, Gemma4VLBridge)._fuse_shared_expert_prenorm(
                         self,
                         hf_param,
                         hf_state_dict,
                     )
             if isinstance(hf_param, str) and hf_param.endswith("router.proj.weight"):
-                return Gemma4VLBridge._fuse_router_weight(
+                return cast(Any, Gemma4VLBridge)._fuse_router_weight(
                     self,
                     hf_param,
                     hf_state_dict,
