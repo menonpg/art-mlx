@@ -572,8 +572,7 @@ def run_megatron_rl_job(
                     num_sequences=num_sequences,
                     global_grad_accumulation_sequences=global_grad_accumulation_sequences,
                 )
-                if cp_lookahead_state is not None
-                and ref_logprobs_by_index is not None
+                if cp_lookahead_state is not None and ref_logprobs_by_index is not None
                 else None
             )
             step_result = run_training_step(
@@ -1065,9 +1064,7 @@ def _forward_prepared_rl_micro(
     with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
         if int(prepared_micro.model_tokens.numel()) == 0:
             logits = model_chunks[0](**model_forward_kwargs, labels=None)
-            return _empty_new_logprobs_from_logits(
-                logits, prepared_micro.model_labels
-            )
+            return _empty_new_logprobs_from_logits(logits, prepared_micro.model_labels)
         return -model_chunks[0](
             **model_forward_kwargs,
             labels=prepared_micro.model_labels,
@@ -1247,7 +1244,9 @@ def _prepare_kl_reference_logprobs(
         )
         return None
 
-    adapter_swapped = os.path.abspath(ref_adapter_path) != os.path.abspath(job.lora_path)
+    adapter_swapped = os.path.abspath(ref_adapter_path) != os.path.abspath(
+        job.lora_path
+    )
     loaded_ref_adapter = False
     try:
         if adapter_swapped:
@@ -1548,7 +1547,7 @@ def run_training_step(
                 f"assistant_tokens={assistant_tokens}, "
                 f"nonzero_weights={nonzero_weights}, "
                 f"nonzero_advantages={nonzero_advantages}"
-        )
+            )
         micro_loss.backward()
         loss_inputs_for_count.append(prepared_micro.loss_inputs)
         del prepared_micro

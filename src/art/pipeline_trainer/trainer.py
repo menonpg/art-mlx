@@ -454,9 +454,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         min_step = max(0, current_step - self.max_steps_off_policy)
         return set(range(min_step, current_step + 1))
 
-    def _kl_penalty_reference_step(self, current_step: int) -> int | None:
-        if self.kl_penalty_coef <= 0.0:
-            return None
+    def _kl_penalty_reference_step(self, current_step: int) -> int:
         if self.kl_penalty_step_lag is None:
             return 0
         return max(0, current_step - self.kl_penalty_step_lag)
@@ -587,10 +585,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 }
                 if self.packed_sequence_length is not None:
                     train_kwargs["packed_sequence_length"] = self.packed_sequence_length
-                kl_penalty_reference_step = self._kl_penalty_reference_step(
-                    current_step
-                )
-                if kl_penalty_reference_step is not None:
+                if self.kl_penalty_coef > 0.0:
+                    kl_penalty_reference_step = self._kl_penalty_reference_step(
+                        current_step
+                    )
                     train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
                     train_kwargs["kl_penalty_source"] = "sample"
                     train_kwargs["kl_penalty_reference_step"] = (
@@ -1093,14 +1091,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             | set(self._checkpoint_lease_counts)
             | set(self._scheduled_eval_steps)
         )
-        kl_penalty_reference_step = self._kl_penalty_reference_step(current_step)
-        if kl_penalty_reference_step is not None:
-            if self.kl_penalty_step_lag is None or kl_penalty_reference_step == 0:
-                protected_steps.add(kl_penalty_reference_step)
+        if self.kl_penalty_coef > 0.0:
+            if self.kl_penalty_step_lag is None:
+                protected_steps.add(0)
             else:
-                protected_steps.update(
-                    range(kl_penalty_reference_step, current_step + 1)
+                kl_penalty_reference_step = self._kl_penalty_reference_step(
+                    current_step
                 )
+                if kl_penalty_reference_step == 0:
+                    protected_steps.add(0)
+                else:
+                    protected_steps.update(
+                        range(kl_penalty_reference_step, current_step + 1)
+                    )
         return protected_steps
 
     async def _run_checkpoint_retention(self, current_step: int) -> None:
