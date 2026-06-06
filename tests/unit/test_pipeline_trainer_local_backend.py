@@ -536,7 +536,7 @@ async def test_pipeline_trainer_checkpoint_retention_protects_lagged_kl_referenc
 
 
 @pytest.mark.asyncio
-async def test_pipeline_trainer_checkpoint_retention_lag_floor_only_protects_zero(
+async def test_pipeline_trainer_checkpoint_retention_lag_warmup_protects_window(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
@@ -567,11 +567,8 @@ async def test_pipeline_trainer_checkpoint_retention_lag_floor_only_protects_zer
 
     await trainer._run_checkpoint_retention(4)
 
-    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [1, 2, 3]
-    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
-        model,
-        [0, 4],
-    )
+    assert contexts == []
+    backend._delete_checkpoint_files.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
