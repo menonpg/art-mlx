@@ -717,6 +717,7 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
         _infer_attn_pattern,
     )
     from megatron.bridge.models.gemma.gemma4_provider import Gemma4ModelProvider
+    from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
     from megatron.core.models.gpt.gpt_model import GPTModel
 
     @MegatronModelBridge.register_bridge(
@@ -726,6 +727,50 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
         model_type="gemma4",
     )
     class _ArtGemma4TextOnlyBridge(Gemma4Bridge):
+        def maybe_modify_converted_hf_weight(
+            self,
+            task: Any,
+            converted_weights_dict: Any,
+            hf_state_dict: Any,
+        ) -> Any:
+            return Gemma4VLBridge.maybe_modify_converted_hf_weight(
+                self,
+                task,
+                converted_weights_dict,
+                hf_state_dict,
+            )
+
+        def maybe_modify_loaded_hf_weight(
+            self,
+            hf_param: str | dict[str, str],
+            hf_state_dict: Any,
+        ) -> Any:
+            if isinstance(hf_param, dict) and "v" in hf_param:
+                v_name = hf_param["v"]
+                if v_name not in hf_state_dict:
+                    k_name = hf_param["k"]
+                    return {
+                        role: hf_state_dict[k_name].clone()
+                        if role == "v"
+                        else hf_state_dict[name]
+                        for role, name in hf_param.items()
+                    }
+            if isinstance(hf_param, dict) and "gate" in hf_param:
+                gate_name = hf_param["gate"]
+                if "mlp.gate_proj" in gate_name:
+                    return Gemma4VLBridge._fuse_shared_expert_prenorm(
+                        self,
+                        hf_param,
+                        hf_state_dict,
+                    )
+            if isinstance(hf_param, str) and hf_param.endswith("router.proj.weight"):
+                return Gemma4VLBridge._fuse_router_weight(
+                    self,
+                    hf_param,
+                    hf_state_dict,
+                )
+            return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+
         def provider_bridge(self, hf_pretrained: Any) -> Any:
             text_config = getattr(
                 hf_pretrained.config,
