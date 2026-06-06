@@ -35,6 +35,7 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
     def fake_calculate_megatron_logprobs(
         *,
         model_chunks: Any,
+        provider: Any,
         model_support_handler: Any,
         inputs: dict[str, torch.Tensor],
         moe_routing_replay_controller: Any,
@@ -42,7 +43,13 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
         sample_index: int,
         global_grad_accumulation_sequences: int,
     ) -> torch.Tensor:
-        del model_chunks, model_support_handler, inputs, moe_routing_replay_controller
+        del (
+            model_chunks,
+            provider,
+            model_support_handler,
+            inputs,
+            moe_routing_replay_controller,
+        )
         calls.append((sample_index, step_index, global_grad_accumulation_sequences))
         return torch.tensor([[float(sample_index)]])
 
@@ -57,6 +64,7 @@ def test_precompute_reference_logprobs_preserves_sample_steps(monkeypatch) -> No
     runtime = SimpleNamespace(
         rank=0,
         model=[],
+        provider=object(),
         model_support_handler=object(),
         moe_routing_replay_controller=object(),
     )
@@ -134,7 +142,8 @@ def test_calculate_megatron_logprobs_replays_routes(monkeypatch) -> None:
     )
 
     logprobs = megatron_train._calculate_megatron_logprobs(
-        model_chunks=[chunk],
+        model_chunks=cast(megatron_train.ModelChunks, [chunk]),
+        provider=object(),
         model_support_handler=_Handler(),
         inputs=_packed_inputs(),
         moe_routing_replay_controller=cast(
