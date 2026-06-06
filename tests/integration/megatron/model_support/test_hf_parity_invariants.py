@@ -21,6 +21,8 @@ from .hf_parity import (
 from .hf_parity_worker import (
     _build_megatron_runtime,
     _filter_language_only_tensor_map,
+    _hf_moe_router_key,
+    _hf_router_num_experts,
     _is_language_hf_param_name,
     _mapping_supports_derivative_parity,
     _normalize_hf_grads_for_bridge,
@@ -305,6 +307,26 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
         "model.language_model.layers.0.input_layernorm.weight",
         "lm_head.weight",
     }
+
+
+def test_hf_moe_routing_capture_recognizes_gemma4_router_names() -> None:
+    assert (
+        _hf_moe_router_key("model.layers.3.mlp.gate")
+        == "chunk_00.layer_0003.mlp.router"
+    )
+    assert (
+        _hf_moe_router_key("model.language_model.layers.5.router")
+        == "chunk_00.layer_0005.mlp.router"
+    )
+    assert _hf_moe_router_key("model.layers.7.router") == (
+        "chunk_00.layer_0007.mlp.router"
+    )
+    assert _hf_moe_router_key("model.language_model.layers.5.mlp.gate") is None
+
+
+def test_hf_router_num_experts_uses_nested_config() -> None:
+    module = SimpleNamespace(config=SimpleNamespace(num_experts=128))
+    assert _hf_router_num_experts(module, torch.ones(2, 8)) == 128
 
 
 def test_build_megatron_runtime_uses_training_provider_bundle(

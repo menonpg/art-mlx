@@ -61,7 +61,12 @@ from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 HF_PARITY_DEBUG_ENV = "ART_HF_PARITY_DEBUG"
 _DEBUG_START_TIME = time.perf_counter()
 _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
-_HF_MOE_ROUTER_NAME_PATTERN = re.compile(r"^model\.layers\.(?P<layer>\d+)\.mlp\.gate$")
+_HF_MOE_ROUTER_NAME_PATTERN = re.compile(
+    r"^(?:"
+    r"model\.layers\.(?P<gate_layer>\d+)\.mlp\.gate|"
+    r"model(?:\.language_model)?\.layers\.(?P<router_layer>\d+)\.router"
+    r")$"
+)
 _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
     r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
 )
@@ -78,7 +83,19 @@ def _hf_moe_router_key(module_name: str) -> str | None:
     match = _HF_MOE_ROUTER_NAME_PATTERN.match(module_name)
     if match is None:
         return None
-    return f"chunk_00.layer_{int(match.group('layer')):04d}.mlp.router"
+    layer = match.group("gate_layer") or match.group("router_layer")
+    return f"chunk_00.layer_{int(layer):04d}.mlp.router"
+
+
+def _hf_router_num_experts(module: Any, router_scores: torch.Tensor) -> int:
+    config = getattr(module, "config", None)
+    return int(
+        getattr(
+            module,
+            "num_experts",
+            getattr(config, "num_experts", router_scores.shape[-1]),
+        )
+    )
 
 
 class _HfMoeRoutingCapture:
@@ -172,9 +189,7 @@ class _HfMoeRoutingCapture:
                 expert_mask=torch.ones_like(
                     router_indices.detach().cpu(), dtype=torch.bool
                 ),
-                num_experts=int(
-                    getattr(module, "num_experts", router_scores.shape[-1])
-                ),
+                num_experts=_hf_router_num_experts(module, router_scores),
                 sample_index=self._active_sample_index,
                 micro_slot=(
                     None
