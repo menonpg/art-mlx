@@ -744,16 +744,29 @@ class MoeRoutingReplayController:
                 topk = int(getattr(module, "topk"))
                 original_routing = module.routing
 
+                def _prepare_native_target_for_bound_router(
+                    _controller: MoeRoutingReplayController = self,
+                    _router_key: str = router_key,
+                ) -> None:
+                    _controller._prepare_native_target_for_router(_router_key)
+
+                prepare_native_target = torch.compiler.disable(
+                    _prepare_native_target_for_bound_router
+                )
+
                 def _routing_with_replay_target(
                     router_module: Any,
                     *args: Any,
                     _controller: MoeRoutingReplayController = self,
-                    _router_key: str = router_key,
                     _original_routing: Any = original_routing,
+                    _prepare_native_target: Any = prepare_native_target,
                     **kwargs: Any,
                 ) -> Any:
                     del router_module
-                    _controller._prepare_native_target_for_router(_router_key)
+                    del _controller
+                    # Replay target selection mutates Python cursor dictionaries and
+                    # must stay outside Dynamo; routing compute below remains compiled.
+                    _prepare_native_target()
                     return _original_routing(*args, **kwargs)
 
                 module.routing = types.MethodType(_routing_with_replay_target, module)
