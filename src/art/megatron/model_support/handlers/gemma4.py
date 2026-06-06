@@ -42,6 +42,7 @@ _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<prefix>\.mlp)\.(?P<module>gate_proj|up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
 )
+_MEGATRON_LAYER_RE = re.compile(r"(?:^|\.)layers\.(?P<layer>\d+)\.")
 
 
 class Gemma4MoeHandler(DefaultMoeHandler):
@@ -557,25 +558,109 @@ def _from_vllm_per_expert_lora_tensors(
     return transformed
 
 
-def _gemma4_text_only_mapping_registry() -> Any:
+def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
     )
+    from megatron.bridge.models.gemma.gemma4_bridge import _Gemma4QKVMapping
     from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
 
     upstream_registry = Gemma4VLBridge().mapping_registry()
+    global_layer_indices = _gemma4_global_layer_indices(hf_config)
+
+    class _ArtGemma4TextOnlyQKVMapping(_Gemma4QKVMapping):
+        def __init__(
+            self,
+            megatron_param: str,
+            q: str,
+            k: str,
+            v: str,
+            *,
+            global_layer_indices: tuple[int, ...],
+        ) -> None:
+            super().__init__(megatron_param, q, k, v)
+            self._global_layer_indices = global_layer_indices
+            self._export_hf_param = dict(self.hf_param)
+
+        def resolve(self, captures: tuple[str, ...]) -> Any:
+            megatron_param, hf_param = self._resolve_names(captures)
+            resolved = type(self)(
+                megatron_param,
+                hf_param["q"],
+                hf_param["k"],
+                hf_param["v"],
+                global_layer_indices=self._global_layer_indices,
+            )
+            layer_index = _megatron_layer_index(megatron_param)
+            if layer_index in self._global_layer_indices:
+                resolved.hf_param = dict(resolved.hf_param)
+                resolved.hf_param["v"] = resolved.hf_param["k"]
+            return resolved
+
+        def megatron_to_hf(
+            self,
+            megatron_weights: torch.Tensor | None,
+            megatron_module: Any | None,
+        ) -> dict[str, torch.Tensor]:
+            import_hf_param = self.hf_param
+            self.hf_param = self._export_hf_param
+            try:
+                return super().megatron_to_hf(megatron_weights, megatron_module)
+            finally:
+                self.hf_param = import_hf_param
+
     language_mappings = [
-        _text_only_gemma4_mapping(mapping)
+        _text_only_gemma4_mapping(
+            mapping,
+            qkv_mapping_type=_ArtGemma4TextOnlyQKVMapping,
+            global_layer_indices=global_layer_indices,
+        )
         for mapping in upstream_registry.mappings
         if mapping.megatron_param.startswith("language_model.")
     ]
     return MegatronMappingRegistry(*language_mappings)
 
 
-def _text_only_gemma4_mapping(mapping: Any) -> Any:
+def _text_only_gemma4_mapping(
+    mapping: Any,
+    *,
+    qkv_mapping_type: type[Any],
+    global_layer_indices: tuple[int, ...],
+) -> Any:
+    megatron_param = mapping.megatron_param.removeprefix("language_model.")
+    hf_param = getattr(mapping, "hf_param", None)
+    if (
+        megatron_param.endswith(".self_attention.linear_qkv.weight")
+        and isinstance(hf_param, dict)
+        and set(hf_param) == {"q", "k", "v"}
+    ):
+        return qkv_mapping_type(
+            megatron_param,
+            hf_param["q"],
+            hf_param["k"],
+            hf_param["v"],
+            global_layer_indices=global_layer_indices,
+        )
     cloned = copy(mapping)
-    cloned.megatron_param = cloned.megatron_param.removeprefix("language_model.")
+    cloned.megatron_param = megatron_param
     return cloned
+
+
+def _gemma4_global_layer_indices(hf_config: Any | None) -> tuple[int, ...]:
+    text_config = getattr(hf_config, "text_config", hf_config)
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types:
+        return ()
+    return tuple(
+        layer_index
+        for layer_index, layer_type in enumerate(layer_types)
+        if layer_type == "full_attention"
+    )
+
+
+def _megatron_layer_index(megatron_param: str) -> int | None:
+    match = _MEGATRON_LAYER_RE.search(megatron_param)
+    return None if match is None else int(match.group("layer"))
 
 
 _GEMMA4_TEXT_ONLY_BRIDGE_REGISTERED = False
@@ -675,6 +760,6 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
             return provider
 
         def mapping_registry(self) -> Any:
-            return _gemma4_text_only_mapping_registry()
+            return _gemma4_text_only_mapping_registry(getattr(self, "hf_config", None))
 
     _GEMMA4_TEXT_ONLY_BRIDGE_REGISTERED = True
