@@ -67,6 +67,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         _patch_gemma4_router_for_mcore()
+        _patch_gemma4_rotary_for_hf_proportional()
         provider.moe_shared_expert_overlap = False
         provider.recompute_granularity = "selective"
         provider.recompute_method = None
@@ -260,6 +261,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
 GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
 
 _GEMMA4_ROUTER_PATCHED = False
+_GEMMA4_ROTARY_PATCHED = False
 
 
 def _patch_gemma4_router_for_mcore() -> None:
@@ -289,6 +291,80 @@ def _patch_gemma4_router_for_mcore() -> None:
 
     setattr(gemma4_provider.Gemma4TopKRouter, "routing", _art_gemma4_router_routing)
     _GEMMA4_ROUTER_PATCHED = True
+
+
+def _gemma4_hf_proportional_inv_freq(
+    *,
+    global_kv_channels: int,
+    global_rotary_percent: float,
+    rotary_base: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """HF proportional RoPE pads non-rotary pairs with zero-frequency angles."""
+    rope_angles = int(global_rotary_percent * global_kv_channels // 2)
+    inv_freq_rotated = 1.0 / (
+        rotary_base
+        ** (
+            torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32, device=device)
+            / global_kv_channels
+        )
+    )
+    nope_angles = global_kv_channels // 2 - rope_angles
+    if nope_angles <= 0:
+        return inv_freq_rotated
+    return torch.cat(
+        (
+            inv_freq_rotated,
+            torch.zeros(nope_angles, dtype=torch.float32, device=device),
+        ),
+        dim=0,
+    )
+
+
+def _patch_gemma4_rotary_for_hf_proportional() -> None:
+    global _GEMMA4_ROTARY_PATCHED
+    if _GEMMA4_ROTARY_PATCHED:
+        return
+    from megatron.bridge.models.gemma import gemma4_provider
+
+    original_init = cast(Any, gemma4_provider.Gemma4RotaryEmbedding.__init__)
+
+    def _art_gemma4_rotary_init(
+        self: Any,
+        *,
+        kv_channels: int,
+        rotary_percent: float,
+        rotary_interleaved: bool = False,
+        seq_len_interpolation_factor: float | None = None,
+        rotary_base: int = 1_000_000,
+        rope_scaling: bool = False,
+        use_cpu_initialization: bool = False,
+        rotary_base_local: int = 10_000,
+        global_kv_channels: int = 512,
+        global_rotary_percent: float = 0.25,
+    ) -> None:
+        original_init(
+            self,
+            kv_channels=kv_channels,
+            rotary_percent=rotary_percent,
+            rotary_interleaved=rotary_interleaved,
+            seq_len_interpolation_factor=seq_len_interpolation_factor,
+            rotary_base=rotary_base,
+            rope_scaling=rope_scaling,
+            use_cpu_initialization=use_cpu_initialization,
+            rotary_base_local=rotary_base_local,
+            global_kv_channels=global_kv_channels,
+            global_rotary_percent=global_rotary_percent,
+        )
+        self.inv_freq = _gemma4_hf_proportional_inv_freq(
+            global_kv_channels=global_kv_channels,
+            global_rotary_percent=global_rotary_percent,
+            rotary_base=rotary_base,
+            device=self.inv_freq.device,
+        )
+
+    setattr(gemma4_provider.Gemma4RotaryEmbedding, "__init__", _art_gemma4_rotary_init)
+    _GEMMA4_ROTARY_PATCHED = True
 
 
 def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
