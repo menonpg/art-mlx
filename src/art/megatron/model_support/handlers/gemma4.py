@@ -68,6 +68,10 @@ class Gemma4MoeHandler(DefaultMoeHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         _patch_gemma4_router_for_mcore()
         provider.moe_shared_expert_overlap = False
+        provider.recompute_granularity = "selective"
+        provider.recompute_method = None
+        provider.recompute_num_layers = None
+        provider.recompute_modules = ["core_attn"]
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
