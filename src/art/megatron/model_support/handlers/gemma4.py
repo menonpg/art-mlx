@@ -66,6 +66,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         return tuple(dict.fromkeys(suffixes))
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
+        _patch_gemma4_router_for_mcore()
         provider.moe_shared_expert_overlap = False
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
@@ -253,6 +254,37 @@ class Gemma4MoeHandler(DefaultMoeHandler):
 
 
 GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
+
+_GEMMA4_ROUTER_PATCHED = False
+
+
+def _patch_gemma4_router_for_mcore() -> None:
+    global _GEMMA4_ROUTER_PATCHED
+    if _GEMMA4_ROUTER_PATCHED:
+        return
+    from megatron.bridge.models.gemma import gemma4_provider
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    def _art_gemma4_router_routing(
+        self: Any,
+        logits: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        del input_ids
+        routing_probs, routing_map = TopKRouter.routing(
+            self,
+            logits,
+            padding_mask=padding_mask,
+        )
+        if routing_map is not None:
+            prob_sums = routing_probs.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+            routing_probs = routing_probs / prob_sums
+            routing_probs = routing_probs * self.per_expert_scale.unsqueeze(0)
+        return routing_probs, routing_map
+
+    gemma4_provider.Gemma4TopKRouter.routing = _art_gemma4_router_routing
+    _GEMMA4_ROUTER_PATCHED = True
 
 
 def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
