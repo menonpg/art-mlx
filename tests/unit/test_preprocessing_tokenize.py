@@ -143,6 +143,13 @@ class _ContinueFinalMessageRejectingTokenizer(_FakeTokenizer):
         )
 
 
+class _NonRoundTripDecodeTokenizer(_FakeTokenizer):
+    def decode(self, token_ids):
+        if isinstance(token_ids, int) and token_ids > self.vocab_size // 2:
+            return "not-a-single-token"
+        return super().decode(token_ids)
+
+
 def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> None:
     tokenizer = _FakeTokenizer()
     messages = cast(
@@ -171,6 +178,32 @@ def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> Non
         if mask
     ]
     assert assistant_ids == tokenizer.encode("OK", add_special_tokens=False)
+
+
+def test_tokenize_trajectory_does_not_require_unused_vocab_token_roundtrip() -> None:
+    tokenizer = _NonRoundTripDecodeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "OK"},
+        ],
+    )
+    result = tokenize_trajectory(
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        image_processor=None,
+        history=History(messages_and_choices=messages),
+        advantage=1.0,
+        allow_training_without_logprobs=True,
+        trajectory=Trajectory(messages_and_choices=messages, reward=1.0),
+    )
+
+    assert result is not None
+    assert [
+        token_id
+        for token_id, mask in zip(result.token_ids, result.assistant_mask)
+        if mask
+    ] == tokenizer.encode("OK", add_special_tokens=False)
 
 
 def test_tokenize_trajectory_passes_chat_template_kwargs() -> None:

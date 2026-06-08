@@ -28,10 +28,15 @@ from .moe_routing import (
     TokenRoute,
     align_choice_routes_to_tokenized_result,
 )
-from .response_masking import response_only_labels, token_ids_for_template_part
+from .response_masking import (
+    _find_subsequence,
+    response_only_labels,
+    token_ids_for_template_part,
+)
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+_CHAT_TEMPLATE_SENTINEL = "<|art_trainable_response_sentinel|>"
 
 
 def _chat_template_kwargs(
@@ -246,6 +251,18 @@ def _apply_chat_template_token_ids(
     return cast(list[int], output)
 
 
+def _chat_template_sentinel_token_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    original_token_ids: list[int],
+) -> tuple[str, list[int]]:
+    for suffix in ("", *(f"_{index}" for index in range(16))):
+        sentinel = f"{_CHAT_TEMPLATE_SENTINEL}{suffix}"
+        token_ids = token_ids_for_template_part(tokenizer, sentinel)
+        if _find_subsequence(original_token_ids, token_ids) is None:
+            return sentinel, token_ids
+    raise RuntimeError("Could not find an unused chat template sentinel")
+
+
 def tokenize_trajectory_groups(
     tokenizer: "PreTrainedTokenizerBase",
     trajectory_groups: list[TrajectoryGroup],
@@ -395,8 +412,10 @@ def tokenize_trajectory(
         continue_final_message=False,
         **template_kwargs,
     )
-    sentinel_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
-    sentinel_token = tokenizer.decode(sentinel_token_id)
+    sentinel_token, sentinel_token_ids = _chat_template_sentinel_token_ids(
+        tokenizer,
+        original_token_ids,
+    )
     token_template_messages: list[dict[str, Any]] = []
     for original, message in zip(messages_and_choices, messages):
         trainable_assistant = (
@@ -440,8 +459,12 @@ def tokenize_trajectory(
                 continue
         elif message.logprobs is None and not allow_training_without_logprobs:  # ty:ignore[possibly-missing-attribute]
             continue
-        start = token_ids.index(sentinel_token_id)
-        end = start + 1
+        start = _find_subsequence(token_ids, sentinel_token_ids)
+        if start is None:
+            raise ValueError(
+                "Chat template sentinel token sequence is not in tokenized chat"
+            )
+        end = start + len(sentinel_token_ids)
         try:
             end_token_id = token_ids[end]
         except IndexError:
