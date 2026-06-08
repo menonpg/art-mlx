@@ -261,13 +261,17 @@ def test_routing_replay_token_uid_sets_keep_full_attention_layout_with_gdn_plan(
         token_uids,
         attention_state=_FakeAttentionState(),
     )
+    attention_token_uids = token_uid_sets["attention"]
+    gdn_token_uids = token_uid_sets["gdn"]
 
+    assert attention_token_uids is not None
     assert torch.equal(
-        token_uid_sets["attention"],
+        attention_token_uids,
         torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64),
     )
+    assert gdn_token_uids is not None
     assert torch.equal(
-        token_uid_sets["gdn"],
+        gdn_token_uids,
         torch.tensor([0, 2], dtype=torch.int64),
     )
 
