@@ -68,6 +68,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         _patch_gemma4_router_for_mcore()
         _patch_gemma4_rotary_for_hf_proportional()
+        _patch_gemma4_qkv_for_hf_tied_value()
         provider.moe_shared_expert_overlap = False
         provider.recompute_granularity = "selective"
         provider.recompute_method = None
@@ -262,6 +263,7 @@ GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
 
 _GEMMA4_ROUTER_PATCHED = False
 _GEMMA4_ROTARY_PATCHED = False
+_GEMMA4_QKV_PATCHED = False
 
 
 def _patch_gemma4_router_for_mcore() -> None:
@@ -365,6 +367,46 @@ def _patch_gemma4_rotary_for_hf_proportional() -> None:
 
     setattr(gemma4_provider.Gemma4RotaryEmbedding, "__init__", _art_gemma4_rotary_init)
     _GEMMA4_ROTARY_PATCHED = True
+
+
+def _patch_gemma4_qkv_for_hf_tied_value() -> None:
+    global _GEMMA4_QKV_PATCHED
+    if _GEMMA4_QKV_PATCHED:
+        return
+    from megatron.bridge.models.gemma import gemma4_provider
+    from megatron.core.transformer.attention import SelfAttention
+
+    def _art_gemma4_get_query_key_value_tensors(
+        self: Any,
+        hidden_states: torch.Tensor,
+        key_value_states: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[Any, ...]:
+        result = cast(
+            tuple[Any, ...],
+            SelfAttention.get_query_key_value_tensors(
+                self,
+                hidden_states,
+                key_value_states,
+                **kwargs,
+            ),
+        )
+        if len(result) < 3:
+            return result
+        query, key, value = result[0], result[1], result[2]
+        # HF global K=V uses the raw K projection for V before k_norm; the
+        # synthesized V rows are loaded from K, so V-norm should consume them here.
+        v_float = value.float()
+        rms = v_float.pow(2).mean(-1, keepdim=True).add(self._v_norm_eps).sqrt()
+        value = (v_float / rms).to(value.dtype)
+        return (query, key, value) + result[3:]
+
+    setattr(
+        gemma4_provider.Gemma4SelfAttention,
+        "get_query_key_value_tensors",
+        _art_gemma4_get_query_key_value_tensors,
+    )
+    _GEMMA4_QKV_PATCHED = True
 
 
 def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
