@@ -44,6 +44,17 @@ _DEBUG_ENV = "ART_PACKED_POSITION_IDS_DEBUG"
 PACKED_POSITION_IDS_REPORT_FILENAME = "report.json"
 PACKED_POSITION_IDS_ARTIFACT_SUITE_NAME = "Megatron packed-position-id artifacts"
 REPO_ROOT = Path(__file__).resolve().parents[4]
+_SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
+    {
+        "default_dense",
+        "default_moe",
+        "qwen3_dense",
+        "qwen3_moe",
+        "qwen3_5_dense",
+        "qwen3_5_moe",
+    }
+)
+_TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_moe"})
 
 
 def _slugify(value: str) -> str:
@@ -246,6 +257,26 @@ def _rotary_grouping_check(
         if not torch.equal(reference, vector):
             return True, False, repeated_position_key_count
     return True, True, repeated_position_key_count
+
+
+def _rotary_outputs_for_validation(
+    *,
+    handler_key: str,
+    preprocess_output: Any,
+) -> tuple[torch.Tensor | None, ...]:
+    rotary_output = preprocess_output[1]
+    if handler_key in _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS:
+        return (
+            cast(torch.Tensor | None, rotary_output)
+            if torch.is_tensor(rotary_output)
+            else None,
+        )
+    if handler_key in _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS:
+        local_rotary, global_rotary = rotary_output
+        return local_rotary, global_rotary
+    raise RuntimeError(
+        f"Packed position validation has no rotary output mapping for {handler_key!r}"
+    )
 
 
 def _build_art_realistic_packed_tensors(
@@ -861,10 +892,9 @@ def _run_packed_position_ids_worker(
                 row_checked = False
                 row_respected = True
                 row_repeated_count = 0
-                rotary_outputs = (
-                    runtime.model_support_handler.packed_position_rotary_outputs(
-                        hooked_output
-                    )
+                rotary_outputs = _rotary_outputs_for_validation(
+                    handler_key=runtime.model_support_handler.key,
+                    preprocess_output=hooked_output,
                 )
                 for rotary_output in rotary_outputs:
                     checked, respected, repeated_count = _rotary_grouping_check(

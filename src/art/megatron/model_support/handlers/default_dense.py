@@ -87,12 +87,6 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
-    def packed_position_rotary_outputs(
-        self,
-        preprocess_output: Sequence[Any],
-    ) -> tuple[torch.Tensor | None, ...]:
-        return (preprocess_output[1],)
-
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

@@ -79,13 +79,6 @@ class Gemma4MoeHandler(DefaultMoeHandler):
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         _install_gemma4_preprocess_patch(model_chunks)
 
-    def packed_position_rotary_outputs(
-        self,
-        preprocess_output: Sequence[Any],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        local_rotary, global_rotary = preprocess_output[1]
-        return local_rotary, global_rotary
-
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
             raise TypeError("Gemma 4 MoE handler received a dense provider")
