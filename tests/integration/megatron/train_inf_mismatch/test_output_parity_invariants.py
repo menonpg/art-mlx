@@ -22,7 +22,12 @@ from .output_parity import (
     config_from_env,
     fwd_mean_abs_pct_limit_for_model,
 )
-from .real_path import RealPathConfig, _delete_adapter_safetensors_on_pass
+from .real_path import (
+    RealPathConfig,
+    _delete_adapter_safetensors_on_pass,
+    _real_path_rollout_mode,
+    _real_path_rollout_weights_mode,
+)
 
 
 def test_logical_map_flattens_shared_prefix_branches() -> None:
@@ -129,6 +134,21 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
 
 def test_real_path_default_generates_16_tokens_per_rollout() -> None:
     assert RealPathConfig().max_completion_tokens == 16
+
+
+def test_real_path_rollout_mode_follows_config() -> None:
+    native_config = TrainInfOutputParityConfig(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+    )
+    merged_config = TrainInfOutputParityConfig(
+        base_model="unvalidated/native-disabled",
+        allow_unvalidated_arch=True,
+    )
+
+    assert _real_path_rollout_mode(native_config) == "native_lora"
+    assert _real_path_rollout_weights_mode(native_config) == "lora"
+    assert _real_path_rollout_mode(merged_config) == "merged"
+    assert _real_path_rollout_weights_mode(merged_config) == "merged"
 
 
 def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:

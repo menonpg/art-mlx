@@ -16,6 +16,7 @@ import uuid
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
+from art.dev.model import RolloutWeightsMode
 from art.preprocessing.moe_routing import choice_moe_routing_metadata
 from art.preprocessing.pack import DiskPackedTensors
 
@@ -24,6 +25,7 @@ from .output_parity import (
     TOP_K,
     LogicalTokenMap,
     PairComparison,
+    RolloutMode,
     ScoreBundle,
     TokenTopK,
     TopKComparison,
@@ -125,6 +127,16 @@ class RealPathTrainInfReport(BaseModel):
     mean_abs_pct_limit: float
     top20_kl_candidate_to_target_limit: float
     passed: bool
+
+
+def _real_path_rollout_mode(config: TrainInfOutputParityConfig) -> RolloutMode:
+    return config.rollout_modes[0]
+
+
+def _real_path_rollout_weights_mode(
+    config: TrainInfOutputParityConfig,
+) -> RolloutWeightsMode:
+    return "lora" if _real_path_rollout_mode(config) == "native_lora" else "merged"
 
 
 _PROMPT_SENTENCES = [
@@ -411,6 +423,7 @@ def _vllm_scores_from_real_choices(
     logical_map: LogicalTokenMap,
     require_routing_metadata: bool,
     weight_state: WeightState,
+    rollout_mode: RolloutMode,
 ) -> ScoreBundle:
     choices_by_tokens = _choice_score_index(
         trajectory_groups,
@@ -470,7 +483,7 @@ def _vllm_scores_from_real_choices(
     return ScoreBundle(
         side="vllm",
         weight_state=weight_state,
-        rollout_mode="native_lora",
+        rollout_mode=rollout_mode,
         target_logprobs=target_logprobs,
         topk=topk,
     )
@@ -570,6 +583,7 @@ async def _score_base_real_generation_path(
         logical_map=logical_map,
         require_routing_metadata=is_moe,
         weight_state="base",
+        rollout_mode="merged",
     )
     vllm_score_path = artifact_dir / "real_path_vllm_base_scores.json"
     _write_json(vllm_score_path, vllm_base.model_dump(mode="json"))
@@ -754,6 +768,7 @@ def _score_megatron_runtime(
     packed_tensors: dict[str, Any],
     logical_map: LogicalTokenMap,
     weight_state: WeightState,
+    rollout_mode: RolloutMode,
     global_grad_accumulation_sequences: int,
     forward_trace_capture: Any | None,
     forward_trace_dir: str | None,
@@ -774,7 +789,7 @@ def _score_megatron_runtime(
             packed_tensors=packed_tensors,
             logical_map=logical_map,
             weight_state=weight_state,
-            rollout_mode="native_lora",
+            rollout_mode=rollout_mode,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
 
@@ -796,7 +811,7 @@ def _score_megatron_runtime(
         logical_map=logical_map,
         side="megatron",
         weight_state=weight_state,
-        rollout_mode="native_lora",
+        rollout_mode=rollout_mode,
     )
 
 
@@ -913,6 +928,7 @@ def _real_path_megatron_worker(
         packed_tensors=cast(dict[str, Any], packed_tensors),
         logical_map=logical_map,
         weight_state=request.weight_state,
+        rollout_mode=_real_path_rollout_mode(request.config),
         global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
         forward_trace_capture=forward_trace_capture,
         forward_trace_dir=request.forward_trace_dir,
@@ -1020,6 +1036,7 @@ async def run_real_path_train_inf_mismatch(
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
+    rollout_mode = _real_path_rollout_mode(parity_config)
     is_moe = model_support_is_moe(
         parity_config.base_model,
         allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
@@ -1043,7 +1060,7 @@ async def run_real_path_train_inf_mismatch(
         _internal_config={
             "trainer_gpu_ids": parity_config.trainer_gpu_ids,
             "inference_gpu_ids": parity_config.inference_gpu_ids,
-            "rollout_weights_mode": "lora",
+            "rollout_weights_mode": _real_path_rollout_weights_mode(parity_config),
             "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
             "engine_args": {
                 "tensor_parallel_size": len(parity_config.inference_gpu_ids),
@@ -1115,6 +1132,7 @@ async def run_real_path_train_inf_mismatch(
             logical_map=logical_map,
             require_routing_metadata=is_moe,
             weight_state="lora",
+            rollout_mode=rollout_mode,
         )
         _write_json(
             artifact_dir / "real_path_vllm_lora_scores.json",
