@@ -248,34 +248,6 @@ def _rotary_grouping_check(
     return True, True, repeated_position_key_count
 
 
-def _rotary_grouping_check_output(
-    rotary_output: Any,
-    *,
-    position_ids: torch.Tensor,
-) -> tuple[bool, bool, int]:
-    if torch.is_tensor(rotary_output):
-        return _rotary_grouping_check(rotary_output, position_ids=position_ids)
-    if not isinstance(rotary_output, (tuple, list)):
-        return _rotary_grouping_check(None, position_ids=position_ids)
-
-    checked_any = False
-    respected_all = True
-    repeated_count: int | None = None
-    for item in rotary_output:
-        if not torch.is_tensor(item):
-            continue
-        checked, respected, item_repeated_count = _rotary_grouping_check(
-            item,
-            position_ids=position_ids,
-        )
-        checked_any = checked_any or checked
-        respected_all = respected_all and respected
-        repeated_count = item_repeated_count
-    if repeated_count is None:
-        return _rotary_grouping_check(None, position_ids=position_ids)
-    return checked_any, respected_all, repeated_count
-
-
 def _build_art_realistic_packed_tensors(
     config: PackedTensorConfig,
     seed: int,
@@ -886,8 +858,11 @@ def _run_packed_position_ids_worker(
                     ),
                     device=row_input_ids.device,
                 )
-                checked, respected, repeated_count = _rotary_grouping_check_output(
-                    hooked_output[1],
+                rotary_output = hooked_output[1]
+                checked, respected, repeated_count = _rotary_grouping_check(
+                    cast(torch.Tensor | None, rotary_output)
+                    if torch.is_tensor(rotary_output)
+                    else None,
                     position_ids=row_position_ids,
                 )
                 rotary_grouping_checked = rotary_grouping_checked or checked
