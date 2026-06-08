@@ -286,6 +286,7 @@ def _engine_args_for_yes_no_trainability(
         "max_num_seqs": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_NUM_SEQS", 4),
         "enforce_eager": True,
         "tensor_parallel_size": tensor_parallel_size,
+        "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
     }
     if enable_expert_parallel:
         engine_args["enable_expert_parallel"] = True
