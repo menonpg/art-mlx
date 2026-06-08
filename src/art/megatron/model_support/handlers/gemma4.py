@@ -721,6 +721,12 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
 
     upstream_registry = Gemma4VLBridge().mapping_registry()
     global_layer_indices = _gemma4_global_layer_indices(hf_config)
+    (
+        bridge_gate_up_mapping,
+        bridge_down_mapping,
+        art_gate_up_mapping,
+        art_down_mapping,
+    ) = _art_gemma4_expert_mapping_types()
 
     class _ArtGemma4TextOnlyQKVMapping(_Gemma4QKVMapping):
         def __init__(
@@ -769,6 +775,10 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
         _text_only_gemma4_mapping(
             mapping,
             qkv_mapping_type=_ArtGemma4TextOnlyQKVMapping,
+            bridge_gate_up_mapping=bridge_gate_up_mapping,
+            bridge_down_mapping=bridge_down_mapping,
+            art_gate_up_mapping=art_gate_up_mapping,
+            art_down_mapping=art_down_mapping,
             global_layer_indices=global_layer_indices,
         )
         for mapping in upstream_registry.mappings
@@ -781,10 +791,18 @@ def _text_only_gemma4_mapping(
     mapping: Any,
     *,
     qkv_mapping_type: type[Any],
+    bridge_gate_up_mapping: type[Any],
+    bridge_down_mapping: type[Any],
+    art_gate_up_mapping: type[Any],
+    art_down_mapping: type[Any],
     global_layer_indices: tuple[int, ...],
 ) -> Any:
     megatron_param = mapping.megatron_param.removeprefix("language_model.")
     hf_param = getattr(mapping, "hf_param", None)
+    if isinstance(mapping, bridge_gate_up_mapping):
+        return art_gate_up_mapping(megatron_param, hf_param)
+    if isinstance(mapping, bridge_down_mapping):
+        return art_down_mapping(megatron_param, hf_param)
     if (
         megatron_param.endswith(".self_attention.linear_qkv.weight")
         and isinstance(hf_param, dict)
@@ -800,6 +818,139 @@ def _text_only_gemma4_mapping(
     cloned = copy(mapping)
     cloned.megatron_param = megatron_param
     return cloned
+
+
+def _art_gemma4_expert_mapping_types() -> tuple[
+    type[Any], type[Any], type[Any], type[Any]
+]:
+    from megatron.bridge.models.conversion.param_mapping import (
+        ColumnParallelMapping,
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+        RowParallelMapping,
+        _align_expert_weight_to_shape,
+    )
+    from megatron.bridge.models.conversion.utils import (
+        get_module_and_param_from_name,
+    )
+    from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+
+    class _ArtGemma4ExpertGateUpProjMapping(FusedGatedExpertMapping):
+        def hf_to_megatron(
+            self,
+            hf_weights: Any,
+            megatron_module: Any,
+        ) -> torch.Tensor:
+            global_expert_number = extract_expert_number_from_param(self.megatron_param)
+            expert_weight = _select_gemma4_expert_weight(
+                hf_weights,
+                global_expert_number=global_expert_number,
+                ep_size=int(self.ep_size),
+            )
+            normalized_param = self._normalize_expert_param_name(self.megatron_param)
+            target_param = get_module_and_param_from_name(
+                megatron_module, normalized_param
+            )[1]
+            full_target_shape = (
+                target_param.shape[0] * self.tp_size,
+                target_param.shape[1],
+            )
+            gate_target_shape = (
+                full_target_shape[0] // 2,
+                full_target_shape[1],
+            )
+            if full_target_shape[0] % 2 != 0:
+                raise ValueError(
+                    f"Expected even fused dim for {self.megatron_param}, got {full_target_shape}."
+                )
+            if (
+                isinstance(expert_weight, torch.Tensor)
+                and expert_weight.ndim == 3
+                and expert_weight.shape[0] == 2
+            ):
+                gate = _align_expert_weight_to_shape(
+                    expert_weight[0], torch.Size(gate_target_shape), "gate"
+                )
+                up = _align_expert_weight_to_shape(
+                    expert_weight[1], torch.Size(gate_target_shape), "up"
+                )
+            else:
+                fused = _align_expert_weight_to_shape(
+                    cast(torch.Tensor, expert_weight),
+                    torch.Size(full_target_shape),
+                    "gate_up",
+                )
+                gate, up = torch.chunk(fused, 2, dim=0)
+            return self._gated_mapping.hf_to_megatron(
+                {"gate": gate, "up": up},
+                megatron_module,
+            )
+
+    class _ArtGemma4ExpertDownProjMapping(FusedExpertMapping):
+        def hf_to_megatron(
+            self,
+            hf_weights: Any,
+            megatron_module: Any,
+        ) -> torch.Tensor:
+            global_expert_number = extract_expert_number_from_param(self.megatron_param)
+            expert_weight = _select_gemma4_expert_weight(
+                hf_weights,
+                global_expert_number=global_expert_number,
+                ep_size=int(self.ep_size),
+            )
+            normalized_param = self._normalize_expert_param_name(self.megatron_param)
+            target_param = get_module_and_param_from_name(
+                megatron_module, normalized_param
+            )[1]
+            if self._mapping is None:
+                self._detected_type = self._detect_parallelism_type(megatron_module)
+                self._mapping = self._get_or_create_mapping(self._detected_type)
+            if isinstance(self._mapping, ColumnParallelMapping):
+                full_target_shape = (
+                    target_param.shape[0] * self.tp_size,
+                    target_param.shape[1],
+                )
+            elif isinstance(self._mapping, RowParallelMapping):
+                full_target_shape = (
+                    target_param.shape[0],
+                    target_param.shape[1] * self.tp_size,
+                )
+            else:
+                full_target_shape = tuple(target_param.shape)
+            aligned = _align_expert_weight_to_shape(
+                expert_weight,
+                torch.Size(full_target_shape),
+                "down_proj",
+            )
+            return self._mapping.hf_to_megatron(aligned, megatron_module)
+
+    return (
+        FusedGatedExpertMapping,
+        FusedExpertMapping,
+        _ArtGemma4ExpertGateUpProjMapping,
+        _ArtGemma4ExpertDownProjMapping,
+    )
+
+
+def _select_gemma4_expert_weight(
+    hf_weights: Any,
+    *,
+    global_expert_number: int,
+    ep_size: int,
+) -> Any:
+    from art.megatron.runtime.bridge_runtime import ExpertTensorSlice
+
+    if isinstance(hf_weights, ExpertTensorSlice):
+        return hf_weights.get(global_expert_number)
+    if isinstance(hf_weights, torch.Tensor) and hf_weights.ndim >= 3:
+        if ep_size > 1:
+            raise RuntimeError(
+                "Gemma 4 EP expert loading expected a sliced fused-expert "
+                "HF tensor, but received the full all-expert tensor for "
+                f"global expert {global_expert_number}."
+            )
+        return hf_weights[global_expert_number]
+    return hf_weights
 
 
 def _gemma4_global_layer_indices(hf_config: Any | None) -> tuple[int, ...]:
