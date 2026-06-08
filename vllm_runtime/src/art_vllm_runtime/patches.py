@@ -16,6 +16,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     patch_nccl_unique_id_bootstrap()
+    patch_gemma4_checkpoint_weight_update_reload()
     patch_routed_experts_prefix_cache_sidecar()
 
 
@@ -183,6 +184,62 @@ def patch_nccl_unique_id_bootstrap() -> None:
 
     patched_comm_init_rank.__art_patched__ = True  # type: ignore[attr-defined]
     NCCLLibrary.ncclCommInitRank = patched_comm_init_rank  # type: ignore[method-assign]
+
+
+def _is_gemma4_conditional_worker(worker: Any) -> bool:
+    hf_config = worker.model_config.hf_config
+    return hf_config.architectures == ["Gemma4ForConditionalGeneration"]
+
+
+def patch_gemma4_checkpoint_weight_update_reload() -> None:
+    from vllm.v1.worker.gpu_worker import Worker
+
+    original_start_weight_update = Worker.start_weight_update
+    if getattr(original_start_weight_update, "__art_patched__", False):
+        return
+    original_finish_weight_update = Worker.finish_weight_update
+
+    def start_weight_update(
+        self: Any,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        if not is_checkpoint_format or not _is_gemma4_conditional_worker(self):
+            return original_start_weight_update(
+                self,
+                is_checkpoint_format=is_checkpoint_format,
+            )
+        self._check_weight_transfer_engine()
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while a weight update is "
+                "already active. Call finish_weight_update first."
+            )
+        # vLLM's layerwise checkpoint reload corrupts Gemma4 after reloading
+        # the original checkpoint. Direct model.load_weights keeps the update
+        # path identical to initial checkpoint loading while preserving the
+        # streaming NCCL transfer used by ART merged serving.
+        self._is_checkpoint_format = True
+        self._weight_update_active = True
+
+    def finish_weight_update(self: Any) -> None:
+        if not _is_gemma4_conditional_worker(self):
+            return original_finish_weight_update(self)
+        self._check_weight_transfer_engine()
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update must be called before finish_weight_update."
+            )
+        if not self._is_checkpoint_format:
+            return original_finish_weight_update(self)
+        self._weight_update_active = False
+        self._is_checkpoint_format = True
+
+    start_weight_update.__art_patched__ = True  # type: ignore[attr-defined]
+    start_weight_update.__art_original__ = original_start_weight_update  # type: ignore[attr-defined]
+    finish_weight_update.__art_patched__ = True  # type: ignore[attr-defined]
+    finish_weight_update.__art_original__ = original_finish_weight_update  # type: ignore[attr-defined]
+    Worker.start_weight_update = start_weight_update  # type: ignore[method-assign]
+    Worker.finish_weight_update = finish_weight_update  # type: ignore[method-assign]
 
 
 def _lora_cache_key(lora_request: Any) -> tuple[Any, ...]:

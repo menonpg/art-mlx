@@ -115,6 +115,61 @@ def test_runtime_patch_adds_gemma4_moe_topk_alias(artifact_dir: Path) -> None:
     assert json.loads(result.stdout.strip()) == {"num_experts_per_tok": 8}
 
 
+def test_runtime_patch_skips_gemma4_layerwise_weight_update_reload(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json; "
+                "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
+                "apply_vllm_runtime_patches(); "
+                "from vllm.v1.worker.gpu_worker import Worker; "
+                "HfConfig = type('HfConfig', (), {"
+                "'architectures': ['Gemma4ForConditionalGeneration']"
+                "}); "
+                "ModelConfig = type('ModelConfig', (), {'hf_config': HfConfig()}); "
+                "DummyWorker = type('DummyWorker', (), {"
+                "'model_config': ModelConfig(), "
+                "'_weight_update_active': False, "
+                "'_is_checkpoint_format': True, "
+                "'checks': 0, "
+                "'_check_weight_transfer_engine': "
+                "lambda self: setattr(self, 'checks', self.checks + 1)"
+                "}); "
+                "dummy = DummyWorker(); "
+                "Worker.start_weight_update(dummy, is_checkpoint_format=True); "
+                "active_after_start = dummy._weight_update_active; "
+                "Worker.finish_weight_update(dummy); "
+                "print(json.dumps({"
+                "'active_after_start': active_after_start, "
+                "'active_after_finish': dummy._weight_update_active, "
+                "'is_checkpoint_format': dummy._is_checkpoint_format, "
+                "'checks': dummy.checks"
+                "}))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "gemma4_weight_update_reload_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "gemma4_weight_update_reload_stderr.txt").write_text(result.stderr)
+    assert json.loads(result.stdout.strip()) == {
+        "active_after_start": True,
+        "active_after_finish": False,
+        "is_checkpoint_format": True,
+        "checks": 2,
+    }
+
+
 def test_runtime_patch_set_does_not_install_lora_monkey_patches() -> None:
     source = (
         ROOT / "vllm_runtime" / "src" / "art_vllm_runtime" / "patches.py"
