@@ -22,6 +22,7 @@ def apply_vllm_runtime_patches() -> None:
 def patch_transformers_v5_compat() -> None:
     _patch_rope_validation_ignore_keys()
     _patch_qwen3_vl_moe_tie_word_embeddings()
+    _patch_gemma4_moe_experts_per_tok_alias()
 
 
 def _patch_rope_validation_ignore_keys() -> None:
@@ -48,6 +49,20 @@ def _patch_qwen3_vl_moe_tie_word_embeddings() -> None:
     from transformers import Qwen3VLMoeTextConfig
 
     setattr(Qwen3VLMoeTextConfig, "tie_word_embeddings", False)
+
+
+def _patch_gemma4_moe_experts_per_tok_alias() -> None:
+    from transformers import Gemma4TextConfig
+
+    if hasattr(Gemma4TextConfig, "num_experts_per_tok"):
+        return
+
+    def num_experts_per_tok(self: Any) -> Any:
+        # vLLM's routed-expert sidecar uses the Mistral MoE field name, while
+        # HF Gemma4 stores the same router top-k value as top_k_experts.
+        return self.top_k_experts
+
+    Gemma4TextConfig.num_experts_per_tok = property(num_experts_per_tok)  # type: ignore[attr-defined]
 
 
 def subclass_chat_completion_request() -> None:
