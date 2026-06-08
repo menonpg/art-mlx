@@ -668,19 +668,29 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 
 
 def test_run_train_inf_mismatch_stage(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def _run_train_inf_mismatch(
+        *,
+        base_model: str,
+        allow_unvalidated_arch: bool,
+    ) -> SimpleNamespace:
+        seen["allow_unvalidated_arch"] = allow_unvalidated_arch
+        return SimpleNamespace(
+            passed=True,
+            artifact_dir="/tmp/train-inf-mismatch",
+            model_dump=lambda mode="json": {
+                "base_model": base_model,
+                "passed": True,
+                "passed_count": 1,
+                "failed_count": 0,
+            },
+        )
+
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_train_inf_mismatch=lambda *, base_model: SimpleNamespace(
-                passed=True,
-                artifact_dir="/tmp/train-inf-mismatch",
-                model_dump=lambda mode="json": {
-                    "base_model": base_model,
-                    "passed": True,
-                    "passed_count": 1,
-                    "failed_count": 0,
-                },
-            )
+            run_train_inf_mismatch=_run_train_inf_mismatch,
         ),
     )
 
@@ -691,11 +701,13 @@ def test_run_train_inf_mismatch_stage(monkeypatch) -> None:
             model_key="qwen3_5_moe",
             handler_key="qwen3_5_moe",
         ),
+        allow_unvalidated_arch=True,
     )
 
     assert result.name == "train_inf_mismatch"
     assert result.passed is True
     assert result.artifact_dir == "/tmp/train-inf-mismatch"
+    assert seen == {"allow_unvalidated_arch": True}
     assert result.metrics == {
         "base_model": "Qwen/Qwen3.5-35B-A3B",
         "passed": True,

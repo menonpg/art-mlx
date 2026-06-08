@@ -239,8 +239,11 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     import subprocess
 
     captured_env = {}
+    real_run = workflow_stage.subprocess.run
 
     def fake_run(*args, **kwargs):
+        if "env" not in kwargs:
+            return real_run(*args, **kwargs)
         captured_env.update(kwargs["env"])
         return subprocess.CompletedProcess(
             args=args,
@@ -252,8 +255,12 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
     monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
 
-    report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
+    report = workflow_stage.run_train_inf_mismatch(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        allow_unvalidated_arch=True,
+    )
 
     assert report.passed is True
     assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
+    assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
     assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"

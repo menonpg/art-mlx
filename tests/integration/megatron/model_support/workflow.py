@@ -417,11 +417,13 @@ def run_train_inf_mismatch_stage(
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
     del architecture
-    del allow_unvalidated_arch
     train_inf_mismatch = _import_integration_module(
         "integration.megatron.train_inf_mismatch.workflow_stage"
     )
-    report = train_inf_mismatch.run_train_inf_mismatch(base_model=base_model)
+    report = train_inf_mismatch.run_train_inf_mismatch(
+        base_model=base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     return ValidationStageResult(
         name="train_inf_mismatch",
         passed=report.passed,
