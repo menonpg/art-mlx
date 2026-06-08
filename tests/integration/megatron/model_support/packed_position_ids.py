@@ -858,20 +858,29 @@ def _run_packed_position_ids_worker(
                     ),
                     device=row_input_ids.device,
                 )
-                rotary_output = hooked_output[1]
-                checked, respected, repeated_count = _rotary_grouping_check(
-                    cast(torch.Tensor | None, rotary_output)
-                    if torch.is_tensor(rotary_output)
-                    else None,
-                    position_ids=row_position_ids,
+                row_checked = False
+                row_respected = True
+                row_repeated_count = 0
+                rotary_outputs = (
+                    runtime.model_support_handler.packed_position_rotary_outputs(
+                        hooked_output
+                    )
                 )
-                rotary_grouping_checked = rotary_grouping_checked or checked
-                rotary_grouping_respected = rotary_grouping_respected and respected
-                repeated_position_key_count += repeated_count
+                for rotary_output in rotary_outputs:
+                    checked, respected, repeated_count = _rotary_grouping_check(
+                        rotary_output,
+                        position_ids=row_position_ids,
+                    )
+                    row_checked = row_checked or checked
+                    row_respected = row_respected and respected
+                    row_repeated_count = repeated_count
+                rotary_grouping_checked = rotary_grouping_checked or row_checked
+                rotary_grouping_respected = rotary_grouping_respected and row_respected
+                repeated_position_key_count += row_repeated_count
                 _debug_log(
                     f"scenario {scenario_name} row={row_index} "
-                    f"checked={checked} respected={respected} "
-                    f"repeated_keys={repeated_count}"
+                    f"checked={row_checked} respected={row_respected} "
+                    f"repeated_keys={row_repeated_count}"
                 )
             (
                 completion_pair_count,
