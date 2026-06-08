@@ -76,6 +76,9 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         provider.recompute_num_layers = None
         provider.recompute_modules = ["core_attn"]
 
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        _install_gemma4_preprocess_patch(model_chunks)
+
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
             raise TypeError("Gemma 4 MoE handler received a dense provider")
@@ -412,6 +415,117 @@ def _patch_gemma4_qkv_for_hf_tied_value() -> None:
         _art_gemma4_get_query_key_value_tensors,
     )
     _GEMMA4_QKV_PATCHED = True
+
+
+def _build_absolute_rotary_pos_emb(
+    rotary_pos_emb: Any,
+    *,
+    max_position: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    cache = getattr(rotary_pos_emb, "_art_absolute_rotary_pos_emb_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(rotary_pos_emb, "_art_absolute_rotary_pos_emb_cache", cache)
+    cache_key = (str(device), max_position + 1)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    freqs = rotary_pos_emb.get_freqs_non_repeated(max_position + 1)
+    if not rotary_pos_emb.rotary_interleaved:
+        absolute_rotary_pos_emb = torch.cat((freqs, freqs), dim=-1)
+    else:
+        absolute_rotary_pos_emb = torch.stack(
+            (freqs.view(-1, 1), freqs.view(-1, 1)),
+            dim=-1,
+        ).view(freqs.shape[0], -1)
+    absolute_rotary_pos_emb = absolute_rotary_pos_emb[:, None, None, :].to(
+        device=device,
+        dtype=dtype,
+    )
+    cache[cache_key] = absolute_rotary_pos_emb
+    return absolute_rotary_pos_emb
+
+
+def _gather_absolute_rotary_pos_emb(
+    table_source: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    embedding_dim = int(table_source.shape[-1])
+    batch_size, sequence_length = position_ids.shape
+    gathered = table_source.view(table_source.shape[0], embedding_dim).index_select(
+        0,
+        position_ids.reshape(-1),
+    )
+    return (
+        gathered.view(batch_size, sequence_length, embedding_dim)
+        .permute(1, 0, 2)
+        .contiguous()
+        .unsqueeze(2)
+    )
+
+
+def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    for chunk in model_chunks:
+        module: Any = chunk
+        while hasattr(module, "module"):
+            module = module.module
+        gpt_module = (
+            module
+            if isinstance(module, GPTModel)
+            else cast(GPTModel, getattr(module, "language_model"))
+        )
+        preprocess = gpt_module._preprocess
+
+        def preprocess_hook(
+            *args: Any,
+            _gpt_module: Any = gpt_module,
+            _preprocess: Any = preprocess,
+            **kwargs: Any,
+        ) -> tuple[Any, ...]:
+            preproc_output = list(_preprocess(*args, **kwargs))
+            position_ids = kwargs.get("position_ids")
+            rotary_pos_emb = preproc_output[1]
+            if not isinstance(position_ids, torch.Tensor) or not isinstance(
+                rotary_pos_emb,
+                (tuple, list),
+            ):
+                return tuple(preproc_output)
+            local_table, global_table = rotary_pos_emb
+            if not torch.is_tensor(local_table) or not torch.is_tensor(global_table):
+                return tuple(preproc_output)
+            max_position = int(position_ids.max().item())
+            gemma4_rotary = getattr(_gpt_module, "rotary_pos_emb")
+            local_source = _build_absolute_rotary_pos_emb(
+                gemma4_rotary.rope_local,
+                max_position=max_position,
+                dtype=local_table.dtype,
+                device=local_table.device,
+            )
+            global_source = _build_absolute_rotary_pos_emb(
+                gemma4_rotary,
+                max_position=max_position,
+                dtype=global_table.dtype,
+                device=global_table.device,
+            )
+            preproc_output[1] = (
+                _gather_absolute_rotary_pos_emb(
+                    local_source,
+                    position_ids=position_ids,
+                ),
+                _gather_absolute_rotary_pos_emb(
+                    global_source,
+                    position_ids=position_ids,
+                ),
+            )
+            return tuple(preproc_output)
+
+        gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
 
 
 def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
