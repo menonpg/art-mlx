@@ -43,12 +43,13 @@ _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<lora>lora_[AB])\.weight$"
 )
 _MEGATRON_LAYER_RE = re.compile(r"(?:^|\.)layers\.(?P<layer>\d+)\.")
+_HF_TEXT_EXPERT_KEY_RE = re.compile(r"(?P<layer>\.layers\.\d+)\.experts")
 
 
 class Gemma4MoeHandler(DefaultMoeHandler):
     key = "gemma4_moe"
     is_moe = True
-    native_vllm_lora_status = "wip"
+    native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
@@ -137,6 +138,10 @@ class Gemma4MoeHandler(DefaultMoeHandler):
                     rank=rank,
                     alpha=alpha,
                 )
+                if (
+                    not target_set or {"q_proj", "k_proj", "v_proj"} & target_set
+                ) and _is_gemma4_global_layer(int(module.layer_number), provider):
+                    _tie_global_value_lora_to_key(module.self_attention)
                 wrap_grouped_moe_experts_3d(
                     _require_moe_experts(module),
                     adapter_model_prefix=adapter_model_prefix,
@@ -437,11 +442,17 @@ def _attention_provider_for_layer(provider: Any, module: Any) -> Any:
     return global_provider
 
 
+def _tie_global_value_lora_to_key(self_attention: Any) -> None:
+    linear_qkv = self_attention.linear_qkv
+    linear_qkv.v_proj_lora = linear_qkv.k_proj_lora
+
+
 def _to_vllm_key(key: str) -> str:
-    return key.replace(".mlp.shared_expert.", ".mlp.").replace(
+    key = key.replace(".mlp.shared_expert.", ".mlp.").replace(
         ".mlp.experts",
         ".moe.experts",
     )
+    return _HF_TEXT_EXPERT_KEY_RE.sub(r"\g<layer>.moe.experts", key)
 
 
 def _from_vllm_key(key: str) -> str:
@@ -504,7 +515,7 @@ def _to_vllm_lora_tensors(
         transformed = {_to_vllm_key(key): tensor for key, tensor in tensors.items()}
         if len(transformed) != len(tensors):
             raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
-        has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in tensors)
+        has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in transformed)
         return (
             transformed,
             _vllm_moe_config(adapter_config) if has_fused_experts else adapter_config,

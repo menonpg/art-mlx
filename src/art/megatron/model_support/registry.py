@@ -138,7 +138,9 @@ GEMMA4_MOE_SPEC = ModelSupportSpec(
         "google/gemma-4-26B-A4B-it",
     ),
     default_target_modules=_GEMMA4_MOE_TARGET_MODULES,
-    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    default_rollout_weights_mode="merged",
+    # vLLM has Gemma4 LoRA coverage for non-MoE paths, but not Gemma4 26B-A4B MoE.
+    native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         transformers="5.6.2",
         megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
