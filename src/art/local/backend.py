@@ -1145,6 +1145,7 @@ class LocalBackend(Backend):
                     chat_template_kwargs=chat_template_kwargs,
                     chat_template_tool_schema_format=chat_template_tool_schema_format,
                     max_seq_length=max_seq_length,
+                    train_on=config.train_on,
                 )
             )
 

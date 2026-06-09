@@ -8,7 +8,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from art.preprocessing.tokenize import tokenize_sft_batch, tokenize_trajectory
 from art.trajectories import History, Trajectory
-from art.types import MessagesAndChoices
+from art.types import MessagesAndChoices, TrainSFTConfig
 
 if "tests" not in sys.path:
     sys.path.insert(0, "tests")
@@ -228,6 +228,85 @@ def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> No
     trainable_token_ids = [token_id for token_id in labels if token_id != -100]
     assert tokenizer.decode(trainable_token_ids) == "OK"
     assert batch.num_trainable_tokens == 2
+
+
+def test_tokenize_sft_batch_trains_all_assistant_spans_by_default() -> None:
+    tokenizer = _FakeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "First"},
+            {"role": "user", "content": "Again"},
+            {"role": "assistant", "content": "Final"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        instruction_part="<user>",
+        response_part="<assistant>",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    trainable_token_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(trainable_token_ids) == "FirstFinal"
+
+
+def test_tokenize_sft_batch_can_train_only_last_assistant_span() -> None:
+    tokenizer = _FakeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "First"},
+            {"role": "user", "content": "Again"},
+            {"role": "assistant", "content": "Final"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        instruction_part="<user>",
+        response_part="<assistant>",
+        train_on="last_assistant",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    trainable_token_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(trainable_token_ids) == "Final"
+    assert batch.num_trainable_tokens == len("Final")
+
+
+def test_train_sft_config_accepts_last_assistant_mode() -> None:
+    config = TrainSFTConfig(train_on="last_assistant")
+
+    assert config.train_on == "last_assistant"
+
+
+def test_tokenize_sft_batch_rejects_unknown_train_on_mode() -> None:
+    tokenizer = _FakeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "OK"},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Unknown SFT train_on mode"):
+        tokenize_sft_batch(
+            trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
+            learning_rate=1e-5,
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            instruction_part="<user>",
+            response_part="<assistant>",
+            train_on="last_user",  # type: ignore[arg-type]
+        )
 
 
 def test_tokenize_trajectory_does_not_continue_real_completion_with_thinking() -> None:

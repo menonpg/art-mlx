@@ -41,6 +41,7 @@ class TrainSFTConfig(pydantic.BaseModel):
     learning_rate: float | list[float] = 5e-5  # Single value or per-batch list
     batch_size: int | Literal["auto"] = "auto"
     megatron_topology: MegatronTopologyConfig | None = None
+    train_on: Literal["all_assistant", "last_assistant"] = "all_assistant"
 
 
 Verbosity = Literal[0, 1, 2]

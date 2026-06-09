@@ -32,6 +32,7 @@ from .response_masking import response_only_labels, token_ids_for_template_part
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+SFTTrainOn = Literal["all_assistant", "last_assistant"]
 
 
 def _chat_template_kwargs(
@@ -227,6 +228,26 @@ def _validate_max_seq_length(max_seq_length: int | None) -> None:
         return
     if max_seq_length < 1:
         raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
+
+
+def _last_trainable_span_labels(labels: list[int]) -> list[int]:
+    final_span: tuple[int, int] | None = None
+    start: int | None = None
+    for index, label in enumerate(labels):
+        if label != -100 and start is None:
+            start = index
+        elif label == -100 and start is not None:
+            final_span = (start, index)
+            start = None
+    if start is not None:
+        final_span = (start, len(labels))
+    if final_span is None:
+        return labels
+
+    masked_labels = [-100] * len(labels)
+    span_start, span_end = final_span
+    masked_labels[span_start:span_end] = labels[span_start:span_end]
+    return masked_labels
 
 
 def _apply_chat_template_token_ids(
@@ -598,6 +619,7 @@ def tokenize_sft_batch(
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     max_seq_length: int | None = None,
+    train_on: SFTTrainOn = "all_assistant",
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -614,6 +636,8 @@ def tokenize_sft_batch(
         SFTBatch object for this batch
     """
     _validate_max_seq_length(max_seq_length)
+    if train_on not in ("all_assistant", "last_assistant"):
+        raise ValueError(f"Unknown SFT train_on mode: {train_on}")
 
     instruction_ids = token_ids_for_template_part(tokenizer, instruction_part)
     response_ids = token_ids_for_template_part(tokenizer, response_part)
@@ -653,6 +677,8 @@ def tokenize_sft_batch(
             instruction_ids=instruction_ids,
             response_ids=response_ids,
         )
+        if train_on == "last_assistant":
+            labels = _last_trainable_span_labels(labels)
 
         trajectory_tensors.append(
             {
