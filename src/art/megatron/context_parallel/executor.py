@@ -29,6 +29,7 @@ from .range_ops import (
 from .types import (
     ArtContextParallelState,
     AttnSlice,
+    CpBlockMaskVariant,
     DkvReducePlan,
     ExactMaskMetadata,
     FlexMaskSpec,
@@ -648,6 +649,7 @@ def _build_stage_block_mask(
     device: torch.device,
     execution_spec: StageExecutionSpec | None = None,
     block_size: SparseBlockSize | None = None,
+    sliding_window: int | None = None,
 ) -> BlockMask | None:
     resolved_block_size = normalize_sparse_block_size(
         state.config.block_size if block_size is None else block_size
@@ -666,6 +668,7 @@ def _build_stage_block_mask(
         int(execution_spec.q_len),
         int(execution_spec.k_len),
         resolved_block_size,
+        None if sliding_window is None else int(sliding_window),
         device.type,
         device.index,
     )
@@ -692,6 +695,8 @@ def _build_stage_block_mask(
         ),
         group_ids=state.group_ids,
         parent_ids=state.parent_ids,
+        input_pos=state.input_pos,
+        sliding_window=sliding_window,
         device=device,
     )
     cache[cache_key] = mask
@@ -703,20 +708,29 @@ def prepare_context_parallel_execution_state(
     state: ArtContextParallelState,
     device: torch.device,
 ) -> None:
+    variants = state.block_mask_variants or (
+        CpBlockMaskVariant(
+            sliding_window=None,
+            block_size=normalize_sparse_block_size(state.config.block_size),
+        ),
+    )
     for stage_plan in state.rank_plan.stage_plans:
         if stage_plan.q_len <= 0 or stage_plan.k_len <= 0 or not stage_plan.slices:
             continue
-        execution_spec = _resolve_stage_execution_spec(
-            stage_plan=stage_plan,
-            state=state,
-        )
-        _build_stage_block_mask(
-            stage_plan=stage_plan,
-            state=state,
-            device=device,
-            execution_spec=execution_spec,
-            block_size=state.config.block_size,
-        )
+        for variant in variants:
+            execution_spec = _resolve_stage_execution_spec(
+                stage_plan=stage_plan,
+                state=state,
+                block_size=variant.block_size,
+            )
+            _build_stage_block_mask(
+                stage_plan=stage_plan,
+                state=state,
+                device=device,
+                execution_spec=execution_spec,
+                block_size=variant.block_size,
+                sliding_window=variant.sliding_window,
+            )
 
 
 def _causal_slice_pair_count(slice_: AttnSlice) -> int:
@@ -867,6 +881,7 @@ def _run_stage_attention(
     kernel: FlexAttentionKernel,
     scale: float,
     enable_gqa: bool,
+    sliding_window: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sparse_block_size = _stage_sparse_block_size(q_stage, v_stage)
     execution_spec = _resolve_stage_execution_spec(
@@ -880,6 +895,7 @@ def _run_stage_attention(
         device=q_stage.device,
         execution_spec=execution_spec,
         block_size=sparse_block_size,
+        sliding_window=sliding_window,
     )
     if block_mask is None:
         raise RuntimeError(
@@ -927,12 +943,16 @@ def _run_stage_attention(
         out_tokens = out.squeeze(0)
         lse_tokens = lse.squeeze(0).to(dtype=torch.float32)
         return (
-            out_tokens[:, :logical_q_len]
-            if int(execution_spec.q_len) == logical_q_len
-            else out_tokens[:, :logical_q_len].contiguous(),
-            lse_tokens[:, :logical_q_len]
-            if int(execution_spec.q_len) == logical_q_len
-            else lse_tokens[:, :logical_q_len].contiguous(),
+            (
+                out_tokens[:, :logical_q_len]
+                if int(execution_spec.q_len) == logical_q_len
+                else out_tokens[:, :logical_q_len].contiguous()
+            ),
+            (
+                lse_tokens[:, :logical_q_len]
+                if int(execution_spec.q_len) == logical_q_len
+                else lse_tokens[:, :logical_q_len].contiguous()
+            ),
         )
     out_tokens = out.squeeze(0).permute(1, 0, 2).contiguous()
     lse_tokens = lse.squeeze(0).permute(1, 0).contiguous().to(dtype=torch.float32)
@@ -1432,6 +1452,7 @@ def _forward_stage_records(
     kernel: FlexAttentionKernel,
     scale: float,
     enable_gqa: bool,
+    sliding_window: int | None,
     record_for_backward: bool,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     q_source = q_flat.detach() if record_for_backward else q_flat
@@ -1526,6 +1547,7 @@ def _forward_stage_records(
                 kernel=kernel,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                sliding_window=sliding_window,
             )
             replay_records.append(
                 {
@@ -1547,6 +1569,7 @@ def _forward_stage_records(
                 kernel=kernel,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                sliding_window=sliding_window,
             )
         stage_out_value = stage_out.detach() if record_for_backward else stage_out
         stage_lse_value = stage_lse.detach() if record_for_backward else stage_lse
@@ -1655,6 +1678,7 @@ def _forward_stage_records(
                     kernel=kernel,
                     scale=scale,
                     enable_gqa=enable_gqa,
+                    sliding_window=sliding_window,
                 )
                 replay_records.append(
                     {
@@ -1676,6 +1700,7 @@ def _forward_stage_records(
                     kernel=kernel,
                     scale=scale,
                     enable_gqa=enable_gqa,
+                    sliding_window=sliding_window,
                 )
             stage_out_value = stage_out.detach() if record_for_backward else stage_out
             stage_lse_value = stage_lse.detach() if record_for_backward else stage_lse
@@ -1740,9 +1765,10 @@ def _forward_stage_records(
 
     if not produced_output:
         if int(q_flat.shape[1]) == 0:
-            return q_flat.new_empty(
-                (q_flat.shape[0], 0, q_flat.shape[2])
-            ), replay_records
+            return (
+                q_flat.new_empty((q_flat.shape[0], 0, q_flat.shape[2])),
+                replay_records,
+            )
         raise RuntimeError("Sparse attention produced no stage outputs")
     if accum_out is None:
         raise RuntimeError("Sparse attention produced no accumulated output")
@@ -1772,6 +1798,7 @@ def _run_context_parallel_forward(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None,
 ) -> torch.Tensor:
     kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
     q_flat, k_flat, v_flat = _flatten_qkv(
@@ -1788,6 +1815,7 @@ def _run_context_parallel_forward(
         kernel=kernel,
         scale=scale,
         enable_gqa=enable_gqa,
+        sliding_window=sliding_window,
         record_for_backward=False,
     )
     return unflatten_valid_sequence_head_major(
@@ -1806,6 +1834,7 @@ def _run_context_parallel_forward_recorded(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
     q_flat, k_flat, v_flat = _flatten_qkv(
@@ -1822,6 +1851,7 @@ def _run_context_parallel_forward_recorded(
         kernel=kernel,
         scale=scale,
         enable_gqa=enable_gqa,
+        sliding_window=sliding_window,
         record_for_backward=True,
     )
     return (
@@ -1903,6 +1933,7 @@ def _run_context_parallel_backward(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None,
     replay_records: list[dict[str, Any]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     kernel = FlexAttentionKernel(compile_enabled=compile_enabled)
@@ -1926,6 +1957,7 @@ def _run_context_parallel_backward(
             kernel=kernel,
             scale=scale,
             enable_gqa=enable_gqa,
+            sliding_window=sliding_window,
             record_for_backward=True,
         )
     stage_out_grads, stage_lse_grads = _merge_stage_output_grads_from_tape(
@@ -1945,12 +1977,16 @@ def _run_context_parallel_backward(
     ):
         stage_plan = cast(StagePlan, record["stage_plan"])
         grad_by_stage_index[int(stage_plan.stage_index)] = (
-            _zero_stage_grads_like(record["stage_out"])
-            if stage_out_grad is None
-            else stage_out_grad,
-            _zero_stage_grads_like(record["stage_lse"])
-            if stage_lse_grad is None
-            else stage_lse_grad,
+            (
+                _zero_stage_grads_like(record["stage_out"])
+                if stage_out_grad is None
+                else stage_out_grad
+            ),
+            (
+                _zero_stage_grads_like(record["stage_lse"])
+                if stage_lse_grad is None
+                else stage_lse_grad
+            ),
         )
     del stage_out_grads, stage_lse_grads
 
@@ -2152,11 +2188,13 @@ class ArtContextParallelFn(torch.autograd.Function):
         scale: float,
         enable_gqa: bool,
         compile_enabled: bool,
+        sliding_window: int | None,
     ) -> torch.Tensor:
         ctx.state = state
         ctx.scale = float(scale)
         ctx.enable_gqa = bool(enable_gqa)
         ctx.compile_enabled = bool(compile_enabled)
+        ctx.sliding_window = sliding_window
         ctx.save_for_backward(query, key, value)
         with torch.enable_grad():
             query_record = query.detach().requires_grad_(bool(query.requires_grad))
@@ -2171,6 +2209,7 @@ class ArtContextParallelFn(torch.autograd.Function):
                     scale=float(scale),
                     enable_gqa=bool(enable_gqa),
                     compile_enabled=bool(compile_enabled),
+                    sliding_window=sliding_window,
                 )
             )
         ctx.replay_records = replay_records
@@ -2190,11 +2229,12 @@ class ArtContextParallelFn(torch.autograd.Function):
                 scale=ctx.scale,
                 enable_gqa=ctx.enable_gqa,
                 compile_enabled=ctx.compile_enabled,
+                sliding_window=ctx.sliding_window,
                 replay_records=cast(list[dict[str, Any]], ctx.replay_records),
             )
         finally:
             ctx.replay_records = None
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 def run_context_parallel(
@@ -2206,6 +2246,7 @@ def run_context_parallel(
     scale: float,
     enable_gqa: bool,
     compile_enabled: bool,
+    sliding_window: int | None = None,
 ) -> torch.Tensor:
     if torch.is_grad_enabled() and (
         query.requires_grad or key.requires_grad or value.requires_grad
@@ -2218,6 +2259,7 @@ def run_context_parallel(
             float(scale),
             bool(enable_gqa),
             bool(compile_enabled),
+            None if sliding_window is None else int(sliding_window),
         )
     return _run_context_parallel_forward(
         query=query,
@@ -2227,4 +2269,5 @@ def run_context_parallel(
         scale=scale,
         enable_gqa=enable_gqa,
         compile_enabled=compile_enabled,
+        sliding_window=sliding_window,
     )

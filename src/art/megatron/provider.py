@@ -139,10 +139,15 @@ def _art_flex_core_attention(config: object) -> object:
             ArtContextParallelCoreAttention,
         )
 
-        return ArtContextParallelCoreAttention
-    from art.megatron.flex_attn.attention import FlexDotProductAttention
+        base_core_attention = ArtContextParallelCoreAttention
+    else:
+        from art.megatron.flex_attn.attention import FlexDotProductAttention
 
-    return FlexDotProductAttention
+        base_core_attention = FlexDotProductAttention
+    wrapper = getattr(config, "art_flex_core_attention_wrapper", None)
+    if wrapper is None:
+        return base_core_attention
+    return wrapper(config, base_core_attention)
 
 
 def _runtime_context_parallel_size() -> int:

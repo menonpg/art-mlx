@@ -8,7 +8,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -21,6 +21,12 @@ class SharedPrefixAttentionState(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     block_mask: BlockMask
+    sliding_block_masks: dict[int, BlockMask] = Field(default_factory=dict)
+
+    def block_mask_for_window(self, window: int | None) -> BlockMask:
+        if window is None:
+            return self.block_mask
+        return self.sliding_block_masks[int(window)]
 
 
 class FlexAttentionWrapper(torch.nn.Module):
@@ -59,6 +65,9 @@ _compiled_create_block_mask = torch.compile(
 def create_shared_prefix_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
+    *,
+    input_pos: Tensor | None = None,
+    sliding_windows: tuple[int, ...] = (),
 ) -> SharedPrefixAttentionState:
     """Build a compiled block mask for ART shared-prefix packing.
 
@@ -75,23 +84,52 @@ def create_shared_prefix_attention_state(
         query_idx: Tensor,
         kv_idx: Tensor,
     ) -> Tensor:
-        del head_idx
+        del batch_idx, head_idx
         # Token q can attend token k if k is causal and either from the same
         # traj (traj -> traj)/within the shared prefix (prefix -> prefix) (same_group)
         # or from the prefix which q uses (traj -> prefix) (parent_prefix).
-        same_group = group_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
-        parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
+        same_group = group_ids[0, query_idx] == group_ids[0, kv_idx]
+        parent_prefix = parent_ids[0, query_idx] == group_ids[0, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
+
+    def _sliding_shared_prefix_mask(window: int):
+        def mask(
+            batch_idx: Tensor,
+            head_idx: Tensor,
+            query_idx: Tensor,
+            kv_idx: Tensor,
+        ) -> Tensor:
+            del batch_idx, head_idx
+            same_group = group_ids[0, query_idx] == group_ids[0, kv_idx]
+            parent_prefix = parent_ids[0, query_idx] == group_ids[0, kv_idx]
+            delta = input_pos[0, query_idx] - input_pos[0, kv_idx]  # type: ignore[index]
+            return (same_group | parent_prefix) & (delta >= 0) & (delta < window)
+
+        return mask
 
     block_mask = _compiled_create_block_mask(
         _shared_prefix_mask,
-        group_ids.shape[0],
+        1,
         None,
         group_ids.shape[1],
         group_ids.shape[1],
         device=group_ids.device,
     )
-    return SharedPrefixAttentionState(block_mask=block_mask)
+    sliding_block_masks = {
+        window: _compiled_create_block_mask(
+            _sliding_shared_prefix_mask(window),
+            1,
+            None,
+            group_ids.shape[1],
+            group_ids.shape[1],
+            device=group_ids.device,
+        )
+        for window in tuple(dict.fromkeys(int(window) for window in sliding_windows))
+    }
+    return SharedPrefixAttentionState(
+        block_mask=block_mask,
+        sliding_block_masks=sliding_block_masks,
+    )
 
 
 class FlexDotProductAttention(torch.nn.Module):
@@ -112,13 +150,8 @@ class FlexDotProductAttention(torch.nn.Module):
         pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
-        del (
-            layer_number,
-            attn_mask_type,
-            attention_type,
-            attention_dropout,
-            cp_comm_type,
-        )
+        del attn_mask_type, attention_type, attention_dropout, cp_comm_type
+        self.layer_number = int(layer_number)
         self.config = config
         self.flex_attention = FlexAttentionWrapper()
 
@@ -171,7 +204,9 @@ class FlexDotProductAttention(torch.nn.Module):
         )
 
         if isinstance(attention_bias, SharedPrefixAttentionState):
-            block_mask = attention_bias.block_mask
+            block_mask = attention_bias.block_mask_for_window(
+                getattr(self, "art_sliding_window", None)
+            )
         else:
             assert isinstance(attention_bias, BlockMask), (
                 "Expected a flex BlockMask in attention_bias."

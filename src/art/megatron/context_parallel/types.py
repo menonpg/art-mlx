@@ -230,6 +230,13 @@ class ContextParallelExecutionCache(BaseModel):
     stage_execution_specs: dict[Any, "StageExecutionSpec"] = Field(default_factory=dict)
 
 
+class CpBlockMaskVariant(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    sliding_window: int | None = None
+    block_size: tuple[int, int]
+
+
 class StageExecutionSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -265,6 +272,8 @@ class ArtContextParallelState(BaseModel):
     config: ContextParallelConfig
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
+    input_pos: torch.Tensor
+    block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
     gdn_execution_spec: Any | None = None
     gdn_execution_plan: Any | None = None
     gdn_hidden_layout: str = "attention"

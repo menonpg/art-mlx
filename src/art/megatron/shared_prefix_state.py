@@ -49,6 +49,8 @@ def create_shared_prefix_state(
     group_ids: Tensor,
     parent_ids: Tensor,
     *,
+    input_pos: Tensor | None = None,
+    sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool = False,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
@@ -62,24 +64,52 @@ def create_shared_prefix_state(
         query_idx: Tensor,
         kv_idx: Tensor,
     ) -> Tensor:
-        del head_idx
-        same_group = group_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
-        parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
+        del batch_idx, head_idx
+        same_group = group_ids[0, query_idx] == group_ids[0, kv_idx]
+        parent_prefix = parent_ids[0, query_idx] == group_ids[0, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
 
+    def _sliding_shared_prefix_mask(window: int):
+        def mask(
+            batch_idx: Tensor,
+            head_idx: Tensor,
+            query_idx: Tensor,
+            kv_idx: Tensor,
+        ) -> Tensor:
+            del batch_idx, head_idx
+            same_group = group_ids[0, query_idx] == group_ids[0, kv_idx]
+            parent_prefix = parent_ids[0, query_idx] == group_ids[0, kv_idx]
+            delta = input_pos[0, query_idx] - input_pos[0, kv_idx]  # type: ignore[index]
+            return (same_group | parent_prefix) & (delta >= 0) & (delta < window)
+
+        return mask
+
+    block_size = _shared_prefix_block_size(
+        group_ids.device,
+        attention_head_dim=attention_head_dim,
+        attention_value_head_dim=attention_value_head_dim,
+    )
     block_mask = _compiled_create_block_mask(
         _shared_prefix_mask,
-        group_ids.shape[0],
+        1,
         None,
         group_ids.shape[1],
         group_ids.shape[1],
         device=group_ids.device,
-        BLOCK_SIZE=_shared_prefix_block_size(
-            group_ids.device,
-            attention_head_dim=attention_head_dim,
-            attention_value_head_dim=attention_value_head_dim,
-        ),
+        BLOCK_SIZE=block_size,
     )
+    sliding_block_masks = {
+        window: _compiled_create_block_mask(
+            _sliding_shared_prefix_mask(window),
+            1,
+            None,
+            group_ids.shape[1],
+            group_ids.shape[1],
+            device=group_ids.device,
+            BLOCK_SIZE=block_size,
+        )
+        for window in tuple(dict.fromkeys(int(window) for window in sliding_windows))
+    }
     cp_rank, cp_size, cp_group = _gdn_cp_rank_size_group()
     gdn_execution_spec = _build_gdn_execution_spec_once(
         group_ids,
@@ -91,6 +121,7 @@ def create_shared_prefix_state(
     )
     return SharedPrefixAttentionState(
         block_mask=block_mask,
+        sliding_block_masks=sliding_block_masks,
         group_ids=group_ids,
         parent_ids=parent_ids,
         gdn_execution_spec=gdn_execution_spec,

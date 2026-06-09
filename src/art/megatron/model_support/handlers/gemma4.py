@@ -70,6 +70,13 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         _patch_gemma4_router_for_mcore()
         _patch_gemma4_rotary_for_hf_proportional()
         _patch_gemma4_qkv_for_hf_tied_value()
+        window_size = int(getattr(provider, "window_size", 1024))
+        provider.art_flex_core_attention_wrapper = _gemma4_flex_core_attention_wrapper
+        provider.art_flex_sliding_windows = (window_size,)
+        provider.art_flex_head_dims_by_window = {
+            None: int(getattr(provider, "global_head_dim", provider.kv_channels)),
+            window_size: int(provider.kv_channels),
+        }
         provider.moe_shared_expert_overlap = False
         provider.recompute_granularity = "selective"
         provider.recompute_method = None
@@ -538,6 +545,9 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
 
 
 def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:
+    layer_types = getattr(provider, "art_gemma4_layer_types", None)
+    if layer_types is not None:
+        return layer_types[int(layer_number) - 1] == "full_attention"
     sliding_count, global_count = _gemma4_attention_pattern(provider)
     if global_count <= 0:
         return False
@@ -545,6 +555,32 @@ def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:
     if cycle <= 0:
         return False
     return (layer_number - 1) % cycle >= sliding_count
+
+
+def _gemma4_sliding_window_for_layer(provider: Any, layer_number: int) -> int | None:
+    if _is_gemma4_global_layer(int(layer_number), provider):
+        return None
+    return int(provider.window_size)
+
+
+def _gemma4_flex_core_attention_wrapper(
+    provider: Any, base_cls: type[Any]
+) -> type[Any]:
+    class Gemma4ArtFlexCoreAttention(base_cls):  # type: ignore[misc, valid-type]
+        def __init__(
+            self,
+            config: Any,
+            layer_number: int,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(config, layer_number, *args, **kwargs)
+            self.art_sliding_window = _gemma4_sliding_window_for_layer(
+                provider,
+                layer_number,
+            )
+
+    return Gemma4ArtFlexCoreAttention
 
 
 def _attention_provider_for_layer(provider: Any, module: Any) -> Any:
@@ -1146,9 +1182,11 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
                 if v_name not in hf_state_dict:
                     k_name = hf_param["k"]
                     return {
-                        role: hf_state_dict[k_name].clone()
-                        if role == "v"
-                        else hf_state_dict[name]
+                        role: (
+                            hf_state_dict[k_name].clone()
+                            if role == "v"
+                            else hf_state_dict[name]
+                        )
                         for role, name in hf_param.items()
                     }
             if isinstance(hf_param, dict) and "gate" in hf_param:
@@ -1208,6 +1246,7 @@ def ensure_gemma4_text_only_bridge_registered() -> None:
                 )
             layer_types = getattr(text_config, "layer_types", None)
             if layer_types:
+                setattr(provider, "art_gemma4_layer_types", tuple(layer_types))
                 provider.interleaved_attn_pattern = _infer_attn_pattern(layer_types)
 
             provider.num_moe_experts = getattr(text_config, "num_experts", 128)

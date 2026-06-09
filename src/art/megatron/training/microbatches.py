@@ -11,10 +11,12 @@ from art.loss import LossInputs, shift_tensor
 from art.megatron.context_parallel.runtime import prepare_cp_micro
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
+    CpBlockMaskVariant,
     DispatchedPackedTensors,
     ParallelTopology,
     PreparedMegatronBatch,
 )
+from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
@@ -174,9 +176,11 @@ def select_micro_inputs(
     zero_template: PackedTensors,
 ) -> list[PackedTensors]:
     return [
-        _clone_packed_tensors(zero_template)
-        if sample_index is None
-        else select_indexed_inputs(packed_tensors, sample_index)
+        (
+            _clone_packed_tensors(zero_template)
+            if sample_index is None
+            else select_indexed_inputs(packed_tensors, sample_index)
+        )
         for sample_index in sample_indices
     ]
 
@@ -187,9 +191,11 @@ def select_sft_micro_inputs(
     zero_template: dict[str, torch.Tensor],
 ) -> list[dict[str, torch.Tensor]]:
     return [
-        _clone_sft_tensors(zero_template)
-        if sample_index is None
-        else _clone_sft_tensors(trajectory_tensors[sample_index])
+        (
+            _clone_sft_tensors(zero_template)
+            if sample_index is None
+            else _clone_sft_tensors(trajectory_tensors[sample_index])
+        )
         for sample_index in sample_indices
     ]
 
@@ -237,10 +243,61 @@ def _local_trainable_token_count_tensor(
     return torch.tensor([local_token_total], device=device, dtype=torch.float32)
 
 
+def _art_flex_sliding_windows(provider: Any) -> tuple[int, ...]:
+    return tuple(
+        dict.fromkeys(
+            int(window) for window in getattr(provider, "art_flex_sliding_windows", ())
+        )
+    )
+
+
+def _art_flex_cp_block_mask_variants(
+    provider: Any,
+    device: torch.device,
+) -> tuple[CpBlockMaskVariant, ...]:
+    head_dims = getattr(provider, "art_flex_head_dims_by_window", {})
+    value_head_dims = getattr(provider, "art_flex_value_head_dims_by_window", {})
+    default_head_dim = getattr(provider, "kv_channels", None)
+    variants: list[CpBlockMaskVariant] = []
+    seen: set[tuple[int | None, tuple[int, int]]] = set()
+    for window in (None, *_art_flex_sliding_windows(provider)):
+        head_dim = (
+            head_dims.get(window, default_head_dim)
+            if isinstance(head_dims, dict)
+            else default_head_dim
+        )
+        value_head_dim = (
+            value_head_dims.get(window, head_dim)
+            if isinstance(value_head_dims, dict)
+            else head_dim
+        )
+        block_size = (
+            (128, 128)
+            if head_dim is None
+            else flash_sparse_block_size_for_head_dim(
+                head_dim=int(head_dim),
+                head_dim_v=int(head_dim if value_head_dim is None else value_head_dim),
+                device=device,
+            )
+        )
+        key = (None if window is None else int(window), block_size)
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(
+            CpBlockMaskVariant(
+                sliding_window=None if window is None else int(window),
+                block_size=block_size,
+            )
+        )
+    return tuple(variants)
+
+
 def _causal_attention_state(
     seq_len: int,
     device: torch.device,
     *,
+    sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
@@ -250,6 +307,8 @@ def _causal_attention_state(
     return create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        input_pos=torch.arange(seq_len, dtype=torch.int64, device=device).unsqueeze(0),
+        sliding_windows=sliding_windows,
         build_gdn_execution_spec=build_gdn_execution_spec,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
@@ -290,6 +349,8 @@ def _prepare_dense_rl_micro(
         attention_state=create_shared_prefix_state(
             group_ids=micro["group_ids"],
             parent_ids=micro["parent_ids"],
+            input_pos=micro["input_pos"],
+            sliding_windows=_art_flex_sliding_windows(provider),
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
@@ -307,6 +368,7 @@ def _prepare_rl_cp_micro_full(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None,
@@ -327,6 +389,7 @@ def _prepare_rl_cp_micro_full(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
         trace_token_uids=trace_token_uids,
+        block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
         ref_logprobs=ref_logprobs,
     )
@@ -344,9 +407,9 @@ def _prepared_rl_micro_from_cp_batch(
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         loss_inputs=prepared.tensors,
-        ref_logprobs=prepared.tensors.ref_logprobs
-        if ref_logprobs is not None
-        else None,
+        ref_logprobs=(
+            prepared.tensors.ref_logprobs if ref_logprobs is not None else None
+        ),
         local_token_uids=prepared.tensors.token_uids,
     )
 
@@ -400,6 +463,7 @@ def _prepare_current_rl_micro(
             micro,
             device=device,
             topology=topology,
+            provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
             ref_logprobs=ref_logprobs,
@@ -412,6 +476,7 @@ def _prepare_next_rl_cp_micro(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None = None,
@@ -422,6 +487,7 @@ def _prepare_next_rl_cp_micro(
         next_micro,
         device=device,
         topology=topology,
+        provider=provider,
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
         ref_logprobs=ref_logprobs,
@@ -472,6 +538,7 @@ def _prepare_dense_sft_micro(
         attention_state=_causal_attention_state(
             seq_len,
             device,
+            sliding_windows=_art_flex_sliding_windows(provider),
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
@@ -528,6 +595,7 @@ def _prepare_sft_cp_micro_full(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
 ) -> PreparedMegatronBatch:
@@ -551,6 +619,7 @@ def _prepare_sft_cp_micro_full(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
         trace_token_uids=trace_token_uids,
+        block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
     )
 
@@ -596,6 +665,7 @@ def _prepare_current_sft_micro(
             micro,
             device=device,
             topology=topology,
+            provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
         )
@@ -607,6 +677,7 @@ def _prepare_next_sft_cp_micro(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
 ) -> PreparedMegatronBatch | None:
@@ -616,6 +687,7 @@ def _prepare_next_sft_cp_micro(
         next_micro,
         device=device,
         topology=topology,
+        provider=provider,
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
     )
