@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -47,6 +48,27 @@ class _FakeAsyncioProcess:
     async def wait(self) -> int:
         await asyncio.Event().wait()
         return 0
+
+
+def test_megatron_default_lora_adapter_config_uses_model_lora_config(
+    tmp_path: Path,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
+        },
+        output_dir=str(tmp_path),
+    )
+
+    config = service._default_lora_adapter_config()
+
+    assert config.r == 8
+    assert config.target_modules == {"q_proj", "down_proj"}
 
 
 @pytest.mark.asyncio
@@ -230,6 +252,10 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
             "trainer_gpu_ids": [0],
             "inference_gpu_ids": [1],
             "rollout_weights_mode": "lora",
+            "lora_config": {
+                "rank": 8,
+                "target_modules": ["q_proj", "down_proj"],
+            },
         },
         output_dir=str(tmp_path),
     )
@@ -271,5 +297,11 @@ async def test_megatron_worker_uses_active_python_for_torchrun(
     ]
     assert "uv run" not in command
     assert recorded["cwd"] == str(Path(__file__).resolve().parents[4])
+    env = cast(dict[str, str], recorded["env"])
+    assert env["ART_MEGATRON_LORA_RANK"] == "8"
+    assert json.loads(env["ART_MEGATRON_LORA_TARGET_MODULES"]) == [
+        "q_proj",
+        "down_proj",
+    ]
     service._child_processes.close()
     service._megatron_log_file.close()

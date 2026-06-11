@@ -71,6 +71,7 @@ def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTe
         },
         pixel_values=[None],
         image_grid_thw=[None],
+        moe_routing_replay=None,
     )
 
 
@@ -84,6 +85,7 @@ def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
         },
         pixel_values=[None],
         image_grid_thw=[None],
+        moe_routing_replay=None,
     )
 
 
@@ -174,9 +176,11 @@ def select_micro_inputs(
     zero_template: PackedTensors,
 ) -> list[PackedTensors]:
     return [
-        _clone_packed_tensors(zero_template)
-        if sample_index is None
-        else select_indexed_inputs(packed_tensors, sample_index)
+        (
+            _clone_packed_tensors(zero_template)
+            if sample_index is None
+            else select_indexed_inputs(packed_tensors, sample_index)
+        )
         for sample_index in sample_indices
     ]
 
@@ -187,9 +191,11 @@ def select_sft_micro_inputs(
     zero_template: dict[str, torch.Tensor],
 ) -> list[dict[str, torch.Tensor]]:
     return [
-        _clone_sft_tensors(zero_template)
-        if sample_index is None
-        else _clone_sft_tensors(trajectory_tensors[sample_index])
+        (
+            _clone_sft_tensors(zero_template)
+            if sample_index is None
+            else _clone_sft_tensors(trajectory_tensors[sample_index])
+        )
         for sample_index in sample_indices
     ]
 
@@ -344,9 +350,9 @@ def _prepared_rl_micro_from_cp_batch(
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         loss_inputs=prepared.tensors,
-        ref_logprobs=prepared.tensors.ref_logprobs
-        if ref_logprobs is not None
-        else None,
+        ref_logprobs=(
+            prepared.tensors.ref_logprobs if ref_logprobs is not None else None
+        ),
         local_token_uids=prepared.tensors.token_uids,
     )
 
