@@ -184,7 +184,7 @@ jobs:
       - name: Smoke launch pushed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
-          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'images.coreweave.com/cluster-images/bradhiltonnw/art-gpu' }}
+          SMOKE_IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           SMOKE_GPUS: ${{ inputs.smoke_gpus }}
         run: |
@@ -224,7 +224,7 @@ jobs:
               -c "${cluster}" \
               --infra "${SKY_INFRA}" \
               --gpus "${SMOKE_GPUS}" \
-              --image-id "docker:${PULL_IMAGE_REPO}:${IMAGE_TAG}" \
+              --image-id "docker:${SMOKE_IMAGE_REPO}:${IMAGE_TAG}" \
               --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
               'python -c "import pathlib, subprocess; print(\"ART_IMAGE_SMOKE_OK\"); print(\"SKY_PYTHON_PATH\", pathlib.Path.home().joinpath(\".sky/python_path\").read_text().strip()); print(\"RAY_PATH\", pathlib.Path.home().joinpath(\".sky/ray_path\").read_text().strip()); print(\"UV\", subprocess.check_output([\"uv\", \"--version\"], text=True).strip())"'
