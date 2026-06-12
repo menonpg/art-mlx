@@ -96,7 +96,6 @@ class TrainInfOutputParityConfig(BaseModel):
     lora_target_modules: list[str] | None = None
     engine_args: dict[str, Any] = Field(default_factory=dict)
     server_args: dict[str, Any] = Field(default_factory=dict)
-    replay_vllm_routing: bool = False
 
     @model_validator(mode="after")
     def _set_default_rollout_modes(self) -> "TrainInfOutputParityConfig":
