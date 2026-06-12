@@ -4,8 +4,14 @@ from copy import copy
 import re
 from typing import Any, Sequence, cast
 
+from megatron.core.extensions.transformer_engine import TERowParallelLinear
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 import torch
 
+from art.megatron.lora import SelfAttentionLinearProjLoRA
 from art.megatron.model_support.handlers.default_dense import (
     DefaultMoeHandler,
     _compile_workaround_flags_for_provider,
@@ -143,18 +149,33 @@ class Gemma4MoeHandler(DefaultMoeHandler):
                         "Gemma 4 expected a SelfAttention module, got "
                         f"{type(module.self_attention)}"
                     )
-                wrap_standard_self_attention(
-                    module.self_attention,
-                    adapter_model_prefix=adapter_model_prefix,
-                    provider=_attention_provider_for_layer(provider, module),
-                    target_modules=target_set,
-                    rank=rank,
-                    alpha=alpha,
+                attention_provider = _attention_provider_for_layer(provider, module)
+                qkv_targets = (
+                    {"q_proj", "k_proj", "v_proj"}
+                    if not target_set
+                    else target_set - {"o_proj"}
                 )
+                if qkv_targets:
+                    wrap_standard_self_attention(
+                        module.self_attention,
+                        adapter_model_prefix=adapter_model_prefix,
+                        provider=attention_provider,
+                        target_modules=qkv_targets,
+                        rank=rank,
+                        alpha=alpha,
+                    )
                 if (
                     not target_set or {"q_proj", "k_proj", "v_proj"} & target_set
                 ) and _is_gemma4_global_layer(int(module.layer_number), provider):
                     _tie_global_value_lora_to_key(module.self_attention)
+                _wrap_gemma4_attention_output_lora(
+                    module.self_attention,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=attention_provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
                 wrap_grouped_moe_experts_3d(
                     _require_moe_experts(module),
                     adapter_model_prefix=adapter_model_prefix,
@@ -573,6 +594,69 @@ def _attention_provider_for_layer(provider: Any, module: Any) -> Any:
 def _tie_global_value_lora_to_key(self_attention: Any) -> None:
     linear_qkv = self_attention.linear_qkv
     linear_qkv.v_proj_lora = linear_qkv.k_proj_lora
+
+
+class _Gemma4SelfAttentionLinearProjLoRA(SelfAttentionLinearProjLoRA):
+    def __init__(
+        self,
+        *,
+        adapter_model_prefix: str,
+        linear_proj: TERowParallelLinear,
+        rank: int,
+        alpha: int,
+        provider: Any,
+    ) -> None:
+        super().__init__(
+            adapter_model_prefix=adapter_model_prefix,
+            linear_proj=linear_proj,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        linear_proj = self.linear_proj
+        base_output, bias_output = TERowParallelLinear.forward(linear_proj, x)
+        lora_output = self.lora(x)
+        if self.reduce_output and self.provider.tensor_model_parallel_size > 1:
+            if self.provider.sequence_parallel:
+                lora_output = reduce_scatter_to_sequence_parallel_region(lora_output)
+            else:
+                lora_output = reduce_from_tensor_model_parallel_region(lora_output)
+        output = base_output + lora_output
+        post_layernorm = getattr(linear_proj, "post_layernorm", None)
+        if post_layernorm is not None:
+            output = post_layernorm(output)
+            if isinstance(output, tuple):
+                output = output[0]
+        return output, bias_output
+
+
+def _wrap_gemma4_attention_output_lora(
+    self_attention: Any,
+    *,
+    adapter_model_prefix: str,
+    provider: Any,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
+    from art.megatron.lora import _targets_include, _unwrap_attr
+
+    if not _targets_include(target_modules, "o_proj"):
+        return
+    linear_proj = _unwrap_attr(
+        self_attention.linear_proj,
+        "linear_proj",
+        TERowParallelLinear,
+    )
+    self_attention.linear_proj = _Gemma4SelfAttentionLinearProjLoRA(
+        adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
+        linear_proj=linear_proj,
+        rank=rank,
+        alpha=alpha,
+        provider=provider,
+    )
 
 
 def _to_vllm_key(key: str) -> str:
