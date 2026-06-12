@@ -251,11 +251,12 @@ def _causal_attention_state(
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
 ) -> Any:
-    group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device=device)
+    group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device="cpu")
     parent_ids = torch.zeros_like(group_ids)
     return create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        target_device=device,
         build_gdn_execution_spec=build_gdn_execution_spec,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
@@ -281,6 +282,16 @@ def _prepare_dense_rl_micro(
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
+    attention_state = create_shared_prefix_state(
+        group_ids=micro["group_ids"],
+        parent_ids=micro["parent_ids"],
+        target_device=device,
+        build_gdn_execution_spec=bool(
+            getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
+    )
     _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
     shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
@@ -293,15 +304,7 @@ def _prepare_dense_rl_micro(
         model_tokens=micro["tokens"],
         model_input_pos=micro["input_pos"],
         model_labels=shifted_labels,
-        attention_state=create_shared_prefix_state(
-            group_ids=micro["group_ids"],
-            parent_ids=micro["parent_ids"],
-            build_gdn_execution_spec=bool(
-                getattr(model_support_handler, "build_gdn_execution_spec", False)
-            ),
-            attention_head_dim=getattr(provider, "kv_channels", None),
-            attention_value_head_dim=getattr(provider, "kv_channels", None),
-        ),
+        attention_state=attention_state,
         loss_inputs=LossInputs(inputs=micro),
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
