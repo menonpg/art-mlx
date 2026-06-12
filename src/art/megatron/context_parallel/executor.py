@@ -648,7 +648,6 @@ def _build_stage_block_mask(
     device: torch.device,
     execution_spec: StageExecutionSpec | None = None,
     block_size: SparseBlockSize | None = None,
-    allow_build: bool = True,
 ) -> BlockMask | None:
     resolved_block_size = normalize_sparse_block_size(
         state.config.block_size if block_size is None else block_size
@@ -662,26 +661,16 @@ def _build_stage_block_mask(
         if execution_spec is None
         else execution_spec
     )
-    cache_key = (
-        int(stage_plan.stage_index),
-        int(execution_spec.q_len),
-        int(execution_spec.k_len),
-        resolved_block_size,
-        device.type,
-        device.index,
+    cache_key = _stage_block_mask_cache_key(
+        stage_plan=stage_plan,
+        execution_spec=execution_spec,
+        block_size=resolved_block_size,
+        device=device,
     )
     cache = state.execution_cache.block_masks
     cached = cache.get(cache_key)
     if cached is not None or cache_key in cache:
         return cached
-    if not allow_build:
-        raise RuntimeError(
-            "ART context parallel forward hit an unprepared stage block-mask cache key. "
-            "Mask construction is CPU planning work and must finish before model forward. "
-            f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
-            f"k_len={int(execution_spec.k_len)} block_size={resolved_block_size} "
-            f"device={device}"
-        )
     mask_metadata = (
         stage_plan.mask_metadata
         if execution_spec.mask_metadata is None
@@ -705,6 +694,57 @@ def _build_stage_block_mask(
     )
     cache[cache_key] = mask
     return mask
+
+
+def _get_prepared_stage_block_mask(
+    *,
+    stage_plan: StagePlan,
+    state: ArtContextParallelState,
+    device: torch.device,
+    execution_spec: StageExecutionSpec,
+    block_size: SparseBlockSize,
+) -> BlockMask:
+    resolved_block_size = normalize_sparse_block_size(block_size)
+    cache_key = _stage_block_mask_cache_key(
+        stage_plan=stage_plan,
+        execution_spec=execution_spec,
+        block_size=resolved_block_size,
+        device=device,
+    )
+    cache = state.execution_cache.block_masks
+    if cache_key not in cache:
+        raise RuntimeError(
+            "ART context parallel forward hit an unprepared stage block-mask cache key. "
+            "Mask construction is CPU planning work and must finish before model forward. "
+            f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
+            f"k_len={int(execution_spec.k_len)} block_size={resolved_block_size} "
+            f"device={device}"
+        )
+    block_mask = cache[cache_key]
+    if block_mask is None:
+        raise RuntimeError(
+            "ART context parallel forward found an empty prepared block mask for a non-empty stage. "
+            f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
+            f"k_len={int(execution_spec.k_len)}"
+        )
+    return cast(BlockMask, block_mask)
+
+
+def _stage_block_mask_cache_key(
+    *,
+    stage_plan: StagePlan,
+    execution_spec: StageExecutionSpec,
+    block_size: tuple[int, int],
+    device: torch.device,
+) -> tuple[int, int, int, tuple[int, int], str, int | None]:
+    return (
+        int(stage_plan.stage_index),
+        int(execution_spec.q_len),
+        int(execution_spec.k_len),
+        block_size,
+        device.type,
+        device.index,
+    )
 
 
 def prepare_context_parallel_execution_state(
@@ -802,74 +842,67 @@ def _resolve_stage_execution_spec(
     stage_plan: StagePlan,
     state: ArtContextParallelState,
     block_size: SparseBlockSize | None = None,
-    allow_build: bool = True,
 ) -> StageExecutionSpec:
     resolved_block_size = normalize_sparse_block_size(
         state.config.block_size if block_size is None else block_size
     )
-    cache_key = (int(stage_plan.stage_index), resolved_block_size)
-    execution_cache = getattr(state, "execution_cache", None)
-    if execution_cache is None:
-        if not allow_build:
-            raise RuntimeError(
-                "ART context parallel forward cannot resolve an uncached stage execution spec "
-                "without an execution cache."
-            )
-        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
-            is_local_stage=bool(stage_plan.is_local_stage),
-            q_len=int(stage_plan.q_len),
-            k_len=int(stage_plan.k_len),
-            block_size=resolved_block_size,
-        )
-        return StageExecutionSpec(
-            q_len=int(target_q_len),
-            k_len=int(target_k_len),
-            compile_key=str(compile_key),
-            mask_metadata=_resize_exact_mask_metadata(
-                stage_plan.mask_metadata,
-                q_len=int(target_q_len),
-                k_len=int(target_k_len),
-            ),
-        )
-    cache = getattr(execution_cache, "stage_execution_specs", None)
-    if cache is None:
-        if not allow_build:
-            raise RuntimeError(
-                "ART context parallel forward cannot resolve an uncached stage execution spec "
-                "without a stage_execution_specs cache."
-            )
-        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
-            is_local_stage=bool(stage_plan.is_local_stage),
-            q_len=int(stage_plan.q_len),
-            k_len=int(stage_plan.k_len),
-            block_size=resolved_block_size,
-        )
-        return StageExecutionSpec(
-            q_len=int(target_q_len),
-            k_len=int(target_k_len),
-            compile_key=str(compile_key),
-            mask_metadata=_resize_exact_mask_metadata(
-                stage_plan.mask_metadata,
-                q_len=int(target_q_len),
-                k_len=int(target_k_len),
-            ),
-        )
+    cache_key = _stage_execution_spec_cache_key(
+        stage_plan=stage_plan,
+        block_size=resolved_block_size,
+    )
+    cache = state.execution_cache.stage_execution_specs
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-    if not allow_build:
+    resolved = _build_stage_execution_spec(
+        stage_plan=stage_plan,
+        block_size=resolved_block_size,
+    )
+    cache[cache_key] = resolved
+    return resolved
+
+
+def _get_prepared_stage_execution_spec(
+    *,
+    stage_plan: StagePlan,
+    state: ArtContextParallelState,
+    block_size: SparseBlockSize,
+) -> StageExecutionSpec:
+    resolved_block_size = normalize_sparse_block_size(block_size)
+    cache_key = _stage_execution_spec_cache_key(
+        stage_plan=stage_plan,
+        block_size=resolved_block_size,
+    )
+    cached = state.execution_cache.stage_execution_specs.get(cache_key)
+    if cached is None:
         raise RuntimeError(
             "ART context parallel forward hit an unprepared stage execution-spec cache key. "
             "Execution planning must finish before model forward. "
             f"stage={int(stage_plan.stage_index)} block_size={resolved_block_size}"
         )
+    return cached
+
+
+def _stage_execution_spec_cache_key(
+    *,
+    stage_plan: StagePlan,
+    block_size: tuple[int, int],
+) -> tuple[int, tuple[int, int]]:
+    return (int(stage_plan.stage_index), block_size)
+
+
+def _build_stage_execution_spec(
+    *,
+    stage_plan: StagePlan,
+    block_size: tuple[int, int],
+) -> StageExecutionSpec:
     target_q_len, target_k_len, compile_key = select_sparse_execution_family(
         is_local_stage=bool(stage_plan.is_local_stage),
         q_len=int(stage_plan.q_len),
         k_len=int(stage_plan.k_len),
-        block_size=resolved_block_size,
+        block_size=block_size,
     )
-    resolved = StageExecutionSpec(
+    return StageExecutionSpec(
         q_len=int(target_q_len),
         k_len=int(target_k_len),
         compile_key=str(compile_key),
@@ -879,8 +912,6 @@ def _resolve_stage_execution_spec(
             k_len=int(target_k_len),
         ),
     )
-    cache[cache_key] = resolved
-    return resolved
 
 
 def _run_stage_attention(
@@ -895,24 +926,18 @@ def _run_stage_attention(
     enable_gqa: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sparse_block_size = _stage_sparse_block_size(q_stage, v_stage)
-    execution_spec = _resolve_stage_execution_spec(
+    execution_spec = _get_prepared_stage_execution_spec(
         stage_plan=stage_plan,
         state=state,
         block_size=sparse_block_size,
-        allow_build=False,
     )
-    block_mask = _build_stage_block_mask(
+    block_mask = _get_prepared_stage_block_mask(
         stage_plan=stage_plan,
         state=state,
         device=q_stage.device,
         execution_spec=execution_spec,
         block_size=sparse_block_size,
-        allow_build=False,
     )
-    if block_mask is None:
-        raise RuntimeError(
-            f"Stage {stage_plan.stage_index} unexpectedly produced an empty block mask"
-        )
     _validate_stage_block_alignment(
         q_len=int(execution_spec.q_len),
         k_len=int(execution_spec.k_len),

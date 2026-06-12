@@ -9,6 +9,8 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from art.megatron.context_parallel.executor import (
     _build_stage_block_mask,
+    _get_prepared_stage_block_mask,
+    _get_prepared_stage_execution_spec,
     _resolve_stage_execution_spec,
 )
 from art.megatron.context_parallel.runtime import (
@@ -94,11 +96,10 @@ def test_cp_forward_requires_prepared_stage_caches() -> None:
         if stage.q_len > 0 and stage.k_len > 0 and stage.slices
     )
     with pytest.raises(RuntimeError, match="unprepared stage execution-spec"):
-        _resolve_stage_execution_spec(
+        _get_prepared_stage_execution_spec(
             stage_plan=stage_plan,
             state=state,
             block_size=state.config.block_size,
-            allow_build=False,
         )
     execution_spec = _resolve_stage_execution_spec(
         stage_plan=stage_plan,
@@ -106,13 +107,12 @@ def test_cp_forward_requires_prepared_stage_caches() -> None:
         block_size=state.config.block_size,
     )
     with pytest.raises(RuntimeError, match="unprepared stage block-mask"):
-        _build_stage_block_mask(
+        _get_prepared_stage_block_mask(
             stage_plan=stage_plan,
             state=state,
             device=torch.device("cpu"),
             execution_spec=execution_spec,
             block_size=state.config.block_size,
-            allow_build=False,
         )
 
 
