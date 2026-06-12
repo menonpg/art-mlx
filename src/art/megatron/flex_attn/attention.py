@@ -13,7 +13,10 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from art.megatron.flex_attn.compiled import dense_compiled_flex_attention
+from art.megatron.flex_attn.compiled import (
+    flex_backend_for_head_dims,
+    get_dense_compiled_flex_attention,
+)
 
 
 class SharedPrefixAttentionState(BaseModel):
@@ -43,9 +46,13 @@ class FlexAttentionWrapper(torch.nn.Module):
         enable_gqa: bool,
     ) -> Tensor:
         # q, k, v are [B, H, S, D] tensors expected by torch.flex_attention.
+        backend = flex_backend_for_head_dims(
+            head_dim=int(q.shape[-1]),
+            head_dim_v=int(v.shape[-1]),
+        )
         return cast(
             Tensor,
-            dense_compiled_flex_attention(
+            get_dense_compiled_flex_attention(backend=backend)(
                 q,
                 k,
                 v,

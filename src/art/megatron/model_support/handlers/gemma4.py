@@ -11,6 +11,9 @@ from art.megatron.model_support.handlers.default_dense import (
     _compile_workaround_flags_for_provider,
     _require_moe_experts,
 )
+from art.megatron.model_support.handlers.qwen3_common import (
+    _context_parallel_world_size,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
@@ -424,38 +427,6 @@ def _patch_gemma4_qkv_for_hf_tied_value() -> None:
     _GEMMA4_QKV_PATCHED = True
 
 
-def _build_absolute_rotary_pos_emb(
-    rotary_pos_emb: Any,
-    *,
-    max_position: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    cache = getattr(rotary_pos_emb, "_art_absolute_rotary_pos_emb_cache", None)
-    if cache is None:
-        cache = {}
-        setattr(rotary_pos_emb, "_art_absolute_rotary_pos_emb_cache", cache)
-    cache_key = (str(device), max_position + 1)
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    freqs = rotary_pos_emb.get_freqs_non_repeated(max_position + 1)
-    if not rotary_pos_emb.rotary_interleaved:
-        absolute_rotary_pos_emb = torch.cat((freqs, freqs), dim=-1)
-    else:
-        absolute_rotary_pos_emb = torch.stack(
-            (freqs.view(-1, 1), freqs.view(-1, 1)),
-            dim=-1,
-        ).view(freqs.shape[0], -1)
-    absolute_rotary_pos_emb = absolute_rotary_pos_emb[:, None, None, :].to(
-        device=device,
-        dtype=dtype,
-    )
-    cache[cache_key] = absolute_rotary_pos_emb
-    return absolute_rotary_pos_emb
-
-
 def _gather_absolute_rotary_pos_emb(
     table_source: torch.Tensor,
     *,
@@ -495,8 +466,29 @@ def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             _preprocess: Any = preprocess,
             **kwargs: Any,
         ) -> tuple[Any, ...]:
-            preproc_output = list(_preprocess(*args, **kwargs))
             position_ids = kwargs.get("position_ids")
+            gemma4_rotary = getattr(_gpt_module, "rotary_pos_emb")
+            local_rotary = getattr(gemma4_rotary, "rope_local", None)
+            rotary_cp_group = getattr(gemma4_rotary, "cp_group", None)
+            local_rotary_cp_group = getattr(local_rotary, "cp_group", None)
+            uses_dispatched_local_cp_positions = (
+                isinstance(position_ids, torch.Tensor)
+                and position_ids.ndim == 2
+                and _context_parallel_world_size(getattr(_gpt_module, "config", None))
+                > 1
+                and (rotary_cp_group is not None or local_rotary_cp_group is not None)
+            )
+            if uses_dispatched_local_cp_positions:
+                setattr(gemma4_rotary, "cp_group", None)
+                if local_rotary is not None:
+                    setattr(local_rotary, "cp_group", None)
+            try:
+                preproc_output = list(_preprocess(*args, **kwargs))
+            finally:
+                if uses_dispatched_local_cp_positions:
+                    setattr(gemma4_rotary, "cp_group", rotary_cp_group)
+                    if local_rotary is not None:
+                        setattr(local_rotary, "cp_group", local_rotary_cp_group)
             rotary_pos_emb = preproc_output[1]
             if not isinstance(position_ids, torch.Tensor) or not isinstance(
                 rotary_pos_emb,
@@ -506,27 +498,13 @@ def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             local_table, global_table = rotary_pos_emb
             if not torch.is_tensor(local_table) or not torch.is_tensor(global_table):
                 return tuple(preproc_output)
-            max_position = int(position_ids.max().item())
-            gemma4_rotary = getattr(_gpt_module, "rotary_pos_emb")
-            local_source = _build_absolute_rotary_pos_emb(
-                gemma4_rotary.rope_local,
-                max_position=max_position,
-                dtype=local_table.dtype,
-                device=local_table.device,
-            )
-            global_source = _build_absolute_rotary_pos_emb(
-                gemma4_rotary,
-                max_position=max_position,
-                dtype=global_table.dtype,
-                device=global_table.device,
-            )
             preproc_output[1] = (
                 _gather_absolute_rotary_pos_emb(
-                    local_source,
+                    local_table,
                     position_ids=position_ids,
                 ),
                 _gather_absolute_rotary_pos_emb(
-                    global_source,
+                    global_table,
                     position_ids=position_ids,
                 ),
             )

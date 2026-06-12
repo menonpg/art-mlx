@@ -12,6 +12,7 @@ import triton.language as tl
 from art.megatron.flex_attn.compiled import (
     SparseBlockSize,
     flash_sparse_block_size_for_head_dim,
+    flex_backend_for_head_dims,
     get_sparse_compiled_flex_attention,
     normalize_flex_lse,
     normalize_sparse_block_size,
@@ -609,6 +610,10 @@ class FlexAttentionKernel:
             raise RuntimeError(
                 "ART context parallel attention requires a concrete block mask for compiled flex attention."
             )
+        backend = flex_backend_for_head_dims(
+            head_dim=int(q.shape[-1]),
+            head_dim_v=int(v.shape[-1]),
+        )
         if compile_key is None:
             _q_len, _k_len, compile_key = select_sparse_execution_family(
                 is_local_stage=bool(is_local_stage),
@@ -618,9 +623,10 @@ class FlexAttentionKernel:
             )
         compiled_flex_attention = (
             sparse_compiled_flex_attention
-            if str(compile_key) == "sparse"
+            if str(compile_key) == "sparse" and backend == "FLASH"
             else get_sparse_compiled_flex_attention(
                 family_key=str(compile_key),
+                backend=backend,
             )
         )
         out, aux = cast(
@@ -638,7 +644,7 @@ class FlexAttentionKernel:
         lse = aux.lse
         if lse is None:
             raise RuntimeError("Compiled flex attention did not return lse.")
-        lse = normalize_flex_lse(lse)
+        lse = normalize_flex_lse(lse, backend=backend)
         return out, lse
 
 
