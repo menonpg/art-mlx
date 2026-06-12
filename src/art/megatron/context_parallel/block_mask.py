@@ -321,6 +321,89 @@ def _build_sparse_block_mask(
     )
 
 
+def _valid_prefix(indices: torch.Tensor, *, name: str) -> torch.Tensor:
+    if indices.ndim != 1:
+        raise RuntimeError(f"{name} exact token indices must be rank 1.")
+    if indices.dtype != torch.int64:
+        raise RuntimeError(f"{name} exact token indices must be int64.")
+    indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    invalid = indices_cpu < 0
+    if bool(invalid.any().item()):
+        first_invalid = int(torch.nonzero(invalid, as_tuple=False)[0].item())
+        if bool((indices_cpu[first_invalid:] >= 0).any().item()):
+            raise RuntimeError(
+                f"{name} exact token indices must use only contiguous tail padding."
+            )
+        return indices_cpu[:first_invalid]
+    return indices_cpu
+
+
+def _validate_exact_indices(
+    indices: torch.Tensor,
+    *,
+    name: str,
+    source_len: int,
+) -> int:
+    valid = _valid_prefix(indices, name=name)
+    if int(valid.numel()) == 0:
+        return 0
+    if bool((valid[1:] <= valid[:-1]).any().item()):
+        raise RuntimeError(f"{name} exact token indices must be strictly increasing.")
+    max_index = int(valid[-1].item())
+    if max_index >= int(source_len):
+        raise RuntimeError(
+            f"{name} exact token index {max_index} exceeds source metadata length {int(source_len)}."
+        )
+    return int(valid.numel())
+
+
+def _validate_supported_mask_spec(
+    spec: FlexMaskSpec,
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+) -> None:
+    if group_ids.ndim != 1 or parent_ids.ndim != 1:
+        raise RuntimeError(
+            "Shared-prefix sparse block masks require rank-1 group_ids and parent_ids."
+        )
+    if int(group_ids.numel()) != int(parent_ids.numel()):
+        raise RuntimeError(
+            "Shared-prefix sparse block masks require equal group_ids and parent_ids lengths."
+        )
+    q_valid_len = _validate_exact_indices(
+        spec.exact_mask.q_token_indices,
+        name="q",
+        source_len=int(group_ids.numel()),
+    )
+    k_valid_len = _validate_exact_indices(
+        spec.exact_mask.k_token_indices,
+        name="k",
+        source_len=int(group_ids.numel()),
+    )
+    for slice_ in spec.slices:
+        if int(slice_.row_index) != 0:
+            raise RuntimeError(
+                "Shared-prefix sparse block masks support exactly one packed row."
+            )
+        if slice_.mask_kind not in {AttnMaskKind.FULL, AttnMaskKind.CAUSAL}:
+            raise RuntimeError(f"Unsupported attention mask kind: {slice_.mask_kind}")
+        if (
+            slice_.q_range.start < 0
+            or slice_.q_range.end > int(spec.q_len)
+            or slice_.k_range.start < 0
+            or slice_.k_range.end > int(spec.k_len)
+            or slice_.q_range.end < slice_.q_range.start
+            or slice_.k_range.end < slice_.k_range.start
+        ):
+            raise RuntimeError(f"Attention slice is outside mask bounds: {slice_}")
+        if slice_.q_range.end > q_valid_len or slice_.k_range.end > k_valid_len:
+            raise RuntimeError(
+                "Attention slices may not cover exact-index tail padding: "
+                f"slice={slice_}, q_valid_len={q_valid_len}, k_valid_len={k_valid_len}"
+            )
+
+
 def build_block_mask(
     spec: FlexMaskSpec,
     *,
@@ -340,6 +423,7 @@ def build_block_mask(
             "Exact stage k-token metadata length mismatch: "
             f"{int(spec.exact_mask.k_token_indices.numel())} != {int(spec.k_len)}"
         )
+    _validate_supported_mask_spec(spec, group_ids=group_ids, parent_ids=parent_ids)
     block_size = normalize_sparse_block_size(spec.block_size)
     return _build_sparse_block_mask(
         spec,
