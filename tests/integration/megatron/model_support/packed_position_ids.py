@@ -575,6 +575,7 @@ def _logits_equivalence_check(
     *,
     model: Any,
     handler: Any,
+    provider: Any,
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
@@ -589,6 +590,11 @@ def _logits_equivalence_check(
     logits_abs_sum = 0.0
     logits_ref_abs_sum = 0.0
     logits_numel = 0
+    sliding_windows = tuple(
+        dict.fromkeys(
+            int(window) for window in getattr(provider, "art_flex_sliding_windows", ())
+        )
+    )
     for row_index in range(int(input_ids.shape[0])):
         row_group_ids = group_ids[row_index : row_index + 1]
         row_parent_ids = parent_ids[row_index : row_index + 1]
@@ -601,9 +607,13 @@ def _logits_equivalence_check(
         packed_bias = create_shared_prefix_state(
             group_ids=row_group_ids,
             parent_ids=row_parent_ids,
+            input_pos=row_position_ids,
+            sliding_windows=sliding_windows,
             build_gdn_execution_spec=bool(
                 getattr(handler, "build_gdn_execution_spec", False)
             ),
+            attention_head_dim=getattr(provider, "kv_channels", None),
+            attention_value_head_dim=getattr(provider, "kv_channels", None),
         )
         _debug_log(f"logits_check row={row_index} families={len(families)}")
         packed_logits = _time_block(
@@ -647,9 +657,13 @@ def _logits_equivalence_check(
                 reference_bias = create_shared_prefix_state(
                     group_ids=reference_group_ids,
                     parent_ids=reference_parent_ids,
+                    input_pos=reference_position_ids,
+                    sliding_windows=sliding_windows,
                     build_gdn_execution_spec=bool(
                         getattr(handler, "build_gdn_execution_spec", False)
                     ),
+                    attention_head_dim=getattr(provider, "kv_channels", None),
+                    attention_value_head_dim=getattr(provider, "kv_channels", None),
                 )
                 _debug_log(
                     "logits_check row="
@@ -773,7 +787,7 @@ def _run_packed_position_ids_worker(
             PackedTensorConfig(
                 num_sequences=4,
                 sequence_length=_env_int(
-                    "ART_PACKED_POSITION_IDS_STOP_EARLY_SEQUENCE_LENGTH", 1024
+                    "ART_PACKED_POSITION_IDS_STOP_EARLY_SEQUENCE_LENGTH", 2048
                 ),
                 prefill_tokens=_env_int(
                     "ART_PACKED_POSITION_IDS_STOP_EARLY_PREFILL_TOKENS", 256
@@ -793,7 +807,7 @@ def _run_packed_position_ids_worker(
             PackedTensorConfig(
                 num_sequences=4,
                 sequence_length=_env_int(
-                    "ART_PACKED_POSITION_IDS_TRUNCATE_SEQUENCE_LENGTH", 1024
+                    "ART_PACKED_POSITION_IDS_TRUNCATE_SEQUENCE_LENGTH", 2048
                 ),
                 prefill_tokens=_env_int(
                     "ART_PACKED_POSITION_IDS_TRUNCATE_PREFILL_TOKENS", 256
@@ -922,6 +936,7 @@ def _run_packed_position_ids_worker(
                 lambda: _logits_equivalence_check(
                     model=model_chunks[0],
                     handler=runtime.model_support_handler,
+                    provider=runtime.provider,
                     input_ids=input_ids,
                     position_ids=position_ids,
                     group_ids=group_ids,
