@@ -15,6 +15,7 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     PreparedMegatronBatch,
 )
+from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.shared_prefix_state import create_shared_prefix_state
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
@@ -243,6 +244,21 @@ def _local_trainable_token_count_tensor(
     return torch.tensor([local_token_total], device=device, dtype=torch.float32)
 
 
+def _cp_context_parallel_config(
+    provider: Any, device: torch.device
+) -> ContextParallelConfig:
+    head_dim = getattr(provider, "kv_channels", None)
+    if head_dim is None:
+        return ContextParallelConfig()
+    return ContextParallelConfig(
+        attention_sparse_block_size=flash_sparse_block_size_for_head_dim(
+            head_dim=int(head_dim),
+            head_dim_v=int(head_dim),
+            device=device,
+        )
+    )
+
+
 def _causal_attention_state(
     seq_len: int,
     device: torch.device,
@@ -316,6 +332,7 @@ def _prepare_rl_cp_micro_full(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None,
@@ -329,7 +346,7 @@ def _prepare_rl_cp_micro_full(
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
-        config=ContextParallelConfig(),
+        config=_cp_context_parallel_config(provider, device),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
@@ -409,6 +426,7 @@ def _prepare_current_rl_micro(
             micro,
             device=device,
             topology=topology,
+            provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
             ref_logprobs=ref_logprobs,
@@ -421,6 +439,7 @@ def _prepare_next_rl_cp_micro(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None = None,
@@ -431,6 +450,7 @@ def _prepare_next_rl_cp_micro(
         next_micro,
         device=device,
         topology=topology,
+        provider=provider,
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
         ref_logprobs=ref_logprobs,
@@ -537,6 +557,7 @@ def _prepare_sft_cp_micro_full(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
 ) -> PreparedMegatronBatch:
@@ -553,7 +574,7 @@ def _prepare_sft_cp_micro_full(
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
-        config=ContextParallelConfig(),
+        config=_cp_context_parallel_config(provider, device),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
@@ -605,6 +626,7 @@ def _prepare_current_sft_micro(
             micro,
             device=device,
             topology=topology,
+            provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
         )
@@ -616,6 +638,7 @@ def _prepare_next_sft_cp_micro(
     *,
     device: torch.device,
     topology: ParallelTopology,
+    provider: Any,
     model_support_handler: Any,
     trace_token_uids: bool,
 ) -> PreparedMegatronBatch | None:
@@ -625,6 +648,7 @@ def _prepare_next_sft_cp_micro(
         next_micro,
         device=device,
         topology=topology,
+        provider=provider,
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
     )

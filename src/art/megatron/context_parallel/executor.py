@@ -57,6 +57,10 @@ def _stage_sparse_block_size(
     )
 
 
+def _execution_sparse_block_size(state: ArtContextParallelState) -> SparseBlockSize:
+    return state.config.attention_sparse_block_size or state.config.block_size
+
+
 def _pad_exact_indices(indices: torch.Tensor, target_len: int) -> torch.Tensor:
     current_len = int(indices.numel())
     target_len = int(target_len)
@@ -650,7 +654,7 @@ def _build_stage_block_mask(
     block_size: SparseBlockSize | None = None,
 ) -> BlockMask | None:
     resolved_block_size = normalize_sparse_block_size(
-        state.config.block_size if block_size is None else block_size
+        _execution_sparse_block_size(state) if block_size is None else block_size
     )
     execution_spec = (
         _resolve_stage_execution_spec(
@@ -752,19 +756,21 @@ def prepare_context_parallel_execution_state(
     state: ArtContextParallelState,
     device: torch.device,
 ) -> None:
+    block_size = _execution_sparse_block_size(state)
     for stage_plan in state.rank_plan.stage_plans:
         if stage_plan.q_len <= 0 or stage_plan.k_len <= 0 or not stage_plan.slices:
             continue
         execution_spec = _resolve_stage_execution_spec(
             stage_plan=stage_plan,
             state=state,
+            block_size=block_size,
         )
         _build_stage_block_mask(
             stage_plan=stage_plan,
             state=state,
             device=device,
             execution_spec=execution_spec,
-            block_size=state.config.block_size,
+            block_size=block_size,
         )
 
 
