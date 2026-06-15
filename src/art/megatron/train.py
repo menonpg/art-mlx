@@ -1369,6 +1369,7 @@ def run_megatron_sft_step(
             _next_micro_lookahead(micro_inputs, micro_order),
             device=device,
             topology=topology,
+            provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
         )
@@ -1559,6 +1560,7 @@ def run_training_step(
             ),
             device=device,
             topology=topology,
+            provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
             ref_logprobs=_select_next_ref_logprobs(
