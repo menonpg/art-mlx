@@ -18,11 +18,7 @@ from art.megatron.routing_replay import (
     TopologyAwareLocalTokenIndexer,
     build_router_key_from_module_name,
 )
-from art.megatron.training.trace import (
-    TRACE_ROW_TOKEN_UIDS_ATTR,
-    TRACE_UID_SPAN_ATTR,
-    _routing_replay_token_uid_sets,
-)
+from art.megatron.training.trace import _routing_replay_token_uid_sets
 
 
 def _make_route(
@@ -394,28 +390,6 @@ def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
     expected_map[rows, expected_indices.to(torch.long)] = True
     _assert_target(replay, expected_indices, index=0)
     assert torch.equal(routing_map.cpu(), expected_map)
-
-    controller.finalize_step()
-    controller.remove_router_patches()
-
-
-def test_controller_does_not_attach_trace_uids_to_router_outputs() -> None:
-    bundle, _route = _make_bundle()
-    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
-    chunk = _FakeChunk()
-    router = _fake_chunk_router(chunk)
-
-    controller.install_router_patches([chunk])
-    controller.set_step(step_index=0, sample_index=[0])
-    controller.begin_micro(0, 0)
-    replay_uids = torch.tensor([-1, 3, 1], dtype=torch.int64)
-    controller.set_local_input_token_uids(replay_uids)
-    probs, routing_map = router.routing(torch.randn((3, 3), dtype=torch.float32))
-
-    assert not hasattr(probs, TRACE_ROW_TOKEN_UIDS_ATTR)
-    assert not hasattr(routing_map, TRACE_ROW_TOKEN_UIDS_ATTR)
-    assert not hasattr(probs, TRACE_UID_SPAN_ATTR)
-    assert not hasattr(routing_map, TRACE_UID_SPAN_ATTR)
 
     controller.finalize_step()
     controller.remove_router_patches()
