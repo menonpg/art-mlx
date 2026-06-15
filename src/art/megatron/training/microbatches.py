@@ -244,7 +244,7 @@ def _local_trainable_token_count_tensor(
     return torch.tensor([local_token_total], device=device, dtype=torch.float32)
 
 
-def _cp_context_parallel_config(
+def _context_parallel_config_for_provider(
     provider: Any, device: torch.device
 ) -> ContextParallelConfig:
     head_dim = getattr(provider, "kv_channels", None)
@@ -346,7 +346,7 @@ def _prepare_rl_cp_micro_full(
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
-        config=_cp_context_parallel_config(provider, device),
+        config=_context_parallel_config_for_provider(provider, device),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
@@ -574,7 +574,7 @@ def _prepare_sft_cp_micro_full(
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
-        config=_cp_context_parallel_config(provider, device),
+        config=_context_parallel_config_for_provider(provider, device),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
