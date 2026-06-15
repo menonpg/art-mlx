@@ -637,6 +637,20 @@ def test_router_score_rule_uses_tight_dedicated_limit() -> None:
     )
 
 
+def test_router_topk_diff_summary_counts_mismatches() -> None:
+    accumulator = DiffAccumulator()
+
+    accumulator.update_router_ids(
+        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.long),
+        torch.tensor([[2, 1], [3, 0], [9, 6]], dtype=torch.long),
+    )
+    summary = accumulator.as_summary()
+
+    assert summary["numel"] == 6.0
+    assert summary["topk_mismatch_fraction"] == pytest.approx(2 / 3)
+    assert summary["top1_mismatch_fraction"] == pytest.approx(2 / 3)
+
+
 def test_forward_expert_lora_noise_pass_requires_clean_step_gates() -> None:
     noisy_row = _metric_row(
         phase="forward",

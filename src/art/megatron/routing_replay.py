@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 ROUTER_NAME_TOKEN = ".mlp.router"
 ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v2"
 GLOBAL_TOKEN_UIDS_KEY = "global_token_uids"
+TRACE_ROW_TOKEN_UIDS_ATTR = "_art_trace_row_token_uids"
+TRACE_UID_SPAN_ATTR = "_art_trace_uid_span"
 
 _ROUTER_LAYER_PATTERN = re.compile(r"decoder\.layers\.(?P<layer>\d+)\.mlp\.router$")
 _TRACE_CHUNK_PREFIX_PATTERN = re.compile(r"^chunk(?P<chunk>\d+)\.(?P<name>.+)$")
@@ -680,6 +682,7 @@ class MoeRoutingReplayController:
         self._router_bindings: dict[str, dict[str, Any]] = {}
         self._prepared_uid_sets: dict[str, torch.Tensor] = {}
         self._prepared_targets: dict[tuple[str, str, int], torch.Tensor] = {}
+        self._prepared_target_uids: dict[tuple[str, str, int], torch.Tensor] = {}
         self._router_prepared_target_keys: dict[str, tuple[str, int]] = {}
         self._target_buffers: dict[tuple[str, str, int], torch.Tensor] = {}
         self._host_target_staging: list[torch.Tensor] = []
@@ -759,6 +762,8 @@ class MoeRoutingReplayController:
                     *args: Any,
                     _original_routing: Any = original_routing,
                     _prepare_native_target: Any = prepare_native_target,
+                    _controller: MoeRoutingReplayController = self,
+                    _router_key: str = router_key,
                     **kwargs: Any,
                 ) -> Any:
                     del router_module
@@ -766,7 +771,9 @@ class MoeRoutingReplayController:
                     # RouterReplay state; keep it out of Dynamo while preserving
                     # compiled routing compute below.
                     _prepare_native_target()
-                    return _original_routing(*args, **kwargs)
+                    output = _original_routing(*args, **kwargs)
+                    _controller._attach_router_trace_token_uids(_router_key, output)
+                    return output
 
                 module.routing = types.MethodType(_routing_with_replay_target, module)
                 setattr(module, "_art_routing_replay_target_patched", True)
@@ -864,6 +871,9 @@ class MoeRoutingReplayController:
                 self._stage_prepared_target(
                     target_key=(token_uid_key, router_key, call_index),
                     target_cpu=target_cpu,
+                )
+                self._prepared_target_uids[(token_uid_key, router_key, call_index)] = (
+                    router_token_uids
                 )
         self._record_target_copy_event()
         self.set_active_token_uid_key(active_token_uid_key)
@@ -1027,6 +1037,7 @@ class MoeRoutingReplayController:
     def _reset_staged_micro_targets(self) -> None:
         self._prepared_uid_sets = {}
         self._prepared_targets = {}
+        self._prepared_target_uids = {}
         self._router_prepared_target_keys = {}
         self._host_target_staging = []
         self._target_copy_event = None
@@ -1335,6 +1346,53 @@ class MoeRoutingReplayController:
             _router_replay_classes()[1].REPLAY_FORWARD
         )
         self._router_prepared_target_keys[router_key] = target_key
+
+    def _attach_router_trace_token_uids(self, router_key: str, output: Any) -> None:
+        target_key = self._router_prepared_target_keys.get(router_key)
+        if target_key is None:
+            return
+        token_uid_key, call_index = target_key
+        row_token_uids = self._prepared_target_uids.get(
+            (token_uid_key, router_key, call_index)
+        )
+        if row_token_uids is None:
+            return
+        self._attach_trace_attrs(
+            output,
+            row_token_uids=row_token_uids,
+            uid_span=self._global_uid_count,
+        )
+
+    def _attach_trace_attrs(
+        self,
+        value: Any,
+        *,
+        row_token_uids: torch.Tensor,
+        uid_span: int,
+    ) -> None:
+        if isinstance(value, torch.Tensor):
+            setattr(
+                value,
+                TRACE_ROW_TOKEN_UIDS_ATTR,
+                row_token_uids.detach().to(device="cpu", dtype=torch.int64),
+            )
+            setattr(value, TRACE_UID_SPAN_ATTR, int(uid_span))
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                self._attach_trace_attrs(
+                    item,
+                    row_token_uids=row_token_uids,
+                    uid_span=uid_span,
+                )
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._attach_trace_attrs(
+                    item,
+                    row_token_uids=row_token_uids,
+                    uid_span=uid_span,
+                )
 
     def _explicit_target_for_router_call(
         self,
