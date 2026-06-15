@@ -753,6 +753,7 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
         _sync_merged_weights_to_vllm(
             runtime,
             job.merged_weight_transfer,
+            lora_path=job.lora_path,
             pause_generation=False,
         )
         return
@@ -764,6 +765,7 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
         _sync_merged_weights_to_vllm(
             runtime,
             job.merged_weight_transfer,
+            lora_path=job.lora_path,
             pause_generation=True,
         )
 
@@ -1302,8 +1304,13 @@ def _sync_merged_weights_to_vllm(
     runtime: TrainingRuntime,
     spec: MergedWeightTransferSpec,
     *,
+    lora_path: str,
     pause_generation: bool,
 ) -> None:
+    adapter_model = load_lora_tensors_for_megatron(
+        lora_path,
+        handler=runtime.model_support_handler,
+    )
     (
         runtime.merged_weight_transfer_group,
         runtime.merged_weight_transfer_init_info,
@@ -1311,6 +1318,8 @@ def _sync_merged_weights_to_vllm(
         bridge=runtime.bridge,
         model=runtime.model,
         model_support_handler=runtime.model_support_handler,
+        adapter_model=adapter_model,
+        adapter_config=load_adapter_config(lora_path),
         rank=runtime.rank,
         world_size=runtime.world_size,
         merged_weight_transfer_group=runtime.merged_weight_transfer_group,
