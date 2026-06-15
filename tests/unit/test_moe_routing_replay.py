@@ -9,8 +9,6 @@ import torch
 from torch import nn
 
 from art.megatron.routing_replay import (
-    TRACE_ROW_TOKEN_UIDS_ATTR,
-    TRACE_UID_SPAN_ATTR,
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
     ParallelTopology,
@@ -20,7 +18,11 @@ from art.megatron.routing_replay import (
     TopologyAwareLocalTokenIndexer,
     build_router_key_from_module_name,
 )
-from art.megatron.training.trace import _routing_replay_token_uid_sets
+from art.megatron.training.trace import (
+    TRACE_ROW_TOKEN_UIDS_ATTR,
+    TRACE_UID_SPAN_ATTR,
+    _routing_replay_token_uid_sets,
+)
 
 
 def _make_route(
@@ -397,7 +399,7 @@ def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
     controller.remove_router_patches()
 
 
-def test_controller_attaches_replay_token_uids_to_router_outputs() -> None:
+def test_controller_does_not_attach_trace_uids_to_router_outputs() -> None:
     bundle, _route = _make_bundle()
     controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
     chunk = _FakeChunk()
@@ -410,10 +412,10 @@ def test_controller_attaches_replay_token_uids_to_router_outputs() -> None:
     controller.set_local_input_token_uids(replay_uids)
     probs, routing_map = router.routing(torch.randn((3, 3), dtype=torch.float32))
 
-    assert torch.equal(getattr(probs, TRACE_ROW_TOKEN_UIDS_ATTR), replay_uids)
-    assert torch.equal(getattr(routing_map, TRACE_ROW_TOKEN_UIDS_ATTR), replay_uids)
-    assert getattr(probs, TRACE_UID_SPAN_ATTR) == 4
-    assert getattr(routing_map, TRACE_UID_SPAN_ATTR) == 4
+    assert not hasattr(probs, TRACE_ROW_TOKEN_UIDS_ATTR)
+    assert not hasattr(routing_map, TRACE_ROW_TOKEN_UIDS_ATTR)
+    assert not hasattr(probs, TRACE_UID_SPAN_ATTR)
+    assert not hasattr(routing_map, TRACE_UID_SPAN_ATTR)
 
     controller.finalize_step()
     controller.remove_router_patches()
