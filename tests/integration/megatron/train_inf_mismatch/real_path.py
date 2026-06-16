@@ -21,7 +21,6 @@ from art.preprocessing.pack import DiskPackedTensors
 
 from .artifacts import REPO_ROOT
 from .output_parity import (
-    TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     LogicalTokenMap,
     PairComparison,
@@ -46,6 +45,8 @@ from .output_parity import (
     compare_topk,
     fwd_mean_abs_pct_limit_for_model,
     model_support_is_moe,
+    score_context_parallel_runtime,
+    top20_kl_candidate_to_target_limit_for_model,
 )
 
 
@@ -482,10 +483,7 @@ async def _score_base_real_generation_path(
     is_moe: bool,
 ) -> RealPathBaseDiagnosticBundle:
     import art
-    from art.megatron.routing_replay import (
-        build_moe_routing_replay_bundle_from_packed_tensors,
-    )
-    from art.megatron.runtime.backend import MegatronBackend
+    from art.megatron.backend import MegatronBackend
     from art.preprocessing.moe_routing import MoeRoutingPackStats
     from art.preprocessing.pack import packed_tensors_to_dir
 
@@ -532,11 +530,11 @@ async def _score_base_real_generation_path(
             name=f"{served_name}_client",
             project="train_inf_mismatch",
             base_model=parity_config.base_model,
-            _internal_config=art.dev.InternalModelConfig(
-                init_args={
+            _internal_config={
+                "init_args": {
                     "max_seq_length": parity_config.packed.sequence_length,
                 },
-            ),
+            },
         )
         object.__setattr__(model, "inference_base_url", f"http://{host}:{port}/v1")
         object.__setattr__(model, "inference_api_key", "EMPTY")
@@ -580,14 +578,13 @@ async def _score_base_real_generation_path(
     global_grad_accumulation_sequences = int(packed_tensors["tokens"].shape[0])
     if is_moe:
         routing_replay_dir = artifact_dir / "real_path_base_moe_routing_replay"
-        build_moe_routing_replay_bundle_from_packed_tensors(
+        _build_real_path_moe_routing_replay_bundle(
             packed_tensors=packed_tensors,
+            config=parity_config,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         ).to_dir(routing_replay_dir)
         routing_replay_path = str(routing_replay_dir)
-        moe_routing_replay = packed_tensors["moe_routing_replay"]
-        assert moe_routing_replay is not None
-        stats = moe_routing_replay.pack_stats
+        stats = packed_tensors["moe_routing_replay"].pack_stats
     else:
         stats = MoeRoutingPackStats()
 
@@ -657,6 +654,37 @@ def _move_adapter_to_step_zero(*, adapter_path: str, model: Any, backend: Any) -
     return step_zero
 
 
+def _routing_topology_from_config(config: TrainInfOutputParityConfig) -> Any:
+    from art.megatron.routing_replay import ParallelTopology
+
+    return ParallelTopology(
+        tp=config.topology.tp,
+        ep=config.topology.ep,
+        etp=config.topology.etp,
+        dp=config.topology.dp,
+        sp=config.topology.tp > 1,
+        cp=config.topology.cp,
+        pp=config.topology.pp,
+    )
+
+
+def _build_real_path_moe_routing_replay_bundle(
+    *,
+    packed_tensors: Any,
+    config: TrainInfOutputParityConfig,
+    global_grad_accumulation_sequences: int,
+) -> Any:
+    from art.megatron.routing_replay import (
+        build_moe_routing_replay_bundle_from_packed_tensors,
+    )
+
+    return build_moe_routing_replay_bundle_from_packed_tensors(
+        packed_tensors=packed_tensors,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        topology=_routing_topology_from_config(config),
+    )
+
+
 def _make_nonzero_adapter(
     *,
     config: TrainInfOutputParityConfig,
@@ -720,6 +748,58 @@ def _run_logits_with_replay(
     return torch.cat(logits_by_sample, dim=0)
 
 
+def _score_megatron_runtime(
+    *,
+    runtime: Any,
+    packed_tensors: dict[str, Any],
+    logical_map: LogicalTokenMap,
+    weight_state: WeightState,
+    global_grad_accumulation_sequences: int,
+    forward_trace_capture: Any | None,
+    forward_trace_dir: str | None,
+) -> ScoreBundle:
+    from megatron.core import parallel_state as ps
+    import torch
+
+    if int(ps.get_context_parallel_world_size()) > 1:
+        if forward_trace_capture is not None or forward_trace_dir is not None:
+            if forward_trace_capture is not None:
+                forward_trace_capture.close()
+            raise RuntimeError(
+                "CP train/inf mismatch scoring uses sparse UID records, not gathered "
+                "full logits, so forward trace logits capture is unsupported here."
+            )
+        return score_context_parallel_runtime(
+            runtime=runtime,
+            packed_tensors=packed_tensors,
+            logical_map=logical_map,
+            weight_state=weight_state,
+            rollout_mode="native_lora",
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+
+    try:
+        logits = _run_logits_with_replay(
+            runtime=runtime,
+            packed_tensors=packed_tensors,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        if forward_trace_capture is not None and forward_trace_dir is not None:
+            trace_dir = Path(forward_trace_dir)
+            forward_trace_capture.save_current_step(trace_dir)
+            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
+    finally:
+        if forward_trace_capture is not None:
+            forward_trace_capture.close()
+    return _extract_scores_from_logits(
+        logits=logits,
+        logical_map=logical_map,
+        side="megatron",
+        weight_state=weight_state,
+        rollout_mode="native_lora",
+    )
+
+
 def _real_path_megatron_worker(
     request: RealPathMegatronWorkerRequest,
     *,
@@ -728,7 +808,7 @@ def _real_path_megatron_worker(
     import torch
 
     from art.megatron import train as megatron_train
-    from art.megatron.weights.merge import load_lora_adapter_state_dict
+    from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
     from art.preprocessing.pack import packed_tensors_from_dir
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -786,7 +866,7 @@ def _real_path_megatron_worker(
             adapter_path = artifact_dir / "real_path_active_lora"
         else:
             adapter_path = Path(request.adapter_path)
-        adapter_model = load_lora_adapter_state_dict(
+        adapter_model = load_lora_tensors_for_megatron(
             str(adapter_path),
             handler=runtime.model_support_handler,
             allow_unvalidated_arch=request.config.allow_unvalidated_arch,
@@ -828,25 +908,14 @@ def _real_path_megatron_worker(
             0,
             list(range(int(packed_tensors["tokens"].shape[0]))),
         )
-    try:
-        logits = _run_logits_with_replay(
-            runtime=runtime,
-            packed_tensors=cast(dict[str, Any], packed_tensors),
-            global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
-        )
-        if forward_trace_capture is not None and request.forward_trace_dir is not None:
-            trace_dir = Path(request.forward_trace_dir)
-            forward_trace_capture.save_current_step(trace_dir)
-            torch.save(logits.detach().cpu(), trace_dir / "logits.pt")
-    finally:
-        if forward_trace_capture is not None:
-            forward_trace_capture.close()
-    score = _extract_scores_from_logits(
-        logits=logits,
+    score = _score_megatron_runtime(
+        runtime=runtime,
+        packed_tensors=cast(dict[str, Any], packed_tensors),
         logical_map=logical_map,
-        side="megatron",
         weight_state=request.weight_state,
-        rollout_mode="native_lora",
+        global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
+        forward_trace_capture=forward_trace_capture,
+        forward_trace_dir=request.forward_trace_dir,
     )
 
     if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
@@ -947,10 +1016,7 @@ async def run_real_path_train_inf_mismatch(
     artifact_dir: Path,
 ) -> RealPathTrainInfReport:
     import art
-    from art.megatron.routing_replay import (
-        build_moe_routing_replay_bundle_from_packed_tensors,
-    )
-    from art.megatron.runtime.backend import MegatronBackend
+    from art.megatron.backend import MegatronBackend
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
@@ -974,23 +1040,23 @@ async def run_real_path_train_inf_mismatch(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
         project="train_inf_mismatch",
         base_model=parity_config.base_model,
-        _internal_config=art.dev.InternalModelConfig(
-            trainer_gpu_ids=parity_config.trainer_gpu_ids,
-            inference_gpu_ids=parity_config.inference_gpu_ids,
-            rollout_weights_mode="lora",
-            allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
-            engine_args=art.dev.EngineArgs(
-                tensor_parallel_size=len(parity_config.inference_gpu_ids),
-                enable_expert_parallel=is_moe
+        _internal_config={
+            "trainer_gpu_ids": parity_config.trainer_gpu_ids,
+            "inference_gpu_ids": parity_config.inference_gpu_ids,
+            "rollout_weights_mode": "lora",
+            "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
+            "engine_args": {
+                "tensor_parallel_size": len(parity_config.inference_gpu_ids),
+                "enable_expert_parallel": is_moe
                 and len(parity_config.inference_gpu_ids) > 1,
-                max_model_len=parity_config.packed.sequence_length + 8,
-                max_logprobs=TOP_K,
+                "max_model_len": parity_config.packed.sequence_length + 8,
+                "max_logprobs": TOP_K,
                 **parity_config.engine_args,
-            ),
-            init_args={
+            },
+            "init_args": {
                 "max_seq_length": parity_config.packed.sequence_length,
             },
-        ),
+        },
     )
     _move_adapter_to_step_zero(adapter_path=adapter_path, model=model, backend=backend)
 
@@ -1022,8 +1088,9 @@ async def run_real_path_train_inf_mismatch(
         global_grad_accumulation_sequences = int(packed_tensors["tokens"].shape[0])
         routing_replay_path: str | None = None
         if is_moe:
-            build_moe_routing_replay_bundle_from_packed_tensors(
+            _build_real_path_moe_routing_replay_bundle(
                 packed_tensors=packed_tensors,
+                config=parity_config,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             ).to_dir(routing_replay_dir)
             routing_replay_path = str(routing_replay_dir)
@@ -1037,7 +1104,6 @@ async def run_real_path_train_inf_mismatch(
         )
         if is_moe:
             routing_replay = packed_tensors["moe_routing_replay"]
-            assert routing_replay is not None
             stats = routing_replay.pack_stats
         else:
             from art.preprocessing.moe_routing import MoeRoutingPackStats
@@ -1108,10 +1174,14 @@ async def run_real_path_train_inf_mismatch(
             parity_config.base_model,
             allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
         )
+        top20_kl_limit = top20_kl_candidate_to_target_limit_for_model(
+            parity_config.base_model,
+            allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+        )
         passed = (
             comparison.mean_abs_pct <= mean_abs_pct_limit
             and topk_comparison.top20_intersection_kl_candidate_to_target
-            <= TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+            <= top20_kl_limit
         )
         report = RealPathTrainInfReport(
             base_model=parity_config.base_model,
@@ -1170,7 +1240,7 @@ async def run_real_path_train_inf_mismatch(
                 stats.shared_prefix_compared_slots
             ),
             mean_abs_pct_limit=mean_abs_pct_limit,
-            top20_kl_candidate_to_target_limit=TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
+            top20_kl_candidate_to_target_limit=top20_kl_limit,
             passed=passed,
         )
         _write_json(

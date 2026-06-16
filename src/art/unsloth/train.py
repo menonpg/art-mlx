@@ -26,7 +26,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from trl import GRPOConfig, GRPOTrainer
 
 from .. import dev, types
-from ..loss import loss_fn, shift_tensor
+from ..loss import LossInputs, loss_fn, shift_tensor
 from ..preprocessing.inputs import TrainInputs, create_train_inputs
 from ..preprocessing.pack import (
     DiskPackedTensors,
@@ -479,7 +479,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         del attn_bias
 
         loss = loss_fn(
-            inputs,
+            LossInputs(inputs=inputs),
             new_logprobs,
             ref_logprobs,
             entropies,

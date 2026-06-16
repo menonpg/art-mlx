@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 from typing import Any, Callable
 
 from megatron.core.tensor_parallel import (
@@ -20,30 +21,97 @@ def _active_controller() -> Any | None:
     return _CONTROLLER_GETTER()
 
 
+@torch._dynamo.disable
 def _dispatcher_local_token_uids(
     controller: Any,
     dispatcher: Any,
     *,
     num_local_tokens: int,
 ) -> torch.Tensor:
+    num_local_tokens = int(num_local_tokens)
     step_routes = controller._active_step_routes
     if step_routes is None:
         raise RuntimeError("Routing replay dispatcher used without an active step")
-    local_uids = controller.local_token_indexer.build_local_token_uids(
-        global_token_uids=step_routes.global_token_uids,
-        num_local_tokens=num_local_tokens,
-        sequence_parallel=bool(
-            getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
-        ),
-        context_parallel_size=int(
-            getattr(getattr(dispatcher, "config", None), "context_parallel_size", 1)
-        ),
+    sequence_parallel = bool(
+        getattr(getattr(dispatcher, "config", None), "sequence_parallel", False)
     )
+    prepared_uids = getattr(
+        controller,
+        "local_token_uids_for_active_dispatch",
+        None,
+    )
+    if callable(prepared_uids):
+        local_uids = prepared_uids(
+            num_local_tokens=num_local_tokens,
+            sequence_parallel=sequence_parallel,
+        )
+    else:
+        local_uids = None
+    if local_uids is None:
+        route_uids, rank_sliced = _active_route_global_token_uids(controller)
+        if int(route_uids.numel()) == num_local_tokens:
+            local_uids = route_uids
+        elif rank_sliced:
+            local_uids = torch.arange(num_local_tokens, dtype=torch.int64)
+        else:
+            local_uids = controller.local_token_indexer.build_local_token_uids(
+                global_token_uids=route_uids,
+                num_local_tokens=num_local_tokens,
+                sequence_parallel=sequence_parallel,
+                context_parallel_size=int(
+                    getattr(
+                        getattr(dispatcher, "config", None),
+                        "context_parallel_size",
+                        1,
+                    )
+                ),
+            )
     sample_index = getattr(controller, "_active_sample_index", None)
     uid_span = int(step_routes.global_token_uids.numel())
     if isinstance(sample_index, int) and sample_index >= 0 and uid_span > 0:
-        local_uids = local_uids + sample_index * uid_span
+        if bool((local_uids >= 0).all().item()):
+            local_uids = local_uids + sample_index * uid_span
+        else:
+            local_uids = local_uids.clone()
+            valid_mask = local_uids >= 0
+            local_uids[valid_mask] += sample_index * uid_span
     return local_uids
+
+
+def _active_route_global_token_uids(controller: Any) -> tuple[torch.Tensor, bool]:
+    step_routes = controller._active_step_routes
+    if step_routes is None:
+        raise RuntimeError("Routing replay dispatcher used without an active step")
+    active_call_key = controller._active_router_call_key()
+    if active_call_key is None:
+        return step_routes.global_token_uids, False
+    for router_key in sorted(controller._local_router_keys):
+        router_calls = step_routes.routers[router_key].calls
+        last_call_index = controller._router_last_call_indices.get(router_key)
+        if last_call_index in router_calls:
+            route = router_calls[last_call_index]
+            if controller._router_call_key(route) == active_call_key:
+                return _route_token_uids_for_rank(route)
+        for route in router_calls.values():
+            if controller._router_call_key(route) == active_call_key:
+                return _route_token_uids_for_rank(route)
+    return step_routes.global_token_uids, False
+
+
+def _route_token_uids_for_rank(route: Any) -> tuple[torch.Tensor, bool]:
+    token_uids = torch.arange(route.num_global_tokens, dtype=torch.int64)
+    rank_token_counts = getattr(route, "rank_token_counts", None)
+    if (
+        rank_token_counts is None or not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+    ):
+        return token_uids, False
+    world_size = int(torch.distributed.get_world_size())  # ty: ignore[possibly-missing-attribute]
+    if len(rank_token_counts) != world_size:
+        return token_uids, False
+    rank = int(torch.distributed.get_rank())  # ty: ignore[possibly-missing-attribute]
+    start = sum(int(count) for count in rank_token_counts[:rank])
+    end = start + int(rank_token_counts[rank])
+    return token_uids[start:end].contiguous(), True
 
 
 def _trace_row_uids_from_source(source: Any) -> tuple[torch.Tensor | None, int | None]:
@@ -67,6 +135,93 @@ def _attach_trace_row_uids(
         row_token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
     )
     setattr(target, TRACE_UID_SPAN_ATTR, uid_span)
+
+
+def _attach_trace_row_uids_recursive(
+    target: Any,
+    *,
+    row_token_uids: torch.Tensor,
+    uid_span: int | None,
+) -> None:
+    if isinstance(target, torch.Tensor):
+        _attach_trace_row_uids(
+            target,
+            row_token_uids=row_token_uids,
+            uid_span=uid_span,
+        )
+        return
+    if isinstance(target, dict):
+        for value in target.values():
+            _attach_trace_row_uids_recursive(
+                value,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
+        return
+    if isinstance(target, (list, tuple)):
+        for value in target:
+            _attach_trace_row_uids_recursive(
+                value,
+                row_token_uids=row_token_uids,
+                uid_span=uid_span,
+            )
+
+
+@torch._dynamo.disable
+def _attach_router_output_trace_row_uids(
+    *,
+    controller: Any,
+    router_key: str,
+    output: Any,
+) -> None:
+    target_key = getattr(controller, "_router_prepared_target_keys", {}).get(router_key)
+    if target_key is None:
+        return
+    token_uid_key, _call_index = target_key
+    token_uids = getattr(controller, "_prepared_uid_sets", {}).get(token_uid_key)
+    binding = getattr(controller, "_router_bindings", {}).get(router_key)
+    if token_uids is None or binding is None:
+        return
+    router_token_uids = controller._token_uids_for_router_binding(
+        token_uids,
+        sequence_parallel=bool(binding["sequence_parallel"]),
+    )
+    _attach_trace_row_uids_recursive(
+        output,
+        row_token_uids=router_token_uids,
+        uid_span=getattr(controller, "_global_uid_count", None),
+    )
+
+
+def _install_router_output_trace_hooks(controller: Any | None) -> None:
+    if controller is None:
+        return
+    for router_key, binding in getattr(controller, "_router_bindings", {}).items():
+        module = binding.get("module")
+        if module is None or getattr(module, "_art_oracle_router_trace_patched", False):
+            continue
+        original_routing = module.routing
+
+        def patched_routing(
+            router_module: Any,
+            *args: Any,
+            _original_routing: Any = original_routing,
+            _router_key: str = router_key,
+            **kwargs: Any,
+        ) -> Any:
+            del router_module
+            output = _original_routing(*args, **kwargs)
+            controller = _active_controller()
+            if controller is not None:
+                _attach_router_output_trace_row_uids(
+                    controller=controller,
+                    router_key=_router_key,
+                    output=output,
+                )
+            return output
+
+        module.routing = types.MethodType(patched_routing, module)
+        setattr(module, "_art_oracle_router_trace_patched", True)
 
 
 @torch._dynamo.disable
@@ -260,6 +415,7 @@ def install_moe_routing_trace_hooks(
 ) -> None:
     global _CONTROLLER_GETTER
     _CONTROLLER_GETTER = controller_getter
+    _install_router_output_trace_hooks(_active_controller())
     try:
         from megatron.core.transformer.moe.experts import TEGroupedMLP
         from megatron.core.transformer.moe.token_dispatcher import (

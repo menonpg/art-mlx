@@ -225,6 +225,9 @@ class ServerlessBackend(Backend):
         adam_params: object | None = None,
         # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] | None = None,
+        kl_penalty_step_lag: int | None = None,
         kl_ref_adapter_path: str | None = None,
         # RL algorithm settings
         ppo: bool | None = None,
@@ -275,6 +278,15 @@ class ServerlessBackend(Backend):
                 ServerlessBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
                 Defaults to 0.0 (disabled).
+            kl_penalty_reference_step: Checkpoint step of the training model to
+                use as the KL reference. When omitted, the backend may use
+                kl_ref_adapter_path or its default reference policy.
+            kl_penalty_source: Which policy's logprobs to compare against the
+                reference policy. When omitted, defaults to "sample" if KL is
+                enabled and "current_learner" otherwise.
+            kl_penalty_step_lag: Moving KL reference lag. The serverless
+                backend resolves this as max(0, current_step - lag). Mutually
+                exclusive with kl_penalty_reference_step.
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference.
             ppo: Legacy flag for PPO clipping. Prefer loss_fn="ppo".
@@ -335,6 +347,21 @@ class ServerlessBackend(Backend):
             scale_rewards = False
         if adam_params is not None:
             raise ValueError("ServerlessBackend requires adam_params=None.")
+        if kl_penalty_reference_step is not None and kl_penalty_reference_step < 0:
+            raise ValueError("kl_penalty_reference_step must be >= 0.")
+        if kl_penalty_step_lag is not None:
+            if kl_penalty_step_lag < 1:
+                raise ValueError("kl_penalty_step_lag must be >= 1.")
+            if kl_penalty_reference_step is not None:
+                raise ValueError(
+                    "Only one of kl_penalty_reference_step and "
+                    "kl_penalty_step_lag may be set."
+                )
+        resolved_kl_penalty_source: Literal["current_learner", "sample"] = (
+            kl_penalty_source
+            if kl_penalty_source is not None
+            else ("sample" if kl_penalty_coef > 0.0 else "current_learner")
+        )
         _ = save_checkpoint
 
         config, dev_config = build_rl_train_configs(
@@ -350,6 +377,7 @@ class ServerlessBackend(Backend):
             max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
             kimi_k2_tau=kimi_k2_tau,
             kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_source=resolved_kl_penalty_source,
             allow_training_without_logprobs=allow_training_without_logprobs,
             plot_tensors=plot_tensors,
             truncated_importance_sampling=truncated_importance_sampling,
@@ -359,6 +387,10 @@ class ServerlessBackend(Backend):
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=kl_ref_adapter_path,
         )
+        if kl_penalty_reference_step is not None:
+            dev_config["kl_penalty_reference_step"] = kl_penalty_reference_step
+        if kl_penalty_step_lag is not None:
+            dev_config["kl_penalty_step_lag"] = kl_penalty_step_lag
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
@@ -418,6 +450,9 @@ class ServerlessBackend(Backend):
                 importance_sampling_level=dev_config.get("importance_sampling_level"),
                 kimi_k2_tau=dev_config.get("kimi_k2_tau"),
                 kl_penalty_coef=dev_config.get("kl_penalty_coef"),
+                kl_penalty_reference_step=dev_config.get("kl_penalty_reference_step"),
+                kl_penalty_source=dev_config.get("kl_penalty_source"),
+                kl_penalty_step_lag=dev_config.get("kl_penalty_step_lag"),
                 kl_ref_adapter_path=dev_config.get("kl_ref_adapter_path"),
                 learning_rate=config.learning_rate,
                 logprob_calculation_chunk_size=dev_config.get(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -92,6 +92,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         normalize_advantages: bool = True,
         adam_params: object | None = None,
         packed_sequence_length: int | None = None,
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_step_lag: int | None = None,
+        megatron_topology: art.MegatronTopologyConfig | None = None,
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
@@ -130,6 +133,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("discard_queue_multiplier must be > 0")
         if checkpoint_retention_interval <= 0:
             raise ValueError("checkpoint_retention_interval must be > 0")
+        if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
+            raise ValueError("kl_penalty_step_lag must be >= 1")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -148,6 +153,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.normalize_advantages = normalize_advantages
         self.adam_params = adam_params
         self.packed_sequence_length = packed_sequence_length
+        self.kl_penalty_coef = kl_penalty_coef
+        self.kl_penalty_step_lag = kl_penalty_step_lag
+        self.megatron_topology = megatron_topology
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
@@ -162,6 +170,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._collapse_triggered = False
         self._checkpoint_lease_counts: Counter[int] = Counter()
         self._scheduled_eval_steps: set[int] = set()
+        self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
 
         self.state = PipelineState()
         self._scenario_lock = asyncio.Lock()
@@ -218,9 +227,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._eval_queue = asyncio.Queue()
 
         if self.eval_fn is not None and self.eval_at_start:
-            self._scheduled_eval_steps.add(start_step)
-            await self._eval_queue.put(start_step)
-            self.state.last_eval_step = start_step
+            await self._schedule_eval_step(start_step)
             self._persist_state(start_step)
 
         self._status.start(initial_step=start_step)
@@ -279,6 +286,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         pass
             self._status.flush()
             self._status.close()
+            await self._release_all_scheduled_eval_leases()
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
@@ -375,32 +383,81 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self.state.policy_updated.wait()
 
     @asynccontextmanager
-    async def _adapter_lease(self, step: int) -> AsyncIterator[None]:
+    async def _checkpoint_lease(self, step: int) -> AsyncIterator[None]:
         self._checkpoint_lease_counts[step] += 1
-        if not hasattr(type(self.backend), "adapter_lease"):
-            try:
-                yield
-            finally:
-                self._release_checkpoint_lease(step)
-            return
         try:
+            yield
+        finally:
+            self._release_checkpoint_lease(step)
+
+    @asynccontextmanager
+    async def _adapter_retention_lease(self, step: int) -> AsyncIterator[None]:
+        async with self._checkpoint_lease(step):
+            if not hasattr(type(self.backend), "adapter_retention_lease"):
+                yield
+                return
+            lease = getattr(self.backend, "adapter_retention_lease", None)
+            if lease is None:
+                yield
+                return
+            async with lease(self.model, step):
+                yield
+
+    @asynccontextmanager
+    async def _adapter_lease(self, step: int) -> AsyncIterator[None]:
+        if not hasattr(type(self.backend), "adapter_lease"):
+            async with self._checkpoint_lease(step):
+                yield
+            return
+        async with self._checkpoint_lease(step):
             lease = getattr(self.backend, "adapter_lease", None)
             if lease is None:
                 yield
                 return
             async with lease(self.model, step):
                 yield
-        finally:
-            self._release_checkpoint_lease(step)
 
     def _release_checkpoint_lease(self, step: int) -> None:
         self._checkpoint_lease_counts[step] -= 1
         if self._checkpoint_lease_counts[step] <= 0:
             del self._checkpoint_lease_counts[step]
 
+    async def _schedule_eval_step(self, step: int) -> None:
+        if self._eval_queue is None:
+            raise RuntimeError("eval queue is not initialized")
+        if step in self._scheduled_eval_steps:
+            return
+        stack = AsyncExitStack()
+        await stack.enter_async_context(self._adapter_retention_lease(step))
+        try:
+            self._scheduled_eval_leases[step] = stack
+            self._scheduled_eval_steps.add(step)
+            await self._eval_queue.put(step)
+            self.state.last_eval_step = step
+        except Exception:
+            self._scheduled_eval_steps.discard(step)
+            self._scheduled_eval_leases.pop(step, None)
+            await stack.aclose()
+            raise
+
+    async def _release_scheduled_eval_lease(self, step: int) -> None:
+        self._scheduled_eval_steps.discard(step)
+        stack = self._scheduled_eval_leases.pop(step, None)
+        if stack is not None:
+            await stack.aclose()
+
+    async def _release_all_scheduled_eval_leases(self) -> None:
+        for step in tuple(self._scheduled_eval_leases):
+            await self._release_scheduled_eval_lease(step)
+
     def _retained_adapter_steps(self, current_step: int) -> set[int]:
         min_step = max(0, current_step - self.max_steps_off_policy)
         return set(range(min_step, current_step + 1))
+
+    def _kl_penalty_reference_step(self, current_step: int) -> int:
+        if self.kl_penalty_step_lag is None:
+            return 0
+        return max(0, current_step - self.kl_penalty_step_lag)
 
     async def _prune_model_adapters(self, current_step: int) -> None:
         if not hasattr(type(self.backend), "prune_model_adapters"):
@@ -528,6 +585,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 }
                 if self.packed_sequence_length is not None:
                     train_kwargs["packed_sequence_length"] = self.packed_sequence_length
+                if self.kl_penalty_coef > 0.0:
+                    kl_penalty_reference_step = self._kl_penalty_reference_step(
+                        current_step
+                    )
+                    train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
+                    train_kwargs["kl_penalty_source"] = "sample"
+                    train_kwargs["kl_penalty_reference_step"] = (
+                        kl_penalty_reference_step
+                    )
+                if self.megatron_topology is not None:
+                    train_kwargs["megatron_topology"] = self.megatron_topology
                 result = await self.backend.train(
                     self.model,
                     batch,
@@ -580,10 +648,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self._log_zero_variance_groups(current_step)
 
                 if self.eval_fn is not None and should_eval_step:
-                    self._scheduled_eval_steps.add(current_step)
-                    if self._eval_queue is not None:
-                        await self._eval_queue.put(current_step)
-                    self.state.last_eval_step = current_step
+                    await self._schedule_eval_step(current_step)
 
                 self._persist_state(current_step)
             finally:
@@ -744,7 +809,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         except Exception as exc:
             print(f"Eval failed at step {step}: {exc}")
         finally:
-            self._scheduled_eval_steps.discard(step)
+            await self._release_scheduled_eval_lease(step)
             if eval_completed:
                 self.state.completed_eval_steps.add(step)
                 self._persist_state(self.state.next_training_step)
@@ -1021,11 +1086,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         return sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
 
     def _protected_checkpoint_steps(self, current_step: int) -> set[int]:
-        return (
+        protected_steps = (
             {current_step}
             | set(self._checkpoint_lease_counts)
             | set(self._scheduled_eval_steps)
         )
+        if self.kl_penalty_coef > 0.0:
+            if self.kl_penalty_step_lag is None:
+                protected_steps.add(0)
+            else:
+                kl_penalty_reference_step = self._kl_penalty_reference_step(
+                    current_step
+                )
+                protected_steps.update(
+                    range(kl_penalty_reference_step, current_step + 1)
+                )
+        return protected_steps
 
     async def _run_checkpoint_retention(self, current_step: int) -> None:
         strategy = self.checkpoint_retention_strategy

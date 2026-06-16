@@ -514,11 +514,19 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     )
     capturer_cls._scatter_to_host = scatter_to_host  # type: ignore[method-assign]
     capturer_cls.get_routed_experts = get_routed_experts  # type: ignore[method-assign]
-    routed_experts_capturer.issue_routing_d2h_copy = issue_routing_d2h_copy
-    try:
-        from vllm.v1.worker import gpu_model_runner
+    from vllm.v1.worker import gpu_model_runner
 
-        gpu_model_runner.issue_routing_d2h_copy = issue_routing_d2h_copy
-    except Exception:
-        pass
+    gpu_model_runner_issue_routing_d2h_copy = getattr(
+        gpu_model_runner, "issue_routing_d2h_copy", None
+    )
+    if gpu_model_runner_issue_routing_d2h_copy is not original_issue_routing_d2h_copy:
+        raise RuntimeError(
+            "ART routed-expert prefix-cache patch expected "
+            "vllm.v1.worker.gpu_model_runner.issue_routing_d2h_copy to reference "
+            "vllm.model_executor.layers.fused_moe.routed_experts_capturer."
+            "issue_routing_d2h_copy. vLLM internals changed; update the patch."
+        )
+
+    routed_experts_capturer.issue_routing_d2h_copy = issue_routing_d2h_copy
+    gpu_model_runner.issue_routing_d2h_copy = issue_routing_d2h_copy
     setattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", True)

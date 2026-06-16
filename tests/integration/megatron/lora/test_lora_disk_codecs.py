@@ -2,17 +2,29 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any, cast
 
 from safetensors.torch import load_file, save_file
 import torch
 
+from art.megatron import lora as lora_module
+from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
-from art.megatron.model_support.lora_disk import normalize_lora_checkpoint_to_vllm
-from art.megatron.weights.merge import load_lora_adapter_state_dict, merge_lora_adapter
+from art.megatron.model_support.lora_disk import (
+    load_lora_tensors_for_megatron,
+    normalize_lora_checkpoint_to_vllm,
+    save_vllm_lora_tensors,
+)
+from art.megatron.weights import lora_publish
+from art.megatron.weights.lora_publish import (
+    LoraShardMeta,
+    merge_sharded_adapter_entries,
+    save_vllm_lora_from_model,
+)
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
@@ -65,6 +77,37 @@ def _save_adapter(path: Path, tensors: dict[str, torch.Tensor], config: dict) ->
     path.mkdir(parents=True, exist_ok=True)
     save_file(tensors, path / "adapter_model.safetensors")
     (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def _old_merge_shard_files_to_vllm(
+    lora_path: Path,
+    *,
+    handler,
+    adapter_config: dict,
+) -> None:
+    entries_by_key: dict[str, list[tuple[dict, torch.Tensor]]] = {}
+    shard_paths = sorted(lora_path.glob("adapter_model-*-of-*.safetensors"))
+    manifest_paths = sorted(lora_path.glob("adapter_manifest-*-of-*.json"))
+    for shard_path in shard_paths:
+        suffix = shard_path.name.removeprefix("adapter_model-").removesuffix(
+            ".safetensors"
+        )
+        manifest = json.loads(
+            (lora_path / f"adapter_manifest-{suffix}.json").read_text()
+        )
+        shard_tensors = load_file(shard_path)
+        assert set(shard_tensors) == set(manifest)
+        for key, tensor in shard_tensors.items():
+            entries_by_key.setdefault(key, []).append((manifest[key], tensor))
+
+    merged = merge_sharded_adapter_entries(entries_by_key)
+    vllm_tensors, adapter_config = handler.to_vllm_lora_tensors(
+        merged,
+        adapter_config=adapter_config,
+    )
+    save_vllm_lora_tensors(lora_path, vllm_tensors, adapter_config)
+    for path in [*shard_paths, *manifest_paths]:
+        path.unlink()
 
 
 def _assert_stock_vllm_loads(
@@ -144,6 +187,73 @@ def _qwen35_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
             )
             offset += 100
     return tensors
+
+
+def _qwen35_shared_expert_art_tensors(
+    prefix: str,
+    *,
+    rank: int = 2,
+) -> dict[str, torch.Tensor]:
+    hidden = 3
+    intermediate = 4
+    tensors: dict[str, torch.Tensor] = {}
+    offset = 1000
+    for module, in_dim, out_dim in (
+        ("gate_proj", hidden, intermediate),
+        ("up_proj", hidden, intermediate),
+        ("down_proj", intermediate, hidden),
+    ):
+        module_prefix = f"{prefix}.mlp.shared_expert.{module}"
+        tensors[f"{module_prefix}.lora_A.weight"] = (
+            torch.arange(rank * in_dim, dtype=torch.float32).reshape(rank, in_dim)
+            + offset
+        )
+        offset += 100
+        tensors[f"{module_prefix}.lora_B.weight"] = (
+            torch.arange(out_dim * rank, dtype=torch.float32).reshape(out_dim, rank)
+            + offset
+        )
+        offset += 100
+    return tensors
+
+
+def _pack_qwen35_vllm_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
+    stacked = torch.stack(blocks, dim=0)
+    return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
+
+
+def _qwen35_fused_expert_vllm_tensors(
+    original: dict[str, torch.Tensor],
+    art_prefix: str,
+) -> dict[str, torch.Tensor]:
+    vllm_prefix = art_prefix.replace(
+        "base_model.model.model.layers.",
+        "base_model.model.model.language_model.layers.",
+        1,
+    )
+    expert_prefix = f"{vllm_prefix}.mlp.experts"
+    art_expert_prefix = f"{art_prefix}.mlp.experts"
+    gate_up_a: list[torch.Tensor] = []
+    gate_up_b: list[torch.Tensor] = []
+    down_a: list[torch.Tensor] = []
+    down_b: list[torch.Tensor] = []
+    for expert in range(2):
+        prefix = f"{art_expert_prefix}.{expert}"
+        gate_up_a.append(original[f"{prefix}.gate_up_proj.lora_A.weight"])
+        gate_up_b.append(original[f"{prefix}.gate_up_proj.lora_B.weight"])
+        down_a.append(original[f"{prefix}.down_proj.lora_A.weight"])
+        down_b.append(original[f"{prefix}.down_proj.lora_B.weight"])
+    return {
+        f"{expert_prefix}.base_layer.lora_A.weight": torch.cat(
+            gate_up_a,
+            dim=0,
+        ).contiguous(),
+        f"{expert_prefix}.base_layer.lora_B.weight": _pack_qwen35_vllm_lora_b(
+            gate_up_b
+        ),
+        f"{expert_prefix}.lora_A.weight": torch.cat(down_a, dim=0).contiguous(),
+        f"{expert_prefix}.lora_B.weight": _pack_qwen35_vllm_lora_b(down_b),
+    }
 
 
 def _qwen3_dense_lora_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Tensor]:
@@ -366,6 +476,75 @@ def test_qwen3_fused_identity_normalizes_to_per_expert_vllm_layout(
     _assert_tensors_equal(converted, expected)
     adapter_config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert "experts" in adapter_config["target_modules"]
+
+
+def test_qwen3_target_parameter_identity_normalizes_to_per_expert_vllm_layout(
+    tmp_path: Path,
+) -> None:
+    prefix = "base_model.model.model.layers.0.mlp.experts"
+    rank = 2
+    hidden = 3
+    intermediate = 4
+    num_experts = 2
+    gate_up_a = torch.arange(
+        num_experts * rank * 2 * intermediate,
+        dtype=torch.float32,
+    ).reshape(num_experts * rank, 2 * intermediate)
+    gate_up_b = (
+        torch.arange(hidden * num_experts * rank, dtype=torch.float32).reshape(
+            hidden, num_experts * rank
+        )
+        + 100
+    )
+    down_a = (
+        torch.arange(num_experts * rank * hidden, dtype=torch.float32).reshape(
+            num_experts * rank, hidden
+        )
+        + 200
+    )
+    down_b = (
+        torch.arange(intermediate * num_experts * rank, dtype=torch.float32).reshape(
+            intermediate, num_experts * rank
+        )
+        + 300
+    )
+    _save_adapter(
+        tmp_path,
+        {
+            f"{prefix}.base_layer.lora_A.weight": gate_up_a,
+            f"{prefix}.base_layer.lora_B.weight": gate_up_b,
+            f"{prefix}.lora_A.weight": down_a,
+            f"{prefix}.lora_B.weight": down_b,
+        },
+        _config("Qwen/Qwen3-30B-A3B", rank=rank),
+    )
+
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=QWEN3_MOE_HANDLER,
+        adapter_config=_config("Qwen/Qwen3-30B-A3B", rank=rank),
+    )
+
+    expected: dict[str, torch.Tensor] = {}
+    for expert in range(num_experts):
+        rows = slice(expert * rank, (expert + 1) * rank)
+        gate_a, up_a = gate_up_a[rows].split(intermediate, dim=1)
+        expert_prefix = f"{prefix}.{expert}"
+        expected[f"{expert_prefix}.gate_proj.lora_A.weight"] = gate_up_b[
+            :, rows
+        ].T.contiguous()
+        expected[f"{expert_prefix}.gate_proj.lora_B.weight"] = gate_a.T.contiguous()
+        expected[f"{expert_prefix}.up_proj.lora_A.weight"] = gate_up_b[
+            :, rows
+        ].T.contiguous()
+        expected[f"{expert_prefix}.up_proj.lora_B.weight"] = up_a.T.contiguous()
+        expected[f"{expert_prefix}.down_proj.lora_A.weight"] = down_b[
+            :, rows
+        ].T.contiguous()
+        expected[f"{expert_prefix}.down_proj.lora_B.weight"] = down_a[
+            rows
+        ].T.contiguous()
+    _assert_tensors_equal(load_file(tmp_path / "adapter_model.safetensors"), expected)
     loaded_modules = _assert_stock_vllm_loads(
         tmp_path,
         expected_modules={
@@ -390,6 +569,7 @@ def test_qwen3_fused_identity_normalizes_to_per_expert_vllm_layout(
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _qwen35_moe_art_tensors(art_prefix)
+    expected_experts = _qwen35_fused_expert_vllm_tensors(original, art_prefix)
     for base_model in ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.6-35B-A3B"):
         vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
             original,
@@ -408,6 +588,9 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
             "experts",
         ]
         assert all("language_model.layers" in key for key in vllm_tensors)
+        assert not any(".mlp.experts.0." in key for key in vllm_tensors)
+        for key, tensor in expected_experts.items():
+            assert torch.equal(vllm_tensors[key], tensor), key
         roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
             vllm_tensors,
             adapter_config=vllm_config,
@@ -417,11 +600,81 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         _save_adapter(adapter_dir, vllm_tensors, vllm_config)
         loaded_modules = _assert_stock_vllm_loads(
             adapter_dir,
-            expected_modules=set(vllm_config["target_modules"]),
+            expected_modules={"q_proj", "experts"},
             mapper="qwen35",
         )
         assert "language_model.model.layers.0.mlp.experts" in loaded_modules
         assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
+    art_prefix = "base_model.model.model.layers.0"
+    original = {
+        **_qwen35_moe_art_tensors(art_prefix),
+        **_qwen35_shared_expert_art_tensors(art_prefix),
+    }
+    adapter_config = _qwen35_config("Qwen/Qwen3.6-35B-A3B")
+    adapter_config["target_modules"] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "out_proj",
+        "experts",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+    vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=adapter_config,
+    )
+    assert vllm_config["target_modules"] == adapter_config["target_modules"]
+    assert any(".mlp.shared_expert.gate_proj." in key for key in vllm_tensors)
+    assert any(".mlp.shared_expert.up_proj." in key for key in vllm_tensors)
+    assert any(".mlp.shared_expert.down_proj." in key for key in vllm_tensors)
+    roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=vllm_config,
+    )
+    _assert_tensors_equal(roundtrip, original)
+
+
+def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(
+    tmp_path: Path,
+) -> None:
+    art_prefix = "base_model.model.model.layers.0"
+    original = _qwen35_moe_art_tensors(art_prefix)
+    expected = _qwen35_fused_expert_vllm_tensors(original, art_prefix)
+    raw = {
+        key.replace(
+            "base_model.model.model.language_model.layers.",
+            "base_model.model.model.layers.",
+            1,
+        ): tensor
+        for key, tensor in expected.items()
+    }
+    _save_adapter(
+        tmp_path,
+        raw,
+        {
+            **_qwen35_config("Qwen/Qwen3.5-35B-A3B"),
+            "target_parameters": [
+                "model.layers.0.mlp.experts.gate_up_proj",
+                "model.layers.0.mlp.experts.down_proj",
+            ],
+        },
+    )
+
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=QWEN3_5_MOE_HANDLER,
+        adapter_config=_qwen35_config("Qwen/Qwen3.5-35B-A3B"),
+    )
+
+    _assert_tensors_equal(load_file(tmp_path / "adapter_model.safetensors"), expected)
 
 
 def test_qwen35_and_qwen36_dense_prefix_roundtrip_and_stock_loader(tmp_path: Path):
@@ -600,27 +853,18 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
         f"{prefix}.down_proj.lora_A.weight": sharded(1, 1),
     }
     adapter_dir = tmp_path / "qwen35_megatron_shards"
-    adapter_dir.mkdir()
-    (adapter_dir / "adapter_config.json").write_text(
-        json.dumps(_config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)),
-        encoding="utf-8",
+    adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)
+    entries_by_key = {key: [(manifest0[key], tensor)] for key, tensor in shard0.items()}
+    for key, tensor in shard1.items():
+        entries_by_key.setdefault(key, []).append((manifest1[key], tensor))
+    merged = merge_sharded_adapter_entries(entries_by_key)
+    vllm_tensors, adapter_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        merged,
+        adapter_config=adapter_config,
     )
-    save_file(shard0, adapter_dir / "adapter_model-01-of-02.safetensors")
-    save_file(shard1, adapter_dir / "adapter_model-02-of-02.safetensors")
-    (adapter_dir / "adapter_manifest-01-of-02.json").write_text(
-        json.dumps(manifest0),
-        encoding="utf-8",
-    )
-    (adapter_dir / "adapter_manifest-02-of-02.json").write_text(
-        json.dumps(manifest1),
-        encoding="utf-8",
-    )
+    save_vllm_lora_tensors(adapter_dir, vllm_tensors, adapter_config)
 
-    merge_lora_adapter(str(adapter_dir))
-
-    assert not list(adapter_dir.glob("adapter_model-*-of-*.safetensors"))
-    assert not list(adapter_dir.glob("adapter_manifest-*-of-*.json"))
-    roundtrip = load_lora_adapter_state_dict(
+    roundtrip = load_lora_tensors_for_megatron(
         str(adapter_dir),
         handler=QWEN3_5_MOE_HANDLER,
     )
@@ -628,11 +872,417 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
     final_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     loaded_modules = _assert_stock_vllm_loads(
         adapter_dir,
-        expected_modules=set(final_config["target_modules"]),
+        expected_modules={"experts"},
         mapper="qwen35",
     )
     assert "language_model.model.layers.0.mlp.experts" in loaded_modules
     assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_lora_publish_keeps_same_key_shards_separate():
+    key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
+    manifest = {
+        "sharded": True,
+        "shard_world_size": 2,
+        "export_shard_dim": 0,
+        "export_shard_strategy": "uniform",
+    }
+    shard0 = torch.tensor([[1.0], [2.0]])
+    shard1 = torch.tensor([[3.0], [4.0]])
+    metadata = [
+        LoraShardMeta(
+            key=key,
+            owner_rank=0,
+            shape=tuple(shard0.shape),
+            dtype_name="float32",
+            manifest={**manifest, "shard_rank": 0},
+            block="base_model.model.model.layers.0",
+        ),
+        LoraShardMeta(
+            key=key,
+            owner_rank=1,
+            shape=tuple(shard1.shape),
+            dtype_name="float32",
+            manifest={**manifest, "shard_rank": 1},
+            block="base_model.model.model.layers.0",
+        ),
+    ]
+    entries = lora_publish._entries_by_key(
+        metadata,
+        {
+            (0, key): shard0,
+            (1, key): shard1,
+        },
+    )
+
+    merged = merge_sharded_adapter_entries(entries)
+
+    assert torch.equal(merged[key], torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+
+
+def test_lora_publish_planner_derives_metadata_from_lora_modules():
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    b_parallel_spec = LoRAParallelSpec(sharded=True, shard_dim=-1)
+    lora = LoRA(
+        adapter_model_prefix=prefix,
+        in_features=4,
+        out_features=6,
+        rank=2,
+        alpha=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        b_parallel_spec=b_parallel_spec,
+    )
+    adapter_model = {
+        f"{prefix}.lora_A.weight": torch.empty(2, 4, dtype=torch.float32),
+        f"{prefix}.lora_B.weight": torch.empty(6, 2, dtype=torch.float32),
+    }
+
+    metadata = LoRAPublishPlanner([torch.nn.Sequential(lora)]).global_metadata(
+        adapter_model
+    )
+    by_key = {meta.key: meta for meta in metadata}
+
+    a_meta = by_key[f"{prefix}.lora_A.weight"]
+    assert a_meta.shape == (2, 4)
+    assert a_meta.dtype_name == "float32"
+    assert a_meta.owner_rank == 0
+    assert a_meta.manifest == {
+        "sharded": False,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+    }
+    assert a_meta.block == "base_model.model.model.layers.0"
+
+    b_meta = by_key[f"{prefix}.lora_B.weight"]
+    assert b_meta.shape == (6, 2)
+    assert b_meta.dtype_name == "float32"
+    assert b_meta.owner_rank == 0
+    assert b_meta.manifest == {
+        "sharded": True,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+        "export_shard_dim": 0,
+        "export_shard_strategy": "uniform",
+    }
+
+
+def test_lora_publish_planner_maps_expert_owner_ranks(monkeypatch):
+    monkeypatch.setattr(lora_module, "_distributed_initialized", lambda: True)
+    monkeypatch.setattr(
+        lora_module,
+        "_get_shard_world_size",
+        lambda domain: 2 if domain == "expert_tp" else 1,
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_tensor_and_model_parallel_group",
+        lambda check_initialized=False: "joint",
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_model_parallel_group",
+        lambda: "ep",
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_tensor_parallel_group",
+        lambda check_initialized=False: "etp",
+    )
+
+    row_major = {"joint": (0, 1, 2, 3, 4, 5, 6, 7), "ep": (0, 2, 4, 6), "etp": (0, 1)}
+    monkeypatch.setattr(
+        lora_module,
+        "_process_group_ranks",
+        lambda group: row_major[group],
+    )
+    assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
+
+    column_major = {
+        "joint": (0, 1, 2, 3, 4, 5, 6, 7),
+        "ep": (0, 1, 2, 3),
+        "etp": (0, 4),
+    }
+    monkeypatch.setattr(
+        lora_module,
+        "_process_group_ranks",
+        lambda group: column_major[group],
+    )
+    assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
+
+
+def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
+    uniform_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
+    componentwise_key = (
+        "base_model.model.model.layers.0.mlp.experts.gate_up_proj.lora_B.weight"
+    )
+    unsharded_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+    full_uniform = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    full_componentwise = torch.tensor(
+        [[0.0], [1.0], [10.0], [11.0], [2.0], [3.0], [12.0], [13.0]]
+    )
+    shard0 = {
+        unsharded_key: torch.arange(4, dtype=torch.float32).reshape(2, 2) + 100,
+        uniform_key: full_uniform[:2],
+        componentwise_key: torch.tensor([[0.0], [1.0], [2.0], [3.0]]),
+    }
+    shard1 = {
+        uniform_key: full_uniform[2:],
+        componentwise_key: torch.tensor([[10.0], [11.0], [12.0], [13.0]]),
+    }
+    unsharded_manifest = {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
+    uniform_manifest = {
+        "sharded": True,
+        "shard_world_size": 2,
+        "export_shard_dim": 0,
+        "export_shard_strategy": "uniform",
+    }
+    componentwise_manifest = {
+        "sharded": True,
+        "shard_world_size": 2,
+        "export_shard_dim": 0,
+        "export_shard_strategy": "componentwise",
+        "component_sizes": [4, 4],
+    }
+    manifest0 = {
+        unsharded_key: unsharded_manifest,
+        uniform_key: {**uniform_manifest, "shard_rank": 0},
+        componentwise_key: {**componentwise_manifest, "shard_rank": 0},
+    }
+    manifest1 = {
+        uniform_key: {**uniform_manifest, "shard_rank": 1},
+        componentwise_key: {**componentwise_manifest, "shard_rank": 1},
+    }
+
+    class IdentityHandler:
+        def to_vllm_lora_tensors(self, tensors, *, adapter_config):
+            return dict(tensors), dict(adapter_config)
+
+    old_dir = tmp_path / "old"
+    current_dir = tmp_path / "current"
+    old_dir.mkdir()
+    save_file(shard0, old_dir / "adapter_model-01-of-02.safetensors")
+    save_file(shard1, old_dir / "adapter_model-02-of-02.safetensors")
+    (old_dir / "adapter_manifest-01-of-02.json").write_text(
+        json.dumps(manifest0, sort_keys=True)
+    )
+    (old_dir / "adapter_manifest-02-of-02.json").write_text(
+        json.dumps(manifest1, sort_keys=True)
+    )
+    adapter_config = _config("Qwen/Qwen3-30B-A3B")
+    handler = IdentityHandler()
+    _old_merge_shard_files_to_vllm(
+        old_dir,
+        handler=handler,
+        adapter_config=adapter_config,
+    )
+
+    metadata = [
+        LoraShardMeta(
+            key=key,
+            owner_rank=0,
+            shape=tuple(tensor.shape),
+            dtype_name=str(tensor.dtype).removeprefix("torch."),
+            manifest=manifest0[key],
+            block="base_model.model.model.layers.0",
+        )
+        for key, tensor in shard0.items()
+    ] + [
+        LoraShardMeta(
+            key=key,
+            owner_rank=1,
+            shape=tuple(tensor.shape),
+            dtype_name=str(tensor.dtype).removeprefix("torch."),
+            manifest=manifest1[key],
+            block="base_model.model.model.layers.0",
+        )
+        for key, tensor in shard1.items()
+    ]
+    lora_publish._save_rank0_vllm_lora(
+        metadata=metadata,
+        tensors_by_owner_key={
+            **{(0, key): tensor for key, tensor in shard0.items()},
+            **{(1, key): tensor for key, tensor in shard1.items()},
+        },
+        handler=handler,
+        adapter_config=adapter_config,
+        output_dir=str(current_dir),
+    )
+
+    old_tensors = load_file(old_dir / "adapter_model.safetensors")
+    current_tensors = load_file(current_dir / "adapter_model.safetensors")
+    _assert_tensors_equal(current_tensors, old_tensors)
+    assert torch.equal(current_tensors[uniform_key], full_uniform)
+    assert torch.equal(current_tensors[componentwise_key], full_componentwise)
+    assert (current_dir / "adapter_model.safetensors").read_bytes() == (
+        old_dir / "adapter_model.safetensors"
+    ).read_bytes()
+    assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
+        (old_dir / "adapter_config.json").read_text()
+    )
+
+
+def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path):
+    prefix = "base_model.model.model.layers.0.mlp.experts.0"
+    full = {
+        f"{prefix}.gate_up_proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+        f"{prefix}.gate_up_proj.lora_B.weight": torch.arange(
+            8,
+            dtype=torch.float32,
+        ).reshape(8, 1),
+        f"{prefix}.down_proj.lora_A.weight": torch.arange(
+            4,
+            dtype=torch.float32,
+        ).reshape(1, 4),
+        f"{prefix}.down_proj.lora_B.weight": torch.arange(
+            2,
+            dtype=torch.float32,
+        ).reshape(2, 1),
+    }
+
+    gate_up_lora = LoRA(
+        adapter_model_prefix=f"{prefix}.gate_up_proj",
+        in_features=2,
+        out_features=8,
+        rank=1,
+        alpha=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    gate_up_lora.A_T.data.copy_(full[f"{prefix}.gate_up_proj.lora_A.weight"].T)
+    gate_up_lora.B_T.data.copy_(full[f"{prefix}.gate_up_proj.lora_B.weight"].T)
+    down_lora = LoRA(
+        adapter_model_prefix=f"{prefix}.down_proj",
+        in_features=4,
+        out_features=2,
+        rank=1,
+        alpha=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    down_lora.A_T.data.copy_(full[f"{prefix}.down_proj.lora_A.weight"].T)
+    down_lora.B_T.data.copy_(full[f"{prefix}.down_proj.lora_B.weight"].T)
+
+    publish_dir = tmp_path / "published_from_model"
+    save_vllm_lora_from_model(
+        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
+        adapter_model=full,
+        handler=QWEN3_5_MOE_HANDLER,
+        adapter_config=_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1),
+        output_dir=str(publish_dir),
+        rank=0,
+        world_size=1,
+    )
+
+    assert not list(publish_dir.glob("adapter_model-*-of-*.safetensors"))
+    roundtrip = load_lora_tensors_for_megatron(
+        str(publish_dir),
+        handler=QWEN3_5_MOE_HANDLER,
+    )
+    _assert_tensors_equal(roundtrip, full)
+
+
+def test_direct_qwen35_packed_expert_publish_matches_old_vllm_exactly(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
+
+    rank = 2
+    hidden = 3
+    intermediate = 4
+    group_prefix = "base_model.model.model.layers.0.mlp.experts"
+    full: dict[str, torch.Tensor] = {}
+    gate_up_lora = LoRA(
+        adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
+        in_features=hidden,
+        out_features=2 * intermediate,
+        rank=rank,
+        alpha=rank,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=2,
+    )
+    down_lora = LoRA(
+        adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
+        in_features=intermediate,
+        out_features=hidden,
+        rank=rank,
+        alpha=rank,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        num_local_experts=2,
+    )
+    offset = 0
+    for expert in range(2):
+        expert_prefix = f"{group_prefix}.{expert}"
+        tensors = {
+            "gate_up_proj.lora_A.weight": torch.arange(
+                rank * hidden,
+                dtype=torch.float32,
+            ).reshape(rank, hidden)
+            + offset,
+            "gate_up_proj.lora_B.weight": torch.arange(
+                2 * intermediate * rank,
+                dtype=torch.float32,
+            ).reshape(2 * intermediate, rank)
+            + offset
+            + 100,
+            "down_proj.lora_A.weight": torch.arange(
+                rank * intermediate,
+                dtype=torch.float32,
+            ).reshape(rank, intermediate)
+            + offset
+            + 200,
+            "down_proj.lora_B.weight": torch.arange(
+                hidden * rank,
+                dtype=torch.float32,
+            ).reshape(hidden, rank)
+            + offset
+            + 300,
+        }
+        for suffix, tensor in tensors.items():
+            full[f"{expert_prefix}.{suffix}"] = tensor
+        gate_up_lora.A_T.data[expert].copy_(tensors["gate_up_proj.lora_A.weight"].T)
+        gate_up_lora.B_T.data[expert].copy_(tensors["gate_up_proj.lora_B.weight"].T)
+        down_lora.A_T.data[expert].copy_(tensors["down_proj.lora_A.weight"].T)
+        down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
+        offset += 1000
+
+    adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=rank, alpha=rank)
+    old_dir = tmp_path / "old"
+    current_dir = tmp_path / "current"
+    old_tensors, old_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        full,
+        adapter_config=dict(adapter_config),
+    )
+    save_vllm_lora_tensors(old_dir, old_tensors, old_config)
+    save_vllm_lora_from_model(
+        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
+        adapter_model=full,
+        handler=QWEN3_5_MOE_HANDLER,
+        adapter_config=dict(adapter_config),
+        output_dir=str(current_dir),
+        rank=0,
+        world_size=1,
+    )
+
+    _assert_tensors_equal(
+        load_file(current_dir / "adapter_model.safetensors"),
+        load_file(old_dir / "adapter_model.safetensors"),
+    )
+    assert (current_dir / "adapter_model.safetensors").read_bytes() == (
+        old_dir / "adapter_model.safetensors"
+    ).read_bytes()
+    assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
+        (old_dir / "adapter_config.json").read_text()
+    )
 
 
 def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(
@@ -654,29 +1304,21 @@ def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(
             dtype=torch.float32,
         ).reshape(2, 1),
     }
-    shard_dir = tmp_path / "staging"
     publish_dir = tmp_path / "published"
-    shard_dir.mkdir()
-    (shard_dir / "adapter_config.json").write_text(
-        json.dumps(_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1)),
-        encoding="utf-8",
+    adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1)
+    entries_by_key = {
+        key: [({"sharded": False, "shard_world_size": 1, "shard_rank": 0}, tensor)]
+        for key, tensor in full.items()
+    }
+    merged = merge_sharded_adapter_entries(entries_by_key)
+    vllm_tensors, adapter_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        merged,
+        adapter_config=adapter_config,
     )
-    save_file(full, shard_dir / "adapter_model-01-of-01.safetensors")
-    (shard_dir / "adapter_manifest-01-of-01.json").write_text(
-        json.dumps(
-            {
-                key: {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
-                for key in full
-            }
-        ),
-        encoding="utf-8",
-    )
+    save_vllm_lora_tensors(publish_dir, vllm_tensors, adapter_config)
 
-    merge_lora_adapter(str(shard_dir), output_dir=publish_dir)
-
-    assert not (shard_dir / "adapter_model.safetensors").exists()
     assert (publish_dir / "adapter_model.safetensors").exists()
-    roundtrip = load_lora_adapter_state_dict(
+    roundtrip = load_lora_tensors_for_megatron(
         str(publish_dir),
         handler=QWEN3_5_MOE_HANDLER,
     )

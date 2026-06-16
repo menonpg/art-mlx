@@ -11,7 +11,7 @@ import pytest
 
 import art
 from art import dev
-from art.megatron.runtime.backend import MegatronBackend
+from art.megatron.backend import MegatronBackend
 from art.megatron.service import MegatronService
 
 from ..model_support.oracle_harness import ORACLE_TOPOLOGY, Topology
@@ -35,7 +35,7 @@ DEDICATED_MERGED_ENV = "ART_RUN_LIVE_MEGATRON_MERGED_SMOKE"
 DEDICATED_MULTIRANK_MERGED_ENV = "ART_RUN_LIVE_MEGATRON_MULTIRANK_MERGED_SMOKE"
 SHARED_LORA_ENV = "ART_RUN_LIVE_MEGATRON_SHARED_SMOKE"
 SHARED_LONG_LORA_ENV = "ART_RUN_LIVE_MEGATRON_SHARED_LONG_SMOKE"
-SHARED_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+SHARED_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
 
 
 def _base_model() -> str:

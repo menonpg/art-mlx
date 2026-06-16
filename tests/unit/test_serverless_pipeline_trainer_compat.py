@@ -92,6 +92,7 @@ async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
         "allow_training_without_logprobs": True,
         "importance_sampling_level": "token",
         "kl_penalty_coef": 0.1,
+        "kl_penalty_source": "sample",
         "kl_ref_adapter_path": "/tmp/ref-adapter",
         "logprob_calculation_chunk_size": 512,
         "mask_prob_ratio": False,
@@ -123,6 +124,17 @@ async def test_serverless_train_rejects_unsupported_pipeline_kwargs() -> None:
 
     with pytest.raises(ValueError, match="conflicting loss_fn and ppo"):
         await backend.train(model, [_make_group()], loss_fn="ppo", ppo=False)
+
+    with pytest.raises(ValueError, match="kl_penalty_step_lag must be >= 1"):
+        await backend.train(model, [_make_group()], kl_penalty_step_lag=0)
+
+    with pytest.raises(ValueError, match="Only one of"):
+        await backend.train(
+            model,
+            [_make_group()],
+            kl_penalty_reference_step=0,
+            kl_penalty_step_lag=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -163,6 +175,8 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
                 "importance_sampling_level": "sequence",
                 "kimi_k2_tau": 0.4,
                 "kl_penalty_coef": 0.2,
+                "kl_penalty_reference_step": 0,
+                "kl_penalty_source": "sample",
                 "kl_ref_adapter_path": "/tmp/ref",
                 "logprob_calculation_chunk_size": 512,
                 "mask_prob_ratio": True,
@@ -185,6 +199,8 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
     assert payload["normalize_advantages"] is False
     assert payload["packed_sequence_length"] == 4096
     assert payload["kl_penalty_coef"] == 0.2
+    assert payload["kl_penalty_reference_step"] == 0
+    assert payload["kl_penalty_source"] == "sample"
     assert payload["kl_ref_adapter_path"] == "/tmp/ref"
     assert payload["allow_training_without_logprobs"] is True
     assert payload["scale_learning_rate_by_reward_std_dev"] is True
@@ -269,3 +285,43 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     assert config["batch_size"] == 2
     assert metric_logging["enabled"] is True
     assert metric_logging["target_training_step"] == 1
+
+
+@pytest.mark.asyncio
+async def test_serverless_train_forwards_kl_step_lag() -> None:
+    backend = _make_backend()
+    model = TrainableModel(
+        name="serverless-kl-step-lag",
+        project="pipeline-tests",
+        base_model="test-model",
+    )
+    model.id = "model-id"
+
+    seen: dict[str, Any] = {}
+
+    async def fake_train_model(
+        _model: TrainableModel,
+        _groups: list[TrajectoryGroup],
+        _config: TrainConfig,
+        dev_config: dict[str, Any],
+        verbose: bool = False,
+    ):
+        del verbose
+        seen["dev_config"] = dev_config
+        yield {}
+
+    backend._train_model = fake_train_model  # type: ignore[method-assign]
+    backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
+
+    with patch.object(model, "_get_wandb_run", return_value=None):
+        await backend.train(
+            model,
+            [_make_group()],
+            kl_penalty_coef=0.2,
+            kl_penalty_source="sample",
+            kl_penalty_step_lag=3,
+        )
+
+    assert seen["dev_config"]["kl_penalty_coef"] == 0.2
+    assert seen["dev_config"]["kl_penalty_source"] == "sample"
+    assert seen["dev_config"]["kl_penalty_step_lag"] == 3

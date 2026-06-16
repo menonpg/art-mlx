@@ -679,10 +679,10 @@ class _PreparePackedRecurrentInputs(torch.autograd.Function):
         )
         ctx.input_shape = tuple(qkv.shape)
         ctx.beta_shape = tuple(beta.shape)
+        ctx.device = qkv.device
         ctx.input_dtype = qkv.dtype
         ctx.beta_dtype = beta.dtype
         ctx.g_dtype = recurrent_g.dtype
-        ctx.device = qkv.device
         ctx.key_heads = key_heads
         ctx.value_heads = value_heads
         ctx.key_dim = key_dim
@@ -693,7 +693,7 @@ class _PreparePackedRecurrentInputs(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any,
-        *grad_outputs: Any,
+        *grad_outputs: Tensor | None,
     ) -> tuple[
         Tensor | None,
         Tensor | None,
@@ -703,6 +703,8 @@ class _PreparePackedRecurrentInputs(torch.autograd.Function):
         None,
         None,
     ]:
+        if len(grad_outputs) != 5:
+            raise RuntimeError("expected five packed QKV output gradients")
         grad_query, grad_key, grad_value, grad_beta_out, grad_g_out = grad_outputs
         token_count, channels = ctx.input_shape
         grad_qkv = None
@@ -837,9 +839,11 @@ class _CompactScatterBucketOutput(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: Any, *grad_outputs: Any
+        ctx: Any, *grad_outputs: Tensor | None
     ) -> tuple[Tensor, Tensor, None, None, None, None]:
-        (grad_out,) = grad_outputs
+        if len(grad_outputs) != 1 or grad_outputs[0] is None:
+            raise RuntimeError("expected compact scatter output gradient")
+        grad_out = grad_outputs[0]
         row_indices, position_indices, output_mask, cu_seqlens = ctx.saved_tensors
         _, output_sequence_length, heads, dim = ctx.output_shape
         grad_out = grad_out.contiguous()
