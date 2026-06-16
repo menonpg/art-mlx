@@ -882,7 +882,16 @@ def _to_vllm_lora_tensors(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     grouped = _group_art_moe_tensors(tensors)
     if not grouped:
-        transformed = {_to_vllm_key(key): tensor for key, tensor in tensors.items()}
+        transformed = {
+            vllm_key: _rescale_shared_expert_fc1_lora_a(
+                vllm_key,
+                tensor,
+                adapter_config=adapter_config,
+                to_vllm=True,
+            )
+            for key, tensor in tensors.items()
+            for vllm_key in (_to_vllm_key(key),)
+        }
         if len(transformed) != len(tensors):
             raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in transformed)
