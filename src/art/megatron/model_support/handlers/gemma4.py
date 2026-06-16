@@ -74,6 +74,24 @@ class Gemma4MoeHandler(DefaultMoeHandler):
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
 
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        attention_bias = kwargs.get("attention_bias")
+        from art.megatron.context_parallel.types import ArtContextParallelState
+
+        module = model
+        while hasattr(module, "module"):
+            module = module.module
+        gpt_module = getattr(module, "language_model", module)
+        if isinstance(attention_bias, ArtContextParallelState):
+            setattr(
+                gpt_module,
+                "_art_gemma4_rotary_seq_len",
+                int(attention_bias.rank_plan.original_seq_len),
+            )
+        else:
+            setattr(gpt_module, "_art_gemma4_rotary_seq_len", None)
+        return {"extra_block_kwargs": kwargs}
+
     def _identity_lora_parameter_suffixes(
         self,
         target_modules: list[str],
@@ -519,6 +537,17 @@ def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
                 setattr(gemma4_rotary, "cp_group", None)
                 if local_rotary is not None:
                     setattr(local_rotary, "cp_group", None)
+                rotary_seq_len = getattr(
+                    _gpt_module, "_art_gemma4_rotary_seq_len", None
+                )
+                if rotary_seq_len is not None:
+                    from megatron.core.packed_seq_params import PackedSeqParams
+
+                    kwargs = dict(kwargs)
+                    kwargs["packed_seq_params"] = PackedSeqParams(
+                        max_seqlen_q=int(rotary_seq_len),
+                        max_seqlen_kv=int(rotary_seq_len),
+                    )
             try:
                 preproc_output = list(_preprocess(*args, **kwargs))
             finally:
