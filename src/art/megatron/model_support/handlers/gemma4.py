@@ -54,10 +54,6 @@ _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<prefix>\.mlp)\.(?P<module>gate_proj|up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
 )
-_SELF_ATTN_K_LORA_KEY_RE = re.compile(
-    r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)k_proj\."
-    r"(?P<suffix>lora_[AB]\.weight)$"
-)
 _SELF_ATTN_V_LORA_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)v_proj\."
     r"(?P<suffix>lora_[AB]\.weight)$"
@@ -738,23 +734,6 @@ def _gemma4_k_eq_v_layers(adapter_config: dict[str, Any]) -> set[int]:
     }
 
 
-def _add_gemma4_k_eq_v_lora_tensors(
-    tensors: dict[str, torch.Tensor],
-    *,
-    adapter_config: dict[str, Any],
-) -> None:
-    k_eq_v_layers = _gemma4_k_eq_v_layers(adapter_config)
-    if not k_eq_v_layers:
-        return
-    for key, tensor in list(tensors.items()):
-        match = _SELF_ATTN_K_LORA_KEY_RE.match(key)
-        if match is None or int(match.group("layer")) not in k_eq_v_layers:
-            continue
-        tensors[f"{match.group('prefix')}v_proj.{match.group('suffix')}"] = _clone(
-            tensor
-        )
-
-
 def _drop_gemma4_k_eq_v_v_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
@@ -808,10 +787,6 @@ def _to_vllm_lora_tensors(
         if len(transformed) != len(tensors):
             raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in transformed)
-        _add_gemma4_k_eq_v_lora_tensors(
-            transformed,
-            adapter_config=adapter_config,
-        )
         return (
             transformed,
             _vllm_moe_config(adapter_config) if has_fused_experts else adapter_config,
@@ -865,10 +840,6 @@ def _to_vllm_lora_tensors(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
             )
         transformed[vllm_key] = tensor
-    _add_gemma4_k_eq_v_lora_tensors(
-        transformed,
-        adapter_config=adapter_config,
-    )
     return transformed, _vllm_moe_config(adapter_config)
 
 
