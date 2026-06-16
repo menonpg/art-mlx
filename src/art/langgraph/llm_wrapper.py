@@ -26,19 +26,20 @@ mappings = {}
 def add_thread(thread_id, base_url, api_key, model):
     log_path = f".art/langgraph/{thread_id}"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    logger = FileLogger(log_path)
     CURRENT_CONFIG.set(
         {
-            "logger": FileLogger(log_path),
+            "logger": logger,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
         }
     )
-    return log_path
+    return logger
 
 
-def create_messages_from_logs(log_path: str, trajectory: Trajectory):
-    logs = FileLogger(log_path).load_logs()
+def create_messages_from_logs(logger: FileLogger, trajectory: Trajectory):
+    logs = logger.load_logs()
     conversations = []
     tools = []
 
@@ -95,14 +96,14 @@ def create_messages_from_logs(log_path: str, trajectory: Trajectory):
 def wrap_rollout(model, fn):
     async def wrapper(*args, **kwargs):
         thread_id = str(uuid.uuid4())
-        log_path = add_thread(
+        logger = add_thread(
             thread_id,
             model.inference_base_url,
             model.inference_api_key,
             model.inference_model_name,
         )
         result = await fn(*args, **kwargs)
-        return create_messages_from_logs(log_path, result)
+        return create_messages_from_logs(logger, result)
 
     return wrapper
 
