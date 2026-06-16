@@ -167,7 +167,7 @@ _PROMPT_SENTENCES = [
     "The run should not update weights just to measure a forward mismatch.",
     "Validation code belongs in tests unless production needs the behavior.",
 ]
-_PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 13
+_PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 12
 
 
 def config_from_env() -> RealPathConfig:
@@ -234,7 +234,7 @@ def _apply_sliding_window_prompt_defaults(config: RealPathConfig) -> None:
         // _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE,
     )
     min_sequence_length = _round_up(
-        config.prompt_target_tokens + config.max_completion_tokens + 8,
+        config.prompt_target_tokens + config.max_completion_tokens + 256,
         128,
     )
     if config.output_parity.packed.sequence_length < min_sequence_length:
