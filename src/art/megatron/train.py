@@ -210,6 +210,20 @@ def _register_trainable_parameter_mode(
     )
 
 
+def _configure_lora_target_modules_from_env(provider_bundle: ProviderBundle) -> None:
+    raw = os.environ.get("ART_MEGATRON_LORA_TARGET_MODULES")
+    if raw is None:
+        return
+    target_modules = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not target_modules:
+        raise ValueError("ART_MEGATRON_LORA_TARGET_MODULES cannot be empty")
+    spec = provider_bundle.spec.model_copy(
+        update={"default_target_modules": target_modules}
+    )
+    provider_bundle.spec = spec
+    setattr(provider_bundle.provider, "_art_model_support_spec", spec)
+
+
 def _eager_initialize_optimizer_state(optimizer: Any) -> None:
     chained_optimizers = getattr(optimizer, "chained_optimizers", None)
     if chained_optimizers is not None:
@@ -363,6 +377,7 @@ def build_training_runtime(
             else allow_unvalidated_arch
         ),
     )
+    _configure_lora_target_modules_from_env(provider_bundle)
     if provider_bundle_configure is not None:
         provider_bundle_configure(provider_bundle)
     provider = provider_bundle.provider

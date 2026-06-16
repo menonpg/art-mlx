@@ -246,6 +246,10 @@ class MegatronService:
     def _allow_unvalidated_arch(self) -> bool:
         return bool(self.config.get("allow_unvalidated_arch", False))
 
+    def _lora_target_modules(self) -> list[str]:
+        target_modules = self.config.get("lora_config", {}).get("target_modules")
+        return list(target_modules or default_target_modules(self.base_model))
+
     def _model_uses_expert_replay(self) -> bool:
         if not self.enable_expert_replay:
             return False
@@ -431,7 +435,7 @@ class MegatronService:
             base_model_name_or_path=self.base_model,
             r=default_lora_rank_for_handler(handler),
             lora_alpha=LORA_ALPHA,
-            target_modules=default_target_modules(self.base_model),
+            target_modules=self._lora_target_modules(),
             bias="none",
         )
 
@@ -706,6 +710,7 @@ class MegatronService:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         env["MODEL_IDENTIFIER"] = self.base_model
+        env["ART_MEGATRON_LORA_TARGET_MODULES"] = ",".join(self._lora_target_modules())
         if self._allow_unvalidated_arch:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
         if self._model_uses_expert_replay():
