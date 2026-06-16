@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from copy import copy
+from functools import lru_cache
+import json
+from pathlib import Path
 import re
 from typing import Any, Sequence, cast
 
@@ -50,6 +53,14 @@ _VLLM_MOE_EXPERT_KEY_RE = re.compile(
 _DENSE_MLP_LORA_KEY_RE = re.compile(
     r"(?P<prefix>\.mlp)\.(?P<module>gate_proj|up_proj|down_proj)\."
     r"(?P<lora>lora_[AB])\.weight$"
+)
+_SELF_ATTN_K_LORA_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)k_proj\."
+    r"(?P<suffix>lora_[AB]\.weight)$"
+)
+_SELF_ATTN_V_LORA_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)v_proj\."
+    r"(?P<suffix>lora_[AB]\.weight)$"
 )
 _MEGATRON_LAYER_RE = re.compile(r"(?:^|\.)layers\.(?P<layer>\d+)\.")
 _HF_TEXT_EXPERT_KEY_RE = re.compile(r"(?P<layer>\.layers\.\d+)\.experts")
@@ -698,6 +709,70 @@ def _clone(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone().contiguous()
 
 
+@lru_cache(maxsize=8)
+def _gemma4_text_config_dict(base_model_name_or_path: str) -> dict[str, Any]:
+    config_path = Path(base_model_name_or_path) / "config.json"
+    if not config_path.exists():
+        from huggingface_hub import hf_hub_download
+
+        config_path = Path(
+            hf_hub_download(
+                base_model_name_or_path,
+                "config.json",
+                local_files_only=True,
+            )
+        )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return dict(config.get("text_config") or config)
+
+
+def _gemma4_k_eq_v_layers(adapter_config: dict[str, Any]) -> set[int]:
+    base_model = str(adapter_config["base_model_name_or_path"])
+    config = _gemma4_text_config_dict(base_model)
+    if not bool(config.get("attention_k_eq_v", False)):
+        return set()
+    return {
+        layer_idx
+        for layer_idx, layer_type in enumerate(config["layer_types"])
+        if layer_type == "full_attention"
+    }
+
+
+def _add_gemma4_k_eq_v_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> None:
+    k_eq_v_layers = _gemma4_k_eq_v_layers(adapter_config)
+    if not k_eq_v_layers:
+        return
+    for key, tensor in list(tensors.items()):
+        match = _SELF_ATTN_K_LORA_KEY_RE.match(key)
+        if match is None or int(match.group("layer")) not in k_eq_v_layers:
+            continue
+        tensors[f"{match.group('prefix')}v_proj.{match.group('suffix')}"] = _clone(
+            tensor
+        )
+
+
+def _drop_gemma4_k_eq_v_v_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    k_eq_v_layers = _gemma4_k_eq_v_layers(adapter_config)
+    if not k_eq_v_layers:
+        return tensors
+    return {
+        key: tensor
+        for key, tensor in tensors.items()
+        if not (
+            (match := _SELF_ATTN_V_LORA_KEY_RE.match(key)) is not None
+            and int(match.group("layer")) in k_eq_v_layers
+        )
+    }
+
+
 def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     config = dict(adapter_config)
     target_modules = list(config.get("target_modules") or [])
@@ -733,6 +808,10 @@ def _to_vllm_lora_tensors(
         if len(transformed) != len(tensors):
             raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in transformed)
+        _add_gemma4_k_eq_v_lora_tensors(
+            transformed,
+            adapter_config=adapter_config,
+        )
         return (
             transformed,
             _vllm_moe_config(adapter_config) if has_fused_experts else adapter_config,
@@ -786,6 +865,10 @@ def _to_vllm_lora_tensors(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {vllm_key}"
             )
         transformed[vllm_key] = tensor
+    _add_gemma4_k_eq_v_lora_tensors(
+        transformed,
+        adapter_config=adapter_config,
+    )
     return transformed, _vllm_moe_config(adapter_config)
 
 
@@ -804,9 +887,12 @@ def _from_vllm_lora_tensors(
             {},
         ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
     if expert_grouped:
-        return _from_vllm_per_expert_lora_tensors(
-            tensors,
-            expert_grouped=expert_grouped,
+        return _drop_gemma4_k_eq_v_v_lora_tensors(
+            _from_vllm_per_expert_lora_tensors(
+                tensors,
+                expert_grouped=expert_grouped,
+                adapter_config=adapter_config,
+            ),
             adapter_config=adapter_config,
         )
 
@@ -820,7 +906,10 @@ def _from_vllm_lora_tensors(
         )
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
     if not grouped:
-        return {_from_vllm_key(key): tensor for key, tensor in tensors.items()}
+        return _drop_gemma4_k_eq_v_v_lora_tensors(
+            {_from_vllm_key(key): tensor for key, tensor in tensors.items()},
+            adapter_config=adapter_config,
+        )
 
     rank = int(adapter_config["r"])
     transformed: dict[str, torch.Tensor] = {}
@@ -883,7 +972,10 @@ def _from_vllm_lora_tensors(
                 f"Duplicate Gemma 4 LoRA tensor after conversion: {art_key}"
             )
         transformed[art_key] = tensor
-    return transformed
+    return _drop_gemma4_k_eq_v_v_lora_tensors(
+        transformed,
+        adapter_config=adapter_config,
+    )
 
 
 def _from_vllm_per_expert_lora_tensors(
