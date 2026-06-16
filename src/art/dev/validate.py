@@ -71,10 +71,7 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         raise ValueError("trainer_gpu_ids and inference_gpu_ids must not overlap")
 
     engine_args = config.get("engine_args", {})
-    if (
-        "tensor_parallel_size" in engine_args
-        or "pipeline_parallel_size" in engine_args
-    ):
+    if "tensor_parallel_size" in engine_args or "pipeline_parallel_size" in engine_args:
         inference_parallel_size = _engine_parallel_size(config)
         if inference_parallel_size != len(inference_gpu_ids):
             raise ValueError(
