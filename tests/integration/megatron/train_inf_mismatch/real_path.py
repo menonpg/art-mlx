@@ -1057,6 +1057,11 @@ async def run_real_path_train_inf_mismatch(
         name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
         project="train_inf_mismatch",
         base_model=parity_config.base_model,
+        lora_config=(
+            {"target_modules": _lora_target_modules(parity_config)}
+            if parity_config.lora_target_modules is not None
+            else None
+        ),
         _internal_config={
             "trainer_gpu_ids": parity_config.trainer_gpu_ids,
             "inference_gpu_ids": parity_config.inference_gpu_ids,
