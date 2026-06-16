@@ -864,6 +864,11 @@ def _run_logits(
     attention_state = create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
+        input_pos=position_ids,
+        sliding_windows=tuple(
+            int(window)
+            for window in getattr(runtime.provider, "art_flex_sliding_windows", ())
+        ),
         build_gdn_execution_spec=bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ),
