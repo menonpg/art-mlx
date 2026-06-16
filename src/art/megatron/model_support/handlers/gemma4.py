@@ -288,6 +288,11 @@ class Gemma4MoeHandler(DefaultMoeHandler):
         self,
         provider: Any,
     ) -> CompileWorkaroundConfig:
+        if bool(getattr(provider, "moe_shared_expert_overlap", False)):
+            return CompileWorkaroundConfig(
+                shared_expert_state="shared_expert_overlap",
+                disable_compile=True,
+            )
         return CompileWorkaroundConfig(
             flags=_compile_workaround_flags_for_provider(
                 provider,
