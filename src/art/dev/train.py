@@ -2,6 +2,8 @@ from typing import TYPE_CHECKING, Literal
 
 from typing_extensions import TypedDict
 
+from art.types import SFTMetricLoggingConfig
+
 if TYPE_CHECKING:
     from art.megatron.routing_replay import MoeRoutingReplayBundle
 
@@ -47,3 +49,5 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
 
 class TrainSFTConfig(TypedDict, total=False):
     """Experimental SFT configuration options. Use at your own risk."""
+
+    metric_logging: SFTMetricLoggingConfig

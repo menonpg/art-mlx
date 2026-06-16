@@ -20,6 +20,7 @@ from openai.pagination import AsyncCursorPage
 from typing_extensions import override
 
 from ..trajectories import TrajectoryGroup
+from ..types import SFTMetricLoggingConfig
 
 ResponseT = TypeVar("ResponseT")
 
@@ -83,6 +84,7 @@ class ExperimentalTrainingConfig(TypedDict, total=False):
 class SFTTrainingConfig(TypedDict, total=False):
     batch_size: int | None
     learning_rate: float | list[float] | None
+    metric_logging: SFTMetricLoggingConfig | None
 
 
 class TrainingJob(BaseModel):
