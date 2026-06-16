@@ -62,6 +62,8 @@ class RealPathConfig(BaseModel):
     rollouts_per_prompt: int = 2
     max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
+    prompt_target_tokens: int | None = None
+    sliding_window: int | None = None
     diagnose_base: bool = False
     trace_layers: bool = False
     trace_enforce_eager: bool = False
@@ -165,6 +167,7 @@ _PROMPT_SENTENCES = [
     "The run should not update weights just to measure a forward mismatch.",
     "Validation code belongs in tests unless production needs the behavior.",
 ]
+_PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 13
 
 
 def config_from_env() -> RealPathConfig:
@@ -179,6 +182,8 @@ def config_from_env() -> RealPathConfig:
         config.max_completion_tokens = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_PROMPT_SENTENCE_COUNT"):
         config.prompt_sentence_count = int(raw)
+    if raw := os.environ.get("ART_REAL_PATH_PROMPT_TARGET_TOKENS"):
+        config.prompt_target_tokens = int(raw)
     if raw := os.environ.get("ART_REAL_PATH_DIAGNOSE_BASE"):
         config.diagnose_base = raw == "1"
     if raw := os.environ.get("ART_REAL_PATH_TRACE_LAYERS"):
@@ -190,6 +195,59 @@ def config_from_env() -> RealPathConfig:
     return config
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _config_sliding_window(config: TrainInfOutputParityConfig) -> int | None:
+    from huggingface_hub import hf_hub_download
+
+    local_config_path = Path(config.base_model) / "config.json"
+    config_path = (
+        local_config_path
+        if local_config_path.exists()
+        else Path(hf_hub_download(config.base_model, "config.json"))
+    )
+    hf_config = _read_json(config_path)
+    text_config = hf_config.get("text_config", hf_config)
+    if not isinstance(text_config, dict):
+        return None
+    layer_types = tuple(str(value) for value in text_config.get("layer_types", ()))
+    if not any("sliding" in layer_type for layer_type in layer_types):
+        return None
+    window = text_config.get("sliding_window")
+    if window is None:
+        return None
+    return int(window)
+
+
+def _apply_sliding_window_prompt_defaults(config: RealPathConfig) -> None:
+    window = _config_sliding_window(config.output_parity)
+    if window is None:
+        return
+    config.sliding_window = window
+    if config.prompt_target_tokens is None:
+        config.prompt_target_tokens = 2 * window
+    config.prompt_sentence_count = max(
+        config.prompt_sentence_count,
+        (config.prompt_target_tokens + _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE - 1)
+        // _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE,
+    )
+    min_sequence_length = _round_up(
+        config.prompt_target_tokens + config.max_completion_tokens + 8,
+        128,
+    )
+    if config.output_parity.packed.sequence_length < min_sequence_length:
+        config.output_parity.packed.sequence_length = min_sequence_length
+
+
+def _build_prompt_from_sentences(index: int, sentences: list[str]) -> str:
+    return (
+        "Write a concise continuation for probe "
+        f"{index}. Preserve the technical tone.\n\n" + " ".join(sentences)
+    )
+
+
 def _build_prompts(config: RealPathConfig) -> list[str]:
     rng = random.Random(config.output_parity.seed)
     prompts: list[str] = []
@@ -197,10 +255,7 @@ def _build_prompts(config: RealPathConfig) -> list[str]:
         sentences = [
             rng.choice(_PROMPT_SENTENCES) for _ in range(config.prompt_sentence_count)
         ]
-        prompts.append(
-            "Write a concise continuation for probe "
-            f"{index}. Preserve the technical tone.\n\n" + " ".join(sentences)
-        )
+        prompts.append(_build_prompt_from_sentences(index, sentences))
     return prompts
 
 
@@ -1036,6 +1091,7 @@ async def run_real_path_train_inf_mismatch(
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
+    _apply_sliding_window_prompt_defaults(config)
     rollout_mode = _real_path_rollout_mode(parity_config)
     is_moe = model_support_is_moe(
         parity_config.base_model,
