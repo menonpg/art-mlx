@@ -85,6 +85,10 @@ def create_shared_prefix_attention_state(
         parent_ids: `[B, S]` parent group id for each token in a packed sequence.
     """
 
+    group_ids_row = group_ids[0]
+    parent_ids_row = parent_ids[0]
+    input_pos_row = input_pos[0] if input_pos is not None else None
+
     def _shared_prefix_mask(
         batch_idx: Tensor,
         head_idx: Tensor,
@@ -95,8 +99,8 @@ def create_shared_prefix_attention_state(
         # Token q can attend token k if k is causal and either from the same
         # traj (traj -> traj)/within the shared prefix (prefix -> prefix) (same_group)
         # or from the prefix which q uses (traj -> prefix) (parent_prefix).
-        same_group = group_ids[0, query_idx] == group_ids[0, kv_idx]
-        parent_prefix = parent_ids[0, query_idx] == group_ids[0, kv_idx]
+        same_group = group_ids_row[query_idx] == group_ids_row[kv_idx]
+        parent_prefix = parent_ids_row[query_idx] == group_ids_row[kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
 
     def _sliding_shared_prefix_mask(window: int):
@@ -107,10 +111,15 @@ def create_shared_prefix_attention_state(
             kv_idx: Tensor,
         ) -> Tensor:
             del batch_idx, head_idx
-            same_group = group_ids[0, query_idx] == group_ids[0, kv_idx]
-            parent_prefix = parent_ids[0, query_idx] == group_ids[0, kv_idx]
-            delta = input_pos[0, query_idx] - input_pos[0, kv_idx]  # type: ignore[index]
-            return (same_group | parent_prefix) & (delta >= 0) & (delta < window)
+            same_group = group_ids_row[query_idx] == group_ids_row[kv_idx]
+            parent_prefix = parent_ids_row[query_idx] == group_ids_row[kv_idx]
+            q_pos = input_pos_row[query_idx]  # type: ignore[index]
+            k_pos = input_pos_row[kv_idx]  # type: ignore[index]
+            return (
+                (same_group | parent_prefix)
+                & (q_pos >= k_pos)
+                & (q_pos < k_pos + window)
+            )
 
         return mask
 
