@@ -14,7 +14,6 @@ Public cross-repo API consumed by serverless-training:
 - run_megatron_worker_loop
 """
 
-import gc
 import json
 import math
 import os
@@ -494,7 +493,6 @@ def run_megatron_rl_job(
     next_step_first_ref_logprobs = None
     step_result = None
 
-    job_completed = False
     try:
         configure_moe_routing_replay(
             runtime,
@@ -618,7 +616,6 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
-        job_completed = True
     finally:
         configure_moe_routing_replay(runtime)
         if packed_tensors is not None:
@@ -642,9 +639,6 @@ def run_megatron_rl_job(
         if cp_lookahead_state is not None:
             cp_lookahead_state.pending_prepared_micro = None
             del cp_lookahead_state
-        if job_completed:
-            gc.collect()
-            torch.cuda.empty_cache()
 
 
 def run_megatron_sft_job(
@@ -653,7 +647,6 @@ def run_megatron_sft_job(
 ) -> None:
     adapter_model = None
 
-    job_completed = False
     try:
         configure_moe_routing_replay(runtime)
         adapter_model = _load_lora_and_optimizer(
@@ -764,13 +757,9 @@ def run_megatron_sft_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
-        job_completed = True
     finally:
         if adapter_model is not None:
             del adapter_model
-        if job_completed:
-            gc.collect()
-            torch.cuda.empty_cache()
 
 
 def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
@@ -1271,8 +1260,6 @@ def _prepare_kl_reference_logprobs(
         if loaded_ref_adapter:
             assert runtime.optimizer is not None
             load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
-        gc.collect()
-        torch.cuda.empty_cache()
 
 
 def run_megatron_sft_step(
@@ -1595,7 +1582,6 @@ def run_training_step(
     if cp_lookahead_state is not None:
         cp_lookahead_state.pending_prepared_micro = pending_prepared_micro
 
-    torch.cuda.empty_cache()
     token_count = _local_trainable_token_count_tensor(
         loss_inputs_for_count,
         device=device,

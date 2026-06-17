@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import gc
 import importlib
 import json
 import os
@@ -62,13 +61,6 @@ from .training.sft_batches import materialize_sft_batches
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
 OFFLOAD_BETWEEN_JOBS_ENV = "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS"
-
-
-def gc_and_empty_cuda_cache(n: int = 3) -> None:
-    for _ in range(n):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
@@ -821,7 +813,6 @@ class MegatronService:
         self._validate_megatron_dependencies()
         await self._ensure_megatron_running(megatron_topology=megatron_topology)
         await self._sleep_runtime()
-        gc_and_empty_cuda_cache()
 
         lora_path = self._resolve_training_lora_path()
         self._clear_pending_jobs()

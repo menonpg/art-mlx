@@ -95,17 +95,13 @@ class WeightOffloadManager:
             self.streaming.begin_job()
 
     def after_job(self) -> None:
-        did_release_gpu_memory = False
         if self.streaming is not None:
             self.streaming.finish_job()
-            did_release_gpu_memory = True
         if self.offload_between_jobs:
             if self.streaming is None:
                 offload_to_cpu(self.model, self.rank, self.offload_state)
             else:
                 offload_trainable_buffers_to_cpu(self.model, self.rank)
-            did_release_gpu_memory = True
-        if did_release_gpu_memory:
             gc.collect()
             torch.cuda.empty_cache()
 
