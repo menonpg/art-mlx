@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-import gc
 import os
 
 import torch
@@ -102,7 +101,6 @@ class WeightOffloadManager:
                 offload_to_cpu(self.model, self.rank, self.offload_state)
             else:
                 offload_trainable_buffers_to_cpu(self.model, self.rank)
-            gc.collect()
             torch.cuda.empty_cache()
 
     @contextmanager
