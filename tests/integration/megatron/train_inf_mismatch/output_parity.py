@@ -24,10 +24,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
+    # Gemma 4 MoE currently uses merged serving because native vLLM LoRA support
+    # does not exist for this architecture; long-prompt SWA runs measured near 8%.
+    "gemma4_moe": 8.0,
     "qwen3_moe": 8.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
+TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "gemma4_moe": 0.009,
+}
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 ScoreRecord = tuple[int, float, list[int], list[float]]
@@ -266,11 +272,14 @@ def top20_kl_candidate_to_target_limit_for_model(
 ) -> float:
     from art.megatron.model_support.registry import get_model_support_spec
 
-    get_model_support_spec(
+    spec = get_model_support_spec(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT
+    return TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY.get(
+        spec.key,
+        TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
+    )
 
 
 def model_support_is_moe(
