@@ -31,7 +31,7 @@ allow-direct-references = true
 [tool.uv]
 required-version = ">=0.6.15"
 override-dependencies = [
-    "flashinfer-python==0.6.8.post1",
+    "flashinfer-python==0.6.12",
     "numpy<2",
     "nvidia-nccl-cu12==2.28.9 ; sys_platform == 'linux'",
     "torch @ https://download.pytorch.org/whl/test/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl",
