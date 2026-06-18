@@ -27,7 +27,7 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     # Gemma 4 MoE stays on merged serving until native vLLM LoRA validation is
     # revisited; long-prompt SWA runs measured near 8%.
     "gemma4_moe": 8.0,
-    "qwen3_moe": 8.0,
+    "qwen3_moe": 7.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
