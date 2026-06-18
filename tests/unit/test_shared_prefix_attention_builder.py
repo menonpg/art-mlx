@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import torch
 
+from art.megatron.context_parallel.block_mask import build_block_mask
 from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
     build_shared_prefix_attention_spec,
 )
-from art.megatron.context_parallel.block_mask import build_block_mask
-from art.megatron.context_parallel.runtime import build_context_parallel_token_layout_index
+from art.megatron.context_parallel.runtime import (
+    build_context_parallel_token_layout_index,
+)
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
     AttnSlice,
@@ -17,22 +19,14 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     TokenRange,
 )
-from art.megatron.shared_prefix_packing import pack_shared_prefixes
 
 
-def test_shared_prefix_attention_spec_supports_depth_two() -> None:
-    pack = pack_shared_prefixes(
-        (
-            torch.tensor([1, 2, 3, 4]),
-            torch.tensor([1, 2, 3, 5]),
-            torch.tensor([1, 6, 7]),
-        ),
-        max_depth=2,
-    )
+def test_shared_prefix_attention_spec_supports_branching_completions() -> None:
+    group_ids, parent_ids = _branching_prefix_inputs()
 
     spec = build_shared_prefix_attention_spec(
-        group_ids=pack.group_ids,
-        parent_ids=pack.parent_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
     )
     dense = build_dense_reference_mask(row_spec=spec.rows[0])
 
@@ -47,59 +41,37 @@ def test_shared_prefix_attention_spec_supports_depth_two() -> None:
     ]
 
 
-def test_shared_prefix_attention_spec_supports_arbitrary_depth() -> None:
-    pack = pack_shared_prefixes(
-        (
-            torch.tensor([1, 2, 3, 4, 8]),
-            torch.tensor([1, 2, 3, 4, 9]),
-            torch.tensor([1, 2, 3, 5]),
-            torch.tensor([1, 6]),
-        ),
-        max_depth=3,
-    )
+def test_shared_prefix_attention_spec_matches_tree_reference() -> None:
+    group_ids, parent_ids = _branching_prefix_inputs()
 
     spec = build_shared_prefix_attention_spec(
-        group_ids=pack.group_ids,
-        parent_ids=pack.parent_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
     )
     dense = build_dense_reference_mask(row_spec=spec.rows[0])
 
-    assert dense.equal(_reference_tree_mask(pack.group_ids[0], pack.parent_ids[0]))
+    assert dense.equal(_reference_tree_mask(group_ids[0], parent_ids[0]))
 
 
-def test_depth_two_shared_prefix_can_build_context_parallel_layout() -> None:
-    pack = pack_shared_prefixes(
-        (
-            torch.tensor([1, 2, 3, 4]),
-            torch.tensor([1, 2, 3, 5]),
-            torch.tensor([1, 6, 7]),
-        ),
-        max_depth=2,
-    )
+def test_shared_prefix_can_build_context_parallel_layout() -> None:
+    group_ids, parent_ids = _branching_prefix_inputs()
 
     layout = build_context_parallel_token_layout_index(
-        group_ids=pack.group_ids,
-        parent_ids=pack.parent_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
         topology=ParallelTopology(cp=2),
         config=ContextParallelConfig(planner_chunk_size=2, planner_max_search_steps=1),
-        original_seq_len=int(pack.tokens.numel()),
+        original_seq_len=int(group_ids.numel()),
     )
 
-    assert sum(layout.token_counts_by_rank) == int(pack.tokens.numel())
+    assert sum(layout.token_counts_by_rank) == int(group_ids.numel())
 
 
-def test_depth_two_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
-    pack = pack_shared_prefixes(
-        (
-            torch.tensor([1, 2, 3, 4]),
-            torch.tensor([1, 2, 3, 5]),
-            torch.tensor([1, 6, 7]),
-        ),
-        max_depth=2,
-    )
+def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
+    group_ids, parent_ids = _branching_prefix_inputs()
     spec = build_shared_prefix_attention_spec(
-        group_ids=pack.group_ids,
-        parent_ids=pack.parent_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
     )
     row = spec.rows[0]
     token_indices = torch.arange(row.valid_tokens, dtype=torch.long)
@@ -115,8 +87,8 @@ def test_depth_two_sparse_block_mask_exact_predicate_matches_dense_reference() -
                 cache_key="depth-two",
             ),
         ),
-        group_ids=pack.group_ids[0],
-        parent_ids=pack.parent_ids[0],
+        group_ids=group_ids[0],
+        parent_ids=parent_ids[0],
         device=torch.device("cpu"),
     )
 
@@ -174,7 +146,16 @@ def test_sparse_block_mask_supports_non_monotonic_remote_k_indices() -> None:
     assert actual.equal(q_token_indices[:, None] >= k_token_indices[None, :])
 
 
-def _reference_tree_mask(group_ids: torch.Tensor, parent_ids: torch.Tensor) -> torch.Tensor:
+def _branching_prefix_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.tensor([[1, 1, 1, 2, 3, 4, 4]], dtype=torch.long),
+        torch.tensor([[1, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
+    )
+
+
+def _reference_tree_mask(
+    group_ids: torch.Tensor, parent_ids: torch.Tensor
+) -> torch.Tensor:
     group_list = [int(value) for value in group_ids.tolist()]
     parent_by_group: dict[int, int | None] = {}
     for group_id, parent_id in zip(group_list, parent_ids.tolist(), strict=True):
