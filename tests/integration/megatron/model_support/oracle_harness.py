@@ -560,13 +560,25 @@ class DiffAccumulator:
 
     def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
         """Adds router top-k id mismatch counts into the accumulator."""
-        self.router_topk_total += int(reference_ids.numel())
-        self.router_topk_mismatch += int((reference_ids != candidate_ids).sum().item())
+        self.numel += int(reference_ids.numel())
         if reference_ids.ndim >= 2 and reference_ids.shape[1] > 0:
+            self.router_topk_total += int(reference_ids.shape[0])
+            self.router_topk_mismatch += int(
+                (
+                    torch.sort(reference_ids, dim=1).values
+                    != torch.sort(candidate_ids, dim=1).values
+                )
+                .any(dim=1)
+                .sum()
+                .item()
+            )
             self.router_top1_total += int(reference_ids.shape[0])
             self.router_top1_mismatch += int(
                 (reference_ids[:, 0] != candidate_ids[:, 0]).sum().item()
             )
+            return
+        self.router_topk_total += int(reference_ids.numel())
+        self.router_topk_mismatch += int((reference_ids != candidate_ids).sum().item())
 
     def as_summary(self) -> dict[str, float]:
         """Returns normalized summary values for one row."""

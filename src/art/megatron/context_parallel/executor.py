@@ -657,9 +657,9 @@ def _build_stage_block_mask(
     block_size: SparseBlockSize | None = None,
     sliding_window: int | None = None,
 ) -> BlockMask | None:
-    resolved_block_size = normalize_sparse_block_size(
-        state.config.block_size if block_size is None else block_size
-    )
+    if block_size is None:
+        block_size = state.config.attention_sparse_block_size or state.config.block_size
+    resolved_block_size = normalize_sparse_block_size(block_size)
     execution_spec = (
         _resolve_stage_execution_spec(
             stage_plan=stage_plan,

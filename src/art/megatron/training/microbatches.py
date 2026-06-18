@@ -293,6 +293,22 @@ def _art_flex_cp_block_mask_variants(
     return tuple(variants)
 
 
+def _context_parallel_config_for_provider(
+    provider: Any,
+    device: torch.device,
+) -> ContextParallelConfig:
+    head_dim = getattr(provider, "kv_channels", None)
+    if head_dim is None:
+        return ContextParallelConfig()
+    return ContextParallelConfig(
+        attention_sparse_block_size=flash_sparse_block_size_for_head_dim(
+            head_dim=int(head_dim),
+            head_dim_v=int(head_dim),
+            device=device,
+        )
+    )
+
+
 def _causal_attention_state(
     seq_len: int,
     device: torch.device,
@@ -302,12 +318,13 @@ def _causal_attention_state(
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
 ) -> Any:
-    group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device=device)
+    group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device="cpu")
     parent_ids = torch.zeros_like(group_ids)
     return create_shared_prefix_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
-        input_pos=torch.arange(seq_len, dtype=torch.int64, device=device).unsqueeze(0),
+        target_device=device,
+        input_pos=torch.arange(seq_len, dtype=torch.int64).unsqueeze(0),
         sliding_windows=sliding_windows,
         build_gdn_execution_spec=build_gdn_execution_spec,
         attention_head_dim=attention_head_dim,
@@ -334,6 +351,18 @@ def _prepare_dense_rl_micro(
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
+    attention_state = create_shared_prefix_state(
+        group_ids=micro["group_ids"],
+        parent_ids=micro["parent_ids"],
+        target_device=device,
+        input_pos=micro["input_pos"],
+        sliding_windows=_art_flex_sliding_windows(provider),
+        build_gdn_execution_spec=bool(
+            getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
+    )
     _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
     shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
@@ -346,17 +375,7 @@ def _prepare_dense_rl_micro(
         model_tokens=micro["tokens"],
         model_input_pos=micro["input_pos"],
         model_labels=shifted_labels,
-        attention_state=create_shared_prefix_state(
-            group_ids=micro["group_ids"],
-            parent_ids=micro["parent_ids"],
-            input_pos=micro["input_pos"],
-            sliding_windows=_art_flex_sliding_windows(provider),
-            build_gdn_execution_spec=bool(
-                getattr(model_support_handler, "build_gdn_execution_spec", False)
-            ),
-            attention_head_dim=getattr(provider, "kv_channels", None),
-            attention_value_head_dim=getattr(provider, "kv_channels", None),
-        ),
+        attention_state=attention_state,
         loss_inputs=LossInputs(inputs=micro),
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
@@ -382,7 +401,7 @@ def _prepare_rl_cp_micro_full(
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
-        config=ContextParallelConfig(),
+        config=_context_parallel_config_for_provider(provider, device),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
@@ -612,7 +631,7 @@ def _prepare_sft_cp_micro_full(
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
-        config=ContextParallelConfig(),
+        config=_context_parallel_config_for_provider(provider, device),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(

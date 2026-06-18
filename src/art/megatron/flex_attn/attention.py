@@ -11,7 +11,7 @@ from megatron.core.utils import divide
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 from torch import Tensor
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from torch.nn.attention.flex_attention import BlockMask
 
 from art.megatron.flex_attn.compiled import (
     flex_backend_for_head_dims,
@@ -63,12 +63,6 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-_compiled_create_block_mask = torch.compile(
-    create_block_mask,
-    backend="aot_eager",
-)
-
-
 def create_shared_prefix_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
@@ -85,66 +79,13 @@ def create_shared_prefix_attention_state(
         parent_ids: `[B, S]` parent group id for each token in a packed sequence.
     """
 
-    group_ids_row = group_ids[0]
-    parent_ids_row = parent_ids[0]
-    input_pos_row = input_pos[0] if input_pos is not None else None
+    from art.megatron.shared_prefix_state import create_shared_prefix_state
 
-    def _shared_prefix_mask(
-        batch_idx: Tensor,
-        head_idx: Tensor,
-        query_idx: Tensor,
-        kv_idx: Tensor,
-    ) -> Tensor:
-        del batch_idx, head_idx
-        # Token q can attend token k if k is causal and either from the same
-        # traj (traj -> traj)/within the shared prefix (prefix -> prefix) (same_group)
-        # or from the prefix which q uses (traj -> prefix) (parent_prefix).
-        same_group = group_ids_row[query_idx] == group_ids_row[kv_idx]
-        parent_prefix = parent_ids_row[query_idx] == group_ids_row[kv_idx]
-        return (query_idx >= kv_idx) & (same_group | parent_prefix)
-
-    def _sliding_shared_prefix_mask(window: int):
-        def mask(
-            batch_idx: Tensor,
-            head_idx: Tensor,
-            query_idx: Tensor,
-            kv_idx: Tensor,
-        ) -> Tensor:
-            del batch_idx, head_idx
-            same_group = group_ids_row[query_idx] == group_ids_row[kv_idx]
-            parent_prefix = parent_ids_row[query_idx] == group_ids_row[kv_idx]
-            q_pos = input_pos_row[query_idx]  # type: ignore[index]
-            k_pos = input_pos_row[kv_idx]  # type: ignore[index]
-            return (
-                (same_group | parent_prefix)
-                & (q_pos >= k_pos)
-                & (q_pos < k_pos + window)
-            )
-
-        return mask
-
-    block_mask = _compiled_create_block_mask(
-        _shared_prefix_mask,
-        1,
-        None,
-        group_ids.shape[1],
-        group_ids.shape[1],
-        device=group_ids.device,
-    )
-    sliding_block_masks = {
-        window: _compiled_create_block_mask(
-            _sliding_shared_prefix_mask(window),
-            1,
-            None,
-            group_ids.shape[1],
-            group_ids.shape[1],
-            device=group_ids.device,
-        )
-        for window in tuple(dict.fromkeys(int(window) for window in sliding_windows))
-    }
-    return SharedPrefixAttentionState(
-        block_mask=block_mask,
-        sliding_block_masks=sliding_block_masks,
+    return create_shared_prefix_state(
+        group_ids,
+        parent_ids,
+        input_pos=input_pos,
+        sliding_windows=sliding_windows,
     )
 
 

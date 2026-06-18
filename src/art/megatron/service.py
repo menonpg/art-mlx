@@ -1,8 +1,8 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import gc
 import importlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -32,7 +32,12 @@ from ..vllm_runtime import (
     ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
 )
-from .lora import LORA_ALPHA, default_lora_rank_for_handler
+from .lora import (
+    LORA_ALPHA,
+    MEGATRON_LORA_RANK_ENV,
+    MEGATRON_LORA_TARGET_MODULES_ENV,
+    default_lora_rank_for_handler,
+)
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
@@ -58,21 +63,21 @@ safe_open = safetensors.safe_open
 OFFLOAD_BETWEEN_JOBS_ENV = "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS"
 
 
-def gc_and_empty_cuda_cache(n: int = 3) -> None:
-    for _ in range(n):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
 class _RuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
+
+
+def _lora_config_from_model_config(
+    config: dev.InternalModelConfig | dev.BackendModelConfig,
+) -> dev.LoRAConfig:
+    return cast(dev.BackendModelConfig, config).get("lora_config") or dev.LoRAConfig()
 
 
 def create_identity_lora(
     base_model: str,
     lora_path: str,
     rank: int | None = None,
+    target_modules: list[str] | None = None,
     lora_alpha: int = LORA_ALPHA,
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
@@ -98,7 +103,7 @@ def create_identity_lora(
 
     if random_state is not None:
         torch.manual_seed(random_state)
-    target_modules = default_target_modules(base_model)
+    target_modules = target_modules or default_target_modules(base_model)
     handler = get_model_support_handler(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -164,7 +169,7 @@ def create_identity_lora(
 class MegatronService:
     model_name: str
     base_model: str
-    config: dev.InternalModelConfig
+    config: dev.InternalModelConfig | dev.BackendModelConfig
     output_dir: str
     enable_expert_replay: bool = True
     _is_sleeping: bool = False
@@ -245,10 +250,6 @@ class MegatronService:
     @property
     def _allow_unvalidated_arch(self) -> bool:
         return bool(self.config.get("allow_unvalidated_arch", False))
-
-    def _lora_target_modules(self) -> list[str]:
-        target_modules = self.config.get("lora_config", {}).get("target_modules")
-        return list(target_modules or default_target_modules(self.base_model))
 
     def _model_uses_expert_replay(self) -> bool:
         if not self.enable_expert_replay:
@@ -431,11 +432,16 @@ class MegatronService:
             self.base_model,
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
+        lora_config = _lora_config_from_model_config(self.config)
+        rank = int(lora_config.get("rank", default_lora_rank_for_handler(handler)))
+        target_modules = lora_config.get("target_modules") or default_target_modules(
+            self.base_model
+        )
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=default_lora_rank_for_handler(handler),
+            r=rank,
             lora_alpha=LORA_ALPHA,
-            target_modules=self._lora_target_modules(),
+            target_modules=target_modules,
             bias="none",
         )
 
@@ -452,9 +458,13 @@ class MegatronService:
         return True
 
     def _create_identity_lora(self, lora_path: str) -> None:
+        lora_config = _lora_config_from_model_config(self.config)
+        rank = lora_config.get("rank")
         create_identity_lora(
             self.base_model,
             lora_path,
+            rank=int(rank) if rank is not None else None,
+            target_modules=lora_config.get("target_modules"),
             random_state=self._megatron_random_state(),
             allow_unvalidated_arch=self._allow_unvalidated_arch,
         )
@@ -710,7 +720,6 @@ class MegatronService:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
         env["MODEL_IDENTIFIER"] = self.base_model
-        env["ART_MEGATRON_LORA_TARGET_MODULES"] = ",".join(self._lora_target_modules())
         if self._allow_unvalidated_arch:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
         if self._model_uses_expert_replay():
@@ -725,6 +734,11 @@ class MegatronService:
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
+        lora_config = _lora_config_from_model_config(self.config)
+        if (rank := lora_config.get("rank")) is not None:
+            env[MEGATRON_LORA_RANK_ENV] = str(int(rank))
+        if target_modules := lora_config.get("target_modules"):
+            env[MEGATRON_LORA_TARGET_MODULES_ENV] = json.dumps(list(target_modules))
         if megatron_topology is not None:
             for env_name in self._megatron_topology_env_names():
                 env.pop(env_name, None)
@@ -799,7 +813,6 @@ class MegatronService:
         self._validate_megatron_dependencies()
         await self._ensure_megatron_running(megatron_topology=megatron_topology)
         await self._sleep_runtime()
-        gc_and_empty_cuda_cache()
 
         lora_path = self._resolve_training_lora_path()
         self._clear_pending_jobs()

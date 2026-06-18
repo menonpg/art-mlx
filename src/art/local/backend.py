@@ -705,6 +705,7 @@ class LocalBackend(Backend):
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
         kl_ref_adapter_path: str | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -761,6 +762,11 @@ class LocalBackend(Backend):
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference. Alternative to
                 kl_penalty_reference_step.
+            kl_penalty_source: Which policy's logprobs to compare against the
+                reference when building the centered KL penalty. Use
+                "current_learner" to match the original ART implementation, or
+                "sample" to shape from the rollout policy logprobs, which is
+                usually better for async/off-policy workloads.
             epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
@@ -814,6 +820,7 @@ class LocalBackend(Backend):
             scale_rewards = False
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
+        assert kl_penalty_source in {"current_learner", "sample"}
         if (
             self._requires_explicit_packed_sequence_length
             and packed_sequence_length is None
@@ -831,6 +838,15 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path),
                 kl_penalty_reference_step,
             )
+        elif (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_coef > 0.0
+            and self._requires_explicit_packed_sequence_length
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                0,
+            )
         config, dev_config = build_rl_train_configs(
             learning_rate=learning_rate,
             advantage_balance=advantage_balance,
@@ -844,6 +860,7 @@ class LocalBackend(Backend):
             max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
             kimi_k2_tau=kimi_k2_tau,
             kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_source=kl_penalty_source,
             allow_training_without_logprobs=allow_training_without_logprobs,
             plot_tensors=plot_tensors,
             truncated_importance_sampling=truncated_importance_sampling,

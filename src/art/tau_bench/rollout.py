@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import os
 from typing import Any, overload
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
+from openai.types.completion_usage import CompletionUsage
 
 from art.costs import get_model_pricing, tokens_to_cost
 from art.model import Model
@@ -13,6 +15,8 @@ from art.trajectories import Trajectory
 from .client import Scenario, TauBenchClient, _get_default_client
 
 openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
+CONTEXT_TOKEN_LIMIT = 32_768
+DEFAULT_MAX_COMPLETION_TOKENS = 4096
 
 
 @overload
@@ -109,18 +113,23 @@ async def rollout(
         while not terminated:
             if max_turns is not None and num_turns >= max_turns:
                 break
-            chat_completion = await openai_client.chat.completions.create(
-                messages=trajectory.messages(),
-                model=model_name,
-                stream=False,
-                tool_choice="auto",
-                tools=trajectory.tools or [],
-                **chat_completion_kwargs,
-            )
+            try:
+                chat_completion = await openai_client.chat.completions.create(
+                    messages=trajectory.messages(),
+                    model=model_name,
+                    stream=False,
+                    tool_choice="auto",
+                    tools=trajectory.tools or [],
+                    **chat_completion_kwargs,
+                )
+            except BadRequestError as exc:
+                if _is_max_tokens_error(exc):
+                    break
+                raise
             _record_tinker_costs(
                 trajectory,
                 cost_model,
-                getattr(chat_completion, "usage", None),
+                chat_completion.usage,
                 assert_costs=assert_costs,
             )
             choice = chat_completion.choices[0]
@@ -154,6 +163,12 @@ async def rollout(
                 trajectory.reward += step.reward
                 terminated = step.terminated
             num_turns += 1
+            usage = chat_completion.usage
+            if usage is not None and _would_exceed_context_limit(
+                usage.total_tokens,
+                _requested_completion_tokens(chat_completion_kwargs),
+            ):
+                break
         trajectory.metrics["num_turns"] = num_turns
         return trajectory
 
@@ -164,7 +179,7 @@ def _completion_client_and_model(
     api_key: str | None,
     model: str | None,
     base_model: str | None,
-) -> tuple[Any, str, str | None]:
+) -> tuple[AsyncOpenAI, str, str | None]:
     if isinstance(base_url_or_model, Model):
         art_model = base_url_or_model
         return (
@@ -189,7 +204,7 @@ def _tool_call_action(tool_call: Any) -> str:
 def _record_tinker_costs(
     trajectory: Trajectory,
     base_model: str | None,
-    usage: Any,
+    usage: CompletionUsage | None,
     *,
     assert_costs: bool,
 ) -> None:
@@ -203,13 +218,38 @@ def _record_tinker_costs(
             raise ValueError("Costs are not supported for this model")
         return
     trajectory.metrics["cost/tinker/prefill"] += tokens_to_cost(
-        getattr(usage, "prompt_tokens", None) or 0,
+        usage.prompt_tokens,
         pricing.prefill,
     )
     trajectory.metrics["cost/tinker/sample"] += tokens_to_cost(
-        getattr(usage, "completion_tokens", None) or 0,
+        usage.completion_tokens,
         pricing.sample,
     )
+
+
+def _is_max_tokens_error(exc: BadRequestError) -> bool:
+    message = getattr(exc, "message", str(exc))
+    return "max_tokens" in message or "max_completion_tokens" in message
+
+
+def _would_exceed_context_limit(
+    total_tokens: int,
+    requested_completion_tokens: int,
+) -> bool:
+    return total_tokens + requested_completion_tokens > CONTEXT_TOKEN_LIMIT
+
+
+def _requested_completion_tokens(
+    chat_completion_kwargs: Mapping[str, object],
+) -> int:
+    requested_completion_tokens = (
+        chat_completion_kwargs.get("max_tokens")
+        or chat_completion_kwargs.get("max_completion_tokens")
+        or DEFAULT_MAX_COMPLETION_TOKENS
+    )
+    if not isinstance(requested_completion_tokens, int):
+        raise TypeError("max_tokens and max_completion_tokens must be integers")
+    return requested_completion_tokens
 
 
 def default_user_llm_args(user_model_name: str) -> dict[str, Any]:

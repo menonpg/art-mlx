@@ -14,7 +14,6 @@ Public cross-repo API consumed by serverless-training:
 - run_megatron_worker_loop
 """
 
-import gc
 import json
 import math
 import os
@@ -74,6 +73,7 @@ from art.megatron.training.finalize_grads import (
 )
 from art.megatron.training.microbatches import (
     CpBatchLookaheadState,
+    PreparedRLMicroInputs,
     PreparedSFTMicroInputs,
     _causal_attention_state,
     _clone_packed_tensors,
@@ -173,6 +173,7 @@ class TrainStepResult(BaseModel):
 
     reduced_loss: torch.Tensor
     probs_corr: float
+    kl_policy_ref: float | None = None
     new_logprobs: list[torch.Tensor] | None = None
     update_successful: bool
     grad_norm: float
@@ -208,20 +209,6 @@ def _register_trainable_parameter_mode(
         "trainable_parameter_mode must be 'lora' or 'base_model', got "
         f"{trainable_parameter_mode!r}"
     )
-
-
-def _configure_lora_target_modules_from_env(provider_bundle: ProviderBundle) -> None:
-    raw = os.environ.get("ART_MEGATRON_LORA_TARGET_MODULES")
-    if raw is None:
-        return
-    target_modules = tuple(part.strip() for part in raw.split(",") if part.strip())
-    if not target_modules:
-        raise ValueError("ART_MEGATRON_LORA_TARGET_MODULES cannot be empty")
-    spec = provider_bundle.spec.model_copy(
-        update={"default_target_modules": target_modules}
-    )
-    provider_bundle.spec = spec
-    setattr(provider_bundle.provider, "_art_model_support_spec", spec)
 
 
 def _eager_initialize_optimizer_state(optimizer: Any) -> None:
@@ -377,7 +364,6 @@ def build_training_runtime(
             else allow_unvalidated_arch
         ),
     )
-    _configure_lora_target_modules_from_env(provider_bundle)
     if provider_bundle_configure is not None:
         provider_bundle_configure(provider_bundle)
     provider = provider_bundle.provider
@@ -501,11 +487,12 @@ def run_megatron_rl_job(
     adapter_model = None
     template = None
     zero_template = None
+    ref_logprobs_by_index = None
     cp_lookahead_state = None
     next_step_first_micro = None
+    next_step_first_ref_logprobs = None
     step_result = None
 
-    job_completed = False
     try:
         configure_moe_routing_replay(
             runtime,
@@ -531,6 +518,15 @@ def run_megatron_rl_job(
             job.config.grad_accumulation_sequences
         )
         num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+        ref_logprobs_by_index = _prepare_kl_reference_logprobs(
+            runtime=runtime,
+            job=job,
+            adapter_model=adapter_model,
+            packed_tensors=packed_tensors,
+            num_sequences=num_sequences,
+            num_steps=num_steps,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
         topology = _infer_parallel_topology(runtime.model)
         cp_lookahead_state = CpBatchLookaheadState() if int(topology.cp) > 1 else None
         for step_index in range(num_steps):
@@ -544,6 +540,15 @@ def run_megatron_rl_job(
                 micro_indices,
                 zero_template,
             )
+            ref_logprobs = (
+                select_micro_ref_logprobs(
+                    ref_logprobs_by_index,
+                    micro_indices,
+                    zero_template,
+                )
+                if ref_logprobs_by_index is not None
+                else None
+            )
             next_step_first_micro = (
                 _select_next_step_first_micro(
                     packed_tensors=packed_tensors,
@@ -556,6 +561,18 @@ def run_megatron_rl_job(
                 if cp_lookahead_state is not None
                 else None
             )
+            next_step_first_ref_logprobs = (
+                _select_next_step_first_ref_logprobs(
+                    ref_logprobs_by_index=ref_logprobs_by_index,
+                    zero_template=zero_template,
+                    step_index=step_index,
+                    num_steps=num_steps,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                )
+                if cp_lookahead_state is not None and ref_logprobs_by_index is not None
+                else None
+            )
             step_result = run_training_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
@@ -565,12 +582,13 @@ def run_megatron_rl_job(
                 inputs=micro_inputs,
                 config=job.config,
                 experimental_config=cast(dev.TrainConfig, job.experimental_config),
-                ref_logprobs=None,
+                ref_logprobs=ref_logprobs,
                 step_index=step_index,
                 sample_index=micro_indices,
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 cp_lookahead_state=cp_lookahead_state,
                 next_step_first_micro=next_step_first_micro,
+                next_step_first_ref_logprobs=next_step_first_ref_logprobs,
             )
             print0(
                 runtime.rank,
@@ -580,14 +598,15 @@ def run_megatron_rl_job(
 
             if runtime.rank == 0:
                 with open(job.log_path, "a+", encoding="utf-8") as log_file:
-                    log_msg = json.dumps(
-                        {
-                            "loss": step_result.reduced_loss.item(),
-                            "grad_norm": step_result.grad_norm,
-                            "probs_corr": step_result.probs_corr,
-                            TRAIN_GRADIENT_STEPS_KEY: num_steps,
-                        }
-                    )
+                    metrics = {
+                        "loss": step_result.reduced_loss.item(),
+                        "grad_norm": step_result.grad_norm,
+                        "probs_corr": step_result.probs_corr,
+                        TRAIN_GRADIENT_STEPS_KEY: num_steps,
+                    }
+                    if step_result.kl_policy_ref is not None:
+                        metrics["kl_policy_ref"] = step_result.kl_policy_ref
+                    log_msg = json.dumps(metrics)
                     print("Logging", log_msg)
                     log_file.write(log_msg + "\n")
 
@@ -597,7 +616,6 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
-        job_completed = True
     finally:
         configure_moe_routing_replay(runtime)
         if packed_tensors is not None:
@@ -608,18 +626,19 @@ def run_megatron_rl_job(
             del template
         if zero_template is not None:
             del zero_template
+        if ref_logprobs_by_index is not None:
+            del ref_logprobs_by_index
         if "micro_inputs" in locals():
             del micro_inputs
         if next_step_first_micro is not None:
             del next_step_first_micro
+        if next_step_first_ref_logprobs is not None:
+            del next_step_first_ref_logprobs
         if step_result is not None:
             del step_result
         if cp_lookahead_state is not None:
             cp_lookahead_state.pending_prepared_micro = None
             del cp_lookahead_state
-        if job_completed:
-            gc.collect()
-            torch.cuda.empty_cache()
 
 
 def run_megatron_sft_job(
@@ -628,7 +647,6 @@ def run_megatron_sft_job(
 ) -> None:
     adapter_model = None
 
-    job_completed = False
     try:
         configure_moe_routing_replay(runtime)
         adapter_model = _load_lora_and_optimizer(
@@ -739,13 +757,9 @@ def run_megatron_sft_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
-        job_completed = True
     finally:
         if adapter_model is not None:
             del adapter_model
-        if job_completed:
-            gc.collect()
-            torch.cuda.empty_cache()
 
 
 def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
@@ -958,6 +972,298 @@ def _infer_parallel_topology(model_chunks: ModelChunks) -> ParallelTopology:
     )
 
 
+def select_micro_ref_logprobs(
+    ref_logprobs_by_index: dict[int, torch.Tensor],
+    sample_indices: list[int | None],
+    zero_template: PackedTensors,
+) -> list[torch.Tensor]:
+    zero_ref_logprobs = torch.zeros_like(zero_template["tokens"], dtype=torch.float32)
+    return [
+        zero_ref_logprobs.clone()
+        if sample_index is None
+        else ref_logprobs_by_index[sample_index]
+        for sample_index in sample_indices
+    ]
+
+
+def _select_next_step_first_ref_logprobs(
+    *,
+    ref_logprobs_by_index: dict[int, torch.Tensor],
+    zero_template: PackedTensors,
+    step_index: int,
+    num_steps: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int,
+) -> torch.Tensor | None:
+    next_step_index = step_index + 1
+    if next_step_index >= num_steps:
+        return None
+    next_micro_indices = build_micro_sample_indices(
+        step_index=next_step_index,
+        num_sequences=num_sequences,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+    return select_micro_ref_logprobs(
+        ref_logprobs_by_index,
+        [next_micro_indices[0]],
+        zero_template,
+    )[0]
+
+
+def _select_ref_logprobs(
+    ref_logprobs: torch.Tensor | list[torch.Tensor] | None,
+    micro_order: int,
+) -> torch.Tensor | None:
+    if isinstance(ref_logprobs, list):
+        return ref_logprobs[micro_order]
+    return ref_logprobs
+
+
+def _select_next_ref_logprobs(
+    ref_logprobs: torch.Tensor | list[torch.Tensor] | None,
+    *,
+    micro_order: int,
+    micro_count: int,
+    next_step_first_ref_logprobs: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if isinstance(ref_logprobs, list):
+        if micro_order + 1 < len(ref_logprobs):
+            return ref_logprobs[micro_order + 1]
+        return next_step_first_ref_logprobs
+    if micro_order + 1 >= micro_count and next_step_first_ref_logprobs is not None:
+        return next_step_first_ref_logprobs
+    return ref_logprobs
+
+
+def _forward_prepared_rl_micro(
+    *,
+    model_chunks: ModelChunks,
+    model_support_handler: Any,
+    prepared_micro: PreparedRLMicroInputs,
+    device: torch.device,
+) -> torch.Tensor:
+    model_forward_kwargs = dict(
+        input_ids=prepared_micro.model_tokens,
+        position_ids=prepared_micro.model_input_pos,
+        attention_mask=_placeholder_attention_mask(device),
+        packed_seq_params=prepared_micro.packed_seq_params,
+        **model_support_handler.get_forward_kwargs(
+            model_chunks[0],
+            attention_bias=prepared_micro.attention_state,
+        ),
+    )
+    with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
+        if int(prepared_micro.model_tokens.numel()) == 0:
+            logits = model_chunks[0](**model_forward_kwargs, labels=None)
+            return _empty_new_logprobs_from_logits(logits, prepared_micro.model_labels)
+        return -model_chunks[0](
+            **model_forward_kwargs,
+            labels=prepared_micro.model_labels,
+        )
+
+
+def _globalize_context_parallel_logprobs(
+    *,
+    local_logprobs: torch.Tensor,
+    attention_state: Any,
+    seq_len: int,
+) -> torch.Tensor:
+    rank_plan = getattr(attention_state, "rank_plan", None)
+    cp_group = getattr(attention_state, "cp_group", None)
+    if rank_plan is None or cp_group is None:
+        raise RuntimeError("Context-parallel reference logprobs require a rank plan")
+
+    global_logprobs = local_logprobs.new_zeros((1, seq_len))
+    local_values = local_logprobs.reshape(-1)
+    cursor = 0
+    for range_ in rank_plan.local_row_ranges:
+        if range_ is None:
+            continue
+        size = int(range_.size())
+        if size <= 0:
+            continue
+        global_logprobs[0, int(range_.start) : int(range_.end)] = local_values[
+            cursor : cursor + size
+        ]
+        cursor += size
+
+    torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+        global_logprobs,
+        group=cp_group,
+    )
+    return global_logprobs
+
+
+@torch.no_grad()
+def _calculate_megatron_logprobs(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    inputs: PackedTensors,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    step_index: int | None = None,
+    sample_index: int | None = None,
+    global_grad_accumulation_sequences: int | None = None,
+) -> torch.Tensor:
+    if moe_routing_replay_controller is not None:
+        if step_index is None or sample_index is None:
+            raise ValueError(
+                "step_index and sample_index are required for routing replay"
+            )
+        moe_routing_replay_controller.set_step(
+            step_index=step_index,
+            sample_index=sample_index,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        moe_routing_replay_controller.begin_micro(sample_index, 0)
+
+    device = next(model_chunks[0].parameters()).device
+    topology = _infer_parallel_topology(model_chunks)
+    trace_token_uids = context_parallel_trace_token_uids_enabled(
+        topology,
+        moe_routing_replay_controller,
+    )
+    previous_training_modes = [chunk.training for chunk in model_chunks]
+    for chunk in model_chunks:
+        chunk.eval()
+    forward_succeeded = False
+    try:
+        prepared_micro, _pending_prepared_micro = _prepare_current_rl_micro(
+            inputs,
+            device=device,
+            topology=topology,
+            provider=provider,
+            model_support_handler=model_support_handler,
+            ref_logprobs=None,
+            trace_token_uids=trace_token_uids,
+            pending_prepared_micro=None,
+        )
+        prepare_replay_local_input_token_uids(
+            moe_routing_replay_controller,
+            prepared_micro.local_token_uids,
+            prepared_micro.attention_state,
+        )
+        logprobs = _forward_prepared_rl_micro(
+            model_chunks=model_chunks,
+            model_support_handler=model_support_handler,
+            prepared_micro=prepared_micro,
+            device=device,
+        )
+        if int(topology.cp) > 1:
+            logprobs = _globalize_context_parallel_logprobs(
+                local_logprobs=logprobs,
+                attention_state=prepared_micro.attention_state,
+                seq_len=int(inputs["tokens"].shape[1]),
+            )
+        forward_succeeded = True
+    finally:
+        for chunk, was_training in zip(model_chunks, previous_training_modes):
+            chunk.train(was_training)
+        if moe_routing_replay_controller is not None and forward_succeeded:
+            moe_routing_replay_controller.finalize_step()
+    return logprobs.detach().cpu()
+
+
+def _precompute_reference_logprobs(
+    *,
+    runtime: TrainingRuntime,
+    packed_tensors: PackedTensors,
+    sample_step_indices: dict[int, int],
+    global_grad_accumulation_sequences: int,
+) -> dict[int, torch.Tensor]:
+    print0(
+        runtime.rank,
+        "Precomputing KL reference logprobs for",
+        len(sample_step_indices),
+        "local sequences",
+    )
+    return {
+        sample_index: _calculate_megatron_logprobs(
+            model_chunks=runtime.model,
+            provider=runtime.provider,
+            model_support_handler=runtime.model_support_handler,
+            inputs=select_indexed_inputs(packed_tensors, sample_index),
+            moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+            step_index=step_index,
+            sample_index=sample_index,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        for sample_index, step_index in sorted(sample_step_indices.items())
+    }
+
+
+def _reference_sample_step_indices(
+    *,
+    num_sequences: int,
+    num_steps: int,
+    global_grad_accumulation_sequences: int,
+) -> dict[int, int]:
+    return {
+        sample_index: step_index
+        for step_index in range(num_steps)
+        for sample_index in build_micro_sample_indices(
+            step_index=step_index,
+            num_sequences=num_sequences,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        if sample_index is not None
+    }
+
+
+def _prepare_kl_reference_logprobs(
+    *,
+    runtime: TrainingRuntime,
+    job: MegatronTrainingJob | MegatronMergedTrainingJob,
+    adapter_model: dict[str, torch.Tensor],
+    packed_tensors: PackedTensors,
+    num_sequences: int,
+    num_steps: int,
+    global_grad_accumulation_sequences: int,
+) -> dict[int, torch.Tensor] | None:
+    if job.config.kl_penalty_coef <= 0.0:
+        return None
+
+    ref_adapter_path = cast(dev.TrainConfig, job.experimental_config).get(
+        "kl_ref_adapter_path"
+    )
+    if ref_adapter_path is None:
+        raise RuntimeError(
+            "KL penalty is enabled but no kl_ref_adapter_path was provided. "
+            "Megatron training requires an explicit reference LoRA path; pass "
+            "kl_penalty_reference_step=0 for the identity/base reference or "
+            "provide kl_ref_adapter_path."
+        )
+
+    adapter_swapped = os.path.abspath(ref_adapter_path) != os.path.abspath(
+        job.lora_path
+    )
+    loaded_ref_adapter = False
+    try:
+        if adapter_swapped:
+            _load_adapter_into_model(
+                runtime.model,
+                ref_adapter_path,
+                runtime.rank,
+                handler=runtime.model_support_handler,
+            )
+            loaded_ref_adapter = True
+        return _precompute_reference_logprobs(
+            runtime=runtime,
+            packed_tensors=packed_tensors,
+            sample_step_indices=_reference_sample_step_indices(
+                num_sequences=num_sequences,
+                num_steps=num_steps,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            ),
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+    finally:
+        if loaded_ref_adapter:
+            assert runtime.optimizer is not None
+            load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
+
+
 def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
@@ -981,7 +1287,7 @@ def run_megatron_sft_step(
                 "sample_index list length must match number of micro inputs: "
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
-        micro_sample_indices = sample_index
+        micro_sample_indices: list[int | None] = sample_index
     else:
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
@@ -1006,7 +1312,7 @@ def run_megatron_sft_step(
     )
 
     for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
+        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
 
     raw_loss_sum: torch.Tensor | None = None
     loss_inputs_for_count: list[dict[str, torch.Tensor] | PreparedSFTMicroInputs] = []
@@ -1110,10 +1416,11 @@ def run_training_step(
     experimental_config: dev.TrainConfig,
     step_index: int,
     sample_index: int | list[int | None],
-    ref_logprobs: torch.Tensor | None = None,
+    ref_logprobs: torch.Tensor | list[torch.Tensor] | None = None,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     cp_lookahead_state: CpBatchLookaheadState | None = None,
     next_step_first_micro: PackedTensors | None = None,
+    next_step_first_ref_logprobs: torch.Tensor | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -1125,7 +1432,7 @@ def run_training_step(
                 "sample_index list length must match number of micro inputs: "
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
-        micro_sample_indices = sample_index
+        micro_sample_indices: list[int | None] = sample_index
     else:
         assert len(micro_inputs) == 1
         micro_sample_indices = [sample_index]
@@ -1157,12 +1464,14 @@ def run_training_step(
         cp_lookahead_state.pending_prepared_micro = None
 
     for chunk in model_chunks:
-        chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
+        chunk.zero_grad_buffer()  # type: ignore[call-non-callable]
 
     micro_count = len(micro_inputs)
     raw_loss_sum: torch.Tensor | None = None
     loss_inputs_for_count: list[LossInputs | DispatchedPackedTensors] = []
     probs_corr_total: torch.Tensor | None = None
+    kl_policy_ref_sum = 0.0
+    kl_policy_ref_count = 0
     new_logprobs_gpu: list[torch.Tensor] = []
 
     def begin_micro(micro_order: int) -> None:
@@ -1174,13 +1483,16 @@ def run_training_step(
 
     for micro_order in range(micro_count):
         begin_micro(micro_order)
+        micro_ref_logprobs = _select_ref_logprobs(ref_logprobs, micro_order)
+        if micro_ref_logprobs is not None and int(topology.cp) <= 1:
+            micro_ref_logprobs = micro_ref_logprobs.to(device)
         prepared_micro, pending_prepared_micro = _prepare_current_rl_micro(
             micro_inputs[micro_order],
             device=device,
             topology=topology,
             provider=provider,
             model_support_handler=model_support_handler,
-            ref_logprobs=ref_logprobs,
+            ref_logprobs=micro_ref_logprobs,
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
@@ -1190,27 +1502,12 @@ def run_training_step(
             prepared_micro.attention_state,
         )
 
-        model_forward_kwargs = dict(
-            input_ids=prepared_micro.model_tokens,
-            position_ids=prepared_micro.model_input_pos,
-            attention_mask=_placeholder_attention_mask(device),
-            packed_seq_params=prepared_micro.packed_seq_params,
-            **model_support_handler.get_forward_kwargs(
-                model_chunks[0],
-                attention_bias=prepared_micro.attention_state,
-            ),
+        new_logprobs = _forward_prepared_rl_micro(
+            model_chunks=model_chunks,
+            model_support_handler=model_support_handler,
+            prepared_micro=prepared_micro,
+            device=device,
         )
-        with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
-            if int(prepared_micro.model_tokens.numel()) == 0:
-                logits = model_chunks[0](**model_forward_kwargs, labels=None)
-                new_logprobs = _empty_new_logprobs_from_logits(
-                    logits, prepared_micro.model_labels
-                )
-            else:
-                new_logprobs = -model_chunks[0](
-                    **model_forward_kwargs,
-                    labels=prepared_micro.model_labels,
-                )
 
         loss_info = loss_fn(
             prepared_micro.loss_inputs,
@@ -1243,7 +1540,6 @@ def run_training_step(
             )
         micro_loss.backward()
         loss_inputs_for_count.append(prepared_micro.loss_inputs)
-        del model_forward_kwargs
         del prepared_micro
         pending_prepared_micro = _prepare_next_rl_cp_micro(
             _next_micro_lookahead(
@@ -1256,13 +1552,21 @@ def run_training_step(
             provider=provider,
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
-            ref_logprobs=ref_logprobs,
+            ref_logprobs=_select_next_ref_logprobs(
+                ref_logprobs,
+                micro_order=micro_order,
+                micro_count=micro_count,
+                next_step_first_ref_logprobs=next_step_first_ref_logprobs,
+            ),
         )
         detached_probs_corr = loss_info.probs_corr.detach()
         if probs_corr_total is None:
             probs_corr_total = detached_probs_corr
         else:
             probs_corr_total = probs_corr_total + detached_probs_corr
+        if loss_info.kl_policy_ref is not None:
+            kl_policy_ref_sum += float(loss_info.kl_policy_ref.item())
+            kl_policy_ref_count += 1
         detached_micro_loss = micro_loss.detach()
         if raw_loss_sum is None:
             raw_loss_sum = detached_micro_loss
@@ -1280,7 +1584,6 @@ def run_training_step(
     if cp_lookahead_state is not None:
         cp_lookahead_state.pending_prepared_micro = pending_prepared_micro
 
-    torch.cuda.empty_cache()
     token_count = _local_trainable_token_count_tensor(
         loss_inputs_for_count,
         device=device,
@@ -1306,6 +1609,9 @@ def run_training_step(
     return TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=float((probs_corr_total / micro_count).item()),
+        kl_policy_ref=(
+            kl_policy_ref_sum / kl_policy_ref_count if kl_policy_ref_count > 0 else None
+        ),
         new_logprobs=[
             tensor.to(device="cpu", non_blocking=True) for tensor in new_logprobs_gpu
         ],

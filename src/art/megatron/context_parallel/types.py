@@ -95,6 +95,7 @@ class ContextParallelConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     block_size: int = 128
+    attention_sparse_block_size: tuple[int, int] | None = None
     planner_chunk_size: int = 512
     planner_chunk_budget_base: int = 128
     planner_chunk_budget_per_cp_rank: int = 16

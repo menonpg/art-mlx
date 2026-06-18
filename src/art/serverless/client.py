@@ -20,6 +20,7 @@ from openai.pagination import AsyncCursorPage
 from typing_extensions import override
 
 from ..trajectories import TrajectoryGroup
+from ..types import SFTMetricLoggingConfig
 
 ResponseT = TypeVar("ResponseT")
 
@@ -60,6 +61,9 @@ class ExperimentalTrainingConfig(TypedDict, total=False):
     )
     kimi_k2_tau: float | None
     kl_penalty_coef: float | None
+    kl_penalty_reference_step: int | None
+    kl_penalty_source: Literal["current_learner", "sample"] | None
+    kl_penalty_step_lag: int | None
     kl_ref_adapter_path: str | None
     learning_rate: float | None
     logprob_calculation_chunk_size: int | None
@@ -80,6 +84,7 @@ class ExperimentalTrainingConfig(TypedDict, total=False):
 class SFTTrainingConfig(TypedDict, total=False):
     batch_size: int | None
     learning_rate: float | list[float] | None
+    metric_logging: SFTMetricLoggingConfig | None
 
 
 class TrainingJob(BaseModel):

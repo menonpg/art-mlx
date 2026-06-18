@@ -14,7 +14,6 @@ _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
 _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
 _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
-_WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
 
 _DENSE_TARGET_MODULES = (
@@ -52,6 +51,9 @@ _QWEN3_5_MOE_TARGET_MODULES = (
     "in_proj_z",
     "out_proj",
     "experts",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 )
 
 DEFAULT_DENSE_SPEC = ModelSupportSpec(

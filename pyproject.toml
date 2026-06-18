@@ -37,7 +37,7 @@ backend = [
     "nbclient>=0.10.1",
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
-    "gql<4",
+    "gql>=4.0.0",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
 ]
@@ -160,12 +160,13 @@ override-dependencies = [
     "transformers==5.6.2",
     "torch==2.11.0",
 ]
-exclude-dependencies = ["pynvml", "emerging-optimizers"]
+exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
 deep-ep = ["torch>=2.11.0"]
+megatron-core = ["pybind11"]
 nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 
@@ -271,7 +272,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
 deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }

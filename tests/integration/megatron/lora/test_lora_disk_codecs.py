@@ -189,6 +189,34 @@ def _qwen35_moe_art_tensors(prefix: str, *, rank: int = 2) -> dict[str, torch.Te
     return tensors
 
 
+def _qwen35_shared_expert_art_tensors(
+    prefix: str,
+    *,
+    rank: int = 2,
+) -> dict[str, torch.Tensor]:
+    hidden = 3
+    intermediate = 4
+    tensors: dict[str, torch.Tensor] = {}
+    offset = 1000
+    for module, in_dim, out_dim in (
+        ("gate_proj", hidden, intermediate),
+        ("up_proj", hidden, intermediate),
+        ("down_proj", intermediate, hidden),
+    ):
+        module_prefix = f"{prefix}.mlp.shared_expert.{module}"
+        tensors[f"{module_prefix}.lora_A.weight"] = (
+            torch.arange(rank * in_dim, dtype=torch.float32).reshape(rank, in_dim)
+            + offset
+        )
+        offset += 100
+        tensors[f"{module_prefix}.lora_B.weight"] = (
+            torch.arange(out_dim * rank, dtype=torch.float32).reshape(out_dim, rank)
+            + offset
+        )
+        offset += 100
+    return tensors
+
+
 def _pack_qwen35_vllm_lora_b(blocks: list[torch.Tensor]) -> torch.Tensor:
     stacked = torch.stack(blocks, dim=0)
     return stacked.permute(1, 2, 0).reshape(stacked.shape[1], -1).contiguous()
@@ -577,6 +605,41 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         )
         assert "language_model.model.layers.0.mlp.experts" in loaded_modules
         assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
+    art_prefix = "base_model.model.model.layers.0"
+    original = {
+        **_qwen35_moe_art_tensors(art_prefix),
+        **_qwen35_shared_expert_art_tensors(art_prefix),
+    }
+    adapter_config = _qwen35_config("Qwen/Qwen3.6-35B-A3B")
+    adapter_config["target_modules"] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "out_proj",
+        "experts",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+    vllm_tensors, vllm_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=adapter_config,
+    )
+    assert vllm_config["target_modules"] == adapter_config["target_modules"]
+    assert any(".mlp.shared_expert.gate_proj." in key for key in vllm_tensors)
+    assert any(".mlp.shared_expert.up_proj." in key for key in vllm_tensors)
+    assert any(".mlp.shared_expert.down_proj." in key for key in vllm_tensors)
+    roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=vllm_config,
+    )
+    _assert_tensors_equal(roundtrip, original)
 
 
 def test_qwen35_target_parameter_identity_normalizes_to_fused_vllm_layout(

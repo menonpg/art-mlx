@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+from openai.types.completion_usage import CompletionUsage
 import pytest
 
 import art
@@ -255,7 +256,11 @@ class FakeCompletions:
         )
         return SimpleNamespace(
             choices=[choice],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+            usage=CompletionUsage(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            ),
         )
 
 
@@ -313,3 +318,107 @@ async def test_rollout_supports_art_model_like_args() -> None:
 
     assert trajectory.metadata["scenario_id"] == "task_001"
     assert trajectory.metrics["num_turns"] == 1
+
+
+class FakeBadRequestError(Exception):
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class MaxTokensCompletions:
+    async def create(self, **kwargs: Any) -> Any:
+        raise FakeBadRequestError("max_tokens is too large for this model")
+
+
+class MaxTokensAsyncOpenAI:
+    def __init__(self, **kwargs: Any) -> None:
+        self.chat = SimpleNamespace(completions=MaxTokensCompletions())
+
+
+class CountingTauBenchClient(FakeTauBenchClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.steps = 0
+
+    async def step_environment(
+        self, env_id: str, action: str
+    ) -> StepEnvironmentResponse:
+        self.steps += 1
+        return StepEnvironmentResponse(
+            id=env_id,
+            observation=f"user: saw {action}",
+            reward=1.0,
+            terminated=False,
+            truncated=False,
+            info={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollout_stops_on_max_tokens_bad_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+    rollout_module.openai_clients.clear()
+    monkeypatch.setattr(rollout_module, "AsyncOpenAI", MaxTokensAsyncOpenAI)
+    monkeypatch.setattr(rollout_module, "BadRequestError", FakeBadRequestError)
+    client = CountingTauBenchClient()
+    scenario = Scenario(domain="banking_knowledge", task=Task(id="task_001"))
+
+    trajectory = await rollout_module.rollout(
+        scenario,
+        "http://model.test/v1",
+        "model-key",
+        "default",
+        client=client,
+        max_turns=10,
+    )
+
+    assert trajectory.metrics["num_turns"] == 0
+    assert client.steps == 0
+    assert client.deleted == ["env-1"]
+
+
+class NearContextLimitCompletions:
+    async def create(self, **kwargs: Any) -> Any:
+        choice = SimpleNamespace(
+            message=SimpleNamespace(content="hello", tool_calls=None)
+        )
+        return SimpleNamespace(
+            choices=[choice],
+            usage=CompletionUsage(
+                prompt_tokens=32_000,
+                completion_tokens=700,
+                total_tokens=32_700,
+            ),
+        )
+
+
+class NearContextLimitAsyncOpenAI:
+    def __init__(self, **kwargs: Any) -> None:
+        self.chat = SimpleNamespace(completions=NearContextLimitCompletions())
+
+
+@pytest.mark.asyncio
+async def test_rollout_stops_before_next_turn_exceeds_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+    rollout_module.openai_clients.clear()
+    monkeypatch.setattr(rollout_module, "AsyncOpenAI", NearContextLimitAsyncOpenAI)
+    client = CountingTauBenchClient()
+    scenario = Scenario(domain="banking_knowledge", task=Task(id="task_001"))
+
+    trajectory = await rollout_module.rollout(
+        scenario,
+        "http://model.test/v1",
+        "model-key",
+        "default",
+        client=client,
+        max_turns=10,
+    )
+
+    assert trajectory.metrics["num_turns"] == 1
+    assert client.steps == 1
+    assert client.deleted == ["env-1"]
