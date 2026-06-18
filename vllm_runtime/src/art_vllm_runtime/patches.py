@@ -86,9 +86,9 @@ def subclass_chat_completion_request() -> None:
 
 
 def patch_listen_for_disconnect() -> None:
-    import vllm.entrypoints.utils
+    from vllm.entrypoints.serve.utils import api_utils
 
-    if getattr(vllm.entrypoints.utils, "_art_listen_for_disconnect_patched", False):
+    if getattr(api_utils, "_art_listen_for_disconnect_patched", False):
         return
 
     async def patched_listen_for_disconnect(request: Any) -> None:
@@ -96,12 +96,16 @@ def patch_listen_for_disconnect() -> None:
             while True:
                 message = await request.receive()
                 if message["type"] == "http.disconnect":
+                    if getattr(
+                        request.app.state, "enable_server_load_tracking", False
+                    ) and hasattr(request.app.state, "server_load_metrics"):
+                        request.app.state.server_load_metrics -= 1
                     break
         except UnboundLocalError:
             pass
 
-    vllm.entrypoints.utils.listen_for_disconnect = patched_listen_for_disconnect  # ty:ignore[invalid-assignment]
-    setattr(vllm.entrypoints.utils, "_art_listen_for_disconnect_patched", True)
+    api_utils.listen_for_disconnect = patched_listen_for_disconnect  # ty:ignore[invalid-assignment]
+    setattr(api_utils, "_art_listen_for_disconnect_patched", True)
 
 
 def patch_tool_parser_manager() -> None:
@@ -361,6 +365,13 @@ def patch_routed_experts_prefix_cache_sidecar() -> None:
     from vllm.model_executor.layers.fused_moe import routed_experts_capturer
 
     if getattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", False):
+        return
+
+    if hasattr(routed_experts_capturer, "RoutedExpertsManager"):
+        # vLLM 0.23 stores routed experts by physical KV-cache slot, so prefix
+        # cache hits recover routes from the shared slot buffer without ART's
+        # old per-request host-cache sidecar.
+        setattr(routed_experts_capturer, "_art_prefix_route_sidecar_patched", True)
         return
 
     host_cls = routed_experts_capturer._RoutedExpertsHostCache
