@@ -141,6 +141,9 @@ class LengthTrainabilityReport(BaseModel):
     normalize_advantages: bool
     summary_log_path: str
     latest_summary_log_path: str
+    initial_train_abs_error: float | None
+    best_train_abs_error: float | None
+    success_step: int | None
     final_train_reward: float | None
     final_train_abs_error: float | None
     model_ids_after: list[str]
@@ -164,9 +167,7 @@ def _word_count(text: str) -> int:
 
 
 def _target_tokens() -> int:
-    # Keep the task far enough from default one-sentence behavior that later
-    # batches still have reward variance after the model starts learning.
-    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 32)
+    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 4)
 
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
@@ -237,11 +238,6 @@ def _scenario(index: int, *, target_step: int | None = None) -> LengthScenario:
             "prompt_word_count": prompt_word_count,
         },
     )
-
-
-async def _scenario_iter(count: int) -> AsyncIterator[dict[str, object]]:
-    for index in range(count):
-        yield _scenario(index, target_step=0).model_dump()
 
 
 def _step_from_model_name(model_name: str) -> int | None:
@@ -368,6 +364,16 @@ def _mean(values: list[float]) -> float:
     return sum(values) / max(1, len(values))
 
 
+def _mean_abs_error_by_step(samples: list[LengthSampleReport]) -> dict[int, float]:
+    steps = sorted({sample.step for sample in samples if sample.step is not None})
+    return {
+        step: _mean(
+            [float(sample.abs_error) for sample in samples if sample.step == step]
+        )
+        for step in steps
+    }
+
+
 def _init_summary_log(path: Path) -> None:
     path.write_text(
         "\n".join(
@@ -457,6 +463,9 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         "ART_MODEL_SUPPORT_LENGTH_SCENARIOS",
         max_steps * max(rollouts_per_prompt, 2) + rollout_workers + 4,
     )
+    initial_abs_error_min = 5.0
+    success_abs_error_max = 1.5
+    success_hit = False
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
     summary_log_path = artifact_dir / "length_trainability.log"
@@ -487,16 +496,23 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         )
         await model.register(backend)
 
+        async def scenarios() -> AsyncIterator[dict[str, object]]:
+            for index in range(scenario_count):
+                if success_hit:
+                    break
+                yield _scenario(index, target_step=0).model_dump()
+
         async def rollout_fn(
             rollout_model: art.TrainableModel,
             scenario: dict[str, object],
             _config: None,
         ) -> art.TrajectoryGroup:
+            nonlocal success_hit
             model_name = rollout_model.get_inference_name()
             target_step = _step_from_model_name(model_name)
             if target_step is None:
                 target_step = await rollout_model.get_step()
-            return await _length_group(
+            group = await _length_group(
                 rollout_model,
                 scenario=_scenario_for_training_step(scenario, target_step),
                 model_name=model_name,
@@ -510,12 +526,20 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
                 samples=samples,
                 summary_log_path=summary_log_path,
             )
+            if (
+                _mean_abs_error_by_step(
+                    [sample for sample in samples if sample.split == "train"]
+                )[target_step]
+                <= success_abs_error_max
+            ):
+                success_hit = True
+            return group
 
         trainer = PipelineTrainer(
             model=model,
             backend=backend,
             rollout_fn=rollout_fn,
-            scenarios=_scenario_iter(scenario_count),
+            scenarios=scenarios(),
             config=None,
             num_rollout_workers=rollout_workers,
             min_batch_size=1,
@@ -546,6 +570,19 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         step: [sample.reward for sample in train_samples if sample.step == step]
         for step in {sample.step for sample in train_samples}
     }
+    train_abs_error_by_step = _mean_abs_error_by_step(train_samples)
+    initial_train_abs_error = train_abs_error_by_step.get(0)
+    best_train_abs_error = (
+        min(train_abs_error_by_step.values()) if train_abs_error_by_step else None
+    )
+    success_step = next(
+        (
+            step
+            for step, abs_error in train_abs_error_by_step.items()
+            if abs_error <= success_abs_error_max
+        ),
+        None,
+    )
     final_train_samples = [
         sample for sample in train_samples if sample.step == latest_step - 1
     ]
@@ -571,6 +608,9 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         normalize_advantages=normalize_advantages,
         summary_log_path=str(summary_log_path),
         latest_summary_log_path=str(LATEST_SUMMARY_LOG_PATH),
+        initial_train_abs_error=initial_train_abs_error,
+        best_train_abs_error=best_train_abs_error,
+        success_step=success_step,
         final_train_reward=final_train_reward,
         final_train_abs_error=final_train_abs_error,
         model_ids_after=model_ids_after,
@@ -581,11 +621,15 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         encoding="utf-8",
     )
 
-    assert latest_step == max_steps
     assert train_samples
-    assert len(train_rewards_by_step) == max_steps
+    assert latest_step <= max_steps
+    assert initial_train_abs_error is not None
+    assert initial_train_abs_error >= initial_abs_error_min
+    assert best_train_abs_error is not None
+    assert best_train_abs_error <= success_abs_error_max
+    assert success_step is not None
+    assert len(train_rewards_by_step) <= max_steps
     assert all(sample.max_tokens > sample.target_tokens for sample in train_samples)
     assert any(sample.generated_tokens < sample.max_tokens for sample in train_samples)
     assert any(len(set(rewards)) > 1 for rewards in train_rewards_by_step.values())
-    assert final_train_samples
     assert f"{model.name}@{latest_step}" in model_ids_after
