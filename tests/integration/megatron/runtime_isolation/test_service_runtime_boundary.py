@@ -11,7 +11,6 @@ import pytest
 
 import art
 from art.megatron.service import MegatronService
-from art.unsloth.service import UnslothService
 
 
 @pytest.fixture(autouse=True)
@@ -108,7 +107,8 @@ async def test_unsloth_shared_start_requires_runtime_sleep_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={
@@ -164,7 +164,8 @@ async def test_unsloth_runtime_sleep_and_wake_use_runtime_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UnslothService(
+    unsloth_service = pytest.importorskip("art.unsloth.service")
+    service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
         config={"rollout_weights_mode": "lora"},
