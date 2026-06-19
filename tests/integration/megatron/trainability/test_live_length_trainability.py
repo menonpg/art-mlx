@@ -164,7 +164,9 @@ def _word_count(text: str) -> int:
 
 
 def _target_tokens() -> int:
-    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 10)
+    # Keep the task far enough from default one-sentence behavior that later
+    # batches still have reward variance after the model starts learning.
+    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 32)
 
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
