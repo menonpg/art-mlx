@@ -14,6 +14,7 @@ _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
 _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
 _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
+_WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
 
 _DENSE_TARGET_MODULES = (
@@ -141,8 +142,7 @@ GEMMA4_MOE_SPEC = ModelSupportSpec(
     ),
     default_target_modules=_GEMMA4_MOE_TARGET_MODULES,
     default_rollout_weights_mode="merged",
-    # vLLM has Gemma4 LoRA coverage for non-MoE paths, but not Gemma4 26B-A4B MoE.
-    native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         transformers="5.6.2",
         megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
