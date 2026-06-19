@@ -73,7 +73,6 @@ from ..preprocessing.tokenize import (
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import (
     LocalTrainResult,
-    MegatronTopologyConfig,
     Message,
     TrainConfig,
     TrainSFTConfig,
@@ -765,7 +764,6 @@ class LocalBackend(Backend):
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
-        megatron_topology: MegatronTopologyConfig | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -831,9 +829,6 @@ class LocalBackend(Backend):
             packed_sequence_length: Packed sequence length to use for training.
                 When unset, Unsloth keeps the current max-length-rounded-to-2048
                 behavior. Required for Megatron.
-            megatron_topology: Parallel topology for Megatron training. When
-                provided, ART uses it to configure Megatron TP/CP/EP/PP/VPP/ETP
-                before launching the Megatron runtime.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -905,7 +900,6 @@ class LocalBackend(Backend):
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
-            megatron_topology=megatron_topology,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )

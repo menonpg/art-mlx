@@ -24,8 +24,8 @@ from .yes_no_trainability import (
     _get_env_bool,
     _get_env_float,
     _get_env_int,
+    _init_megatron_runtime_config,
     _list_model_ids,
-    _variant_packed_sequence_length,
 )
 
 torch = pytest.importorskip("torch")
@@ -473,6 +473,7 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
         4,
     )
     rollout_weights_mode = internal_config["rollout_weights_mode"]
+    _init_megatron_runtime_config(variant)
 
     async with _backend_context(variant, backend_root=backend_root) as backend:
         model = art.TrainableModel(
@@ -524,15 +525,6 @@ async def test_megatron_dedicated_length_trainability_live(artifact_dir: Path) -
             ),
             loss_fn="cispo",
             normalize_advantages=normalize_advantages,
-            packed_sequence_length=_variant_packed_sequence_length(variant),
-            megatron_topology=art.MegatronTopologyConfig(
-                tp=variant.topology.tp,
-                cp=variant.topology.cp,
-                ep=variant.topology.ep,
-                etp=variant.topology.etp,
-            )
-            if variant.topology is not None
-            else None,
             max_steps=max_steps,
             eval_every_n_steps=0,
             eval_at_start=False,

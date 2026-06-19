@@ -9,9 +9,17 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+import art
 from art.megatron.service import MegatronService
-from art.types import MegatronTopologyConfig
 from art.unsloth.service import UnslothService
+
+
+@pytest.fixture(autouse=True)
+def _init_megatron_runtime_config() -> None:
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
+        packed_sequence_length=1024,
+    )
 
 
 class _AsyncOkResponse:
@@ -204,7 +212,6 @@ async def test_megatron_dedicated_merged_start_syncs_initial_weights(
     sync_merged.assert_awaited_once_with(
         lora_path="/tmp/lora",
         step=0,
-        megatron_topology=None,
     )
 
 
@@ -220,7 +227,6 @@ async def test_megatron_dedicated_merged_start_uses_configured_topology(
             "trainer_gpu_ids": [0],
             "inference_gpu_ids": [1],
             "rollout_weights_mode": "merged",
-            "megatron_topology": {"tp": 1, "cp": 2, "ep": 2, "etp": 1},
         },
         output_dir=str(tmp_path),
     )
@@ -235,8 +241,8 @@ async def test_megatron_dedicated_merged_start_uses_configured_topology(
     sync_merged.assert_awaited_once_with(
         lora_path="/tmp/lora",
         step=0,
-        megatron_topology=MegatronTopologyConfig(tp=1, cp=2, ep=2, etp=1),
     )
+    assert service.runtime_config.topology.cp == 2
 
 
 @pytest.mark.asyncio

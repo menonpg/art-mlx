@@ -736,6 +736,21 @@ def _routing_topology_from_config(config: TrainInfOutputParityConfig) -> Any:
     )
 
 
+def _init_art_megatron_runtime_config(config: TrainInfOutputParityConfig) -> None:
+    import art
+
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(
+            tp=config.topology.tp,
+            cp=config.topology.cp,
+            ep=config.topology.ep,
+            pp=config.topology.pp,
+            etp=config.topology.etp,
+        ),
+        packed_sequence_length=config.packed.sequence_length,
+    )
+
+
 def _build_real_path_moe_routing_replay_bundle(
     *,
     packed_tensors: Any,
@@ -1103,6 +1118,7 @@ async def run_real_path_train_inf_mismatch(
     if not adapter_path:
         raise RuntimeError("Real-path adapter worker did not create an adapter")
 
+    _init_art_megatron_runtime_config(parity_config)
     backend = MegatronBackend(
         path=str(artifact_dir / "art_path"),
         enable_expert_replay=is_moe,
