@@ -165,7 +165,7 @@ def test_validated_dense_model_uses_dense_shared_topology(
         base_model="Qwen/Qwen3.5-4B",
     )
     assert built_variant.topology is not None
-    assert built_variant.topology.tp == 2
+    assert built_variant.topology.cp == 2
     assert built_variant.topology.ep == 1
     assert built_variant.topology.etp == 1
 
