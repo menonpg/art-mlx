@@ -11,7 +11,12 @@ logger = logging.getLogger(__name__)
 
 
 def apply_vllm_runtime_patches() -> None:
+    from art_vllm_runtime.gemma4_moe_lora_patch import (
+        patch_gemma4_moe_lora_support,
+    )
+
     patch_transformers_v5_compat()
+    patch_gemma4_moe_lora_support()
     subclass_chat_completion_request()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
