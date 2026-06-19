@@ -167,7 +167,7 @@ def _word_count(text: str) -> int:
 
 
 def _target_tokens() -> int:
-    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 4)
+    return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 10)
 
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:

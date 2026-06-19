@@ -141,7 +141,6 @@ GEMMA4_MOE_SPEC = ModelSupportSpec(
         "google/gemma-4-26B-A4B-it",
     ),
     default_target_modules=_GEMMA4_MOE_TARGET_MODULES,
-    default_rollout_weights_mode="merged",
     native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         transformers="5.6.2",
