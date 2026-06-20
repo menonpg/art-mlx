@@ -220,7 +220,7 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
         for depth_buckets in plan.tree_chain_buckets_by_depth[1:]
         for bucket in depth_buckets
     )
-    _assert_parent_local_non_chained_children(spec, plans)
+    _assert_remote_parent_state_transfers_cover(spec, plans)
     for plan in plans:
         assert sum(plan.gdn_token_count for plan in plans) == spec.real_token_count
         for depth_buckets in plan.tree_chain_buckets_by_depth:
@@ -230,7 +230,7 @@ def test_gdn_tree_cp_plan_chains_long_nodes() -> None:
                 assert bucket.parent_indices is not None
 
 
-def test_gdn_tree_cp_plan_keeps_non_chained_children_parent_local() -> None:
+def test_gdn_tree_cp_plan_exchanges_remote_parent_states() -> None:
     pytest.importorskip("megatron.core.packed_seq_params")
     from art.megatron.gdn.gdn_shared_prefix import (
         build_gdn_rank_execution_plan,
@@ -268,7 +268,8 @@ def test_gdn_tree_cp_plan_keeps_non_chained_children_parent_local() -> None:
         for depth_buckets in plan.tree_chain_buckets_by_depth[1:]
         for bucket in depth_buckets
     )
-    _assert_parent_local_non_chained_children(spec, plans)
+    assert _remote_parent_state_transfer_count(plans) > 0
+    _assert_remote_parent_state_transfers_cover(spec, plans)
 
 
 def test_gdn_tree_cp_randomized_plans_cover_each_token_once() -> None:
@@ -383,12 +384,37 @@ def _local_owner_by_family(plans) -> dict[int, int]:
     return owner_by_family
 
 
-def _assert_parent_local_non_chained_children(spec, plans) -> None:
+def _assert_remote_parent_state_transfers_cover(spec, plans) -> None:
     owner_by_family = _local_owner_by_family(plans)
     for family_index, parent_index in enumerate(spec.tree_parent_indices):
         if parent_index < 0 or parent_index not in owner_by_family:
             continue
-        assert owner_by_family[family_index] == owner_by_family[parent_index]
+        source_rank = owner_by_family[parent_index]
+        dest_rank = owner_by_family[family_index]
+        if source_rank == dest_rank:
+            continue
+        depth = spec.tree_depths[family_index]
+        source_exchange = plans[source_rank].tree_state_exchanges_by_depth[depth]
+        dest_exchange = plans[dest_rank].tree_state_exchanges_by_depth[depth]
+        assert source_exchange is not None
+        assert dest_exchange is not None
+        assert parent_index in source_exchange.source_family_indices
+        assert parent_index in dest_exchange.dest_family_indices
+        matching = [
+            transfer
+            for transfer in dest_exchange.exchange.transfers
+            if transfer.source_rank == source_rank and transfer.dest_rank == dest_rank
+        ]
+        assert matching
+
+
+def _remote_parent_state_transfer_count(plans) -> int:
+    return sum(
+        exchange.exchange.cross_rank_token_count
+        for plan in plans
+        for exchange in plan.tree_state_exchanges_by_depth
+        if exchange is not None
+    ) // len(plans)
 
 
 def _tree_has_children(spec) -> list[bool]:
@@ -462,7 +488,7 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
             for token_index in range(start, end):
                 token_counts[token_index] += 1
 
-    _assert_parent_local_non_chained_children(spec, plans)
+    _assert_remote_parent_state_transfers_cover(spec, plans)
     assert token_counts == [1] * int(spec.real_token_count)
     rank_tokens = [int(plan.gdn_token_count) for plan in plans]
     assert max(rank_tokens) - min(rank_tokens) <= max(256, spec.real_token_count // 3)

@@ -128,6 +128,17 @@ class GdnSegmentBucketPlan(BaseModel):
         return self.real_token_count_static
 
 
+class GdnStateExchangePlan(BaseModel):
+    """Sparse CP exchange for tree parent states needed by remote children."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    source_family_indices: tuple[int, ...]
+    dest_family_indices: tuple[int, ...]
+    exchange: Any
+    reverse_exchange: Any
+
+
 class GdnPlannerConfig(BaseModel):
     """Tunable cost coefficients for one packed-row GDN execution plan."""
 
@@ -169,6 +180,7 @@ class GdnRankExecutionPlan(BaseModel):
     gdn_token_count: int = Field(default=0, ge=0)
     tree_segment_buckets_by_depth: tuple[tuple[GdnSegmentBucketPlan, ...], ...] = ()
     tree_chain_buckets_by_depth: tuple[tuple[GdnSegmentBucketPlan, ...], ...] = ()
+    tree_state_exchanges_by_depth: tuple[GdnStateExchangePlan | None, ...] = ()
 
     @property
     def attention_token_indices(self) -> tuple[int, ...]:
@@ -322,7 +334,6 @@ def _build_tree_rank_execution_plan(
 
     for depth, depth_segments in enumerate(tree_segments_by_depth):
         local_groups: list[tuple[GdnSegmentSpec, ...]] = []
-        siblings_by_parent: dict[int, list[GdnSegmentSpec]] = {}
         for segment in depth_segments:
             parent_index = spec.tree_parent_indices[segment.family_index]
             if (
@@ -344,31 +355,14 @@ def _build_tree_rank_execution_plan(
                     attention_layout_index=attention_layout_index,
                 )
                 continue
-            if parent_index < 0:
-                local_groups.append((segment,))
-            else:
-                if depth_count <= 2:
-                    siblings_by_parent.setdefault(parent_index, []).append(segment)
-                else:
-                    local_groups.append((segment,))
-        local_groups.extend(tuple(group) for group in siblings_by_parent.values())
+            local_groups.append((segment,))
 
         for local_group in local_groups:
-            parent_owner = _tree_group_parent_owner(
+            owner = _best_segment_owner(
                 local_group,
-                tree_parent_indices=spec.tree_parent_indices,
-                owner_by_node=owner_by_node,
-                chained_nodes=chained_nodes,
-            )
-            owner = (
-                parent_owner
-                if parent_owner is not None
-                else _best_segment_owner(
-                    local_group,
-                    rank_loads,
-                    segment_attention_counts=segment_attention_counts,
-                    planner_config=planner_config,
-                )
+                rank_loads,
+                segment_attention_counts=segment_attention_counts,
+                planner_config=planner_config,
             )
             for segment in local_group:
                 owner_by_node[segment.family_index] = owner
@@ -439,6 +433,15 @@ def _build_tree_rank_execution_plan(
         if cp_size > 1
         else tuple(() for _ in range(depth_count))
     )
+    tree_state_exchanges_by_depth = _build_tree_state_exchanges_by_depth(
+        spec,
+        owner_by_node=tuple(owner_by_node),
+        chained_nodes=tuple(chained_nodes),
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        depth_count=depth_count,
+        device=device,
+    )
     if cp_size == 1:
         valid_lengths = torch.tensor(
             spec.valid_lengths, device=device, dtype=torch.long
@@ -471,6 +474,7 @@ def _build_tree_rank_execution_plan(
         gdn_token_count=rank_loads[cp_rank],
         tree_segment_buckets_by_depth=tree_segment_buckets_by_depth,
         tree_chain_buckets_by_depth=tree_chain_buckets_by_depth,
+        tree_state_exchanges_by_depth=tree_state_exchanges_by_depth,
     )
 
 
@@ -505,6 +509,28 @@ def move_gdn_rank_execution_plan_to_device(
         tree_chain_buckets_by_depth=tuple(
             _move_bucket_plans(buckets, device)
             for buckets in plan.tree_chain_buckets_by_depth
+        ),
+        tree_state_exchanges_by_depth=tuple(
+            _move_state_exchange_plan(exchange, device)
+            for exchange in plan.tree_state_exchanges_by_depth
+        ),
+    )
+
+
+def _move_state_exchange_plan(
+    exchange: GdnStateExchangePlan | None,
+    device: torch.device | str,
+) -> GdnStateExchangePlan | None:
+    if exchange is None:
+        return None
+    from art.megatron.gdn.layout import move_cp_exchange_plan_to_device
+
+    return GdnStateExchangePlan.model_construct(
+        source_family_indices=exchange.source_family_indices,
+        dest_family_indices=exchange.dest_family_indices,
+        exchange=move_cp_exchange_plan_to_device(exchange.exchange, device),
+        reverse_exchange=move_cp_exchange_plan_to_device(
+            exchange.reverse_exchange, device
         ),
     )
 
@@ -769,21 +795,116 @@ def _best_segment_owner(
     return best[-1]
 
 
-def _tree_group_parent_owner(
-    segments: tuple[GdnSegmentSpec, ...],
+def _build_tree_state_exchanges_by_depth(
+    spec: GdnPackedExecutionSpec,
     *,
-    tree_parent_indices: tuple[int, ...],
-    owner_by_node: list[int],
-    chained_nodes: list[bool],
-) -> int | None:
-    if not segments:
-        return None
-    segment = segments[0]
-    parent_index = tree_parent_indices[segment.family_index]
-    if parent_index < 0 or chained_nodes[parent_index]:
-        return None
-    parent_owner = owner_by_node[parent_index]
-    return parent_owner if parent_owner >= 0 else None
+    owner_by_node: tuple[int, ...],
+    chained_nodes: tuple[bool, ...],
+    cp_rank: int,
+    cp_size: int,
+    depth_count: int,
+    device: torch.device | str,
+) -> tuple[GdnStateExchangePlan | None, ...]:
+    if cp_size <= 1:
+        return tuple(None for _ in range(depth_count))
+
+    from art.megatron.gdn.layout import (
+        GdnCpExchangePlan,
+        _make_peer_transfer,
+        _reverse_exchange_plan,
+    )
+
+    families_by_depth_pair: list[dict[tuple[int, int], set[int]]] = [
+        {} for _ in range(depth_count)
+    ]
+    for child_index, parent_index in enumerate(spec.tree_parent_indices):
+        if parent_index < 0 or chained_nodes[parent_index]:
+            continue
+        source_rank = owner_by_node[parent_index]
+        dest_rank = owner_by_node[child_index]
+        if source_rank < 0 or dest_rank < 0:
+            raise ValueError("tree state exchange requires every node to have an owner")
+        if source_rank == dest_rank:
+            continue
+        depth = spec.tree_depths[child_index]
+        families_by_depth_pair[depth].setdefault((source_rank, dest_rank), set()).add(
+            parent_index
+        )
+
+    state_exchanges: list[GdnStateExchangePlan | None] = []
+    for pair_families in families_by_depth_pair:
+        if not pair_families:
+            state_exchanges.append(None)
+            continue
+        source_families_by_rank = [set[int]() for _ in range(cp_size)]
+        dest_families_by_rank = [set[int]() for _ in range(cp_size)]
+        for (source_rank, dest_rank), parent_indices in pair_families.items():
+            source_families_by_rank[source_rank].update(parent_indices)
+            dest_families_by_rank[dest_rank].update(parent_indices)
+        source_families = tuple(
+            tuple(sorted(families)) for families in source_families_by_rank
+        )
+        dest_families = tuple(
+            tuple(sorted(families)) for families in dest_families_by_rank
+        )
+        source_positions = (
+            {family: index for index, family in enumerate(families)}
+            for families in source_families
+        )
+        dest_positions = (
+            {family: index for index, family in enumerate(families)}
+            for families in dest_families
+        )
+        source_position_by_rank = tuple(source_positions)
+        dest_position_by_rank = tuple(dest_positions)
+        transfers = []
+        transfer_count = 0
+        for (source_rank, dest_rank), parent_indices in sorted(pair_families.items()):
+            ordered = tuple(sorted(parent_indices))
+            transfer_count += len(ordered)
+            transfers.append(
+                _make_peer_transfer(
+                    source_rank=source_rank,
+                    dest_rank=dest_rank,
+                    source_positions=torch.tensor(
+                        [
+                            source_position_by_rank[source_rank][family]
+                            for family in ordered
+                        ],
+                        dtype=torch.long,
+                    ),
+                    dest_positions=torch.tensor(
+                        [
+                            dest_position_by_rank[dest_rank][family]
+                            for family in ordered
+                        ],
+                        dtype=torch.long,
+                    ),
+                    source_count=len(source_families[source_rank]),
+                    dest_count=len(dest_families[dest_rank]),
+                    device=device,
+                )
+            )
+        exchange = GdnCpExchangePlan.model_construct(
+            cp_size=cp_size,
+            source_token_counts_by_rank=tuple(
+                len(families) for families in source_families
+            ),
+            dest_token_counts_by_rank=tuple(
+                len(families) for families in dest_families
+            ),
+            transfers=tuple(transfers),
+            cross_rank_token_count_override=transfer_count,
+        )
+        state_exchanges.append(
+            GdnStateExchangePlan.model_construct(
+                source_family_indices=source_families[cp_rank],
+                dest_family_indices=dest_families[cp_rank],
+                exchange=exchange,
+                reverse_exchange=_reverse_exchange_plan(exchange),
+            )
+        )
+    return tuple(state_exchanges)
 
 
 def _build_attention_layout_index_from_token_layout(

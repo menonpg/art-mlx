@@ -14,6 +14,7 @@ from .gdn_shared_prefix import (
     GdnPackedExecutionSpec,
     GdnRankExecutionPlan,
     GdnSegmentBucketPlan,
+    GdnStateExchangePlan,
     build_gdn_rank_execution_plan,
     parse_gdn_shared_prefix_segments,
 )
@@ -557,6 +558,15 @@ def _run_tree_depth_buckets(
     )
 
     for depth, buckets in enumerate(plan.tree_segment_buckets_by_depth):
+        if depth < len(plan.tree_state_exchanges_by_depth):
+            cp_dependency = state_cache.exchange_remote_parent_states(
+                gdn,
+                plan.tree_state_exchanges_by_depth[depth],
+                state_reference=state_reference,
+                rank=plan.cp_rank,
+                group=group,
+                cp_dependency=cp_dependency,
+            )
         if depth < len(plan.tree_chain_buckets_by_depth):
             for bucket in plan.tree_chain_buckets_by_depth[depth]:
                 recurrent_output, cp_dependency = _run_tree_bucket(
@@ -695,6 +705,67 @@ class _TreeStateChunkCache:
         self._rec_chunks.append(rec)
         for source_row, family_index in enumerate(family_indices):
             self._source_by_family[int(family_index)] = (chunk_index, source_row)
+
+    def exchange_remote_parent_states(
+        self,
+        gdn: Any,
+        exchange: GdnStateExchangePlan | None,
+        *,
+        state_reference: Tensor,
+        rank: int,
+        group: Any | None,
+        cp_dependency: Tensor | None,
+    ) -> Tensor | None:
+        if exchange is None:
+            return cp_dependency
+        from .layout import exchange_rank_tensor_all_to_all
+
+        source_conv, source_rec = self.states_for_families(
+            gdn,
+            exchange.source_family_indices,
+            state_reference=state_reference,
+        )
+        if cp_dependency is not None:
+            source_conv = _add_autograd_dependency(source_conv, cp_dependency)
+            source_rec = _add_autograd_dependency(source_rec, cp_dependency)
+        remote_conv = exchange_rank_tensor_all_to_all(
+            source_conv,
+            exchange.exchange,
+            rank=rank,
+            group=group,
+            backward_plan=exchange.reverse_exchange,
+        )
+        remote_rec = exchange_rank_tensor_all_to_all(
+            source_rec,
+            exchange.exchange,
+            rank=rank,
+            group=group,
+            backward_plan=exchange.reverse_exchange,
+        )
+        self.append_families(exchange.dest_family_indices, remote_conv, remote_rec)
+        dependency = _make_zero_autograd_dependency(
+            source_conv, source_rec, remote_conv, remote_rec
+        )
+        return dependency if cp_dependency is None else dependency + cp_dependency
+
+    def states_for_families(
+        self,
+        gdn: Any,
+        family_indices: Sequence[int],
+        *,
+        state_reference: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if len(family_indices) == 0:
+            conv = _zero_conv_state(gdn, state_reference, batch_size=0)
+            rec = _zero_recurrent_state(gdn, state_reference, batch_size=0)
+            return conv.requires_grad_(True), rec.requires_grad_(True)
+        return self._mixed_parent_states(
+            gdn,
+            tuple(int(index) for index in family_indices),
+            state_reference=state_reference,
+            batch_size=len(family_indices),
+            roots_allowed=False,
+        )
 
     def parent_states(
         self,
