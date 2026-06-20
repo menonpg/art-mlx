@@ -62,6 +62,10 @@ _SELF_ATTN_V_LORA_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)v_proj\."
     r"(?P<suffix>lora_[AB]\.weight)$"
 )
+_SELF_ATTN_K_LORA_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.self_attn\.)k_proj\."
+    r"(?P<suffix>lora_[AB]\.weight)$"
+)
 _MEGATRON_LAYER_RE = re.compile(r"(?:^|\.)layers\.(?P<layer>\d+)\.")
 _HF_TEXT_EXPERT_KEY_RE = re.compile(r"(?P<layer>\.layers\.\d+)\.experts")
 
@@ -880,6 +884,25 @@ def _drop_gemma4_k_eq_v_v_lora_tensors(
     }
 
 
+def _add_gemma4_k_eq_v_v_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    k_eq_v_layers = _gemma4_k_eq_v_layers(adapter_config)
+    if not k_eq_v_layers:
+        return tensors
+    transformed = dict(tensors)
+    for key, tensor in tensors.items():
+        match = _SELF_ATTN_K_LORA_KEY_RE.match(key)
+        if match is None or int(match.group("layer")) not in k_eq_v_layers:
+            continue
+        v_key = f"{match.group('prefix')}v_proj.{match.group('suffix')}"
+        if v_key not in transformed:
+            transformed[v_key] = tensor.clone().contiguous()
+    return transformed
+
+
 def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     config = dict(adapter_config)
     target_modules = list(config.get("target_modules") or [])
@@ -923,6 +946,10 @@ def _to_vllm_lora_tensors(
         }
         if len(transformed) != len(tensors):
             raise RuntimeError("Duplicate Gemma 4 LoRA tensor after vLLM conversion")
+        transformed = _add_gemma4_k_eq_v_v_lora_tensors(
+            transformed,
+            adapter_config=adapter_config,
+        )
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in transformed)
         return (
             transformed,
@@ -982,6 +1009,10 @@ def _to_vllm_lora_tensors(
             adapter_config=adapter_config,
             to_vllm=True,
         )
+    transformed = _add_gemma4_k_eq_v_v_lora_tensors(
+        transformed,
+        adapter_config=adapter_config,
+    )
     return transformed, _vllm_moe_config(adapter_config)
 
 
