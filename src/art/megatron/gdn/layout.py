@@ -28,12 +28,18 @@ class GdnCpPeerTransfer(BaseModel):
     source_rank: int = Field(ge=0)
     dest_rank: int = Field(ge=0)
     token_count: int = Field(ge=0)
+    source_positions_cpu: tuple[int, ...] | None = None
+    dest_positions_cpu: tuple[int, ...] | None = None
     source_positions_tensor: Tensor | None = None
     dest_positions_tensor: Tensor | None = None
 
     @model_validator(mode="after")
     def _same_lengths(self) -> "GdnCpPeerTransfer":
         lengths = {int(self.token_count)}
+        if self.source_positions_cpu is not None:
+            lengths.add(len(self.source_positions_cpu))
+        if self.dest_positions_cpu is not None:
+            lengths.add(len(self.dest_positions_cpu))
         if self.source_positions_tensor is not None:
             lengths.add(int(self.source_positions_tensor.numel()))
         if self.dest_positions_tensor is not None:
@@ -238,9 +244,13 @@ def _make_peer_transfer(
         source_count=source_count,
         dest_count=dest_count,
     ):
+        source_cpu = None
+        dest_cpu = None
         source_tensor = None
         dest_tensor = None
     else:
+        source_cpu = _tensor_positions_tuple(source_positions)
+        dest_cpu = _tensor_positions_tuple(dest_positions)
         target = torch.device(device) if device is not None else torch.device("cpu")
         source_tensor = source_positions.to(
             device=target, dtype=torch.long
@@ -250,9 +260,15 @@ def _make_peer_transfer(
         source_rank=source_rank,
         dest_rank=dest_rank,
         token_count=token_count,
+        source_positions_cpu=source_cpu,
+        dest_positions_cpu=dest_cpu,
         source_positions_tensor=source_tensor,
         dest_positions_tensor=dest_tensor,
     )
+
+
+def _tensor_positions_tuple(tensor: Tensor) -> tuple[int, ...]:
+    return tuple(int(value) for value in tensor.detach().cpu().tolist())
 
 
 def _is_full_identity_transfer(
@@ -287,6 +303,8 @@ def _reverse_exchange_plan(plan: GdnCpExchangePlan) -> GdnCpExchangePlan:
                 source_rank=transfer.dest_rank,
                 dest_rank=transfer.source_rank,
                 token_count=_transfer_token_count(transfer),
+                source_positions_cpu=transfer.dest_positions_cpu,
+                dest_positions_cpu=transfer.source_positions_cpu,
                 source_positions_tensor=transfer.dest_positions_tensor,
                 dest_positions_tensor=transfer.source_positions_tensor,
             )
@@ -494,6 +512,8 @@ def move_cp_exchange_plan_to_device(
                 source_rank=transfer.source_rank,
                 dest_rank=transfer.dest_rank,
                 token_count=transfer.token_count,
+                source_positions_cpu=transfer.source_positions_cpu,
+                dest_positions_cpu=transfer.dest_positions_cpu,
                 source_positions_tensor=_move_optional_index_tensor(
                     transfer.source_positions_tensor, target
                 ),
@@ -750,10 +770,15 @@ def _is_implicit_full_identity_transfer(
     )
 
 
-def _transfer_positions_tuple(tensor: Tensor | None) -> tuple[int, ...]:
+def _transfer_positions_tuple(
+    positions: tuple[int, ...] | None,
+    tensor: Tensor | None,
+) -> tuple[int, ...]:
+    if positions is not None:
+        return positions
     if tensor is None:
         return ()
-    return tuple(int(value) for value in tensor.detach().cpu().tolist())
+    return _tensor_positions_tuple(tensor)
 
 
 def _transfer_index_tensor(
@@ -1028,7 +1053,10 @@ def _transfer_dest_positions_for_duplicate_check(
         dest_count=_dest_count_for_rank(plan, transfer.dest_rank),
     ):
         return tuple(range(token_count))
-    positions = _transfer_positions_tuple(transfer.dest_positions_tensor)
+    positions = _transfer_positions_tuple(
+        transfer.dest_positions_cpu,
+        transfer.dest_positions_tensor,
+    )
     if len(positions) != token_count:
         raise ValueError("GDN CP transfer destination positions must match token_count")
     return positions

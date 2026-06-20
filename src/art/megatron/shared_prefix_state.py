@@ -118,30 +118,101 @@ def _build_sparse_shared_prefix_block_mask(
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
     )
-    row_spec = batch_spec.rows[0]
     seq_len = int(group_ids_cpu.shape[1])
-    slices = _full_row_slices_with_padding(
-        row_slices=row_spec.slices,
-        valid_tokens=int(row_spec.valid_tokens),
-        seq_len=seq_len,
-    )
-    if not slices:
+    row_masks = []
+    token_indices = torch.arange(seq_len, dtype=torch.int64)
+    for row_spec in batch_spec.rows:
+        row_index = int(row_spec.row_index)
+        slices = _row_local_slices(
+            _full_row_slices_with_padding(
+                row_slices=row_spec.slices,
+                valid_tokens=int(row_spec.valid_tokens),
+                seq_len=seq_len,
+            )
+        )
+        if not slices:
+            row_masks.append(
+                _empty_block_mask(seq_len=seq_len, block_size=block_size, device=device)
+            )
+            continue
+        row_masks.append(
+            build_block_mask(
+                FlexMaskSpec(
+                    q_len=seq_len,
+                    k_len=seq_len,
+                    block_size=block_size,
+                    slices=slices,
+                    exact_mask=ExactMaskMetadata(
+                        q_token_indices=token_indices,
+                        k_token_indices=token_indices,
+                        cache_key=f"identity:{seq_len}",
+                    ),
+                ),
+                group_ids=group_ids_cpu[row_index],
+                parent_ids=parent_ids_cpu[row_index],
+                device=device,
+            )
+        )
+    if not row_masks:
         return _empty_block_mask(seq_len=seq_len, block_size=block_size, device=device)
-    return build_block_mask(
-        FlexMaskSpec(
-            q_len=seq_len,
-            k_len=seq_len,
-            block_size=block_size,
-            slices=slices,
-            exact_mask=ExactMaskMetadata(
-                q_token_indices=torch.arange(seq_len, dtype=torch.int64),
-                k_token_indices=torch.arange(seq_len, dtype=torch.int64),
-                cache_key=f"identity:{seq_len}",
-            ),
-        ),
-        group_ids=group_ids_cpu[0],
-        parent_ids=parent_ids_cpu[0],
-        device=device,
+    return _stack_row_block_masks(
+        row_masks,
+        seq_len=seq_len,
+        block_size=block_size,
+    )
+
+
+def _row_local_slices(slices: tuple[AttnSlice, ...]) -> tuple[AttnSlice, ...]:
+    return tuple(slice_.model_copy(update={"row_index": 0}) for slice_ in slices)
+
+
+def _stack_optional_block_tensors(
+    masks: list[BlockMask],
+    name: str,
+) -> Tensor | None:
+    tensors = [getattr(mask, name) for mask in masks]
+    if any(tensor is None for tensor in tensors):
+        return None
+    return torch.cat(tensors, dim=0)
+
+
+def _stack_row_block_masks(
+    masks: list[BlockMask],
+    *,
+    seq_len: int,
+    block_size: tuple[int, int],
+) -> BlockMask:
+    if len(masks) == 1:
+        return masks[0]
+    row_mask_mods = tuple(mask.mask_mod for mask in masks)
+
+    def mask_mod(
+        batch_idx: Tensor,
+        head_idx: Tensor,
+        query_idx: Tensor,
+        kv_idx: Tensor,
+    ) -> Tensor:
+        result = torch.zeros_like(query_idx, dtype=torch.bool)
+        for row_index, row_mask_mod in enumerate(row_mask_mods):
+            result = torch.where(
+                batch_idx == row_index,
+                row_mask_mod(batch_idx, head_idx, query_idx, kv_idx),
+                result,
+            )
+        return result
+
+    return BlockMask(
+        seq_lengths=(int(seq_len), int(seq_len)),
+        kv_num_blocks=torch.cat([mask.kv_num_blocks for mask in masks], dim=0),
+        kv_indices=torch.cat([mask.kv_indices for mask in masks], dim=0),
+        full_kv_num_blocks=_stack_optional_block_tensors(masks, "full_kv_num_blocks"),
+        full_kv_indices=_stack_optional_block_tensors(masks, "full_kv_indices"),
+        q_num_blocks=_stack_optional_block_tensors(masks, "q_num_blocks"),
+        q_indices=_stack_optional_block_tensors(masks, "q_indices"),
+        full_q_num_blocks=_stack_optional_block_tensors(masks, "full_q_num_blocks"),
+        full_q_indices=_stack_optional_block_tensors(masks, "full_q_indices"),
+        BLOCK_SIZE=block_size,
+        mask_mod=mask_mod,
     )
 
 
@@ -232,22 +303,12 @@ def _build_gdn_execution_spec_once(
     cp_size: int,
     cp_group: Any | None,
 ) -> GdnPackedExecutionSpec | None:
+    del cp_rank, cp_size, cp_group
     if not build:
         return None
-    if cp_size == 1:
-        return parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
-    if (
-        not torch.distributed.is_available() or not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
-    ):
-        return parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
     return parse_gdn_shared_prefix_segments(
         group_ids, parent_ids, min_completions_per_family=0
     )
-
 
 def _build_gdn_execution_plan_once(
     spec: GdnPackedExecutionSpec | None,

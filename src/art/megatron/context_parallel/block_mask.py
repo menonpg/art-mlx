@@ -5,6 +5,7 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 
 from art.megatron.flex_attn.compiled import normalize_sparse_block_size
+from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 
 from .types import AttnMaskKind, FlexMaskSpec
 
@@ -94,42 +95,6 @@ def _block_min_max(
     return mins, maxes
 
 
-def _build_group_can_attend(
-    *,
-    group_ids: np.ndarray,
-    parent_ids: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    valid = group_ids >= 0
-    sorted_group_ids = np.unique(group_ids[valid]).astype(np.int64, copy=False)
-    group_to_index = {
-        int(group_id): index + 1 for index, group_id in enumerate(sorted_group_ids)
-    }
-    group_can_attend = np.zeros(
-        (int(sorted_group_ids.size) + 1, int(sorted_group_ids.size) + 1),
-        dtype=bool,
-    )
-    parent_by_group: dict[int, int | None] = {}
-    for group_id in sorted_group_ids.tolist():
-        positions = np.flatnonzero(group_ids == int(group_id))
-        parent_id = int(parent_ids[int(positions[0])])
-        parent_by_group[int(group_id)] = (
-            None if parent_id < 0 or parent_id == int(group_id) else parent_id
-        )
-
-    for group_id in sorted_group_ids.tolist():
-        query_index = group_to_index[int(group_id)]
-        cursor = int(group_id)
-        seen: set[int] = set()
-        while cursor in group_to_index:
-            group_can_attend[query_index, group_to_index[cursor]] = True
-            parent_id = parent_by_group.get(cursor)
-            if parent_id is None or parent_id in seen:
-                break
-            seen.add(cursor)
-            cursor = parent_id
-    return sorted_group_ids, group_can_attend
-
-
 def _remap_group_values(
     values: np.ndarray,
     *,
@@ -187,10 +152,13 @@ def _build_sparse_block_mask(
         k_abs,
         invalid_value=-1,
     )
-    sorted_group_ids, group_can_attend = _build_group_can_attend(
-        group_ids=flat_group_ids_np,
-        parent_ids=flat_parent_ids_np,
+    row_tree = parse_shared_prefix_row(
+        group_ids=flat_group_ids,
+        parent_ids=flat_parent_ids,
     )
+    group_ids_for_matrix, group_can_attend_values = row_tree.group_can_attend_matrix()
+    sorted_group_ids = np.asarray(group_ids_for_matrix, dtype=np.int64)
+    group_can_attend = np.asarray(group_can_attend_values, dtype=bool)
     q_group_index = _remap_group_values(
         q_group,
         sorted_group_ids=sorted_group_ids,

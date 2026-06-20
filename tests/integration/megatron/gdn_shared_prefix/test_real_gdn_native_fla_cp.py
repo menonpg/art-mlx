@@ -139,17 +139,9 @@ def _native_gdn_cp_packed_layer_worker(
                 cp_chain_min_tokens_per_rank=16,
                 cp_chain_min_total_tokens=128,
                 cp_chain_min_prefix_only_tokens=128,
-                # This test is the native chain correctness guard, so force the
-                # planner onto chain prefix and completion buckets.
-                planner_chain_bucket_ms=0.0,
-                planner_chain_token_ms=0.0,
-                planner_local_bucket_ms=1.0,
-                planner_local_token_ms=1.0,
-                cp_chain_min_score_delta_ms=0.0,
             ),
         )
-        assert plan.chain_prefix_buckets
-        assert plan.chain_completion_buckets
+        assert any(plan.tree_chain_buckets_by_depth)
         hidden, output_grad = _packed_hidden_and_grad(case, cp_size)
         ref_hidden = hidden.clone().detach().requires_grad_(True)
         ref_out, _ = run_gdn_layer(

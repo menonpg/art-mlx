@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
 import torch
+from torch.nn.attention.flex_attention import BlockMask
+
+pytest.importorskip("megatron.core.packed_seq_params")
 
 from art.megatron.context_parallel.block_mask import build_block_mask
 from art.megatron.context_parallel.builder import (
@@ -9,6 +13,8 @@ from art.megatron.context_parallel.builder import (
 )
 from art.megatron.context_parallel.runtime import (
     build_context_parallel_token_layout_index,
+    get_or_build_runtime_plan,
+    make_runtime_key,
 )
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
@@ -19,6 +25,8 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     TokenRange,
 )
+from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
+from art.megatron.shared_prefix_state import create_shared_prefix_state
 
 
 def test_shared_prefix_attention_spec_supports_branching_completions() -> None:
@@ -36,8 +44,8 @@ def test_shared_prefix_attention_spec_supports_branching_completions() -> None:
         [1, 1, 1, 0, 0, 0, 0],
         [1, 1, 1, 1, 0, 0, 0],
         [1, 1, 1, 0, 1, 0, 0],
-        [1, 0, 0, 0, 0, 1, 0],
-        [1, 0, 0, 0, 0, 1, 1],
+        [1, 1, 1, 0, 0, 1, 0],
+        [1, 1, 1, 0, 0, 1, 1],
     ]
 
 
@@ -103,6 +111,212 @@ def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
     )
 
     assert actual.equal(build_dense_reference_mask(row_spec=row))
+
+
+def test_shared_prefix_state_builds_batched_block_mask() -> None:
+    group_ids = torch.tensor(
+        [
+            [1, 1, 2, 2, -1],
+            [10, 11, 11, -1, -1],
+        ],
+        dtype=torch.long,
+    )
+    parent_ids = torch.tensor(
+        [
+            [1, 1, 1, 1, -1],
+            [10, 10, 10, -1, -1],
+        ],
+        dtype=torch.long,
+    )
+
+    state = create_shared_prefix_state(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        target_device=torch.device("cpu"),
+    )
+    seq_len = int(group_ids.shape[1])
+    batch_idx = torch.arange(2)[:, None, None].expand(2, seq_len, seq_len)
+    query_idx = torch.arange(seq_len)[None, :, None].expand(2, seq_len, seq_len)
+    kv_idx = torch.arange(seq_len)[None, None, :].expand(2, seq_len, seq_len)
+    actual = state.block_mask.mask_mod(
+        batch_idx,
+        torch.zeros_like(batch_idx),
+        query_idx,
+        kv_idx,
+    )
+    spec = build_shared_prefix_attention_spec(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    )
+    assert int(state.block_mask.kv_num_blocks.shape[0]) == 2
+    for row_index, row_spec in enumerate(spec.rows):
+        valid_tokens = int(row_spec.valid_tokens)
+        assert actual[
+            row_index,
+            :valid_tokens,
+            :valid_tokens,
+        ].equal(build_dense_reference_mask(row_spec=row_spec))
+
+
+def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
+    _assert_context_parallel_stage_masks_match_dense(
+        pack_shared_prefixes(
+            (
+                torch.tensor([1, 2, 3, 4, 8]),
+                torch.tensor([1, 2, 3, 4, 9]),
+                torch.tensor([1, 2, 3, 5]),
+                torch.tensor([1, 6]),
+            ),
+            max_depth=3,
+        ),
+        require_remote_stage=True,
+    )
+    _assert_context_parallel_stage_masks_match_dense(
+        pack_shared_prefixes(
+            (
+                torch.tensor([1, 2, 3]),
+                torch.tensor([4, 5, 6]),
+                torch.tensor([7, 8]),
+                torch.tensor([9, 10, 11, 12]),
+            ),
+            max_depth=3,
+        ),
+        require_remote_stage=False,
+    )
+
+
+def _assert_context_parallel_stage_masks_match_dense(
+    pack: SharedPrefixPack,
+    *,
+    require_remote_stage: bool,
+) -> None:
+    spec = build_shared_prefix_attention_spec(
+        group_ids=pack.group_ids,
+        parent_ids=pack.parent_ids,
+    )
+    row = spec.rows[0]
+    dense = build_dense_reference_mask(row_spec=row)
+    topology = ParallelTopology(cp=2)
+    config = ContextParallelConfig(
+        block_size=2,
+        planner_chunk_size=2,
+        planner_max_search_steps=1,
+        planner_remote_stage_token_floor=1,
+        planner_remote_stage_pair_floor=1,
+    )
+    plan = get_or_build_runtime_plan(
+        spec,
+        topology=topology,
+        config=config,
+        runtime_key=make_runtime_key(spec, topology=topology, config=config),
+        original_seq_len=int(pack.tokens.numel()),
+    )
+
+    checked_stages = 0
+    checked_remote_stages = 0
+    for rank_plan in plan.rank_plans:
+        for stage in rank_plan.stage_plans:
+            if stage.mask_metadata is None:
+                continue
+            block_mask = build_block_mask(
+                FlexMaskSpec(
+                    q_len=stage.q_len,
+                    k_len=stage.k_len,
+                    block_size=(2, 2),
+                    slices=stage.slices,
+                    exact_mask=stage.mask_metadata,
+                ),
+                group_ids=pack.group_ids[0],
+                parent_ids=pack.parent_ids[0],
+                device=torch.device("cpu"),
+            )
+            assert block_mask is not None
+            q_offsets = torch.arange(stage.q_len)[:, None]
+            k_offsets = torch.arange(stage.k_len)[None, :]
+            actual = block_mask.mask_mod(
+                torch.zeros_like(q_offsets),
+                torch.zeros_like(q_offsets),
+                q_offsets,
+                k_offsets,
+            )
+            q_tokens = stage.mask_metadata.q_token_indices
+            k_tokens = stage.mask_metadata.k_token_indices
+            expected = (
+                dense[q_tokens.clamp_min(0)[:, None], k_tokens.clamp_min(0)[None, :]]
+                & (q_tokens[:, None] >= 0)
+                & (k_tokens[None, :] >= 0)
+            )
+
+            assert actual.equal(expected)
+            assert _effective_block_mask(block_mask).equal(expected)
+            checked_stages += 1
+            checked_remote_stages += int(not stage.is_local_stage)
+
+    assert checked_stages
+    if require_remote_stage:
+        assert checked_remote_stages
+
+
+def _effective_block_mask(block_mask: BlockMask) -> torch.Tensor:
+    q_len, k_len = block_mask.seq_lengths
+    q_block, k_block = block_mask.BLOCK_SIZE
+    effective = torch.zeros((q_len, k_len), dtype=torch.bool)
+    _fill_full_blocks(effective, block_mask, q_block=q_block, k_block=k_block)
+    _fill_partial_blocks(effective, block_mask, q_block=q_block, k_block=k_block)
+    return effective
+
+
+def _fill_full_blocks(
+    effective: torch.Tensor,
+    block_mask: BlockMask,
+    *,
+    q_block: int,
+    k_block: int,
+) -> None:
+    if (
+        block_mask.full_kv_num_blocks is None
+        or block_mask.full_kv_indices is None
+    ):
+        return
+    for q_block_index in range(int(block_mask.full_kv_num_blocks.shape[-1])):
+        q_slice = slice(q_block_index * q_block, (q_block_index + 1) * q_block)
+        block_count = int(block_mask.full_kv_num_blocks[0, 0, q_block_index])
+        for k_block_index in block_mask.full_kv_indices[
+            0, 0, q_block_index, :block_count
+        ].tolist():
+            k_slice = slice(
+                int(k_block_index) * k_block,
+                (int(k_block_index) + 1) * k_block,
+            )
+            effective[q_slice, k_slice] = True
+
+
+def _fill_partial_blocks(
+    effective: torch.Tensor,
+    block_mask: BlockMask,
+    *,
+    q_block: int,
+    k_block: int,
+) -> None:
+    for q_block_index in range(int(block_mask.kv_num_blocks.shape[-1])):
+        q_offsets = torch.arange(
+            q_block_index * q_block,
+            min((q_block_index + 1) * q_block, effective.shape[0]),
+        )[:, None]
+        block_count = int(block_mask.kv_num_blocks[0, 0, q_block_index])
+        for k_block_index in block_mask.kv_indices[
+            0, 0, q_block_index, :block_count
+        ].tolist():
+            k_offsets = torch.arange(
+                int(k_block_index) * k_block,
+                min((int(k_block_index) + 1) * k_block, effective.shape[1]),
+            )[None, :]
+            effective[q_offsets, k_offsets] |= block_mask.mask_mod(
+                torch.zeros_like(q_offsets),
+                torch.zeros_like(q_offsets),
+                q_offsets,
+                k_offsets,
+            )
 
 
 def test_sparse_block_mask_supports_non_monotonic_remote_k_indices() -> None:

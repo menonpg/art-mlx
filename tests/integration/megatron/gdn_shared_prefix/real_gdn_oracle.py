@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -59,6 +59,57 @@ class GdnChainBoundaryDebug(BaseModel):
 GdnChainMutation = Literal[
     "detach_prefix_state", "zero_conv_tail", "zero_recurrent_parent"
 ]
+
+
+class _TreeFamily(NamedTuple):
+    row_index: int
+    family_index: int
+    prefix: Any
+    completions: tuple[Any, ...]
+    segment_indices: tuple[int, ...]
+    parent_indices: tuple[int, ...]
+
+    @property
+    def token_count(self) -> int:
+        return self.prefix.length + sum(segment.length for segment in self.completions)
+
+
+def _segment_path(spec: Any, segment_index: int) -> tuple[Any, ...]:
+    path = []
+    cursor = segment_index
+    while cursor >= 0:
+        path.append(cursor)
+        cursor = spec.tree_parent_indices[cursor]
+    return tuple(spec.tree_segments[index] for index in reversed(path))
+
+
+def _tree_families(spec: Any) -> tuple[_TreeFamily, ...]:
+    families = []
+    for root_index, root in enumerate(spec.tree_segments):
+        if spec.tree_parent_indices[root_index] >= 0:
+            continue
+        segment_indices = [root_index]
+        for index in range(root_index + 1, len(spec.tree_segments)):
+            parent = spec.tree_parent_indices[index]
+            while parent >= 0:
+                if parent == root_index:
+                    segment_indices.append(index)
+                    break
+                parent = spec.tree_parent_indices[parent]
+        segments = tuple(spec.tree_segments[index] for index in segment_indices)
+        families.append(
+            _TreeFamily(
+                row_index=root.row_index,
+                family_index=root_index,
+                prefix=root,
+                completions=segments[1:],
+                segment_indices=tuple(segment_indices),
+                parent_indices=tuple(
+                    spec.tree_parent_indices[index] for index in segment_indices
+                ),
+            )
+        )
+    return tuple(families)
 
 
 def compare_real_gdn_cp1_to_flattened(
@@ -300,31 +351,32 @@ def run_real_gdn_flattened_reference(
         group_ids, parent_ids, min_completions_per_family=1
     )
     output = torch.zeros_like(hidden_states)
-    for family in spec.families:
-        row = family.row_index
-        prefix_hidden = hidden_states[
-            family.prefix.start : family.prefix.end, row : row + 1, :
-        ]
-        prefix_len = family.prefix.length
-        for child_index, completion in enumerate(family.completions):
-            suffix_hidden = hidden_states[
-                completion.start : completion.end, row : row + 1, :
-            ]
-            flat_hidden = torch.cat([prefix_hidden, suffix_hidden], dim=0)
-            flat_out, _, _, _ = _run_gdn_segment(
-                gdn,
-                flat_hidden,
-                conv_initial=_zero_conv_state(gdn, hidden_states, row),
-                recurrent_initial=_zero_recurrent_state(gdn, hidden_states, row),
-                output_final_state=False,
-            )
-            if child_index == 0:
-                output[family.prefix.start : family.prefix.end, row : row + 1, :] = (
-                    flat_out[:prefix_len]
-                )
-            output[completion.start : completion.end, row : row + 1, :] = flat_out[
-                prefix_len:
-            ]
+    for segment_index, segment in enumerate(spec.tree_segments):
+        flat_hidden = torch.cat(
+            [
+                hidden_states[
+                    node.start : node.end,
+                    node.row_index : node.row_index + 1,
+                    :,
+                ]
+                for node in _segment_path(spec, segment_index)
+            ],
+            dim=0,
+        )
+        flat_out, _, _, _ = _run_gdn_segment(
+            gdn,
+            flat_hidden,
+            conv_initial=_zero_conv_state(gdn, hidden_states, segment.row_index),
+            recurrent_initial=_zero_recurrent_state(
+                gdn, hidden_states, segment.row_index
+            ),
+            output_final_state=False,
+        )
+        output[
+            segment.start : segment.end,
+            segment.row_index : segment.row_index + 1,
+            :,
+        ] = flat_out[-segment.length :]
     return output
 
 
@@ -414,7 +466,7 @@ def _split_gdn_families_by_rank(
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
     ranks: list[list[int]] = [[] for _ in range(cp_size)]
     loads = [0] * cp_size
-    for family in spec.families:
+    for family in _tree_families(spec):
         rank = min(range(cp_size), key=lambda index: (loads[index], index))
         family_tokens = tuple(
             token
@@ -527,7 +579,7 @@ def run_real_gdn_suffix_only_chain_reference(
         group_ids, parent_ids, min_completions_per_family=0
     )
     output = torch.zeros_like(hidden_states)
-    for family in spec.families:
+    for family in _tree_families(spec):
         row = family.row_index
         zero_conv = _zero_conv_state(gdn, hidden_states, batch_size=1)
         zero_rec = _zero_recurrent_state(gdn, hidden_states, batch_size=1)
@@ -579,7 +631,7 @@ def run_real_gdn_chunk_native_reference(
         group_ids, parent_ids, min_completions_per_family=0
     )
     output = torch.zeros_like(hidden_states)
-    for family in spec.families:
+    for family in _tree_families(spec):
         _scatter_family_output(
             output,
             family,
@@ -603,7 +655,7 @@ def run_real_gdn_mixed_cp_reference(
     output = torch.zeros_like(hidden_states)
     local_count = 0
     chain_count = 0
-    for family in spec.families:
+    for family in _tree_families(spec):
         if family.token_count <= local_fork_max_tokens:
             local_count += 1
             _scatter_family_output(
@@ -753,14 +805,23 @@ def _family_group_tensors(
 ) -> tuple[Tensor, Tensor]:
     group_ids = []
     parent_ids = []
-    prefix_group_id = 0
-    group_ids.extend([prefix_group_id] * family.prefix.length)
-    parent_ids.extend([prefix_group_id] * family.prefix.length)
-    next_group_id = 1
-    for completion in family.completions:
-        group_ids.extend([next_group_id] * completion.length)
-        parent_ids.extend([prefix_group_id] * completion.length)
-        next_group_id += 1
+    local_group_by_global: dict[int, int] = {}
+    for local_group_id, (segment, global_index, parent_index) in enumerate(
+        zip(
+            (family.prefix, *family.completions),
+            family.segment_indices,
+            family.parent_indices,
+            strict=True,
+        )
+    ):
+        local_group_by_global[global_index] = local_group_id
+        local_parent_id = (
+            local_group_id
+            if parent_index < 0
+            else local_group_by_global[parent_index]
+        )
+        group_ids.extend([local_group_id] * segment.length)
+        parent_ids.extend([local_parent_id] * segment.length)
     return (
         torch.tensor([group_ids], device=device, dtype=torch.long),
         torch.tensor([parent_ids], device=device, dtype=torch.long),
@@ -883,7 +944,7 @@ def _local_fork_group_tensors(
     )
     parent_ids = torch.full_like(group_ids, -1)
     next_group_id = 0
-    for family in spec.families:
+    for family in _tree_families(spec):
         family_segments = (family.prefix, *family.completions)
         family_tokens = tuple(
             token_index
@@ -898,19 +959,23 @@ def _local_fork_group_tensors(
         if not all(token_is_local):
             raise ValueError("local-fork execution requires whole prompt families")
 
-        prefix_group_id = next_group_id
-        next_group_id += 1
-        for token_index in family.prefix.linear_indices(spec.sequence_length):
-            position = local_position[token_index]
-            group_ids[position] = prefix_group_id
-            parent_ids[position] = prefix_group_id
-        for completion in family.completions:
-            child_group_id = next_group_id
+        group_by_segment_index: dict[int, int] = {}
+        for segment, global_index, parent_index in zip(
+            family_segments,
+            family.segment_indices,
+            family.parent_indices,
+            strict=True,
+        ):
+            group_id = next_group_id
             next_group_id += 1
-            for token_index in completion.linear_indices(spec.sequence_length):
+            group_by_segment_index[global_index] = group_id
+            parent_group_id = (
+                group_id if parent_index < 0 else group_by_segment_index[parent_index]
+            )
+            for token_index in segment.linear_indices(spec.sequence_length):
                 position = local_position[token_index]
-                group_ids[position] = child_group_id
-                parent_ids[position] = prefix_group_id
+                group_ids[position] = group_id
+                parent_ids[position] = parent_group_id
     if torch.any(group_ids == -1):
         raise RuntimeError("local-fork metadata left unassigned token rows")
     return group_ids.unsqueeze(0), parent_ids.unsqueeze(0)

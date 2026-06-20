@@ -99,63 +99,67 @@ def test_qwen35_full_model_cp1_matches_flattened_grad_accumulation() -> None:
         spec = parse_gdn_shared_prefix_segments(
             group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
         )
-        for family in spec.families:
-            row = family.row_index
-            prefix = family.prefix
-            for completion in family.completions:
-                ref_tokens = torch.cat(
-                    [
-                        tokens[row : row + 1, prefix.start : prefix.end],
-                        tokens[row : row + 1, completion.start : completion.end],
+        for segment_index, completion in enumerate(spec.tree_segments):
+            if spec.tree_parent_indices[segment_index] < 0:
+                continue
+            row = completion.row_index
+            path = _segment_path(spec, segment_index)
+            completion_offset = sum(segment.length for segment in path[:-1])
+            ref_tokens = torch.cat(
+                [
+                    tokens[row : row + 1, segment.start : segment.end]
+                    for segment in path
+                ],
+                dim=1,
+            )
+            ref_pos = torch.cat(
+                [
+                    input_pos[row : row + 1, segment.start : segment.end]
+                    for segment in path
+                ],
+                dim=1,
+            )
+            ref_assistant_mask = torch.cat(
+                [
+                    torch.zeros(
+                        (1, completion_offset),
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                    assistant_mask[
+                        row : row + 1, completion.start : completion.end
                     ],
-                    dim=1,
-                )
-                ref_pos = torch.cat(
-                    [
-                        input_pos[row : row + 1, prefix.start : prefix.end],
-                        input_pos[row : row + 1, completion.start : completion.end],
-                    ],
-                    dim=1,
-                )
-                ref_assistant_mask = torch.cat(
-                    [
-                        torch.zeros(
-                            (1, prefix.length), dtype=torch.bool, device=device
-                        ),
-                        assistant_mask[
-                            row : row + 1, completion.start : completion.end
-                        ],
-                    ],
-                    dim=1,
-                )
-                ref_group_ids = torch.zeros_like(ref_tokens)
-                ref_parent_ids = torch.zeros_like(ref_tokens)
-                ref_logits, ref_loss = _run_model_loss(
-                    flat_model,
-                    tokens=ref_tokens,
-                    input_pos=ref_pos,
-                    group_ids=ref_group_ids,
-                    parent_ids=ref_parent_ids,
-                    assistant_mask=ref_assistant_mask,
-                )
-                ref_loss.backward()
-                flat_loss_sum = (
-                    ref_loss.detach()
-                    if flat_loss_sum is None
-                    else flat_loss_sum + ref_loss.detach()
-                )
+                ],
+                dim=1,
+            )
+            ref_group_ids = torch.zeros_like(ref_tokens)
+            ref_parent_ids = torch.zeros_like(ref_tokens)
+            ref_logits, ref_loss = _run_model_loss(
+                flat_model,
+                tokens=ref_tokens,
+                input_pos=ref_pos,
+                group_ids=ref_group_ids,
+                parent_ids=ref_parent_ids,
+                assistant_mask=ref_assistant_mask,
+            )
+            ref_loss.backward()
+            flat_loss_sum = (
+                ref_loss.detach()
+                if flat_loss_sum is None
+                else flat_loss_sum + ref_loss.detach()
+            )
 
-                if completion.length > 1:
-                    packed_slice = packed_logits[
-                        row : row + 1, completion.start : completion.end - 1
-                    ]
-                    ref_slice = ref_logits[
-                        :, prefix.length : prefix.length + completion.length - 1
-                    ]
-                    logits_mean_abs_pct = max(
-                        logits_mean_abs_pct,
-                        mean_abs_pct(ref_slice, packed_slice),
-                    )
+            if completion.length > 1:
+                packed_slice = packed_logits[
+                    row : row + 1, completion.start : completion.end - 1
+                ]
+                ref_slice = ref_logits[
+                    :, completion_offset : completion_offset + completion.length - 1
+                ]
+                logits_mean_abs_pct = max(
+                    logits_mean_abs_pct,
+                    mean_abs_pct(ref_slice, packed_slice),
+                )
 
         assert flat_loss_sum is not None
         grad_name, grad_pct = parameter_grad_mean_abs_pct_with_name(
@@ -217,67 +221,69 @@ def _assert_logits_vjp_equivalence(
     spec = parse_gdn_shared_prefix_segments(
         group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
     )
-    for family in spec.families:
-        row = family.row_index
-        prefix = family.prefix
-        for completion in family.completions:
-            ref_tokens = torch.cat(
-                [
-                    tokens[row : row + 1, prefix.start : prefix.end],
-                    tokens[row : row + 1, completion.start : completion.end],
-                ],
-                dim=1,
+    for segment_index, completion in enumerate(spec.tree_segments):
+        if spec.tree_parent_indices[segment_index] < 0:
+            continue
+        row = completion.row_index
+        path = _segment_path(spec, segment_index)
+        completion_offset = sum(segment.length for segment in path[:-1])
+        ref_tokens = torch.cat(
+            [
+                tokens[row : row + 1, segment.start : segment.end]
+                for segment in path
+            ],
+            dim=1,
+        )
+        ref_pos = torch.cat(
+            [
+                input_pos[row : row + 1, segment.start : segment.end]
+                for segment in path
+            ],
+            dim=1,
+        )
+        ref_logits = _run_model_logits(
+            flat_model,
+            tokens=ref_tokens,
+            input_pos=ref_pos,
+            group_ids=torch.zeros_like(ref_tokens),
+            parent_ids=torch.zeros_like(ref_tokens),
+        )
+        ref_output_grad = torch.zeros_like(ref_logits)
+        ref_output_mask = torch.zeros(
+            ref_logits.shape[:2],
+            device=ref_logits.device,
+            dtype=torch.bool,
+        )
+        if completion.length > 1:
+            ref_output_grad[
+                :, completion_offset : completion_offset + completion.length - 1
+            ] = output_grad[row : row + 1, completion.start : completion.end - 1]
+            ref_output_mask[
+                :, completion_offset : completion_offset + completion.length - 1
+            ] = True
+        ref_loss = stable_output_mse_loss(
+            ref_logits,
+            ref_output_grad,
+            mask=ref_output_mask.unsqueeze(-1),
+            denominator=loss_denominator,
+        )
+        ref_loss.backward()
+        flat_loss_sum = (
+            ref_loss.detach()
+            if flat_loss_sum is None
+            else flat_loss_sum + ref_loss.detach()
+        )
+        if completion.length > 1:
+            packed_slice = packed_logits[
+                row : row + 1, completion.start : completion.end - 1
+            ]
+            ref_slice = ref_logits[
+                :, completion_offset : completion_offset + completion.length - 1
+            ]
+            logits_mean_abs_pct = max(
+                logits_mean_abs_pct,
+                mean_abs_pct(ref_slice, packed_slice),
             )
-            ref_pos = torch.cat(
-                [
-                    input_pos[row : row + 1, prefix.start : prefix.end],
-                    input_pos[row : row + 1, completion.start : completion.end],
-                ],
-                dim=1,
-            )
-            ref_logits = _run_model_logits(
-                flat_model,
-                tokens=ref_tokens,
-                input_pos=ref_pos,
-                group_ids=torch.zeros_like(ref_tokens),
-                parent_ids=torch.zeros_like(ref_tokens),
-            )
-            ref_output_grad = torch.zeros_like(ref_logits)
-            ref_output_mask = torch.zeros(
-                ref_logits.shape[:2],
-                device=ref_logits.device,
-                dtype=torch.bool,
-            )
-            if completion.length > 1:
-                ref_output_grad[
-                    :, prefix.length : prefix.length + completion.length - 1
-                ] = output_grad[row : row + 1, completion.start : completion.end - 1]
-                ref_output_mask[
-                    :, prefix.length : prefix.length + completion.length - 1
-                ] = True
-            ref_loss = stable_output_mse_loss(
-                ref_logits,
-                ref_output_grad,
-                mask=ref_output_mask.unsqueeze(-1),
-                denominator=loss_denominator,
-            )
-            ref_loss.backward()
-            flat_loss_sum = (
-                ref_loss.detach()
-                if flat_loss_sum is None
-                else flat_loss_sum + ref_loss.detach()
-            )
-            if completion.length > 1:
-                packed_slice = packed_logits[
-                    row : row + 1, completion.start : completion.end - 1
-                ]
-                ref_slice = ref_logits[
-                    :, prefix.length : prefix.length + completion.length - 1
-                ]
-                logits_mean_abs_pct = max(
-                    logits_mean_abs_pct,
-                    mean_abs_pct(ref_slice, packed_slice),
-                )
 
     assert flat_loss_sum is not None
     grad_name, grad_pct = parameter_grad_mean_abs_pct_with_name(
@@ -357,6 +363,15 @@ def _run_model_logits(
         **forward_kwargs,
     )
     return logits
+
+
+def _segment_path(spec: Any, segment_index: int) -> tuple[Any, ...]:
+    indices = []
+    cursor = segment_index
+    while cursor >= 0:
+        indices.append(cursor)
+        cursor = spec.tree_parent_indices[cursor]
+    return tuple(spec.tree_segments[index] for index in reversed(indices))
 
 
 def _make_matching_models() -> tuple[torch.nn.Module, torch.nn.Module]:

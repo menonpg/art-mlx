@@ -119,7 +119,7 @@ class ContextParallelConfig(BaseModel):
     planner_remote_stage_underfill_ms: float = 0.287151
     planner_tuned_backend: str | None = "art_context_parallel"
     planner_tuned_hardware: str | None = "NVIDIA H200"
-    planner_tuned_cp_sizes: tuple[int, ...] = (2,)
+    planner_tuned_cp_sizes: tuple[int, ...] = (2, 4)
     planner_cp_overrides: tuple[PlannerCpOverride, ...] = ()
 
 
