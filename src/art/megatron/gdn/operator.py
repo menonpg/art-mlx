@@ -298,6 +298,7 @@ def _is_empty_safe_norm_target(module: Any) -> bool:
     )
 
 
+@torch.compiler.disable
 def _empty_safe_norm_forward(
     self: Any, input_: Tensor, *args: Any, **kwargs: Any
 ) -> Any:
