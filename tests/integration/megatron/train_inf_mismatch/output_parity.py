@@ -24,15 +24,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
-    # Gemma 4 MoE stays on merged serving until native vLLM LoRA validation is
-    # revisited; long-prompt SWA runs measured near 8%.
-    "gemma4_moe": 8.0,
+    # Gemma 4 MoE long-prompt SWA native-LoRA runs measured near 6%.
+    "gemma4_moe": 6.0,
     "qwen3_moe": 7.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
-    "gemma4_moe": 0.009,
+    "gemma4_moe": 0.004,
 }
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
