@@ -37,7 +37,9 @@ def test_shared_prefix_ce_parameter_grads_match_independent_sequences(
     multi_target: bool,
 ) -> None:
     input_ids = _input_ids()
-    target_ids = tuple(_targets(tokens, multi_target=multi_target) for tokens in input_ids)
+    target_ids = tuple(
+        _targets(tokens, multi_target=multi_target) for tokens in input_ids
+    )
     pack = pack_shared_prefixes(input_ids, max_depth=max_depth)
 
     assert int(pack.tokens.numel()) < sum(len(row) for row in input_ids)
@@ -257,7 +259,10 @@ def _shared_prefix_causal_mask(pack: SharedPrefixPack) -> torch.Tensor:
         query_ancestors = ancestors[query_group]
         query_position = position_ids[query_index]
         for key_index, key_group in enumerate(group_ids):
-            if key_group in query_ancestors and position_ids[key_index] <= query_position:
+            if (
+                key_group in query_ancestors
+                and position_ids[key_index] <= query_position
+            ):
                 mask[query_index, key_index] = True
     return mask
 

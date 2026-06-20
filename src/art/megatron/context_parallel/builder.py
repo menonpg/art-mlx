@@ -71,7 +71,9 @@ def build_shared_prefix_attention_spec(
     ):
         if row.valid_tokens == 0:
             rows.append(
-                PackedRowAttentionSpec(row_index=row.row_index, valid_tokens=0, slices=())
+                PackedRowAttentionSpec(
+                    row_index=row.row_index, valid_tokens=0, slices=()
+                )
             )
             continue
 

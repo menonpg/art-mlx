@@ -126,9 +126,7 @@ def test_qwen35_full_model_cp1_matches_flattened_grad_accumulation() -> None:
                         dtype=torch.bool,
                         device=device,
                     ),
-                    assistant_mask[
-                        row : row + 1, completion.start : completion.end
-                    ],
+                    assistant_mask[row : row + 1, completion.start : completion.end],
                 ],
                 dim=1,
             )
@@ -228,17 +226,11 @@ def _assert_logits_vjp_equivalence(
         path = _segment_path(spec, segment_index)
         completion_offset = sum(segment.length for segment in path[:-1])
         ref_tokens = torch.cat(
-            [
-                tokens[row : row + 1, segment.start : segment.end]
-                for segment in path
-            ],
+            [tokens[row : row + 1, segment.start : segment.end] for segment in path],
             dim=1,
         )
         ref_pos = torch.cat(
-            [
-                input_pos[row : row + 1, segment.start : segment.end]
-                for segment in path
-            ],
+            [input_pos[row : row + 1, segment.start : segment.end] for segment in path],
             dim=1,
         )
         ref_logits = _run_model_logits(

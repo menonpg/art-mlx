@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import triton
@@ -151,7 +152,9 @@ def _logsumexp_stage1_kernel(
     block_max = tl.max(values, axis=0)
     partial_offset = row * n_blocks + block
     tl.store(partial_max_ptr + partial_offset, block_max)
-    tl.store(partial_sum_ptr + partial_offset, tl.sum(tl.exp(values - block_max), axis=0))
+    tl.store(
+        partial_sum_ptr + partial_offset, tl.sum(tl.exp(values - block_max), axis=0)
+    )
 
 
 @triton.jit
@@ -179,7 +182,9 @@ def _logsumexp_stage2_kernel(
         other=0.0,
     )
     tl.store(local_max_ptr + row, row_max)
-    tl.store(local_sum_ptr + row, tl.sum(block_sum * tl.exp(block_max - row_max), axis=0))
+    tl.store(
+        local_sum_ptr + row, tl.sum(block_sum * tl.exp(block_max - row_max), axis=0)
+    )
 
 
 @triton.jit
@@ -249,7 +254,8 @@ class _LocalTopKStatsFunction(torch.autograd.Function):
         return stats.local_max, stats.local_sum, stats.values, stats.tokens
 
     @staticmethod
-    def backward(ctx, grad_local_max, grad_local_sum, grad_values, grad_tokens):
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        grad_local_max, grad_local_sum, grad_values, grad_tokens = grad_outputs
         del grad_local_max, grad_tokens
         logits, local_max, tokens = ctx.saved_tensors
         k = int(ctx.k)
@@ -276,10 +282,10 @@ class _LocalTopKStatsFunction(torch.autograd.Function):
             grad_values.contiguous(),
             grad_logits,
             logits.stride(0),
-            vocab_size,
-            k,
-            block_v,
-            num_warps=8,
+            vocab_size,  # ty: ignore[invalid-argument-type]
+            k,  # ty: ignore[invalid-argument-type]
+            block_v,  # ty: ignore[invalid-argument-type]
+            num_warps=8,  # ty: ignore[unknown-argument]
         )
         return grad_logits, None
 
@@ -292,7 +298,8 @@ class _LocalLogSumExpStatsFunction(torch.autograd.Function):
         return stats.local_max, stats.local_sum
 
     @staticmethod
-    def backward(ctx, grad_local_max, grad_local_sum):
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        grad_local_max, grad_local_sum = grad_outputs
         del grad_local_max
         logits, local_max = ctx.saved_tensors
         rows = int(logits.shape[0])
@@ -310,16 +317,18 @@ class _LocalLogSumExpStatsFunction(torch.autograd.Function):
             grad_local_sum.contiguous(),
             grad_logits,
             logits.stride(0),
-            vocab_size,
-            block_v,
-            num_warps=8,
+            vocab_size,  # ty: ignore[invalid-argument-type]
+            block_v,  # ty: ignore[invalid-argument-type]
+            num_warps=8,  # ty: ignore[unknown-argument]
         )
         return grad_logits
 
 
 def _check_local_logits(local_logits: torch.Tensor) -> torch.Tensor:
     if local_logits.ndim != 2:
-        raise ValueError(f"expected [rows, vocab] logits, got {tuple(local_logits.shape)}")
+        raise ValueError(
+            f"expected [rows, vocab] logits, got {tuple(local_logits.shape)}"
+        )
     if not local_logits.is_cuda:
         raise ValueError("local top-k helpers require CUDA logits")
     return local_logits.contiguous()
@@ -328,7 +337,9 @@ def _check_local_logits(local_logits: torch.Tensor) -> torch.Tensor:
 def _local_topk_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTopKStats:
     logits = _check_local_logits(local_logits)
     if k < 1 or k > int(local_logits.shape[1]):
-        raise ValueError(f"k={k} is outside local vocab size {int(local_logits.shape[1])}")
+        raise ValueError(
+            f"k={k} is outside local vocab size {int(local_logits.shape[1])}"
+        )
 
     rows = int(logits.shape[0])
     vocab_size = int(logits.shape[1])
@@ -362,12 +373,12 @@ def _local_topk_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTop
         partial_sum,
         partial_values,
         partial_tokens,
-        logits.stride(0),
-        vocab_size,
+        logits.stride(0),  # ty: ignore[invalid-argument-type]
+        vocab_size,  # ty: ignore[invalid-argument-type]
         n_blocks,
-        k,
-        block_v,
-        num_warps=8,
+        k,  # ty: ignore[invalid-argument-type]
+        block_v,  # ty: ignore[invalid-argument-type]
+        num_warps=8,  # ty: ignore[unknown-argument]
     )
     _topk_stage2_kernel[(rows,)](
         partial_max,
@@ -379,10 +390,10 @@ def _local_topk_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTop
         values,
         tokens,
         n_blocks,
-        k,
+        k,  # ty: ignore[invalid-argument-type]
         block_b,
         block_candidates,
-        num_warps=8,
+        num_warps=8,  # ty: ignore[unknown-argument]
     )
     return LocalTopKStats(
         local_max=local_max,
@@ -410,11 +421,11 @@ def _local_logsumexp_stats_forward(local_logits: torch.Tensor) -> LocalLogSumExp
         logits,
         partial_max,
         partial_sum,
-        logits.stride(0),
-        vocab_size,
+        logits.stride(0),  # ty: ignore[invalid-argument-type]
+        vocab_size,  # ty: ignore[invalid-argument-type]
         n_blocks,
-        block_v,
-        num_warps=8,
+        block_v,  # ty: ignore[invalid-argument-type]
+        num_warps=8,  # ty: ignore[unknown-argument]
     )
     _logsumexp_stage2_kernel[(rows,)](
         partial_max,
@@ -423,7 +434,7 @@ def _local_logsumexp_stats_forward(local_logits: torch.Tensor) -> LocalLogSumExp
         local_sum,
         n_blocks,
         block_b,
-        num_warps=8,
+        num_warps=8,  # ty: ignore[unknown-argument]
     )
     return LocalLogSumExpStats(local_max=local_max, local_sum=local_sum)
 

@@ -46,11 +46,14 @@ class SharedPrefixRowTree:
             segments.setdefault(segment.group_id, segment)
         return segments
 
-    def group_can_attend_matrix(self) -> tuple[tuple[int, ...], tuple[tuple[bool, ...], ...]]:
+    def group_can_attend_matrix(
+        self,
+    ) -> tuple[tuple[int, ...], tuple[tuple[bool, ...], ...]]:
         group_ids = tuple(sorted({segment.group_id for segment in self.segments}))
         group_index = {group_id: index + 1 for index, group_id in enumerate(group_ids)}
         matrix = [
-            [False for _ in range(len(group_ids) + 1)] for _ in range(len(group_ids) + 1)
+            [False for _ in range(len(group_ids) + 1)]
+            for _ in range(len(group_ids) + 1)
         ]
         for segment in self.segments:
             query_index = group_index[segment.group_id]
@@ -105,8 +108,7 @@ def parse_shared_prefix_row(
         )
     if group_ids.ndim != 1:
         raise RuntimeError(
-            "group_ids and parent_ids must be rank-1 row tensors, got "
-            f"{group_ids.ndim}"
+            f"group_ids and parent_ids must be rank-1 row tensors, got {group_ids.ndim}"
         )
 
     valid_tokens = _valid_length(

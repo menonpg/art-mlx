@@ -244,7 +244,9 @@ def main(
                 )
             if "logits_builtin_fwd" in benchmarks:
                 assert logits_prepared is not None
-                register_case("logits_builtin_fwd", _logits_requests(requests), request_stats)
+                register_case(
+                    "logits_builtin_fwd", _logits_requests(requests), request_stats
+                )
                 results["logits_builtin_fwd_ms"] = _bench(
                     lambda: _full_logits(rank, logits_prepared),
                     warmup=warmup,
@@ -252,7 +254,9 @@ def main(
                 )
             if "logits_hidden_fwd" in benchmarks:
                 assert logits_items is not None and logits_prepared is not None
-                register_case("logits_hidden_fwd", _logits_requests(requests), request_stats)
+                register_case(
+                    "logits_hidden_fwd", _logits_requests(requests), request_stats
+                )
                 results["logits_hidden_fwd_ms"] = _bench(
                     lambda: rank._project_head(
                         logits_items,
@@ -329,7 +333,9 @@ def main(
                 register_case(
                     name,
                     case_requests,
-                    _packed_request_stats(case_requests, items, batch, request_metadata={}),
+                    _packed_request_stats(
+                        case_requests, items, batch, request_metadata={}
+                    ),
                 )
                 prepared = rank._prepare_packed_forward(batch)
                 results[f"{name}_ms"] = _bench(
@@ -360,7 +366,9 @@ def main(
                 register_case(
                     "trainer_topk_head",
                     case_requests,
-                    _packed_request_stats(case_requests, items, batch, request_metadata={}),
+                    _packed_request_stats(
+                        case_requests, items, batch, request_metadata={}
+                    ),
                 )
                 prepared = rank._prepare_packed_forward(batch)
                 hidden = rank._gather_sequence_parallel_hidden(
@@ -869,10 +877,14 @@ def _packed_request_stats(
         **request_metadata,
         "request_count": len(requests),
         "packed_tokens": int(batch.tokens.numel()),
-        "logical_tokens": sum(int(request.input_tokens.numel()) for request in requests),
+        "logical_tokens": sum(
+            int(request.input_tokens.numel()) for request in requests
+        ),
         "trainable_tokens": trainable_tokens,
         "packed_trainable_tokens": int(trainable_mask.sum().item()),
-        "packed_group_count": int(group_ids.max().item()) if int(group_ids.numel()) else 0,
+        "packed_group_count": int(group_ids.max().item())
+        if int(group_ids.numel())
+        else 0,
         "nested_prefix_depth": max_shared_prefix_tree_depth(
             group_ids=group_ids,
             parent_ids=parent_ids,
@@ -911,7 +923,9 @@ def _gather_planner_metadata(prepared: object) -> dict[str, object]:
         if not values:
             continue
         if key.endswith("_ratio"):
-            merged[f"planner_{key}_max"] = round(max(float(value) for value in values), 3)
+            merged[f"planner_{key}_max"] = round(
+                max(float(value) for value in values), 3
+            )
         else:
             merged[f"planner_{key}_sum"] = int(sum(int(value) for value in values))
             merged[f"planner_{key}_max"] = int(max(int(value) for value in values))
@@ -923,7 +937,9 @@ def _gather_planner_metadata(prepared: object) -> dict[str, object]:
 
 
 def _local_planner_metadata(prepared: object) -> dict[str, object]:
-    plan = getattr(getattr(prepared, "attention_state", None), "gdn_execution_plan", None)
+    plan = getattr(
+        getattr(prepared, "attention_state", None), "gdn_execution_plan", None
+    )
     if plan is None:
         return {}
     local_buckets = tuple(
@@ -950,11 +966,21 @@ def _local_planner_metadata(prepared: object) -> dict[str, object]:
         "tree_completion_count": int(getattr(plan, "completion_count", 0)),
         "tree_local_bucket_count": len(local_buckets),
         "tree_chain_bucket_count": len(chain_buckets),
-        "tree_local_segment_count": sum(bucket.segment_count for bucket in local_buckets),
-        "tree_chain_segment_count": sum(bucket.segment_count for bucket in chain_buckets),
-        "tree_local_real_tokens": sum(bucket.real_token_count for bucket in local_buckets),
-        "tree_chain_real_tokens": sum(bucket.real_token_count for bucket in chain_buckets),
-        "tree_state_transfer_count": sum(len(transfers) for transfers in transfers_by_depth),
+        "tree_local_segment_count": sum(
+            bucket.segment_count for bucket in local_buckets
+        ),
+        "tree_chain_segment_count": sum(
+            bucket.segment_count for bucket in chain_buckets
+        ),
+        "tree_local_real_tokens": sum(
+            bucket.real_token_count for bucket in local_buckets
+        ),
+        "tree_chain_real_tokens": sum(
+            bucket.real_token_count for bucket in chain_buckets
+        ),
+        "tree_state_transfer_count": sum(
+            len(transfers) for transfers in transfers_by_depth
+        ),
         "tree_state_transfer_rows": sum(
             len(transfer.family_indices)
             for transfers in transfers_by_depth
@@ -1096,9 +1122,7 @@ def _trainer_topk_loss(
 ) -> torch.Tensor:
     outputs = rank._forward_packed(items, prepared)
     losses = [
-        -output.top_k.logprobs.sum()
-        for output in outputs
-        if output.top_k is not None
+        -output.top_k.logprobs.sum() for output in outputs if output.top_k is not None
     ]
     if not losses:
         raise RuntimeError("top_k logprobs were not produced")

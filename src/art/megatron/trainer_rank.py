@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from megatron.bridge.models.gpt_provider import GPTModelProvider
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.optimizer import MegatronOptimizer, OptimizerConfig
+    from megatron.core.packed_seq_params import PackedSeqParams
 
     from art.megatron.context_parallel.types import (
         ArtContextParallelState,
@@ -311,7 +312,7 @@ class _PreparedPackedForward:
     tokens: torch.Tensor
     position_ids: torch.Tensor
     attention_state: "SharedPrefixAttentionState | ArtContextParallelState"
-    packed_seq_params: object | None
+    packed_seq_params: "PackedSeqParams | None"
     positions_by_item: tuple[torch.Tensor, ...]
     source_positions_by_item: tuple[torch.Tensor, ...]
 
@@ -655,7 +656,7 @@ class TrainerRank:
         preprocessed = model._preprocess(
             input_ids=prepared.tokens,
             position_ids=prepared.position_ids,
-            packed_seq_params=prepared.packed_seq_params,
+            packed_seq_params=cast("PackedSeqParams", prepared.packed_seq_params),
         )
         (
             decoder_input,
@@ -1534,7 +1535,9 @@ def _can_use_reference_target_ce(
     return (
         os.environ.get("ART_TRAINER_RANK_REFERENCE_TARGET_CE", "0").lower()
         not in {"0", "false"}
-        and all(item.request.top_k is None and not item.request.logits for item in items)
+        and all(
+            item.request.top_k is None and not item.request.logits for item in items
+        )
         and any(labels is not None and labels.ndim > 1 for labels in label_rows)
     )
 
@@ -1569,7 +1572,9 @@ def _reference_row_labels(
         candidates = candidates.masked_select(has_label)
         unset = references.index_select(0, row_offsets) == -100
         if bool(unset.any()):
-            references[row_offsets.masked_select(unset)] = candidates.masked_select(unset)
+            references[row_offsets.masked_select(unset)] = candidates.masked_select(
+                unset
+            )
     if bool((references == -100).any()):
         return None
     return references

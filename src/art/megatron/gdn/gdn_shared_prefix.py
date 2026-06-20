@@ -82,6 +82,8 @@ _GDN_SEGMENT_SPEC_FIELDS = frozenset(
         "child_index",
     }
 )
+
+
 def _trusted_pydantic_construct(
     model_type: type[_PydanticModelT],
     fields_set: frozenset[str],
@@ -323,10 +325,14 @@ def _build_tree_rank_execution_plan(
         siblings_by_parent: dict[int, list[GdnSegmentSpec]] = {}
         for segment in depth_segments:
             parent_index = spec.tree_parent_indices[segment.family_index]
-            if parent_index < 0 and cp_size > 1 and _can_chain_tree_segment(
-                segment,
-                cp_size=cp_size,
-                planner_config=planner_config,
+            if (
+                parent_index < 0
+                and cp_size > 1
+                and _can_chain_tree_segment(
+                    segment,
+                    cp_size=cp_size,
+                    planner_config=planner_config,
+                )
             ):
                 chained_nodes[segment.family_index] = True
                 chain_segments_by_depth[depth].append(segment)
@@ -434,7 +440,9 @@ def _build_tree_rank_execution_plan(
         else tuple(() for _ in range(depth_count))
     )
     if cp_size == 1:
-        valid_lengths = torch.tensor(spec.valid_lengths, device=device, dtype=torch.long)
+        valid_lengths = torch.tensor(
+            spec.valid_lengths, device=device, dtype=torch.long
+        )
         positions = torch.arange(spec.sequence_length, device=device, dtype=torch.long)
         real_token_mask = positions.unsqueeze(0) < valid_lengths.unsqueeze(1)
     else:
@@ -733,8 +741,7 @@ def _best_segment_owner(
         target_load = sum(projected_loads) / max(1, len(projected_loads))
         overload = max(
             0.0,
-            max_load
-            - planner_config.max_zero_exchange_load_imbalance * target_load,
+            max_load - planner_config.max_zero_exchange_load_imbalance * target_load,
         )
         idle_tokens = sum(max_load - load for load in projected_loads)
         cross_rank_tokens = segment_length - int(tokens)
@@ -1376,14 +1383,10 @@ def _batch_tree_segments_by_padded_work(
     max_segments_per_batch: int = 128,
 ) -> tuple[tuple[GdnSegmentSpec, ...], ...]:
     stateful = tuple(
-        segment
-        for segment in segments
-        if tree_has_children[segment.family_index]
+        segment for segment in segments if tree_has_children[segment.family_index]
     )
     stateless = tuple(
-        segment
-        for segment in segments
-        if not tree_has_children[segment.family_index]
+        segment for segment in segments if not tree_has_children[segment.family_index]
     )
     return (
         *_batch_segments_by_padded_work(

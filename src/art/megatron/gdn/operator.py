@@ -641,8 +641,14 @@ def _run_tree_bucket(
     )
     if bucket.needs_final_state and (segment_conv is None or segment_rec is None):
         raise RuntimeError("tree GDN execution must return final states")
-    if bucket.needs_final_state and segment_conv is not None and segment_rec is not None:
-        cp_dependency = _make_autograd_dependency(segment_out, segment_conv, segment_rec)
+    if (
+        bucket.needs_final_state
+        and segment_conv is not None
+        and segment_rec is not None
+    ):
+        cp_dependency = _make_autograd_dependency(
+            segment_out, segment_conv, segment_rec
+        )
     else:
         cp_dependency = _make_autograd_dependency(segment_out)
     recurrent_output = _scatter_bucket_recurrent_output(
@@ -696,7 +702,7 @@ class _TreeStateChunkCache:
         bucket: GdnSegmentBucketPlan,
         *,
         state_reference: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         parent_indices = bucket.parent_indices
         if parent_indices is None:
             raise RuntimeError("tree GDN bucket is missing parent indices")
@@ -816,7 +822,10 @@ def _long_tensor(values: Iterable[int], *, device: torch.device) -> Tensor:
 def _bucket_has_parent_state(bucket: GdnSegmentBucketPlan) -> bool:
     parent_indices_cpu = bucket.parent_indices_cpu
     if parent_indices_cpu is None:
-        parent_indices_cpu = bucket.parent_indices.detach().cpu()
+        parent_indices = bucket.parent_indices
+        if parent_indices is None:
+            raise RuntimeError("tree GDN bucket is missing parent indices")
+        parent_indices_cpu = parent_indices.detach().cpu()
     return any(int(parent_index) >= 0 for parent_index in parent_indices_cpu.tolist())
 
 

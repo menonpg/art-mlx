@@ -255,7 +255,9 @@ def main(
                             ),
                             "same_layout": compare_same_layout,
                             "stress_tokens": stress_tokens,
-                            "estimated_unpacked_output_gb": round(unpacked_output_gb, 3),
+                            "estimated_unpacked_output_gb": round(
+                                unpacked_output_gb, 3
+                            ),
                             "elapsed_s": round(elapsed_s, 3),
                             "peak_memory_gb": round(float(peak_memory_gb.item()), 3),
                         },
@@ -756,7 +758,9 @@ def _records(
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     independent_records: list[CheckOutput | None] = (
-        independent_outputs if independent_outputs is not None else [None] * len(local_pairs)
+        independent_outputs
+        if independent_outputs is not None
+        else [None] * len(local_pairs)
     )
     for local_index, (
         (input_index, _),

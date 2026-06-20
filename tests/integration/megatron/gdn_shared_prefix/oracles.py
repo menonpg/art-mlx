@@ -7,6 +7,8 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
+from art.megatron.gdn.gdn_shared_prefix import GdnPackedExecutionSpec, GdnSegmentSpec
+
 from .metrics import (
     mean_abs_pct,
     parameter_grad_mean_abs_pct_with_name,
@@ -147,10 +149,7 @@ def run_toy_flattened_reference(
     for segment_index, segment in enumerate(spec.tree_segments):
         path = _segment_path(spec, segment_index)
         flattened = torch.cat(
-            [
-                hidden[node.row_index, node.start : node.end]
-                for node in path
-            ],
+            [hidden[node.row_index, node.start : node.end] for node in path],
             dim=0,
         )
         flat_out, _, _ = module.forward_segment(
@@ -163,7 +162,10 @@ def run_toy_flattened_reference(
     return output
 
 
-def _segment_path(spec: object, segment_index: int) -> tuple[object, ...]:
+def _segment_path(
+    spec: GdnPackedExecutionSpec,
+    segment_index: int,
+) -> tuple[GdnSegmentSpec, ...]:
     indices = []
     cursor = segment_index
     while cursor >= 0:

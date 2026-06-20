@@ -671,8 +671,7 @@ def _random_tree_sequences(seed: int, *, max_depth: int) -> tuple[torch.Tensor, 
         here = torch.cat((prefix, tokens(segment_length(depth))))
         if depth + 1 >= max_depth:
             return [
-                torch.cat((here, tokens(randint(1, 17))))
-                for _ in range(randint(2, 4))
+                torch.cat((here, tokens(randint(1, 17)))) for _ in range(randint(2, 4))
             ]
         leaves: list[torch.Tensor] = []
         for _ in range(randint(2, 3)):

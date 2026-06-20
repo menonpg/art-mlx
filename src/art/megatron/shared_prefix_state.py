@@ -310,6 +310,7 @@ def _build_gdn_execution_spec_once(
         group_ids, parent_ids, min_completions_per_family=0
     )
 
+
 def _build_gdn_execution_plan_once(
     spec: GdnPackedExecutionSpec | None,
     *,

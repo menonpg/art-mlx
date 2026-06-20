@@ -273,10 +273,7 @@ def _fill_full_blocks(
     q_block: int,
     k_block: int,
 ) -> None:
-    if (
-        block_mask.full_kv_num_blocks is None
-        or block_mask.full_kv_indices is None
-    ):
+    if block_mask.full_kv_num_blocks is None or block_mask.full_kv_indices is None:
         return
     for q_block_index in range(int(block_mask.full_kv_num_blocks.shape[-1])):
         q_slice = slice(q_block_index * q_block, (q_block_index + 1) * q_block)

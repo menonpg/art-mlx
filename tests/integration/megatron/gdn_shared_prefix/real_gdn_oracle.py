@@ -816,9 +816,7 @@ def _family_group_tensors(
     ):
         local_group_by_global[global_index] = local_group_id
         local_parent_id = (
-            local_group_id
-            if parent_index < 0
-            else local_group_by_global[parent_index]
+            local_group_id if parent_index < 0 else local_group_by_global[parent_index]
         )
         group_ids.extend([local_group_id] * segment.length)
         parent_ids.extend([local_parent_id] * segment.length)

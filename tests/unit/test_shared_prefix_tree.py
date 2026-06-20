@@ -134,8 +134,7 @@ def test_gdn_tree_parser_accepts_zero_depth_roots() -> None:
     assert not hasattr(plan, "chain_completion_buckets")
     assert not hasattr(plan, "prefix_boundary_buckets")
     assert all(
-        not bucket.needs_final_state
-        for bucket in plan.tree_segment_buckets_by_depth[0]
+        not bucket.needs_final_state for bucket in plan.tree_segment_buckets_by_depth[0]
     )
 
 
@@ -348,7 +347,9 @@ def test_gdn_tree_cp_randomized_plans_pass_health_checks() -> None:
             for rank in range(4)
         )
 
-        _assert_tree_plan_health(spec, plans, max_padding_ratio=config.max_padding_ratio)
+        _assert_tree_plan_health(
+            spec, plans, max_padding_ratio=config.max_padding_ratio
+        )
 
 
 def _chain_every_legal_segment_config():
@@ -402,7 +403,9 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
     tree_has_children = _tree_has_children(spec)
     token_counts = [0] * int(spec.real_token_count)
     for plan in plans:
-        range_tokens = sum(end - start for start, end, _position in plan.gdn_token_ranges)
+        range_tokens = sum(
+            end - start for start, end, _position in plan.gdn_token_ranges
+        )
         assert range_tokens == int(plan.gdn_token_count)
         assert len(plan.attention_token_indices) == int(plan.attention_token_count)
 
@@ -413,7 +416,9 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
                 assert bucket.parent_indices is not None
                 assert int(bucket.parent_indices.numel()) == int(bucket.segment_count)
                 assert int(bucket.real_token_count) > 0
-                padding_ratio = bucket.length * bucket.segment_count / bucket.real_token_count
+                padding_ratio = (
+                    bucket.length * bucket.segment_count / bucket.real_token_count
+                )
                 assert padding_ratio <= max_padding_ratio
                 bucket_state_flags = {
                     tree_has_children[family_index]
@@ -433,7 +438,9 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
                 assert bucket.parent_indices is not None
                 assert int(bucket.parent_indices.numel()) == int(bucket.segment_count)
                 assert int(bucket.real_token_count) > 0
-                padding_ratio = bucket.length * bucket.segment_count / bucket.real_token_count
+                padding_ratio = (
+                    bucket.length * bucket.segment_count / bucket.real_token_count
+                )
                 assert padding_ratio <= max_padding_ratio
                 bucket_state_flags = {
                     tree_has_children[family_index]
@@ -461,7 +468,9 @@ def _assert_tree_plan_health(spec, plans, *, max_padding_ratio: float) -> None:
     assert max(rank_tokens) - min(rank_tokens) <= max(256, spec.real_token_count // 3)
 
 
-def _random_tree_sequences(seed: int, *, max_depth: int = 4) -> tuple[torch.Tensor, ...]:
+def _random_tree_sequences(
+    seed: int, *, max_depth: int = 4
+) -> tuple[torch.Tensor, ...]:
     generator = torch.Generator().manual_seed(seed)
     next_token = 1
 
@@ -479,8 +488,7 @@ def _random_tree_sequences(seed: int, *, max_depth: int = 4) -> tuple[torch.Tens
         here = torch.cat((prefix, tokens(segment_length)))
         if depth + 1 >= max_depth:
             return [
-                torch.cat((here, tokens(randint(1, 9))))
-                for _ in range(randint(2, 4))
+                torch.cat((here, tokens(randint(1, 9)))) for _ in range(randint(2, 4))
             ]
         leaves: list[torch.Tensor] = []
         for _ in range(randint(2, 3)):

@@ -110,9 +110,7 @@ def main(
         dist.all_gather_object(gathered, records)
         if dist.get_rank() == 0:
             flat_records = [
-                record
-                for rank_records in gathered
-                for record in rank_records or []
+                record for rank_records in gathered for record in rank_records or []
             ]
             report = _build_report(
                 records=flat_records,
@@ -203,6 +201,7 @@ def _unique_requests(
         for index in range(sequences)
     ]
 
+
 def _run_capture(
     rank: TrainerRank,
     requests: Sequence[AnyForwardInput],
@@ -215,7 +214,9 @@ def _run_capture(
     items = [rank._forward_item(request) for request in requests]
     batch = _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
     if mutate_except is not None:
-        batch = _mutated_batch(batch, keep_positions=batch.positions_by_item[mutate_except])
+        batch = _mutated_batch(
+            batch, keep_positions=batch.positions_by_item[mutate_except]
+        )
     prepared = rank._prepare_packed_forward(batch)
     local_seq_len = int(prepared.tokens.shape[1])
     values: dict[str, torch.Tensor] = {}
@@ -247,9 +248,7 @@ def _run_capture(
                 rotary_pos_emb=preprocessed[1],
                 rotary_pos_cos=preprocessed[2],
                 rotary_pos_sin=preprocessed[3],
-                rotary_pos_cos_sin=preprocessed[6]
-                if len(preprocessed) == 7
-                else None,
+                rotary_pos_cos_sin=preprocessed[6] if len(preprocessed) == 7 else None,
                 packed_seq_params=prepared.packed_seq_params,
                 sequence_len_offset=preprocessed[4],
                 padding_mask=preprocessed[5],
@@ -331,7 +330,9 @@ def _capture_label(module_name: str) -> str | None:
     input_norm_match = re.fullmatch(rf"{layer_prefix}\.input_layernorm", module_name)
     if input_norm_match:
         return f"05.layer.{int(input_norm_match.group(1)):03d}.input_layernorm"
-    qkv_match = re.fullmatch(rf"{layer_prefix}\.self_attention\.linear_qkv", module_name)
+    qkv_match = re.fullmatch(
+        rf"{layer_prefix}\.self_attention\.linear_qkv", module_name
+    )
     if qkv_match:
         return f"08.layer.{int(qkv_match.group(1)):03d}.self_attention.linear_qkv"
     core_attention_match = re.fullmatch(
@@ -390,7 +391,11 @@ def _rows(tensor: torch.Tensor, *, seq_len: int) -> torch.Tensor:
             return rows[:, 0].contiguous()
         return rows.contiguous()
     if tensor.ndim >= 2 and int(tensor.shape[1]) == seq_len:
-        rows = tensor[:, :, 0] if tensor.ndim == 4 and int(tensor.shape[2]) == 1 else tensor
+        rows = (
+            tensor[:, :, 0]
+            if tensor.ndim == 4 and int(tensor.shape[2]) == 1
+            else tensor
+        )
         if int(rows.shape[0]) == 1:
             return rows[0].contiguous()
     raise RuntimeError(
@@ -517,7 +522,9 @@ def _assemble(
         output[positions] = value
         filled[positions] = True
     if not bool(filled.all().item()):
-        raise RuntimeError(f"Missing positions for {kind} {name} request={request_index}")
+        raise RuntimeError(
+            f"Missing positions for {kind} {name} request={request_index}"
+        )
     return output
 
 

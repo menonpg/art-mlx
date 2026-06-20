@@ -133,8 +133,10 @@ def pack_shared_prefixes(
         active = indices[lengths.index_select(0, indices) > start]
         if int(active.numel()) == 0:
             return
-        if max_depth == 0 or int(active.numel()) == 1 or (
-            parent_group_id is not None and depth >= max_depth
+        if (
+            max_depth == 0
+            or int(active.numel()) == 1
+            or (parent_group_id is not None and depth >= max_depth)
         ):
             for sequence_index in active:
                 emit(
@@ -181,9 +183,7 @@ def visualize_shared_prefix_pack(pack: SharedPrefixPack) -> str:
             strict=True,
         )
     ):
-        rows.append(
-            f"{position:>3} {token:>5} {group:>5} {parent:>6} {source_pos:>10}"
-        )
+        rows.append(f"{position:>3} {token:>5} {group:>5} {parent:>6} {source_pos:>10}")
     for index, positions in enumerate(pack.positions_by_sequence):
         rows.append(f"seq {index}: {positions.detach().cpu().tolist()}")
     return "\n".join(rows)

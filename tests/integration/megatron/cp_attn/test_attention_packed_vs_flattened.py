@@ -93,9 +93,7 @@ def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
 
         ref_out[row, :, segment.start : segment.end] = flat_out[0, :, output_slice]
         flat_grad = torch.zeros_like(flat_out)
-        flat_grad[0, :, output_slice] = output_grad[
-            row, :, segment.start : segment.end
-        ]
+        flat_grad[0, :, output_slice] = output_grad[row, :, segment.start : segment.end]
         ref_loss = ref_loss + (flat_out * flat_grad).sum()
     ref_loss.backward()
 
@@ -212,7 +210,9 @@ def _completion_token_mask(
     return mask
 
 
-def _segment_context_positions(spec: Any, segment_index: int) -> tuple[list[int], slice]:
+def _segment_context_positions(
+    spec: Any, segment_index: int
+) -> tuple[list[int], slice]:
     path = []
     cursor = segment_index
     while cursor >= 0:
@@ -222,7 +222,9 @@ def _segment_context_positions(spec: Any, segment_index: int) -> tuple[list[int]
     positions = [
         position
         for index in path
-        for position in range(spec.tree_segments[index].start, spec.tree_segments[index].end)
+        for position in range(
+            spec.tree_segments[index].start, spec.tree_segments[index].end
+        )
     ]
     segment_length = spec.tree_segments[segment_index].length
     return positions, slice(len(positions) - segment_length, len(positions))
