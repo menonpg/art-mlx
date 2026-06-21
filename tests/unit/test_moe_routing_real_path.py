@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import base64
-import io
 import math
 from typing import Any, cast
 
-import numpy as np
 from openai.types.chat.chat_completion import Choice
 import pytest
 
@@ -42,12 +39,6 @@ def _route(seed: int) -> list[list[int]]:
     return [[seed, seed + 1], [seed + 2, seed + 3]]
 
 
-def _encoded_routes(routes: list[list[list[int]]]) -> str:
-    buffer = io.BytesIO()
-    np.save(buffer, np.array(routes, dtype=np.uint8))
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
 def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
     routes, stats = align_choice_routes_to_tokenized_result(
         token_ids=[10, 11, 20, 21],
@@ -73,13 +64,14 @@ def test_align_choice_routes_to_tokenized_result_maps_vllm_routes() -> None:
 def test_align_choice_routes_to_tokenized_result_uses_current_vllm_contract() -> None:
     response_payload = {
         "prompt_token_ids": [10, 11],
+        "prompt_routed_experts": [_route(0), _route(10)],
         "choices": [
             {
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {"role": "assistant", "content": "x"},
                 "token_ids": [20, 21],
-                "routed_experts": _encoded_routes([_route(0), _route(10), _route(20)]),
+                "routed_experts": [_route(20), _route(30)],
             }
         ],
     }
@@ -97,9 +89,9 @@ def test_align_choice_routes_to_tokenized_result_uses_current_vllm_contract() ->
         choice_token_lengths=[2],
     )
 
-    assert routes == [_route(0), _route(10), _route(20), None]
+    assert routes == [_route(0), _route(10), _route(20), _route(30)]
     assert stats.choices_with_routing == 1
-    assert stats.routed_tokens == 3
+    assert stats.routed_tokens == 4
 
 
 def test_align_choice_routes_to_tokenized_result_rejects_token_mismatch() -> None:

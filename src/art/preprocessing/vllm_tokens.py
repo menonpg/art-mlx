@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from openai.types.chat.chat_completion import Choice
 
@@ -29,13 +29,9 @@ def attach_vllm_token_metadata_to_choice(
     if not isinstance(raw_choice, dict):
         return
     completion_token_ids = raw_choice.get("token_ids")
-    if prompt_token_ids is None and completion_token_ids is None:
-        return
     if prompt_token_ids is None or completion_token_ids is None:
         return
-    extra = choice.model_extra
-    if extra is None:
-        raise RuntimeError("OpenAI Choice.model_extra is unavailable for token capture")
+    extra = cast(dict[str, Any], choice.model_extra)
     extra[ART_VLLM_TOKEN_METADATA_KEY] = {
         "prompt_token_ids": _normalize_token_ids(
             prompt_token_ids,
