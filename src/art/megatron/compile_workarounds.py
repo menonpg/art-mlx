@@ -173,6 +173,13 @@ def _install_weighted_bias_swiglu_no_inner_forward_cast_workaround() -> None:
     )
 
 
+def _install_moe_postprocess_workaround(moe_layer: Any) -> None:
+    # The routed-token axis changes across packed RL steps, and
+    # combine_postprocess reshapes through dispatcher-owned mutable shape state.
+    # Keep this small boundary eager while compiling the surrounding layer.
+    moe_layer.MoELayer.postprocess = _disable(moe_layer.MoELayer.postprocess)
+
+
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
@@ -189,6 +196,8 @@ def install_torch_compile_workarounds(
     from megatron.core.extensions import transformer_engine as te_ext
     from megatron.core.transformer.moe import experts as moe_experts
     from megatron.core.transformer.moe import moe_layer, moe_utils, token_dispatcher
+
+    _install_moe_postprocess_workaround(moe_layer)
 
     if "fake_sync_dealloc" in flags:
         try:
