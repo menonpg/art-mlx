@@ -1,6 +1,8 @@
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from art.megatron.model_support.spec import (
     ArchitectureReport,
     LayerFamilyInstance,
@@ -18,6 +20,7 @@ from .workflow import (
     build_validation_stage_names,
     run_chat_template_rollout_stage,
     run_correctness_sensitivity_stage,
+    run_length_trainability_stage,
     run_lora_coverage_stage,
     run_merged_vllm_serving_stage,
     run_native_vllm_lora_stage,
@@ -26,6 +29,21 @@ from .workflow import (
     run_yes_no_trainability_stage,
     validated_architecture_representative_models,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_pinned_git_state(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.pinned_git_state",
+        lambda suite_name: SimpleNamespace(
+            model_dump=lambda mode="json": {
+                "path": "/tmp/art",
+                "commit": "test",
+                "dirty": False,
+                "status": [],
+            }
+        ),
+    )
 
 
 def test_build_validation_stage_names_has_fixed_order() -> None:
@@ -37,6 +55,10 @@ def test_build_validation_stage_names_has_fixed_order() -> None:
     assert build_validation_stage_names(native_vllm_lora_status="wip") == [
         *MANDATORY_VALIDATION_STAGES,
         NATIVE_VLLM_LORA_STAGE,
+    ]
+    assert build_validation_stage_names(include_yes_no_trainability=True) == [
+        *MANDATORY_VALIDATION_STAGES,
+        "yes_no_trainability",
     ]
 
 
@@ -92,12 +114,14 @@ def test_build_all_architectures_validation_report_stops_on_failure(
     def _build_validation_report(
         *,
         base_model,
+        include_yes_no_trainability=False,
         include_sensitivity=None,
         output_json=None,
         skip_stages=None,
         stop_on_failure=False,
         allow_unvalidated_arch=False,
     ):
+        del include_yes_no_trainability
         del include_sensitivity
         del output_json
         del skip_stages
@@ -208,14 +232,14 @@ def test_build_validation_report_populates_architecture_stage(
                 },
                 artifact_dir="/tmp/packed-position-ids",
             ),
-            "yes_no_trainability": ValidationStageResult(
-                name="yes_no_trainability",
+            "length_trainability": ValidationStageResult(
+                name="length_trainability",
                 passed=True,
                 metrics={
-                    "latest_step": 3,
-                    "final_eval_reward": 0.97,
+                    "latest_step": 4,
+                    "best_train_abs_error": 1.0,
                 },
-                artifact_dir="/tmp/trainability",
+                artifact_dir="/tmp/length-trainability",
             ),
             "native_vllm_lora": ValidationStageResult(
                 name="native_vllm_lora",
@@ -319,14 +343,15 @@ def test_build_validation_report_populates_architecture_stage(
     }
     assert position_id_stage.artifact_dir == "/tmp/packed-position-ids"
     trainability_stage = next(
-        stage for stage in report.stages if stage.name == "yes_no_trainability"
+        stage for stage in report.stages if stage.name == "length_trainability"
     )
     assert trainability_stage.passed is True
     assert trainability_stage.metrics == {
-        "latest_step": 3,
-        "final_eval_reward": 0.97,
+        "latest_step": 4,
+        "best_train_abs_error": 1.0,
     }
-    assert trainability_stage.artifact_dir == "/tmp/trainability"
+    assert trainability_stage.artifact_dir == "/tmp/length-trainability"
+    assert all(stage.name != "yes_no_trainability" for stage in report.stages)
     native_vllm_lora_stage = next(
         stage for stage in report.stages if stage.name == "native_vllm_lora"
     )
@@ -665,6 +690,39 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 
     assert result.passed is True
     assert result.artifact_dir == "/tmp/trainability"
+
+
+def test_run_length_trainability_stage(monkeypatch) -> None:
+    report = SimpleNamespace(
+        summary_log_path="/tmp/length-trainability/length_trainability.log",
+        model_dump=lambda mode="json": {
+            "latest_step": 3,
+            "initial_train_abs_error": 12.0,
+            "best_train_abs_error": 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(
+            run_length_trainability=lambda *, base_model, allow_unvalidated_arch=False: (
+                report
+            ),
+            length_trainability_passed=lambda candidate: candidate is report,
+        ),
+    )
+
+    result = run_length_trainability_stage(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        architecture=ArchitectureReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+        ),
+    )
+
+    assert result.name == "length_trainability"
+    assert result.passed is True
+    assert result.artifact_dir == "/tmp/length-trainability"
 
 
 def test_run_train_inf_mismatch_stage(monkeypatch) -> None:
