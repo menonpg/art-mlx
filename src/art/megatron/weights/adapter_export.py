@@ -227,14 +227,14 @@ def add_gated_delta_net_adapter_weights(
             _zero_adapter_weight(
                 base_prefix=base_prefix,
                 adapter_key="adapter_b",
-                input_dim=int(in_proj.qkv_lora.A_T.shape[-1]),
+                input_dim=int(in_proj.qkv_lora.A_T.shape[-2]),
                 output_dim=int(in_proj.num_value_heads_per_partition),
                 like=in_proj.qkv_lora.B_T,
             ),
             _zero_adapter_weight(
                 base_prefix=base_prefix,
                 adapter_key="adapter_a",
-                input_dim=int(in_proj.qkv_lora.A_T.shape[-1]),
+                input_dim=int(in_proj.qkv_lora.A_T.shape[-2]),
                 output_dim=int(in_proj.num_value_heads_per_partition),
                 like=in_proj.qkv_lora.B_T,
             ),

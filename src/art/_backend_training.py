@@ -9,7 +9,7 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .trajectories import TrajectoryGroup
-from .types import TrainConfig
+from .types import MegatronTopologyConfig, TrainConfig
 
 
 def build_rl_train_configs(
@@ -28,23 +28,27 @@ def build_rl_train_configs(
     max_negative_advantage_importance_sampling_weight: float | None = None,
     kimi_k2_tau: float | None = None,
     kl_penalty_coef: float = 0.0,
+    kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
     allow_training_without_logprobs: bool | None = None,
     plot_tensors: bool | None = None,
     truncated_importance_sampling: float | None = None,
     scale_learning_rate_by_reward_std_dev: bool | None = None,
     logprob_calculation_chunk_size: int | None = None,
     packed_sequence_length: int | None = None,
+    megatron_topology: MegatronTopologyConfig | dict[str, int | None] | None = None,
     num_trajectories_learning_rate_multiplier_power: float | None = None,
     kl_ref_adapter_path: str | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
     config = TrainConfig(
         learning_rate=learning_rate,
         kl_penalty_coef=kl_penalty_coef,
+        kl_penalty_source=kl_penalty_source,
     )
     dev_config: dev.TrainConfig = {
         "advantage_balance": advantage_balance,
         "importance_sampling_level": importance_sampling_level,
         "kl_penalty_coef": kl_penalty_coef,
+        "kl_penalty_source": kl_penalty_source,
         "mask_prob_ratio": mask_prob_ratio,
         "ppo": ppo,
         "precalculate_logprobs": precalculate_logprobs,
@@ -65,6 +69,10 @@ def build_rl_train_configs(
         dev_config["logprob_calculation_chunk_size"] = logprob_calculation_chunk_size
     if packed_sequence_length is not None:
         dev_config["packed_sequence_length"] = packed_sequence_length
+    if megatron_topology is not None:
+        dev_config["megatron_topology"] = MegatronTopologyConfig.model_validate(
+            megatron_topology
+        ).model_dump(mode="json")
     if num_trajectories_learning_rate_multiplier_power is not None:
         dev_config["num_trajectories_learning_rate_multiplier_power"] = (
             num_trajectories_learning_rate_multiplier_power

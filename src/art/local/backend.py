@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 import gc
 import hashlib
@@ -9,7 +11,7 @@ import shutil
 import socket
 import time
 from types import TracebackType
-from typing import Any, AsyncIterator, Iterable, Literal, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 logger = logging.getLogger(__name__)
@@ -22,10 +24,12 @@ import numpy as np
 import polars as pl
 import torch
 from tqdm import auto as tqdm
-from transformers import AutoImageProcessor, AutoTokenizer
-from transformers.image_processing_utils import BaseImageProcessor
+from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -66,7 +70,13 @@ from ..preprocessing.tokenize import (
     tokenize_trajectory_groups,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
+from ..types import (
+    LocalTrainResult,
+    MegatronTopologyConfig,
+    Message,
+    TrainConfig,
+    TrainSFTConfig,
+)
 from ..utils import format_message, get_model_step
 from .adapter_leases import (
     AdapterLeaseManager,
@@ -410,6 +420,16 @@ class LocalBackend(Backend):
         async with pin_inference_step(model.name, step), manager.lease(step):
             yield
 
+    @asynccontextmanager
+    async def adapter_retention_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model.name)
+        async with manager.lease(step):
+            yield
+
     async def prune_model_adapters(
         self,
         model: AnyTrainableModel,
@@ -491,6 +511,8 @@ class LocalBackend(Backend):
             self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
+                from transformers import AutoImageProcessor
+
                 self._image_processors[model.base_model] = (
                     AutoImageProcessor.from_pretrained(model.base_model, use_fast=True)
                 )
@@ -683,6 +705,7 @@ class LocalBackend(Backend):
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
         kl_ref_adapter_path: str | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -704,6 +727,7 @@ class LocalBackend(Backend):
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
+        megatron_topology: MegatronTopologyConfig | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -738,6 +762,11 @@ class LocalBackend(Backend):
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference. Alternative to
                 kl_penalty_reference_step.
+            kl_penalty_source: Which policy's logprobs to compare against the
+                reference when building the centered KL penalty. Use
+                "current_learner" to match the original ART implementation, or
+                "sample" to shape from the rollout policy logprobs, which is
+                usually better for async/off-policy workloads.
             epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
@@ -764,6 +793,9 @@ class LocalBackend(Backend):
             packed_sequence_length: Packed sequence length to use for training.
                 When unset, Unsloth keeps the current max-length-rounded-to-2048
                 behavior. Required for Megatron.
+            megatron_topology: Parallel topology for Megatron training. When
+                provided, ART uses it to configure Megatron TP/CP/EP/PP/VPP/ETP
+                before launching the Megatron runtime.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -788,6 +820,7 @@ class LocalBackend(Backend):
             scale_rewards = False
         if adam_params is not None:
             raise ValueError("LocalBackend requires adam_params=None.")
+        assert kl_penalty_source in {"current_learner", "sample"}
         if (
             self._requires_explicit_packed_sequence_length
             and packed_sequence_length is None
@@ -805,6 +838,15 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path),
                 kl_penalty_reference_step,
             )
+        elif (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_coef > 0.0
+            and self._requires_explicit_packed_sequence_length
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                0,
+            )
         config, dev_config = build_rl_train_configs(
             learning_rate=learning_rate,
             advantage_balance=advantage_balance,
@@ -818,12 +860,14 @@ class LocalBackend(Backend):
             max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
             kimi_k2_tau=kimi_k2_tau,
             kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_source=kl_penalty_source,
             allow_training_without_logprobs=allow_training_without_logprobs,
             plot_tensors=plot_tensors,
             truncated_importance_sampling=truncated_importance_sampling,
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
+            megatron_topology=megatron_topology,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )

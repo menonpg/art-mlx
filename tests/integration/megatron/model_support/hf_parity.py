@@ -8,28 +8,36 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from art.megatron.model_support.spec import MinimalLayerCoverageReport
-
+from ..artifacts import GitRepoState, pinned_git_state
 from .oracle_harness import (
     NON_FINITE_METRIC_VALUE,
     ORACLE_TOPOLOGY,
     DiffAccumulator,
     DiskPackedTensorsSpec,
+    MetricThresholdRule,
     OracleCaseConfig,
+    PackedTensorConfig,
     PhasePassFn,
-    _default_phase_pass_fns,
+    _prune_case_artifacts,
     _read_json,
     _write_json,
     ensure_case_artifacts,
 )
 from .oracle_worker import provider_topology_env
+from .validation_spec import MinimalLayerCoverageReport
 from .workflow import assess_minimal_layer_coverage
 
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
 HF_PARITY_OUTPUT_DIRNAME = "hf_parity_sft"
 HF_PARITY_REPORT_FILENAME = "report.json"
+HF_PARITY_PACKED_TENSORS = PackedTensorConfig(
+    sequence_length=256,
+    prefill_tokens=64,
+    decode_tokens=64,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+HF_PARITY_ARTIFACT_SUITE_NAME = "Megatron HF parity artifacts"
 
 
 class HfParityMetricRow(BaseModel):
@@ -46,6 +54,7 @@ class HfParityMetricRow(BaseModel):
 
 
 class HfParityRunRequest(BaseModel):
+    git: GitRepoState
     case_id: str
     case_config: OracleCaseConfig
     packed_tensors: DiskPackedTensorsSpec
@@ -54,6 +63,7 @@ class HfParityRunRequest(BaseModel):
 
 
 class HfParityReport(BaseModel):
+    git: GitRepoState
     case_id: str
     base_model: str
     model_key: str
@@ -66,7 +76,32 @@ class HfParityReport(BaseModel):
 
 
 def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
-    return _default_phase_pass_fns()
+    non_zero_scales = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+    fwd_out = MetricThresholdRule(
+        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0},
+        minimums=non_zero_scales,
+    )
+    loss = MetricThresholdRule(
+        limits={"relative_l2": 2e-2, "mean_abs_pct": 2.0},
+        minimums=non_zero_scales,
+    )
+    grads_deltas = MetricThresholdRule(
+        limits={"mean_abs_pct": 3.0},
+        minimums=non_zero_scales,
+    )
+    return {
+        "forward": fwd_out,
+        "outputs": fwd_out,
+        "losses": loss,
+        "grads": grads_deltas,
+        "deltas": grads_deltas,
+    }
+
+
+def hf_parity_case_config(case_config: OracleCaseConfig) -> OracleCaseConfig:
+    return case_config.model_copy(
+        update={"packed_tensors": HF_PARITY_PACKED_TENSORS.model_copy(deep=True)}
+    )
 
 
 def hf_parity_enabled() -> bool:
@@ -93,6 +128,7 @@ def _build_metric_row(
     param: str,
     summary: dict[str, float],
     structural_failure: str | None = None,
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> HfParityMetricRow:
     row = HfParityMetricRow(
         phase=phase,
@@ -104,7 +140,7 @@ def _build_metric_row(
         candidate_abs_scale=summary["candidate_abs_scale"],
         mean_abs_pct=summary["mean_abs_pct"],
     )
-    pass_fn = _hf_parity_phase_pass_fns().get(phase)
+    pass_fn = (phase_pass_fns or _hf_parity_phase_pass_fns()).get(phase)
     if pass_fn is None:
         row.pass_signal = structural_failure is None
         if structural_failure is not None:
@@ -133,6 +169,7 @@ def build_tensor_map_metric_rows(
     phase: str,
     reference: dict[str, Any],
     candidate: dict[str, Any],
+    phase_pass_fns: dict[str, PhasePassFn] | None = None,
 ) -> list[HfParityMetricRow]:
     reference_keys = set(reference.keys())
     candidate_keys = set(candidate.keys())
@@ -145,6 +182,7 @@ def build_tensor_map_metric_rows(
                 param="__tensor_set__",
                 summary=_inf_summary(),
                 structural_failure=f"missing={missing[:5]} extra={extra[:5]}",
+                phase_pass_fns=phase_pass_fns,
             )
         ]
     rows: list[HfParityMetricRow] = []
@@ -156,6 +194,7 @@ def build_tensor_map_metric_rows(
                     param=key,
                     summary=_inf_summary(),
                     structural_failure=f"shape mismatch for '{key}'",
+                    phase_pass_fns=phase_pass_fns,
                 )
             )
             continue
@@ -164,6 +203,7 @@ def build_tensor_map_metric_rows(
                 phase=phase,
                 param=key,
                 summary=summarize_tensor_pair(reference[key], candidate[key]),
+                phase_pass_fns=phase_pass_fns,
             )
         )
     return rows
@@ -283,6 +323,7 @@ def run_hf_parity(
     *,
     case_config: OracleCaseConfig,
 ) -> HfParityReport:
+    case_config = hf_parity_case_config(case_config)
     if case_config.precision != "fp32":
         raise ValueError("HF parity currently requires fp32 precision")
     if case_config.num_steps != 1:
@@ -300,6 +341,7 @@ def run_hf_parity(
             f"risks={coverage.unresolved_risks}"
         )
 
+    git = pinned_git_state(HF_PARITY_ARTIFACT_SUITE_NAME)
     case_artifacts = ensure_case_artifacts(case_config)
     output_dir = Path(case_artifacts.case_dir) / HF_PARITY_OUTPUT_DIRNAME
     report_path = output_dir / HF_PARITY_REPORT_FILENAME
@@ -307,6 +349,7 @@ def run_hf_parity(
     if report_path.exists():
         report_path.unlink()
     request = HfParityRunRequest(
+        git=git,
         case_id=case_artifacts.case_id,
         case_config=case_config,
         packed_tensors=case_artifacts.packed_tensors,
@@ -317,6 +360,7 @@ def run_hf_parity(
         run_hf_parity_subprocess(request, output_dir)
     report = HfParityReport.model_validate(_read_json(report_path))
     assert_hf_parity_pass(report, report_path=report_path)
+    _prune_case_artifacts(Path(case_artifacts.case_dir))
     return report
 
 
@@ -327,22 +371,26 @@ def build_hf_parity_report(
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
+    phase_pass_fns = _hf_parity_phase_pass_fns()
     rows = [
         _build_metric_row(
             phase="outputs",
             param="trainable_token_losses",
             summary=outputs_summary,
+            phase_pass_fns=phase_pass_fns,
         ),
         _build_metric_row(
             phase="losses",
             param="loss",
             summary=loss_summary,
+            phase_pass_fns=phase_pass_fns,
         ),
         *grads_rows,
     ]
     pass_count = sum(1 for row in rows if row.pass_signal)
     fail_count = len(rows) - pass_count
     return HfParityReport(
+        git=request.git,
         case_id=request.case_id,
         base_model=request.case_config.base_model,
         model_key=request.coverage.model_key,
@@ -358,6 +406,7 @@ def build_hf_parity_report(
 __all__ = [
     "HF_PARITY_ENABLE_ENV",
     "HF_PARITY_OUTPUT_DIRNAME",
+    "HF_PARITY_PACKED_TENSORS",
     "HF_PARITY_REPORT_FILENAME",
     "HfParityMetricRow",
     "HfParityReport",
@@ -366,6 +415,7 @@ __all__ = [
     "build_hf_parity_report",
     "build_parity_sample_indices",
     "build_tensor_map_metric_rows",
+    "hf_parity_case_config",
     "hf_parity_enabled",
     "run_hf_parity",
     "set_hf_config_num_layers",

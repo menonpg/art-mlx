@@ -4,13 +4,12 @@ from typing import Any, cast
 import pytest
 import torch
 
-from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER
-from art.megatron.model_support.spec import MinimalLayerCoverageReport
-
+from ..artifacts import GitRepoState
 from . import hf_parity as hf_parity_module
 from . import hf_parity_worker as hf_parity_worker_module
 from .hf_parity import (
     HF_PARITY_OUTPUT_DIRNAME,
+    HF_PARITY_PACKED_TENSORS,
     HF_PARITY_REPORT_FILENAME,
     HfParityReport,
     HfParityRunRequest,
@@ -28,6 +27,11 @@ from .hf_parity_worker import (
     _normalize_hf_tensor_map_for_bridge,
 )
 from .oracle_harness import DiskPackedTensorsSpec, OracleCaseConfig
+from .validation_spec import MinimalLayerCoverageReport
+
+
+def _git_state() -> GitRepoState:
+    return GitRepoState(path="/repo", commit="a" * 40, dirty=False)
 
 
 def test_build_parity_sample_indices_pads_with_none() -> None:
@@ -35,6 +39,23 @@ def test_build_parity_sample_indices_pads_with_none() -> None:
         num_sequences=2,
         global_grad_accumulation_sequences=4,
     ) == [0, 1, None, None]
+
+
+def test_hf_parity_uses_train_inf_mismatch_settings() -> None:
+    assert HF_PARITY_PACKED_TENSORS.sequence_length == 256
+    assert HF_PARITY_PACKED_TENSORS.prefill_tokens == 64
+    assert HF_PARITY_PACKED_TENSORS.decode_tokens == 64
+
+    phase_pass = hf_parity_module._hf_parity_phase_pass_fns()
+    assert cast(Any, phase_pass["outputs"]).limits == {
+        "relative_l2": 1e-2,
+        "mean_abs_pct": 1.0,
+    }
+    assert cast(Any, phase_pass["losses"]).limits == {
+        "relative_l2": 2e-2,
+        "mean_abs_pct": 2.0,
+    }
+    assert cast(Any, phase_pass["grads"]).limits == {"mean_abs_pct": 3.0}
 
 
 def test_set_hf_config_num_layers_updates_supported_field() -> None:
@@ -105,6 +126,7 @@ def test_run_hf_parity_always_reruns_existing_report(
     output_dir = case_dir / HF_PARITY_OUTPUT_DIRNAME
     output_dir.mkdir(parents=True)
     stale_report = HfParityReport(
+        git=_git_state(),
         case_id="stale",
         base_model="Qwen/Qwen3.5-35B-A3B",
         model_key="qwen3_5_moe",
@@ -142,6 +164,7 @@ def test_run_hf_parity_always_reruns_existing_report(
     def _fake_subprocess(request, run_output_dir):
         calls.append(request.case_id)
         fresh_report = HfParityReport(
+            git=request.git,
             case_id=request.case_id,
             base_model=request.case_config.base_model,
             model_key=request.coverage.model_key,
@@ -171,6 +194,7 @@ def test_run_hf_parity_subprocess_does_not_override_recompute(
     monkeypatch, tmp_path
 ) -> None:
     request = HfParityRunRequest(
+        git=_git_state(),
         case_id="case-id",
         case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
         packed_tensors=DiskPackedTensorsSpec(
@@ -275,7 +299,6 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
             "model.language_model.layers.0.input_layernorm.weight",
             "lm_head.weight",
         },
-        model_support_handler=QWEN3_5_MOE_HANDLER,
     )
 
     assert set(normalized) == {
@@ -297,6 +320,7 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     )
 
     request = HfParityRunRequest(
+        git=_git_state(),
         case_id="case",
         case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
         packed_tensors=DiskPackedTensorsSpec(

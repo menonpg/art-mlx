@@ -4,9 +4,7 @@ import json
 import os
 from typing import Any, AsyncIterator
 
-from art.megatron.weights.merge import merge_lora_adapter
-
-from .jobs import DEFAULT_JOBS_DIR, MegatronJob, MegatronSyncJob, dump_megatron_job
+from .jobs import DEFAULT_JOBS_DIR, MegatronJob, dump_megatron_job
 
 DEFAULT_TRAINING_LOG_DIR = "/tmp/megatron_training_logs"
 
@@ -35,7 +33,6 @@ async def stream_megatron_job(
     job: MegatronJob,
     *,
     job_path: str,
-    merge_output_path: str | None = None,
     process: Any | None = None,
     process_log_path: str | None = None,
     poll_interval: float = 0.1,
@@ -60,12 +57,6 @@ async def stream_megatron_job(
                 if not (line := line.strip()):
                     continue
                 if line == "all done":
-                    if not isinstance(job, MegatronSyncJob):
-                        merge_lora_adapter(
-                            job.lora_path,
-                            output_dir=merge_output_path,
-                            allow_unvalidated_arch=job.allow_unvalidated_arch,
-                        )
                     return
                 num_lines += 1
                 yield json.loads(line)

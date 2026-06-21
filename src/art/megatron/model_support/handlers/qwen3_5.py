@@ -1,30 +1,41 @@
+from __future__ import annotations
+
 from copy import copy
 from functools import lru_cache
 import re
 from types import MethodType
 from typing import Any, Sequence, cast
 
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 import torch
 
 from art.megatron.model_support.handlers.default_dense import (
     DefaultDenseHandler,
+    _compile_workaround_flags_for_provider,
     _require_dense_mlp,
     _require_moe_experts,
 )
+from art.megatron.model_support.handlers.qwen3_common import (
+    _context_parallel_world_size,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
     LayerFamilyInstance,
 )
-from art.megatron.provider_common import patch_layer_spec_tree
-from art.megatron.training.model_chunks import ModelChunks
 
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "alltoall_dtoh",
     "alltoall_dispatch_preprocess",
+    "deepep_dispatch_combine",
     "deepep_permute_restore",
+    "flex_token_dispatch_combine",
+    "te_triton_permute_with_mask_map",
+    # Torch 2.11.0 compiles Megatron's weighted SwiGLU custom autograd
+    # function with zero cotangents when its forward casts internally.
+    "weighted_bias_swiglu_no_inner_forward_cast",
 )
+_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
 _ART_MOE_EXPERT_KEY_RE = re.compile(
@@ -35,10 +46,15 @@ _VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
 )
+_VLLM_MOE_EXPERT_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
+    r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+)
 
 
 class Qwen35BaseHandler(DefaultDenseHandler):
     key = "qwen3_5_base"
+    build_gdn_execution_spec = True
     native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
@@ -98,6 +114,8 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         return transformed
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
         from art.megatron.gdn.operator import (
             install_gdn_island_hooks,
             install_shared_prefix_gdn_hooks,
@@ -105,7 +123,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
         install_shared_prefix_gdn_hooks(model_chunks)
         install_gdn_island_hooks(model_chunks)
-        for chunk in cast(ModelChunks, list(model_chunks)):
+        for chunk in list(model_chunks):
             module: Any = chunk
             while hasattr(module, "module"):
                 module = module.module
@@ -127,7 +145,24 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                         position_ids.shape[0],
                         position_ids.shape[1],
                     )
-                preproc_output = list(_preprocess(*args, **kwargs))
+                rotary_pos_emb = getattr(gpt_module, "rotary_pos_emb", None)
+                rotary_cp_group = getattr(rotary_pos_emb, "cp_group", None)
+                dispatched_local_cp_positions = (
+                    isinstance(position_ids, torch.Tensor)
+                    and position_ids.ndim == 2
+                    and _context_parallel_world_size(
+                        getattr(gpt_module, "config", None)
+                    )
+                    > 1
+                    and rotary_cp_group is not None
+                )
+                if dispatched_local_cp_positions:
+                    setattr(rotary_pos_emb, "cp_group", None)
+                try:
+                    preproc_output = list(_preprocess(*args, **kwargs))
+                finally:
+                    if dispatched_local_cp_positions:
+                        setattr(rotary_pos_emb, "cp_group", rotary_cp_group)
                 decoder_input = cast(torch.Tensor, preproc_output[0])
                 if not decoder_input.requires_grad and decoder_input.is_leaf:
                     decoder_input.requires_grad_(True)
@@ -165,7 +200,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
 
     def patch_bridge(self, bridge: Any) -> None:
         del bridge
-        _ensure_qwen35_text_only_bridge_registered()
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
@@ -179,7 +213,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
             patch_standard_attention_specs,
             transformer_block_spec_factory,
         ) = _require_qwen35_provider_symbols()
-        from art.megatron.flex_attention import FlexDotProductAttention
+        from art.megatron.provider import patch_art_flex_attention
 
         matched_provider_type = next(
             provider_type
@@ -187,14 +221,14 @@ class Qwen35BaseHandler(DefaultDenseHandler):
             if isinstance(provider, provider_type)
         )
 
-        def _patch_qwen35_block_spec(block_spec: object) -> None:
+        def _patch_qwen35_block_spec(block_spec: object, config: Any) -> None:
             patch_standard_attention_specs(block_spec, qwen3_vl_self_attention)
             for layer_spec in getattr(block_spec, "layer_specs", ()):
-                patch_layer_spec_tree(layer_spec, FlexDotProductAttention)
+                patch_art_flex_attention(layer_spec, config)
 
         def _qwen35_layer_spec(config: Any, vp_stage: int | None = None) -> object:
             block_spec = transformer_block_spec_factory(config, vp_stage=vp_stage)
-            _patch_qwen35_block_spec(block_spec)
+            _patch_qwen35_block_spec(block_spec, config)
             return block_spec
 
         def _provide_qwen35_with_flex_attention(
@@ -224,6 +258,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         rank: int,
         alpha: int,
     ) -> None:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -278,6 +313,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -371,6 +407,39 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     key = "qwen3_5_moe"
     is_moe = True
 
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=(
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_A",
+                        output_suffix="base_layer.lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="gate_up_proj",
+                        source_lora="lora_B",
+                        output_suffix="base_layer.lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_A",
+                        output_suffix="lora_A.weight",
+                        pack_layout="expert_rows",
+                    ),
+                    ExpertPackedLoraSlot(
+                        source_projection="down_proj",
+                        source_lora="lora_B",
+                        output_suffix="lora_B.weight",
+                        pack_layout="rank_major_expert_cols",
+                    ),
+                ),
+            ),
+        )
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -414,7 +483,10 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import wrap_grouped_moe_experts_3d
+        from art.megatron.lora import (
+            wrap_grouped_moe_experts_3d,
+            wrap_shared_experts_mlp,
+        )
 
         wrap_grouped_moe_experts_3d(
             _require_moe_experts(module),
@@ -423,6 +495,16 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             rank=rank,
             alpha=alpha,
         )
+        shared_experts = getattr(module.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            wrap_shared_experts_mlp(
+                shared_experts,
+                adapter_model_prefix=adapter_model_prefix,
+                provider=provider,
+                target_modules=target_modules,
+                rank=rank,
+                alpha=alpha,
+            )
 
     def _add_mlp_adapter_weights(
         self,
@@ -433,6 +515,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     ) -> None:
         from art.megatron.weights.adapter_export import (
             add_grouped_moe_adapter_weights,
+            add_shared_experts_adapter_weights,
         )
 
         add_grouped_moe_adapter_weights(
@@ -440,6 +523,13 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             layer_prefix=layer_prefix,
             experts=_require_moe_experts(module),
         )
+        shared_experts = getattr(module.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            add_shared_experts_adapter_weights(
+                adapter_weights_by_base,
+                layer_prefix=layer_prefix,
+                shared_experts=shared_experts,
+            )
 
     def compile_workaround_config(
         self,
@@ -448,11 +538,16 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         if bool(getattr(provider, "moe_shared_expert_overlap", False)):
             return CompileWorkaroundConfig(
                 flags=("moe_forward",),
+                unconditional_flags=_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS,
                 shared_expert_state="shared_expert_overlap",
                 disable_compile=True,
             )
         return CompileWorkaroundConfig(
-            flags=_QWEN35_MOE_COMPILE_WORKAROUND_FLAGS,
+            flags=_compile_workaround_flags_for_provider(
+                provider,
+                _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS,
+            ),
+            unconditional_flags=_QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS,
             shared_expert_state="shared_experts",
             disable_compile=False,
         )
@@ -602,12 +697,27 @@ def _unpack_vllm_3d_lora_b(
     return tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1)
 
 
-def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
+def _clone(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.clone().contiguous()
+
+
+def _has_shared_expert_lora_tensors(tensors: dict[str, torch.Tensor]) -> bool:
+    return any(".mlp.shared_expert." in key for key in tensors)
+
+
+def _vllm_moe_config(
+    adapter_config: dict[str, Any],
+    *,
+    has_shared_experts: bool = False,
+) -> dict[str, Any]:
     config = dict(adapter_config)
+    stripped_modules = {"gate_up_proj"}
+    if not has_shared_experts:
+        stripped_modules.update({"gate_proj", "up_proj", "down_proj"})
     target_modules = [
         module
         for module in list(config.get("target_modules") or [])
-        if module not in {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+        if module not in stripped_modules
     ]
     if "experts" not in target_modules:
         target_modules.append("experts")
@@ -636,17 +746,29 @@ def _to_vllm_lora_tensors(
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     grouped = _group_art_moe_tensors(tensors)
+    has_shared_experts = _has_shared_expert_lora_tensors(tensors)
+    transformed: dict[str, torch.Tensor] = {}
     if not grouped:
-        transformed: dict[str, torch.Tensor] = {}
+        has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in tensors)
         for key, tensor in tensors.items():
             vllm_key, tensor = _to_vllm_lora_tensor(
                 key,
                 tensor,
                 adapter_config=adapter_config,
             )
+            if vllm_key in transformed:
+                raise RuntimeError(
+                    f"Duplicate Qwen3.5 LoRA tensor after conversion: {vllm_key}"
+                )
             transformed[vllm_key] = tensor
-        return transformed, adapter_config
-    transformed: dict[str, torch.Tensor] = {}
+        return transformed, (
+            _vllm_moe_config(
+                adapter_config,
+                has_shared_experts=has_shared_experts,
+            )
+            if has_fused_experts
+            else adapter_config
+        )
     used_keys: set[str] = set()
     for prefix, experts in grouped.items():
         vllm_prefix = _to_vllm_key(prefix)
@@ -665,6 +787,11 @@ def _to_vllm_lora_tensors(
                 raise RuntimeError(
                     f"Incomplete Qwen3.5 MoE LoRA block for {prefix}.{expert}"
                 ) from exc
+            if gate_up_b_tensor.shape[0] % 2 != 0:
+                raise RuntimeError(
+                    f"{prefix}.{expert}: gate/up lora_B rows "
+                    f"{gate_up_b_tensor.shape[0]} are not even"
+                )
             gate_up_a.append(gate_up_a_tensor.contiguous())
             gate_up_b.append(gate_up_b_tensor.contiguous())
             down_a.append(d_a.contiguous())
@@ -693,7 +820,10 @@ def _to_vllm_lora_tensors(
             adapter_config=adapter_config,
         )
         transformed[vllm_key] = tensor
-    return transformed, _vllm_moe_config(adapter_config)
+    return transformed, _vllm_moe_config(
+        adapter_config,
+        has_shared_experts=has_shared_experts,
+    )
 
 
 def _from_vllm_lora_tensors(
@@ -701,6 +831,69 @@ def _from_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
+    expert_grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    for key, tensor in tensors.items():
+        match = _VLLM_MOE_EXPERT_KEY_RE.match(key)
+        if match is None:
+            continue
+        expert_grouped.setdefault(match.group("prefix"), {}).setdefault(
+            int(match.group("expert")),
+            {},
+        ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+    if expert_grouped:
+        transformed: dict[str, torch.Tensor] = {}
+        used_keys: set[str] = set()
+        for prefix, experts in expert_grouped.items():
+            art_prefix = _from_vllm_key(prefix)
+            for expert, modules in experts.items():
+                try:
+                    gate_a = modules["gate_proj"]["lora_A"]
+                    gate_b = modules["gate_proj"]["lora_B"]
+                    up_a = modules["up_proj"]["lora_A"]
+                    up_b = modules["up_proj"]["lora_B"]
+                    down_a = modules["down_proj"]["lora_A"]
+                    down_b = modules["down_proj"]["lora_B"]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"Incomplete Qwen3.5 vLLM MoE LoRA block for {prefix}.{expert}"
+                    ) from exc
+                if not torch.equal(gate_a, up_a):
+                    raise RuntimeError(
+                        "Qwen3.5 Megatron gate_up_proj requires gate/up "
+                        f"LoRA-A tensors to match for {prefix}.{expert}"
+                    )
+                transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"] = (
+                    _clone(gate_a)
+                )
+                transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"] = (
+                    torch.cat([gate_b, up_b], dim=0).contiguous()
+                )
+                transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = _clone(
+                    down_a
+                )
+                transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = _clone(
+                    down_b
+                )
+                for module_name in ("gate_proj", "up_proj", "down_proj"):
+                    for lora_name in ("lora_A", "lora_B"):
+                        used_keys.add(
+                            f"{prefix}.{expert}.{module_name}.{lora_name}.weight"
+                        )
+        for key, tensor in tensors.items():
+            if key in used_keys:
+                continue
+            if _VLLM_MOE_KEY_RE.match(key) is not None:
+                raise RuntimeError(
+                    "Mixed fused and per-expert Qwen3.5 vLLM MoE LoRA tensors"
+                )
+            art_key, tensor = _from_vllm_lora_tensor(
+                key,
+                tensor,
+                adapter_config=adapter_config,
+            )
+            transformed[art_key] = tensor
+        return transformed
+
     grouped: dict[str, dict[str, torch.Tensor]] = {}
     for key, tensor in tensors.items():
         match = _VLLM_MOE_KEY_RE.match(key)
@@ -865,177 +1058,213 @@ def _qwen35_text_only_mapping_registry(
 
 
 def _text_only_qwen35_mapping(mapping: Any) -> Any:
-    from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-        FusedExpertMapping,
-        FusedGatedExpertMapping,
-    )
-
+    (
+        bridge_gate_up_mapping,
+        bridge_down_mapping,
+        art_gate_up_mapping,
+        art_down_mapping,
+    ) = _art_qwen35_expert_mapping_types()
     megatron_param = mapping.megatron_param.removeprefix("language_model.")
-    if isinstance(mapping, FusedGatedExpertMapping):
-        return _ArtExpertMLPGateUpProjMapping(megatron_param, mapping.hf_param)
-    if isinstance(mapping, FusedExpertMapping):
-        return _ArtExpertMLPDownProjMapping(megatron_param, mapping.hf_param)
+    if isinstance(mapping, bridge_gate_up_mapping):
+        return art_gate_up_mapping(megatron_param, mapping.hf_param)
+    if isinstance(mapping, bridge_down_mapping):
+        return art_down_mapping(megatron_param, mapping.hf_param)
     cloned = copy(mapping)
     cloned.megatron_param = megatron_param
     return cloned
 
 
-from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-    FusedExpertMapping as _BridgeExpertMLPDownProjMapping,
-)
-from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-    FusedGatedExpertMapping as _BridgeExpertMLPGateUpProjMapping,
-)
+@lru_cache(maxsize=1)
+def _art_qwen35_expert_mapping_types() -> tuple[
+    type[Any], type[Any], type[Any], type[Any]
+]:
+    from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
 
-
-class _ArtExpertMLPGateUpProjMapping(_BridgeExpertMLPGateUpProjMapping):
-    def hf_to_megatron(
-        self,
-        hf_weights: torch.Tensor | dict[str, torch.Tensor],
-        megatron_module: Any,
-    ) -> torch.Tensor:
-        from megatron.bridge.models.conversion.param_mapping import (
-            _align_expert_weight_to_shape,
-        )
-        from megatron.bridge.models.conversion.utils import (
-            get_module_and_param_from_name,
-        )
-        from megatron.bridge.utils.common_utils import (
-            extract_expert_number_from_param,
-        )
-
-        global_expert_number = extract_expert_number_from_param(self.megatron_param)
-        expert_weight = (
-            hf_weights[global_expert_number]
-            if isinstance(hf_weights, torch.Tensor) and hf_weights.ndim >= 3
-            else hf_weights
-        )
-        normalized_param = self._normalize_expert_param_name(self.megatron_param)
-        target_param = get_module_and_param_from_name(
-            megatron_module, normalized_param
-        )[1]
-        full_target_shape = (
-            target_param.shape[0] * self.tp_size,
-            target_param.shape[1],
-        )
-        gate_target_shape = (
-            full_target_shape[0] // 2,
-            full_target_shape[1],
-        )
-        if full_target_shape[0] % 2 != 0:
-            raise ValueError(
-                f"Expected even fused dim for {self.megatron_param}, got {full_target_shape}."
+    class _ArtExpertMLPGateUpProjMapping(FusedGatedExpertMapping):
+        def hf_to_megatron(
+            self,
+            hf_weights: Any,
+            megatron_module: Any,
+        ) -> torch.Tensor:
+            from megatron.bridge.models.conversion.param_mapping import (
+                _align_expert_weight_to_shape,
             )
-        if (
-            isinstance(expert_weight, torch.Tensor)
-            and expert_weight.ndim == 3
-            and expert_weight.shape[0] == 2
-        ):
-            gate = _align_expert_weight_to_shape(
-                expert_weight[0], torch.Size(gate_target_shape), "gate"
+            from megatron.bridge.models.conversion.utils import (
+                get_module_and_param_from_name,
             )
-            up = _align_expert_weight_to_shape(
-                expert_weight[1], torch.Size(gate_target_shape), "up"
+            from megatron.bridge.utils.common_utils import (
+                extract_expert_number_from_param,
             )
-        else:
-            fused = _align_expert_weight_to_shape(
-                cast(torch.Tensor, expert_weight),
-                torch.Size(full_target_shape),
-                "gate_up",
+
+            global_expert_number = extract_expert_number_from_param(self.megatron_param)
+            expert_weight = _select_qwen35_expert_weight(
+                hf_weights,
+                global_expert_number=global_expert_number,
+                ep_size=int(self.ep_size),
             )
-            gate, up = torch.chunk(fused, 2, dim=0)
-        return self._gated_mapping.hf_to_megatron(
-            {"gate": gate, "up": up},
-            megatron_module,
-        )
-
-
-class _ArtExpertMLPDownProjMapping(_BridgeExpertMLPDownProjMapping):
-    def hf_to_megatron(
-        self,
-        hf_weights: torch.Tensor,
-        megatron_module: Any,
-    ) -> torch.Tensor:
-        from megatron.bridge.models.conversion.param_mapping import (
-            ColumnParallelMapping,
-            RowParallelMapping,
-            _align_expert_weight_to_shape,
-        )
-        from megatron.bridge.models.conversion.utils import (
-            get_module_and_param_from_name,
-        )
-        from megatron.bridge.utils.common_utils import (
-            extract_expert_number_from_param,
-        )
-
-        global_expert_number = extract_expert_number_from_param(self.megatron_param)
-        expert_weight = (
-            hf_weights[global_expert_number] if hf_weights.ndim >= 3 else hf_weights
-        )
-        normalized_param = self._normalize_expert_param_name(self.megatron_param)
-        target_param = get_module_and_param_from_name(
-            megatron_module, normalized_param
-        )[1]
-        if self._mapping is None:
-            self._detected_type = self._detect_parallelism_type(megatron_module)
-            self._mapping = self._get_or_create_mapping(self._detected_type)
-        if isinstance(self._mapping, ColumnParallelMapping):
+            normalized_param = self._normalize_expert_param_name(self.megatron_param)
+            target_param = get_module_and_param_from_name(
+                megatron_module, normalized_param
+            )[1]
             full_target_shape = (
                 target_param.shape[0] * self.tp_size,
                 target_param.shape[1],
             )
-        elif isinstance(self._mapping, RowParallelMapping):
-            full_target_shape = (
-                target_param.shape[0],
-                target_param.shape[1] * self.tp_size,
+            gate_target_shape = (
+                full_target_shape[0] // 2,
+                full_target_shape[1],
             )
-        else:
-            full_target_shape = tuple(target_param.shape)
-        aligned = _align_expert_weight_to_shape(
-            expert_weight,
-            torch.Size(full_target_shape),
-            "down_proj",
-        )
-        return self._mapping.hf_to_megatron(aligned, megatron_module)
+            if full_target_shape[0] % 2 != 0:
+                raise ValueError(
+                    f"Expected even fused dim for {self.megatron_param}, got {full_target_shape}."
+                )
+            if (
+                isinstance(expert_weight, torch.Tensor)
+                and expert_weight.ndim == 3
+                and expert_weight.shape[0] == 2
+            ):
+                gate = _align_expert_weight_to_shape(
+                    expert_weight[0], torch.Size(gate_target_shape), "gate"
+                )
+                up = _align_expert_weight_to_shape(
+                    expert_weight[1], torch.Size(gate_target_shape), "up"
+                )
+            else:
+                fused = _align_expert_weight_to_shape(
+                    cast(torch.Tensor, expert_weight),
+                    torch.Size(full_target_shape),
+                    "gate_up",
+                )
+                gate, up = torch.chunk(fused, 2, dim=0)
+            return self._gated_mapping.hf_to_megatron(
+                {"gate": gate, "up": up},
+                megatron_module,
+            )
+
+    class _ArtExpertMLPDownProjMapping(FusedExpertMapping):
+        def hf_to_megatron(
+            self,
+            hf_weights: Any,
+            megatron_module: Any,
+        ) -> torch.Tensor:
+            from megatron.bridge.models.conversion.param_mapping import (
+                ColumnParallelMapping,
+                RowParallelMapping,
+                _align_expert_weight_to_shape,
+            )
+            from megatron.bridge.models.conversion.utils import (
+                get_module_and_param_from_name,
+            )
+            from megatron.bridge.utils.common_utils import (
+                extract_expert_number_from_param,
+            )
+
+            global_expert_number = extract_expert_number_from_param(self.megatron_param)
+            expert_weight = _select_qwen35_expert_weight(
+                hf_weights,
+                global_expert_number=global_expert_number,
+                ep_size=int(self.ep_size),
+            )
+            normalized_param = self._normalize_expert_param_name(self.megatron_param)
+            target_param = get_module_and_param_from_name(
+                megatron_module, normalized_param
+            )[1]
+            if self._mapping is None:
+                self._detected_type = self._detect_parallelism_type(megatron_module)
+                self._mapping = self._get_or_create_mapping(self._detected_type)
+            if isinstance(self._mapping, ColumnParallelMapping):
+                full_target_shape = (
+                    target_param.shape[0] * self.tp_size,
+                    target_param.shape[1],
+                )
+            elif isinstance(self._mapping, RowParallelMapping):
+                full_target_shape = (
+                    target_param.shape[0],
+                    target_param.shape[1] * self.tp_size,
+                )
+            else:
+                full_target_shape = tuple(target_param.shape)
+            aligned = _align_expert_weight_to_shape(
+                expert_weight,
+                torch.Size(full_target_shape),
+                "down_proj",
+            )
+            return self._mapping.hf_to_megatron(aligned, megatron_module)
+
+    return (
+        FusedGatedExpertMapping,
+        FusedExpertMapping,
+        _ArtExpertMLPGateUpProjMapping,
+        _ArtExpertMLPDownProjMapping,
+    )
 
 
-def _ensure_qwen35_text_only_bridge_registered() -> None:
-    return None
+def _select_qwen35_expert_weight(
+    hf_weights: Any,
+    *,
+    global_expert_number: int,
+    ep_size: int,
+) -> Any:
+    from art.megatron.runtime.bridge_runtime import ExpertTensorSlice
+
+    if isinstance(hf_weights, ExpertTensorSlice):
+        return hf_weights.get(global_expert_number)
+    if isinstance(hf_weights, torch.Tensor) and hf_weights.ndim >= 3:
+        if ep_size > 1:
+            raise RuntimeError(
+                "Qwen3.5 EP expert loading expected a sliced fused-expert "
+                "HF tensor, but received the full all-expert tensor for "
+                f"global expert {global_expert_number}."
+            )
+        return hf_weights[global_expert_number]
+    return hf_weights
 
 
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
-    _QWEN3_5_DENSE_HF_CLASS_NAME,
-    _QWEN3_5_MOE_HF_CLASS_NAME,
-    Qwen35VLBridge,
-    Qwen35VLMoEBridge,
-)
-from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
-    Qwen35VLModelProvider,
-    Qwen35VLMoEModelProvider,
-)
+_QWEN35_TEXT_ONLY_BRIDGE_REGISTERED = False
 
 
-@MegatronModelBridge.register_bridge(
-    source=_QWEN3_5_DENSE_HF_CLASS_NAME,
-    target=GPTModel,
-    provider=Qwen35VLModelProvider,
-    model_type="qwen3_5_moe",
-)
-class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
-    def mapping_registry(self) -> Any:
-        return _qwen35_text_only_mapping_registry(Qwen35VLBridge)
+def ensure_qwen35_text_only_bridge_registered() -> None:
+    global _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED
+    if _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED:
+        return
 
+    from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (
+        _QWEN3_5_DENSE_HF_CLASS_NAME,
+        _QWEN3_5_MOE_HF_CLASS_NAME,
+        Qwen35VLBridge,
+        Qwen35VLMoEBridge,
+    )
+    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+        Qwen35VLModelProvider,
+        Qwen35VLMoEModelProvider,
+    )
+    from megatron.core.models.gpt.gpt_model import GPTModel
 
-@MegatronModelBridge.register_bridge(
-    source=_QWEN3_5_MOE_HF_CLASS_NAME,
-    target=GPTModel,
-    provider=Qwen35VLMoEModelProvider,
-    model_type="qwen3_5_moe",
-)
-class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
-    def mapping_registry(self) -> Any:
-        return _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge)
+    @MegatronModelBridge.register_bridge(
+        source=_QWEN3_5_DENSE_HF_CLASS_NAME,
+        target=GPTModel,
+        provider=Qwen35VLModelProvider,
+        model_type="qwen3_5",
+    )
+    class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
+        def mapping_registry(self) -> Any:
+            return _qwen35_text_only_mapping_registry(Qwen35VLBridge)
+
+    @MegatronModelBridge.register_bridge(
+        source=_QWEN3_5_MOE_HF_CLASS_NAME,
+        target=GPTModel,
+        provider=Qwen35VLMoEModelProvider,
+        model_type="qwen3_5_moe",
+    )
+    class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
+        def mapping_registry(self) -> Any:
+            return _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge)
+
+    _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED = True
 
 
 def _linear_attention_pattern(provider: Any) -> list[int]:

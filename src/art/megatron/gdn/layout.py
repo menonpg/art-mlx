@@ -73,24 +73,17 @@ class GdnCpExchangePlan(BaseModel):
         )
 
 
+class GdnSpExchangePlan(BaseModel):
+    """Sequence-parallel view of an existing CP exchange plan."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    plan: GdnCpExchangePlan
+    rank: int
+
+
 def _layout_cp_size(layout: TokenLayoutIndex) -> int:
     return len(layout.token_counts_by_rank)
-
-
-def _token_layout_from_rank_ranges(
-    ranges_by_rank: Sequence[Sequence[tuple[int, int, int]]],
-) -> TokenLayoutIndex:
-    ranges = _normalize_rank_ranges(
-        "ranges_by_rank",
-        ranges_by_rank,
-        cp_size=len(ranges_by_rank),
-    )
-    return TokenLayoutIndex(
-        ownership_ranges_by_rank=ranges,
-        token_counts_by_rank=tuple(
-            _rank_range_count(rank_ranges) for rank_ranges in ranges
-        ),
-    )
 
 
 def _normalize_rank_ranges(
@@ -120,10 +113,6 @@ def _normalize_rank_ranges(
             cursor += end - start
         normalized.append(tuple(normalized_rank))
     return tuple(normalized)
-
-
-def _rank_range_count(ranges: Sequence[tuple[int, int, int]]) -> int:
-    return sum(int(end) - int(start) for start, end, _ in ranges)
 
 
 def _intersection_position_tensors(
@@ -171,92 +160,6 @@ def _intersection_position_tensors(
             lengths_tensor,
         )
         + item_offsets,
-    )
-
-
-def _merged_token_ranges(
-    ranges_by_rank: Sequence[Sequence[tuple[int, int, int]]],
-) -> tuple[tuple[int, int], ...]:
-    ranges = sorted(
-        (int(start), int(end))
-        for rank_ranges in ranges_by_rank
-        for start, end, _ in rank_ranges
-        if int(start) < int(end)
-    )
-    if not ranges:
-        return ()
-    merged = [ranges[0]]
-    for start, end in ranges[1:]:
-        prev_start, prev_end = merged[-1]
-        if start <= prev_end:
-            merged[-1] = (prev_start, max(prev_end, end))
-        else:
-            merged.append((start, end))
-    return tuple(merged)
-
-
-def _range_list_count(ranges: Sequence[tuple[int, int]]) -> int:
-    return sum(int(end) - int(start) for start, end in ranges)
-
-
-def build_cp_exchange_plan_from_layout_index(
-    *,
-    source_layout: TokenLayoutIndex,
-    dest_layout: TokenLayoutIndex,
-    device: torch.device | str | None,
-    validate: bool = True,
-    local_rank: int | None = None,
-) -> GdnCpExchangePlan:
-    cp_size = _layout_cp_size(source_layout)
-    if _layout_cp_size(dest_layout) != cp_size:
-        raise ValueError(
-            "source and destination cp_size differ: "
-            f"{cp_size} and {_layout_cp_size(dest_layout)}"
-        )
-    if local_rank is not None and (local_rank < 0 or local_rank >= cp_size):
-        raise ValueError(f"local_rank must be in [0, {cp_size}), got {local_rank}")
-    if validate:
-        _validate_layout_token_sets_match(source_layout, dest_layout)
-    source_counts = source_layout.token_counts_by_rank
-    dest_counts = dest_layout.token_counts_by_rank
-    transfers: list[GdnCpPeerTransfer] = []
-    cross_rank_token_count = 0
-    for source_rank, source_ranges in enumerate(source_layout.ownership_ranges_by_rank):
-        for dest_rank, dest_ranges in enumerate(dest_layout.ownership_ranges_by_rank):
-            source_positions, dest_positions = _intersection_position_tensors(
-                source_ranges,
-                dest_ranges,
-            )
-            token_count = int(source_positions.numel())
-            if token_count == 0:
-                continue
-            if source_rank != dest_rank:
-                cross_rank_token_count += token_count
-            if (
-                local_rank is not None
-                and source_rank != local_rank
-                and dest_rank != local_rank
-            ):
-                continue
-            transfers.append(
-                _make_peer_transfer(
-                    source_rank=source_rank,
-                    dest_rank=dest_rank,
-                    source_positions=source_positions,
-                    dest_positions=dest_positions,
-                    source_count=source_counts[source_rank],
-                    dest_count=dest_counts[dest_rank],
-                    device=device,
-                )
-            )
-    return GdnCpExchangePlan.model_construct(
-        cp_size=cp_size,
-        source_token_counts_by_rank=source_counts,
-        dest_token_counts_by_rank=dest_counts,
-        transfers=tuple(
-            sorted(transfers, key=lambda item: (item.source_rank, item.dest_rank))
-        ),
-        cross_rank_token_count_override=cross_rank_token_count,
     )
 
 
@@ -312,22 +215,6 @@ def build_local_rank_cp_exchange_plan_from_dest_ranges(
         ),
         cross_rank_token_count_override=int(cross_rank_token_count),
     )
-
-
-def _validate_layout_token_sets_match(
-    source_layout: TokenLayoutIndex,
-    dest_layout: TokenLayoutIndex,
-) -> None:
-    source_ranges = _merged_token_ranges(source_layout.ownership_ranges_by_rank)
-    dest_ranges = _merged_token_ranges(dest_layout.ownership_ranges_by_rank)
-    if (
-        source_ranges != dest_ranges
-        or sum(source_layout.token_counts_by_rank) != _range_list_count(source_ranges)
-        or sum(dest_layout.token_counts_by_rank) != _range_list_count(dest_ranges)
-    ):
-        raise ValueError(
-            "source and destination token layouts must cover the same tokens"
-        )
 
 
 def _make_peer_transfer(
@@ -410,6 +297,187 @@ def _reverse_exchange_plan(plan: GdnCpExchangePlan) -> GdnCpExchangePlan:
     )
 
 
+def _infer_tp_cp_rank_mode(
+    *,
+    cp_rank: int,
+    tp_rank: int,
+    tp_size: int,
+    cp_size: int,
+    tp_cp_rank: int,
+) -> str:
+    cp_major = cp_rank * tp_size + tp_rank
+    tp_major = tp_rank * cp_size + cp_rank
+    if tp_cp_rank == cp_major:
+        return "cp_major"
+    if tp_cp_rank == tp_major:
+        return "tp_major"
+    raise ValueError(
+        "unsupported TPxCP process-group rank order for GDN SP exchange: "
+        f"cp_rank={cp_rank}, tp_rank={tp_rank}, tp_size={tp_size}, "
+        f"cp_size={cp_size}, tp_cp_rank={tp_cp_rank}"
+    )
+
+
+def _composite_tp_cp_rank(
+    cp_rank: int,
+    tp_rank: int,
+    *,
+    tp_size: int,
+    cp_size: int,
+    mode: str,
+) -> int:
+    if mode == "cp_major":
+        return int(cp_rank) * int(tp_size) + int(tp_rank)
+    if mode == "tp_major":
+        return int(tp_rank) * int(cp_size) + int(cp_rank)
+    raise ValueError(f"unsupported TPxCP rank mode {mode!r}")
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (int(value) + int(divisor) - 1) // int(divisor)
+
+
+def _sp_counts_by_composite_rank(
+    cp_counts: Sequence[int],
+    *,
+    tp_size: int,
+    mode: str,
+) -> tuple[int, ...]:
+    cp_size = len(cp_counts)
+    counts = [0] * (cp_size * tp_size)
+    for cp_rank, count in enumerate(cp_counts):
+        rows_per_tp = _ceil_div(int(count), tp_size)
+        for tp_rank in range(tp_size):
+            counts[
+                _composite_tp_cp_rank(
+                    cp_rank,
+                    tp_rank,
+                    tp_size=tp_size,
+                    cp_size=cp_size,
+                    mode=mode,
+                )
+            ] = rows_per_tp
+    return tuple(counts)
+
+
+def _sp_shard_bounds(count: int, *, tp_rank: int, tp_size: int) -> tuple[int, int, int]:
+    rows_per_tp = _ceil_div(count, tp_size)
+    start = int(tp_rank) * rows_per_tp
+    end = min(start + rows_per_tp, int(count))
+    return start, end, rows_per_tp
+
+
+def _shard_implicit_identity_transfer_for_sequence_parallel(
+    transfer: GdnCpPeerTransfer,
+    plan: GdnCpExchangePlan,
+    *,
+    tp_size: int,
+    tp_rank: int,
+    local_rank: int,
+    rank_mode: str,
+    source_counts: tuple[int, ...],
+    dest_counts: tuple[int, ...],
+    device: torch.device | str | None,
+) -> tuple[GdnCpPeerTransfer, ...]:
+    if transfer.source_rank != transfer.dest_rank:
+        return ()
+    source_rank = _composite_tp_cp_rank(
+        transfer.source_rank,
+        tp_rank,
+        tp_size=tp_size,
+        cp_size=plan.cp_size,
+        mode=rank_mode,
+    )
+    if source_rank != local_rank:
+        return ()
+    start, end, _ = _sp_shard_bounds(
+        _source_count_for_rank(plan, transfer.source_rank),
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    rows = end - start
+    if rows <= 0:
+        return ()
+    positions = torch.arange(rows, dtype=torch.long, device=device)
+    return (
+        _make_peer_transfer(
+            source_rank=source_rank,
+            dest_rank=source_rank,
+            source_positions=positions,
+            dest_positions=positions,
+            source_count=source_counts[source_rank],
+            dest_count=dest_counts[source_rank],
+            device=device,
+        ),
+    )
+
+
+def _shard_indexed_transfer_for_sequence_parallel(
+    transfer: GdnCpPeerTransfer,
+    plan: GdnCpExchangePlan,
+    *,
+    tp_size: int,
+    local_rank: int,
+    rank_mode: str,
+    source_counts: tuple[int, ...],
+    dest_counts: tuple[int, ...],
+    device: torch.device | str | None,
+) -> tuple[GdnCpPeerTransfer, ...]:
+    source_positions = transfer.source_positions_tensor
+    dest_positions = transfer.dest_positions_tensor
+    if source_positions is None or dest_positions is None:
+        raise ValueError("indexed SP exchange requires explicit CP transfer positions")
+    source_rows_per_tp = _ceil_div(
+        _source_count_for_rank(plan, transfer.source_rank), tp_size
+    )
+    dest_rows_per_tp = _ceil_div(
+        _dest_count_for_rank(plan, transfer.dest_rank), tp_size
+    )
+    if source_rows_per_tp <= 0 or dest_rows_per_tp <= 0:
+        return ()
+    source_tp = torch.div(source_positions, source_rows_per_tp, rounding_mode="floor")
+    dest_tp = torch.div(dest_positions, dest_rows_per_tp, rounding_mode="floor")
+    source_rank = (
+        transfer.source_rank * tp_size + source_tp
+        if rank_mode == "cp_major"
+        else source_tp * plan.cp_size + transfer.source_rank
+    )
+    dest_rank = (
+        transfer.dest_rank * tp_size + dest_tp
+        if rank_mode == "cp_major"
+        else dest_tp * plan.cp_size + transfer.dest_rank
+    )
+    keep = (source_rank == local_rank) | (dest_rank == local_rank)
+    if not bool(torch.any(keep).item()):
+        return ()
+    source_rank = source_rank[keep]
+    dest_rank = dest_rank[keep]
+    source_local_positions = (
+        source_positions[keep] - source_tp[keep] * source_rows_per_tp
+    )
+    dest_local_positions = dest_positions[keep] - dest_tp[keep] * dest_rows_per_tp
+    world_size = plan.cp_size * tp_size
+    keys = source_rank * world_size + dest_rank
+    transfers = []
+    for key in torch.unique(keys, sorted=True).detach().cpu().tolist():
+        key = int(key)
+        peer_source_rank = key // world_size
+        peer_dest_rank = key % world_size
+        peer_mask = keys == key
+        transfers.append(
+            _make_peer_transfer(
+                source_rank=peer_source_rank,
+                dest_rank=peer_dest_rank,
+                source_positions=source_local_positions[peer_mask],
+                dest_positions=dest_local_positions[peer_mask],
+                source_count=source_counts[peer_source_rank],
+                dest_count=dest_counts[peer_dest_rank],
+                device=device,
+            )
+        )
+    return tuple(transfers)
+
+
 def move_cp_exchange_plan_to_device(
     plan: GdnCpExchangePlan | None,
     device: torch.device | str,
@@ -426,10 +494,10 @@ def move_cp_exchange_plan_to_device(
                 source_rank=transfer.source_rank,
                 dest_rank=transfer.dest_rank,
                 token_count=transfer.token_count,
-                source_positions_tensor=_move_index_tensor_if_present(
+                source_positions_tensor=_move_optional_index_tensor(
                     transfer.source_positions_tensor, target
                 ),
-                dest_positions_tensor=_move_index_tensor_if_present(
+                dest_positions_tensor=_move_optional_index_tensor(
                     transfer.dest_positions_tensor, target
                 ),
             )
@@ -439,7 +507,7 @@ def move_cp_exchange_plan_to_device(
     )
 
 
-def _move_index_tensor_if_present(
+def _move_optional_index_tensor(
     tensor: Tensor | None, device: torch.device
 ) -> Tensor | None:
     if tensor is None or tensor.device == device:
@@ -447,12 +515,104 @@ def _move_index_tensor_if_present(
     return tensor.to(device=device)
 
 
-def send_split_sizes_for_rank(plan: GdnCpExchangePlan, rank: int) -> tuple[int, ...]:
-    _check_rank(plan, rank)
-    return tuple(
-        _transfer_token_count(_transfer(plan, source_rank=rank, dest_rank=dest_rank))
-        for dest_rank in range(plan.cp_size)
+def shard_cp_exchange_plan_for_sequence_parallel(
+    plan: GdnCpExchangePlan,
+    *,
+    cp_rank: int,
+    tp_rank: int,
+    tp_size: int,
+    tp_cp_rank: int,
+    device: torch.device | str | None,
+) -> GdnSpExchangePlan:
+    """Split one CP exchange plan into the local TPxCP sequence-parallel view.
+
+    The GDN planner stays CP-only. This adapter preserves the planner's existing
+    source/destination position tensors and only remaps them into local SP shards
+    for the actual boundary all-to-all.
+    """
+
+    if tp_size <= 1:
+        return GdnSpExchangePlan.model_construct(plan=plan, rank=cp_rank)
+    _check_rank(plan, cp_rank)
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    world_size = plan.cp_size * tp_size
+    rank_mode = _infer_tp_cp_rank_mode(
+        cp_rank=cp_rank,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        cp_size=plan.cp_size,
+        tp_cp_rank=tp_cp_rank,
     )
+    composite_rank = _composite_tp_cp_rank(
+        cp_rank, tp_rank, tp_size=tp_size, cp_size=plan.cp_size, mode=rank_mode
+    )
+    if composite_rank != tp_cp_rank:
+        raise ValueError(
+            "TPxCP rank mapping mismatch: inferred "
+            f"{composite_rank}, process group reports {tp_cp_rank}"
+        )
+
+    source_counts = _sp_counts_by_composite_rank(
+        plan.source_token_counts_by_rank,
+        tp_size=tp_size,
+        mode=rank_mode,
+    )
+    dest_counts = _sp_counts_by_composite_rank(
+        plan.dest_token_counts_by_rank,
+        tp_size=tp_size,
+        mode=rank_mode,
+    )
+    transfers: list[GdnCpPeerTransfer] = []
+    for transfer in plan.transfers:
+        if not _transfer_token_count(transfer):
+            continue
+        if _is_implicit_full_identity_transfer(
+            transfer,
+            source_count=_source_count_for_rank(plan, transfer.source_rank),
+            dest_count=_dest_count_for_rank(plan, transfer.dest_rank),
+        ):
+            transfers.extend(
+                _shard_implicit_identity_transfer_for_sequence_parallel(
+                    transfer,
+                    plan,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    local_rank=composite_rank,
+                    rank_mode=rank_mode,
+                    source_counts=source_counts,
+                    dest_counts=dest_counts,
+                    device=device,
+                )
+            )
+            continue
+        transfers.extend(
+            _shard_indexed_transfer_for_sequence_parallel(
+                transfer,
+                plan,
+                tp_size=tp_size,
+                local_rank=composite_rank,
+                rank_mode=rank_mode,
+                source_counts=source_counts,
+                dest_counts=dest_counts,
+                device=device,
+            )
+        )
+
+    # Force all sequence-parallel layout conversions through the same collective.
+    # A CP-local reorder can still move rows between TP ranks, and local CP plans do
+    # not contain enough global TP information for every rank to independently
+    # prove that no peer exchange is needed.
+    sp_plan = GdnCpExchangePlan.model_construct(
+        cp_size=world_size,
+        source_token_counts_by_rank=source_counts,
+        dest_token_counts_by_rank=dest_counts,
+        transfers=tuple(
+            sorted(transfers, key=lambda item: (item.source_rank, item.dest_rank))
+        ),
+        cross_rank_token_count_override=1,
+    )
+    return GdnSpExchangePlan.model_construct(plan=sp_plan, rank=composite_rank)
 
 
 def recv_split_sizes_for_rank(plan: GdnCpExchangePlan, rank: int) -> tuple[int, ...]:
@@ -686,9 +846,17 @@ def _exchange_rank_tensor_all_to_all_forward(
 ) -> Tensor:
     if plan.cross_rank_token_count == 0:
         return _exchange_rank_tensor_local(local_tensor, plan, rank=rank)
-    accumulate = _rank_recv_requires_accumulation(plan, rank)
+    write_positions = _rank_recv_write_positions(plan, rank)
+    accumulate = len(write_positions) != len(set(write_positions))
+    zero_init = accumulate or len(set(write_positions)) != _dest_count_for_rank(
+        plan, rank
+    )
     output = _init_rank_exchange_output(
-        local_tensor, plan, rank=rank, accumulate=accumulate
+        local_tensor,
+        plan,
+        rank=rank,
+        accumulate=accumulate,
+        zero_init=zero_init,
     )
     send_buffer = _pack_rank_cross_send_tensor(local_tensor, plan, source_rank=rank)
     send_buffer = send_buffer.contiguous()
@@ -727,18 +895,30 @@ def _exchange_rank_tensor_local(
     )
 
 
+def _copy_rank_self_transfers(
+    local_tensor: Tensor,
+    plan: GdnCpExchangePlan,
+    *,
+    rank: int,
+) -> Tensor:
+    return _init_rank_exchange_output(
+        local_tensor, plan, rank=rank, accumulate=False, zero_init=False
+    )
+
+
 def _init_rank_exchange_output(
     local_tensor: Tensor,
     plan: GdnCpExchangePlan,
     *,
     rank: int,
     accumulate: bool,
+    zero_init: bool,
 ) -> Tensor:
     dest_rows = _dest_count_for_rank(plan, rank)
     output_shape = (dest_rows, *local_tensor.shape[1:])
     output = (
         local_tensor.new_zeros(output_shape)
-        if accumulate
+        if zero_init
         else local_tensor.new_empty(output_shape)
     )
     transfer = _transfer(plan, source_rank=rank, dest_rank=rank)
@@ -826,14 +1006,14 @@ def _unpack_rank_cross_recv_tensor_into(
             output.index_copy_(0, dest_index, peer_rows)
 
 
-def _rank_recv_requires_accumulation(plan: GdnCpExchangePlan, rank: int) -> bool:
+def _rank_recv_write_positions(plan: GdnCpExchangePlan, rank: int) -> list[int]:
     positions: list[int] = []
     for source_rank in range(plan.cp_size):
         transfer = _transfer(plan, source_rank=source_rank, dest_rank=rank)
         if not _transfer_token_count(transfer):
             continue
         positions.extend(_transfer_dest_positions_for_duplicate_check(plan, transfer))
-    return len(positions) != len(set(positions))
+    return positions
 
 
 def _transfer_dest_positions_for_duplicate_check(

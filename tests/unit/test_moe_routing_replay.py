@@ -18,6 +18,7 @@ from art.megatron.routing_replay import (
     TopologyAwareLocalTokenIndexer,
     build_router_key_from_module_name,
 )
+from art.megatron.training.trace import _routing_replay_token_uid_sets
 
 
 def _make_route(
@@ -121,6 +122,15 @@ class _FakeParallelState:
 
     def get_tensor_model_parallel_rank(self) -> int:
         return self._tp_rank
+
+
+class _FakeGdnExecutionPlan:
+    attention_token_indices = (0, 1, 2, 3)
+    gdn_token_indices = (0, 2)
+
+
+class _FakeAttentionState:
+    gdn_execution_plan = _FakeGdnExecutionPlan()
 
 
 class _FakeRouterReplay:
@@ -242,6 +252,30 @@ def _expected_routing_map(route: RouterCallRoute) -> torch.Tensor:
     return routing_map
 
 
+def test_routing_replay_token_uid_sets_keep_full_attention_layout_with_gdn_plan() -> (
+    None
+):
+    token_uids = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int64)
+
+    token_uid_sets = _routing_replay_token_uid_sets(
+        token_uids,
+        attention_state=_FakeAttentionState(),
+    )
+    attention_token_uids = token_uid_sets["attention"]
+    gdn_token_uids = token_uid_sets["gdn"]
+
+    assert attention_token_uids is not None
+    assert torch.equal(
+        attention_token_uids,
+        torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64),
+    )
+    assert gdn_token_uids is not None
+    assert torch.equal(
+        gdn_token_uids,
+        torch.tensor([0, 2], dtype=torch.int64),
+    )
+
+
 def test_build_router_key_from_compiled_module_name() -> None:
     assert (
         build_router_key_from_module_name(
@@ -321,6 +355,7 @@ def test_controller_uses_native_router_replay_target_indices() -> None:
     controller.install_router_patches([chunk])
     controller.set_step(step_index=0, sample_index=[0])
     controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.arange(4, dtype=torch.int64))
     _probs, routing_map = router.routing(torch.randn((4, 3), dtype=torch.float32))
 
     expected_map = torch.zeros((4, 3), dtype=torch.bool)
@@ -328,6 +363,74 @@ def test_controller_uses_native_router_replay_target_indices() -> None:
     expected_map[rows, route.expert_indices.to(torch.long)] = True
     assert torch.equal(routing_map.cpu(), expected_map)
     _assert_target(replay, route.expert_indices)
+
+    controller.finalize_step()
+    controller.remove_router_patches()
+
+
+def test_controller_explicit_token_uids_refresh_native_router_replay() -> None:
+    bundle, route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.tensor([3, 1], dtype=torch.int64))
+    assert replay.targets_seen == []
+    _probs, routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+
+    expected_indices = route.expert_indices.index_select(
+        0, torch.tensor([3, 1], dtype=torch.long)
+    )
+    expected_map = torch.zeros((2, 3), dtype=torch.bool)
+    rows = torch.arange(2).unsqueeze(1)
+    expected_map[rows, expected_indices.to(torch.long)] = True
+    _assert_target(replay, expected_indices, index=0)
+    assert torch.equal(routing_map.cpu(), expected_map)
+
+    controller.finalize_step()
+    controller.remove_router_patches()
+
+
+def test_controller_switches_prestaged_layout_targets() -> None:
+    bundle, route = _make_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    controller.prepare_micro_targets(
+        {
+            "attention": torch.tensor([0, 1], dtype=torch.int64),
+            "gdn": torch.tensor([3, 1], dtype=torch.int64),
+        }
+    )
+    assert replay.targets_seen == []
+
+    _probs, attention_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+    controller.set_active_token_uid_key("gdn")
+    _probs, gdn_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
+
+    attention_indices = route.expert_indices.index_select(
+        0, torch.tensor([0, 1], dtype=torch.long)
+    )
+    gdn_indices = route.expert_indices.index_select(
+        0, torch.tensor([3, 1], dtype=torch.long)
+    )
+    _assert_target(replay, attention_indices, index=0)
+    _assert_target(replay, gdn_indices, index=1)
+    assert torch.equal(
+        attention_map.cpu(), _expected_routing_map(_make_route([[0, 2], [1, 0]]))
+    )
+    assert torch.equal(
+        gdn_map.cpu(), _expected_routing_map(_make_route([[1, 0], [1, 0]]))
+    )
 
     controller.finalize_step()
     controller.remove_router_patches()
@@ -353,11 +456,13 @@ def test_controller_reuses_route_for_recompute_with_same_active_micro() -> None:
     controller.set_step(step_index=0, sample_index=[0, 1])
 
     controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.arange(2, dtype=torch.int64))
     _probs, routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
     _probs, recompute_routing_map = router.routing(
         torch.randn((2, 3), dtype=torch.float32)
     )
     controller.begin_micro(1, 1)
+    controller.set_local_input_token_uids(torch.arange(2, dtype=torch.int64))
     _probs, next_routing_map = router.routing(torch.randn((2, 3), dtype=torch.float32))
 
     calls = bundle.steps[0].routers[bundle.router_keys[0]].calls

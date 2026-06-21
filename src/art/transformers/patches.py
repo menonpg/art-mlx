@@ -35,3 +35,30 @@ def _patched_preprocess_mask_arguments(
 
 def patch_preprocess_mask_arguments() -> None:
     masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments  # ty:ignore[invalid-assignment]
+
+
+def disable_broken_torchvision_for_transformers() -> None:
+    try:
+        import torchvision  # noqa: F401
+
+        return
+    except Exception:
+        import sys
+
+        for module_name in list(sys.modules):
+            if module_name == "torchvision" or module_name.startswith("torchvision."):
+                sys.modules.pop(module_name, None)
+
+    from transformers import utils as transformers_utils
+    from transformers.utils import import_utils
+
+    def _torchvision_unavailable() -> bool:
+        return False
+
+    for module in (import_utils, transformers_utils):
+        for name in ("is_torchvision_available", "is_torchvision_v2_available"):
+            original = getattr(module, name, None)
+            cache_clear = getattr(original, "cache_clear", None)
+            if callable(cache_clear):
+                cache_clear()
+            setattr(module, name, _torchvision_unavailable)

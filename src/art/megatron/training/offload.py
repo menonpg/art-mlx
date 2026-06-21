@@ -1,12 +1,21 @@
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-import gc
+import logging
 from typing import Any, Sequence, cast
 
 from megatron.core.distributed import DistributedDataParallel
 import torch
 
 from .model_chunks import unwrap_megatron_chunk
+
+logger = logging.getLogger(__name__)
+
+OFFLOADED_TRAINABLE_BUFFERS_MESSAGE = (
+    "Offloaded Megatron trainable param buffers to CPU"
+)
+RELOADED_TRAINABLE_BUFFERS_MESSAGE = "Reloaded Megatron trainable param buffers to GPU"
+OFFLOADED_FROZEN_PARAMS_MESSAGE = "Offloaded frozen model params to CPU"
+RELOADED_FROZEN_PARAMS_MESSAGE = "Reloaded frozen model params to GPU"
 
 
 @dataclass
@@ -36,6 +45,29 @@ def _iter_megatron_param_buffers(model: Sequence[torch.nn.Module]) -> Iterator[A
         yield from expert_buffers
 
 
+def _rank0_info(rank: int, message: str) -> None:
+    if rank == 0:
+        logger.info(message)
+
+
+def offload_trainable_buffers_to_cpu(
+    model: Sequence[torch.nn.Module],
+    rank: int,
+) -> None:
+    for param_buffer in _iter_megatron_param_buffers(model):
+        param_buffer.offload_to_cpu(move_params=True, move_grads=True)
+    _rank0_info(rank, OFFLOADED_TRAINABLE_BUFFERS_MESSAGE)
+
+
+def reload_trainable_buffers_to_gpu(
+    model: Sequence[torch.nn.Module],
+    rank: int,
+) -> None:
+    for param_buffer in _iter_megatron_param_buffers(model):
+        param_buffer.reload_from_cpu(move_params=True, move_grads=True)
+    _rank0_info(rank, RELOADED_TRAINABLE_BUFFERS_MESSAGE)
+
+
 def offload_to_cpu(
     model: Sequence[torch.nn.Module],
     rank: int,
@@ -46,8 +78,7 @@ def offload_to_cpu(
         return
     pinned_buffers = offload_state.pinned_buffers
 
-    for param_buffer in _iter_megatron_param_buffers(model):
-        param_buffer.offload_to_cpu(move_params=True, move_grads=True)
+    offload_trainable_buffers_to_cpu(model, rank)
 
     # Megatron remaps trainable params into contiguous DDP buffers. Offload those via the
     # native buffer APIs above, and only manually offload frozen params here.
@@ -72,11 +103,8 @@ def offload_to_cpu(
             param.data = pinned_buffers[key]
 
     torch.cuda.synchronize()
-    gc.collect()
-    torch.cuda.empty_cache()
     offload_state.is_offloaded = True
-    if rank == 0:
-        print("Offloaded model params to CPU")
+    _rank0_info(rank, OFFLOADED_FROZEN_PARAMS_MESSAGE)
 
 
 def reload_to_gpu(
@@ -94,8 +122,7 @@ def reload_to_gpu(
     else:
         device = torch.device(device)
 
-    for param_buffer in _iter_megatron_param_buffers(model):
-        param_buffer.reload_from_cpu(move_params=True, move_grads=True)
+    reload_trainable_buffers_to_gpu(model, rank)
 
     # Reload frozen params that were manually offloaded.
     for chunk in model:
@@ -112,5 +139,4 @@ def reload_to_gpu(
 
     torch.cuda.synchronize()
     offload_state.is_offloaded = False
-    if rank == 0:
-        print("Reloaded LoRA params to GPU")
+    _rank0_info(rank, RELOADED_FROZEN_PARAMS_MESSAGE)

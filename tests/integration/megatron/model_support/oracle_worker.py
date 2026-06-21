@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from types import MethodType
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import numpy as np
 import torch
@@ -24,6 +24,8 @@ from art.preprocessing.pack import PackedTensors
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
 from .forward_trace import ForwardTraceCapture
+from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
+from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
     SUPPORTED_SENSITIVITY_MUTATIONS,
     OracleCaseConfig,
@@ -40,10 +42,12 @@ from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
 
 _TOPOLOGY_ENV_VARS = {
     "tp": "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE",
+    "cp": "ART_MEGATRON_CONTEXT_PARALLEL_SIZE",
     "ep": "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE",
     "etp": "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
 }
 _ORACLE_DEBUG_ENV = "ART_ORACLE_DEBUG"
+_ATTACH_TOKEN_UIDS_ENV = "ART_MEGATRON_ATTACH_TOKEN_UIDS"
 _ORACLE_DEBUG_START_TIME = time.perf_counter()
 
 
@@ -110,8 +114,13 @@ def run_worker_subprocess(
                     f"\n=== {request.objective} {request.topology.slug()} ===\n"
                 )
                 live_log.flush()
-            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-            env["ART_DISABLE_MEGATRON_COMPILE"] = "1"
+            env = {
+                **os.environ,
+                "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
+                "PYTHONUNBUFFERED": "1",
+            }
+            if request.case_config.precision == "fp32":
+                env["NVIDIA_TF32_OVERRIDE"] = "0"
             run = subprocess.Popen(
                 command,
                 cwd=str(worker_cwd),
@@ -156,6 +165,7 @@ def _set_deterministic_seed(seed: int) -> None:
 def provider_topology_env_vars(topology: Topology) -> dict[str, str]:
     return {
         _TOPOLOGY_ENV_VARS["tp"]: str(topology.tp),
+        _TOPOLOGY_ENV_VARS["cp"]: str(topology.cp),
         _TOPOLOGY_ENV_VARS["ep"]: str(topology.ep),
         _TOPOLOGY_ENV_VARS["etp"]: str(topology.etp),
     }
@@ -177,7 +187,7 @@ def provider_topology_env(topology: Topology):
 
 def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
     """Merges rank-sharded LoRA tensors into a full state dict on rank 0."""
-    from art.megatron.weights.merge import merge_sharded_adapter_entries
+    from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
     entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = {}
     for rank_entry in shards_by_rank:
@@ -238,7 +248,7 @@ def _collect_lora_state(
                     raise RuntimeError(
                         f"Duplicate LoRA key while collecting state: {key}"
                     )
-                local_state[key] = value.detach().cpu()
+                local_state[key] = value.detach().cpu().contiguous()
     return _gather_full_state(local_state, local_manifest)
 
 
@@ -266,7 +276,7 @@ def _collect_lora_grads(
                     raise RuntimeError(
                         f"Duplicate LoRA grad key while collecting grads: {key}"
                     )
-                local_grads[key] = value.detach().cpu()
+                local_grads[key] = value.detach().cpu().contiguous()
     return _gather_full_state(local_grads, local_manifest)
 
 
@@ -349,6 +359,31 @@ def _build_deterministic_shared_init(
     return initialized
 
 
+def _stack_output_tensors(outputs: list[torch.Tensor]) -> torch.Tensor:
+    """Stacks micro outputs, padding the trailing sequence axis when lengths differ."""
+    if not outputs:
+        raise RuntimeError("Expected at least one output tensor to stack")
+    first = outputs[0]
+    if all(tensor.shape == first.shape for tensor in outputs[1:]):
+        return torch.stack(outputs, dim=0)
+    if any(tensor.ndim != first.ndim for tensor in outputs[1:]) or any(
+        tensor.shape[:-1] != first.shape[:-1] for tensor in outputs[1:]
+    ):
+        raise RuntimeError("Unable to stack output tensors with incompatible shapes")
+
+    max_last_dim = max(int(tensor.shape[-1]) for tensor in outputs)
+    padded_outputs: list[torch.Tensor] = []
+    for tensor in outputs:
+        if int(tensor.shape[-1]) == max_last_dim:
+            padded_outputs.append(tensor)
+            continue
+        pad_value = float("nan") if tensor.dtype.is_floating_point else 0
+        padded = tensor.new_full((*tensor.shape[:-1], max_last_dim), pad_value)
+        padded[..., : tensor.shape[-1]] = tensor
+        padded_outputs.append(padded)
+    return torch.stack(padded_outputs, dim=0)
+
+
 def _configure_provider(
     provider: Any,
     topology: Topology,
@@ -381,17 +416,18 @@ def _patch_finalize_provider_bundle_for_oracle(
 
     def _oracle_finalize_provider_bundle(provider_bundle: Any) -> Any:
         provider = provider_bundle.provider
+        from art.megatron.provider import _finalize_provider_with_art_overrides
+
         if case_config.precision == "fp32":
-            if case_config.is_moe:
-                provider.moe_token_dispatcher_type = "alltoall"
-                provider.moe_flex_dispatcher_backend = None
-                provider.moe_shared_expert_overlap = True
-                provider.overlap_moe_expert_parallel_comm = False
+            provider.moe_token_dispatcher_type = "alltoall"
+            provider.moe_flex_dispatcher_backend = None
+            provider.moe_enable_deepep = False
+            provider.moe_shared_expert_overlap = True
+            provider.overlap_moe_expert_parallel_comm = False
             provider.delay_wgrad_compute = False
             provider.ep_overlap_early_attn_memory_release = False
-            provider.finalize()
-            return provider_bundle
-        return original_finalize_provider_bundle(provider_bundle)
+        _finalize_provider_with_art_overrides(provider)
+        return provider_bundle
 
     megatron_train_module.finalize_provider_bundle = _oracle_finalize_provider_bundle
     try:
@@ -422,7 +458,6 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
             weight_decay=0.0,
             adam_eps=1e-13,
         )
-
     return OptimizerConfig(
         bf16=True,
         fp16=False,
@@ -443,12 +478,210 @@ def _configure_cuda_precision(case_config: OracleCaseConfig) -> None:
     torch.set_float32_matmul_precision("highest")
 
 
+@contextmanager
+def _apply_requested_flex_backend_patch(flex_backend: str | None):
+    if flex_backend is None:
+        yield
+        return
+
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
+
+    original_dense = compiled_flex_attention.dense_compiled_flex_attention
+    original_sparse = compiled_flex_attention.sparse_compiled_flex_attention
+    original_backend = compiled_flex_attention._FORCED_FLEX_BACKEND
+    original_kernel_options = compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS
+    if flex_backend == "FLASH":
+        patched_backend = "FLASH"
+        patched_kernel_options = cast(Any, {"BACKEND": "FLASH"})
+    elif flex_backend == "TRITON":
+        patched_backend = "TRITON"
+        patched_kernel_options = cast(Any, {"BACKEND": "TRITON"})
+    elif flex_backend in {
+        "TRITON_LEGACY",
+        "TRITON_LEGACY_INNER_FP32",
+        "TRITON_LEGACY_FULL_FP32",
+    }:
+        patched_backend = "TRITON"
+        patched_kernel_options = cast(Any, {"FORCE_USE_FLEX_ATTENTION": True})
+    else:
+        raise RuntimeError(f"Unsupported flex backend request: {flex_backend}")
+
+    compiled_flex_attention._FORCED_FLEX_BACKEND = patched_backend  # type: ignore[invalid-assignment]
+    compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS = patched_kernel_options
+    compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
+        compiled_flex_attention._forced_flex_attention_dense
+    )
+    compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
+        compiled_flex_attention._forced_flex_attention_sparse
+    )
+    try:
+        yield
+    finally:
+        compiled_flex_attention._FORCED_FLEX_BACKEND = original_backend
+        compiled_flex_attention._FORCED_FLEX_KERNEL_OPTIONS = original_kernel_options
+        compiled_flex_attention.dense_compiled_flex_attention = original_dense
+        compiled_flex_attention.sparse_compiled_flex_attention = original_sparse
+
+
+@contextmanager
+def _apply_test_flex_inner_fp32_patch(flex_backend: str | None):
+    if flex_backend != "TRITON_LEGACY_INNER_FP32":
+        yield
+        return
+
+    from torch.nn.attention.flex_attention import AuxRequest, flex_attention
+
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
+
+    original_dense = compiled_flex_attention.dense_compiled_flex_attention
+    original_sparse = compiled_flex_attention.sparse_compiled_flex_attention
+    legacy_kernel_options = cast(Any, {"FORCE_USE_FLEX_ATTENTION": True})
+
+    def _fp32_inner_call(
+        q,
+        k,
+        v,
+        *,
+        block_mask,
+        scale,
+        enable_gqa,
+        return_aux: AuxRequest | None = None,
+    ):
+        out = flex_attention(
+            q.float(),
+            k.float(),
+            v.float(),
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            kernel_options=legacy_kernel_options,
+            return_aux=return_aux,
+        )
+        if return_aux is None:
+            assert torch.is_tensor(out)
+            return out.to(dtype=q.dtype)
+        attn_out, aux = out
+        return attn_out.to(dtype=q.dtype), aux
+
+    compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
+        _fp32_inner_call
+    )
+    compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
+        _fp32_inner_call
+    )
+    try:
+        yield
+    finally:
+        compiled_flex_attention.dense_compiled_flex_attention = original_dense
+        compiled_flex_attention.sparse_compiled_flex_attention = original_sparse
+
+
+@contextmanager
+def _apply_test_attention_full_fp32_patch(flex_backend: str | None):
+    if flex_backend != "TRITON_LEGACY_FULL_FP32":
+        yield
+        return
+
+    from megatron.core.tensor_parallel.layers import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+    from megatron.core.transformer.attention import Attention
+    from torch.nn.attention.flex_attention import AuxRequest, flex_attention
+
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
+
+    original_dense = compiled_flex_attention.dense_compiled_flex_attention
+    original_sparse = compiled_flex_attention.sparse_compiled_flex_attention
+    original_column_forward_impl = ColumnParallelLinear._forward_impl
+    original_row_forward_impl = RowParallelLinear._forward_impl
+    original_attention_forward = Attention.forward
+    legacy_kernel_options = cast(Any, {"FORCE_USE_FLEX_ATTENTION": True})
+
+    def _fp32_inner_call(
+        q,
+        k,
+        v,
+        *,
+        block_mask,
+        scale,
+        enable_gqa,
+        return_aux: AuxRequest | None = None,
+    ):
+        out = flex_attention(
+            q.float(),
+            k.float(),
+            v.float(),
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            kernel_options=legacy_kernel_options,
+            return_aux=return_aux,
+        )
+        if return_aux is None:
+            return out
+        return out
+
+    def _column_forward_impl_fp32(self, input, weight, *args, **kwargs):
+        fp32_kwargs = dict(kwargs)
+        if fp32_kwargs.get("bias") is not None:
+            fp32_kwargs["bias"] = fp32_kwargs["bias"].float()
+        return original_column_forward_impl(
+            self, input.float(), weight.float(), *args, **fp32_kwargs
+        )
+
+    def _row_forward_impl_fp32(self, input, weight, *args, **kwargs):
+        fp32_kwargs = dict(kwargs)
+        if fp32_kwargs.get("bias") is not None:
+            fp32_kwargs["bias"] = fp32_kwargs["bias"].float()
+        return original_row_forward_impl(
+            self, input.float(), weight.float(), *args, **fp32_kwargs
+        )
+
+    def _attention_forward_fp32(self, hidden_states, *args, **kwargs):
+        output, bias = original_attention_forward(self, hidden_states, *args, **kwargs)
+        target_dtype = hidden_states.dtype
+        if torch.is_tensor(output):
+            output = output.to(dtype=target_dtype)
+        if torch.is_tensor(bias):
+            bias = bias.to(dtype=target_dtype)
+        return output, bias
+
+    compiled_flex_attention.dense_compiled_flex_attention = torch.compile(
+        _fp32_inner_call
+    )
+    compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
+        _fp32_inner_call
+    )
+    setattr(ColumnParallelLinear, "_forward_impl", _column_forward_impl_fp32)
+    setattr(RowParallelLinear, "_forward_impl", _row_forward_impl_fp32)
+    setattr(Attention, "forward", _attention_forward_fp32)
+    try:
+        yield
+    finally:
+        compiled_flex_attention.dense_compiled_flex_attention = original_dense
+        compiled_flex_attention.sparse_compiled_flex_attention = original_sparse
+        setattr(ColumnParallelLinear, "_forward_impl", original_column_forward_impl)
+        setattr(RowParallelLinear, "_forward_impl", original_row_forward_impl)
+        setattr(Attention, "forward", original_attention_forward)
+
+
 def _assert_runtime_configuration(
     model_chunks: list[Any],
     case_config: OracleCaseConfig,
+    topology: Topology,
 ) -> None:
-    """Validates runtime model depth equals requested oracle case config."""
+    """Validates runtime model depth/topology equals requested oracle config."""
     observed_num_layers: set[int] = set()
+    observed_context_parallel_sizes: set[int] = set()
+    gdn_layers = 0
+    standard_attention_layers = 0
+
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:  # pragma: no cover - optional dependency guard.
+        GatedDeltaNet = ()  # type: ignore[assignment]
+    from megatron.core.transformer.attention import SelfAttention
 
     for chunk in model_chunks:
         module: Any = chunk
@@ -457,11 +690,32 @@ def _assert_runtime_configuration(
         config = getattr(module, "config", None)
         if config is not None and hasattr(config, "num_layers"):
             observed_num_layers.add(int(config.num_layers))
+        if config is not None and hasattr(config, "context_parallel_size"):
+            observed_context_parallel_sizes.add(int(config.context_parallel_size))
+        for child in module.modules():
+            if GatedDeltaNet and isinstance(child, GatedDeltaNet):
+                gdn_layers += 1
+            if isinstance(child, SelfAttention):
+                standard_attention_layers += 1
 
     if observed_num_layers != {case_config.num_layers}:
         raise RuntimeError(
             "Runtime num_layers mismatch: "
             f"requested={case_config.num_layers}, observed={sorted(observed_num_layers)}"
+        )
+    if observed_context_parallel_sizes != {topology.cp}:
+        raise RuntimeError(
+            "Runtime context_parallel_size mismatch: "
+            f"requested={topology.cp}, observed={sorted(observed_context_parallel_sizes)}"
+        )
+    if "qwen3.5" not in case_config.base_model.lower():
+        return
+    if gdn_layers <= 0:
+        raise RuntimeError("Expected Qwen3.5 runtime to include GatedDeltaNet layers.")
+    if topology.cp > 1 and case_config.num_layers == 1 and standard_attention_layers:
+        raise RuntimeError(
+            "Expected one-layer Qwen3.5 CP oracle to skip standard self-attention, "
+            f"found {standard_attention_layers} SelfAttention layer(s)."
         )
 
 
@@ -635,6 +889,173 @@ def _apply_o_proj_forward_mutation(
 
 
 @contextmanager
+def _apply_attention_async_comm_mutation(mutation: SensitivityMutation | None):
+    if mutation != "attn_kv_fetch_pack_on_comm_stream":
+        yield
+        return
+
+    from art.megatron.context_parallel import comm
+
+    original = comm.A2AVCommunicator.launch_kv_fetch
+    comm_delay_cycles = 80_000_000
+
+    def _mutated_launch_kv_fetch(
+        self: Any,
+        *,
+        k_local: torch.Tensor,
+        v_local: torch.Tensor,
+        plan: Any,
+        group: Any,
+        async_op: bool,
+        range_meta_cache: dict[Any, Any] | None = None,
+        label: str = "kv_fetch",
+        input_layout: str = "token_major",
+        output_layout: str = "head_major",
+    ):
+        if group is None or comm._DIST.get_world_size(group) == 1:
+            return original(
+                self,
+                k_local=k_local,
+                v_local=v_local,
+                plan=plan,
+                group=group,
+                async_op=async_op,
+                range_meta_cache=range_meta_cache,
+                label=label,
+                input_layout=input_layout,
+                output_layout=output_layout,
+            )
+
+        total_send_rows = int(sum(plan.send_splits))
+        total_recv_rows = int(sum(plan.recv_splits))
+        recv_packed = k_local.new_empty(
+            comm._packed_peer_tensor_shape(
+                tensor=k_local,
+                total_rows=total_recv_rows,
+                input_layout=input_layout,
+            )
+        )
+        input_split_sizes = [split * 2 for split in plan.send_splits]
+        output_split_sizes = [split * 2 for split in plan.recv_splits]
+        stream = self._get_stream(k_local) if async_op else None
+        if stream is None:
+            return original(
+                self,
+                k_local=k_local,
+                v_local=v_local,
+                plan=plan,
+                group=group,
+                async_op=async_op,
+                range_meta_cache=range_meta_cache,
+                label=label,
+                input_layout=input_layout,
+                output_layout=output_layout,
+            )
+        current_stream = torch.cuda.current_stream(k_local.device)
+        if total_send_rows > 0:
+            stream.wait_stream(current_stream)
+        with torch.cuda.stream(stream):
+            if total_send_rows <= 0:
+                send_buffer = k_local.new_empty(
+                    comm._packed_peer_tensor_shape(
+                        tensor=k_local,
+                        total_rows=0,
+                        input_layout=input_layout,
+                    )
+                )
+            else:
+                send_buffer = comm._pack_gathered_tensors_per_peer(
+                    left_tensor=k_local,
+                    right_tensor=v_local,
+                    ranges_by_peer=plan.send_ranges_by_peer,
+                    range_meta_cache=range_meta_cache,
+                    input_layout=input_layout,
+                )
+            if total_send_rows > 0:
+                torch.cuda._sleep(comm_delay_cycles)
+            handle = comm._launch_peer_exchange(
+                recv_buffer=recv_packed,
+                send_buffer=send_buffer,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+                async_op=True,
+            )
+        if total_send_rows > 0 and send_buffer.numel() > 0:
+            send_buffer.zero_()
+        return comm.KvFetchWork(
+            packed_buffer=recv_packed,
+            recv_splits=plan.recv_splits,
+            handle=handle,
+            send_buffer=send_buffer,
+            stream=stream,
+            label=label,
+            output_layout=output_layout,
+        )
+
+    comm.A2AVCommunicator.launch_kv_fetch = _mutated_launch_kv_fetch  # type: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        comm.A2AVCommunicator.launch_kv_fetch = original
+
+
+@contextmanager
+def _apply_attention_nested_grad_mutation(mutation: SensitivityMutation | None):
+    if mutation != "attn_skip_nested_grad_sanitize":
+        yield
+        return
+
+    from art.megatron.context_parallel import executor
+
+    original = executor._sanitize_nested_stage_input_grad
+    shared_scratch: dict[tuple[int | None, torch.dtype], torch.Tensor] = {}
+
+    def _mutated_sanitize(grad: torch.Tensor | None) -> torch.Tensor | None:
+        if grad is None:
+            return None
+        key = (grad.device.index, grad.dtype)
+        flat = shared_scratch.get(key)
+        needed = int(grad.numel())
+        if flat is None or flat.numel() < needed:
+            flat = torch.empty(needed, device=grad.device, dtype=grad.dtype)
+            shared_scratch[key] = flat
+        view = flat[:needed].view_as(grad)
+        view.copy_(grad)
+        return view
+
+    executor._sanitize_nested_stage_input_grad = _mutated_sanitize  # type: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        executor._sanitize_nested_stage_input_grad = original
+
+
+@contextmanager
+def _apply_attention_lse_normalize_mutation(mutation: SensitivityMutation | None):
+    if mutation != "attn_skip_flash_lse_normalize":
+        yield
+        return
+
+    from art.megatron.context_parallel import executor
+    import art.megatron.flex_attn.compiled as compiled_flex_attention
+
+    original_compiled = compiled_flex_attention.normalize_flex_lse
+    original_executor = executor.normalize_flex_lse
+
+    def _identity(lse: torch.Tensor) -> torch.Tensor:
+        return lse
+
+    compiled_flex_attention.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
+    executor.normalize_flex_lse = _identity  # type: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        compiled_flex_attention.normalize_flex_lse = original_compiled
+        executor.normalize_flex_lse = original_executor
+
+
+@contextmanager
 def _patch_lora_for_fp32(
     model_chunks: list[Any],
     optimizer: Any,
@@ -738,6 +1159,11 @@ def _mutation_hook(
     )
 
     known_mutations = {None, *SUPPORTED_SENSITIVITY_MUTATIONS}
+    known_mutations |= {
+        "attn_kv_fetch_pack_on_comm_stream",
+        "attn_skip_nested_grad_sanitize",
+        "attn_skip_flash_lse_normalize",
+    }
     if mutation not in known_mutations:
         raise ValueError(f"Unsupported mutation: {mutation}")
 
@@ -853,6 +1279,9 @@ def _mutation_hook(
     with ExitStack() as stack:
         stack.enter_context(_apply_o_proj_forward_mutation(model_chunks, mutation))
         stack.enter_context(_apply_grad_sync_skip_mutation(model_chunks, mutation))
+        stack.enter_context(_apply_attention_async_comm_mutation(mutation))
+        stack.enter_context(_apply_attention_nested_grad_mutation(mutation))
+        stack.enter_context(_apply_attention_lse_normalize_mutation(mutation))
         try:
             yield
         finally:
@@ -872,11 +1301,13 @@ def _mutation_hook(
 
 def _worker_run(request: WorkerRunRequest) -> None:
     """Executes one full distributed training trace generation worker run."""
+    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
     from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
     import torch
 
     from art import dev, types
     from art.megatron import train as megatron_train
+    from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -885,6 +1316,21 @@ def _worker_run(request: WorkerRunRequest) -> None:
     _enable_debug_traceback_dump()
     _set_deterministic_seed(request.case_config.seed)
     _configure_cuda_precision(request.case_config)
+    flex_patch_stack = ExitStack()
+    flex_patch_stack.enter_context(
+        _apply_requested_flex_backend_patch(request.flex_backend)
+    )
+    flex_patch_stack.enter_context(
+        _apply_test_flex_inner_fp32_patch(request.flex_backend)
+    )
+    flex_patch_stack.enter_context(
+        _apply_test_attention_full_fp32_patch(request.flex_backend)
+    )
+    if request.case_config.precision == "fp32":
+        install_megatron_qwen35_gdn_fp32_reference(
+            flex_patch_stack,
+            base_model=request.case_config.base_model,
+        )
 
     with provider_topology_env(request.topology):
         _debug(
@@ -894,13 +1340,14 @@ def _worker_run(request: WorkerRunRequest) -> None:
         with _patch_finalize_provider_bundle_for_oracle(
             megatron_train, request.case_config
         ):
+            provider_torch_dtype = (
+                torch.float32
+                if request.case_config.precision == "fp32"
+                else torch.bfloat16
+            )
             runtime = megatron_train.build_training_runtime(
                 model_identifier=request.case_config.base_model,
-                provider_torch_dtype=(
-                    torch.float32
-                    if request.case_config.precision == "fp32"
-                    else torch.bfloat16
-                ),
+                provider_torch_dtype=provider_torch_dtype,
                 provider_configure=lambda provider: _configure_provider(
                     provider, request.topology, request.case_config
                 ),
@@ -913,8 +1360,17 @@ def _worker_run(request: WorkerRunRequest) -> None:
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
     optimizer = runtime.optimizer
-    assert optimizer is not None
-    _assert_runtime_configuration(model_chunks, request.case_config)
+    _assert_runtime_configuration(model_chunks, request.case_config, request.topology)
+    weight_offload = WeightOffloadManager.from_config(
+        model=model_chunks,
+        rank=torch.distributed.get_rank(),  # ty: ignore[possibly-missing-attribute]
+        compile_enabled=runtime.transformer_layers_compiled,
+        offload_between_jobs=request.offload_between_jobs,
+        streaming_config=request.streaming_weight_offload,
+    )
+    weight_offload.install()
+    weight_offload.after_job()
+    weight_offload.before_job()
 
     topology_dir = Path(request.topology_dir)
     traces_dir = topology_dir / "traces"
@@ -923,27 +1379,35 @@ def _worker_run(request: WorkerRunRequest) -> None:
     # setup the shared initial lora
     shared_init_path = Path(request.shared_init_adapter_path)
     if not shared_init_path.exists():
+        _debug("collecting initial lora state")
         initial_state = _collect_lora_state(model_chunks)
         if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+            _debug("building deterministic initial lora state")
             shared_init_path.parent.mkdir(parents=True, exist_ok=True)
             deterministic_init = _build_deterministic_shared_init(
                 _require_not_none(initial_state, "initial_state"),
                 seed=request.case_config.seed,
             )
+            _debug("saving deterministic initial lora state")
             save_file(
                 deterministic_init,
                 str(shared_init_path),
             )
+    _debug("waiting for shared initial lora state")
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
     # load the shared initial lora into the model and validate we can collect it from the model
+    _debug("loading shared initial lora state")
     adapter_model = load_file(str(shared_init_path))
     megatron_train.load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+        _debug("validating loaded lora state")
         _validate_loaded_state_matches_adapter(
             _require_not_none(loaded_state, "loaded_state"), adapter_model
         )
+    _debug("waiting after loaded lora validation")
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
     # load the inputs
@@ -974,29 +1438,31 @@ def _worker_run(request: WorkerRunRequest) -> None:
     experimental_config: dev.TrainConfig = {}
     step_traces: list[StepTrace] = []
     captured_grads: dict[str, Any] | None = None
-    routing_replay_controller = runtime.moe_routing_replay_controller
-    install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
     forward_trace_capture = ForwardTraceCapture(
         model_chunks,
         enabled=True,
-        strict_output_match=request.mutation is None,
     )
+    install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
 
     def _capture_lora_grads() -> None:
         nonlocal captured_grads
         captured_grads = _collect_lora_grads(model_chunks)
 
-    with (
-        _mutation_hook(
-            megatron_train,
-            model_chunks,
-            request.mutation,
-            request.topology,
-            pre_optimizer_step_hook=_capture_lora_grads,
-            loss_scale=request.case_config.loss_scale,
-        ),
-        _patch_lora_for_fp32(model_chunks, optimizer),
-    ):
+    with ExitStack() as training_stack:
+        training_stack.enter_context(install_gdn_trace_token_uid_hooks())
+        training_stack.enter_context(
+            _mutation_hook(
+                megatron_train,
+                model_chunks,
+                request.mutation,
+                request.topology,
+                pre_optimizer_step_hook=_capture_lora_grads,
+                loss_scale=request.case_config.loss_scale,
+            )
+        )
+        if request.use_fp32_lora_reference:
+            training_stack.enter_context(_patch_lora_for_fp32(model_chunks, optimizer))
+
         _debug("starting training loop")
         for step_index in range(request.case_config.num_steps):
             micro_sample_indices = megatron_train.build_micro_sample_indices(
@@ -1015,6 +1481,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 )
                 step_result = megatron_train.run_training_step(
                     model_chunks=model_chunks,
+                    provider=runtime.provider,
                     model_support_handler=runtime.model_support_handler,
                     optimizer=optimizer,
                     learning_rate=train_config.learning_rate,
@@ -1034,6 +1501,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 )
                 step_result = megatron_train.run_megatron_sft_step(
                     model_chunks=model_chunks,
+                    provider=runtime.provider,
                     model_support_handler=runtime.model_support_handler,
                     optimizer=optimizer,
                     learning_rate=train_config.learning_rate,
@@ -1044,7 +1512,17 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 )
             _debug(f"finished step_index={step_index}")
-            ordered_micro_outputs = forward_trace_capture.ordered_step_outputs()
+            print(f"finished step_index={step_index}", flush=True)
+            ordered_step_outputs = (
+                forward_trace_capture.ordered_step_outputs_with_sample_indices()
+            )
+            if ordered_step_outputs is None:
+                ordered_micro_sample_indices = None
+                ordered_micro_outputs = None
+            else:
+                ordered_micro_sample_indices, ordered_micro_outputs = (
+                    ordered_step_outputs
+                )
             forward_trace_capture.save_current_step(traces_dir)
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
             current_lora_state = _collect_lora_state(model_chunks)
@@ -1080,7 +1558,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     raise RuntimeError("Expected at least one captured micro output")
 
                 torch.save(
-                    torch.stack(ordered_outputs, dim=0),
+                    _stack_output_tensors(
+                        [(-output).contiguous() for output in ordered_outputs]
+                    ),
                     topology_dir / output_rel,
                 )
                 save_file(grads, str(topology_dir / grads_rel))
@@ -1095,6 +1575,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
                             / request.case_config.loss_scale
                         ),
                         probs_corr=step_result.probs_corr,
+                        micro_sample_indices=list(
+                            ordered_micro_sample_indices
+                            if ordered_micro_sample_indices is not None
+                            else micro_sample_indices
+                        ),
                         output_file=str(output_rel),
                         grads_file=str(grads_rel),
                         deltas_file=str(deltas_rel),
@@ -1122,6 +1607,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
         # build and save the run manifest
         manifest = RunManifest(
+            git=request.git,
             case_id=request.case_id,
             objective=request.objective,
             base_model=request.case_config.base_model,
@@ -1131,17 +1617,26 @@ def _worker_run(request: WorkerRunRequest) -> None:
             seed=request.case_config.seed,
             num_steps=request.case_config.num_steps,
             packed_tensors=request.packed_tensors,
+            offload_between_jobs=request.offload_between_jobs,
+            streaming_weight_offload=request.streaming_weight_offload,
+            use_fp32_lora_reference=request.use_fp32_lora_reference,
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
+    weight_offload.after_job()
     torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+    flex_patch_stack.close()
     torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
 
 
 def run_worker_cli(run_request_path: Path) -> None:
     """Loads a worker request and dispatches worker execution."""
     request = WorkerRunRequest.model_validate(_read_json(run_request_path))
-    _worker_run(request)
+    try:
+        _worker_run(request)
+    finally:
+        if _oracle_debug_enabled():
+            faulthandler.cancel_dump_traceback_later()
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
