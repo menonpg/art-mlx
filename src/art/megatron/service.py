@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import gc
 import importlib
 import json
 import os
@@ -855,10 +854,6 @@ class MegatronService:
         self._validate_megatron_dependencies()
         # Shared-GPU Megatron must start after vLLM has released GPU memory.
         await self._sleep_runtime()
-        for _ in range(3):
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         await self._ensure_megatron_running(megatron_topology=megatron_topology)
 
         lora_path = self._resolve_training_lora_path()
