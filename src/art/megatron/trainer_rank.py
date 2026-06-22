@@ -338,7 +338,9 @@ class _PushedSlot:
         traceback: object,
     ) -> bool:
         if not self.trainer._slot_stack or self.trainer._slot_stack[-1] != self.ref:
-            raise RuntimeError("Pushed LoRA/checkpoint stack changed before context exit")
+            raise RuntimeError(
+                "Pushed LoRA/checkpoint stack changed before context exit"
+            )
         self.trainer.pop_pushed_lora_or_checkpoint()
         return False
 
@@ -473,7 +475,9 @@ class TrainerRank:
         *,
         alpha: float | None = None,
     ) -> int:
-        return self._load_slot("lora", name, adapter_model, trainable=False, alpha=alpha)
+        return self._load_slot(
+            "lora", name, adapter_model, trainable=False, alpha=alpha
+        )
 
     def _load_slot(
         self,
@@ -500,7 +504,9 @@ class TrainerRank:
         self._default_slot_ref = ref
 
     @staticmethod
-    def _slot_ref(kind: Literal["checkpoint", "lora"], name: str | None) -> "LoRASlotRef":
+    def _slot_ref(
+        kind: Literal["checkpoint", "lora"], name: str | None
+    ) -> "LoRASlotRef":
         from art.megatron.lora import LoRASlotRef
 
         return LoRASlotRef(kind=kind, name=name)

@@ -32,8 +32,12 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         )
         ref_a = LoRASlotRef("checkpoint", "A")
         ref_b = LoRASlotRef("checkpoint", "B")
-        lora.load_lora_slot(ref_a, _adapter("dense", rank=1, seed=1), requires_grad=True)
-        lora.load_lora_slot(ref_b, _adapter("dense", rank=4, seed=2), requires_grad=True)
+        lora.load_lora_slot(
+            ref_a, _adapter("dense", rank=1, seed=1), requires_grad=True
+        )
+        lora.load_lora_slot(
+            ref_b, _adapter("dense", rank=4, seed=2), requires_grad=True
+        )
 
         x = torch.randn(7, 4, device=device)
         with use_lora_slot(LoRASlotRef("checkpoint", None)):
@@ -65,7 +69,9 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
         _assert_checkpoint_recomputes_with(ref_a, ref_b, lora, torch_checkpoint)
-        _assert_checkpoint_recomputes_with(ref_a, ref_b, lora, megatron_checkpoint, False)
+        _assert_checkpoint_recomputes_with(
+            ref_a, ref_b, lora, megatron_checkpoint, False
+        )
         _assert_step_updates_only(ref_a, ref_b, lora, trainer)
 
 
