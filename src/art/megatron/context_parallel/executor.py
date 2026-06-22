@@ -19,7 +19,7 @@ from art.megatron.flex_attn.compiled import (
     sparse_compiled_flex_attention,
 )
 
-from .block_mask import build_block_mask
+from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
 from .range_ops import (
     range_gather_head_major,
@@ -684,7 +684,14 @@ def _build_stage_block_mask(
         raise RuntimeError(
             f"Stage {stage_plan.stage_index} is missing exact mask metadata"
         )
-    mask = build_block_mask(
+    block_mask_context = state.execution_cache.block_mask_context
+    if block_mask_context is None:
+        block_mask_context = prepare_block_mask_context(
+            group_ids=state.group_ids,
+            parent_ids=state.parent_ids,
+        )
+        state.execution_cache.block_mask_context = block_mask_context
+    mask = build_block_mask_from_context(
         FlexMaskSpec(
             q_len=int(execution_spec.q_len),
             k_len=int(execution_spec.k_len),
@@ -692,9 +699,9 @@ def _build_stage_block_mask(
             slices=stage_plan.slices,
             exact_mask=mask_metadata.model_dump(mode="python"),
         ),
-        group_ids=state.group_ids,
-        parent_ids=state.parent_ids,
+        context=block_mask_context,
         device=device,
+        validate=False,
     )
     cache[cache_key] = mask
     return mask

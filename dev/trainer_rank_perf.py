@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 import json
 import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -42,6 +43,10 @@ def main(
     tree_depth: int = 3,
     tree_seed: int = 1,
     tree_duplicate_factor: int = 1,
+    adapter_slots: int = 0,
+    adapter_slot_mode: str = "family",
+    adapter_slot_rank: int = 1,
+    output_jsonl: str = "",
 ) -> None:
     os.environ.setdefault("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
     os.environ.setdefault("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "1")
@@ -71,6 +76,18 @@ def main(
             head_chunk_tokens=head_chunk_tokens,
             shared_prefix_max_depth=shared_prefix_max_depth,
         )
+        if adapter_slots < 0:
+            raise ValueError("adapter_slots must be >= 0")
+        if adapter_slot_rank < 1:
+            raise ValueError("adapter_slot_rank must be >= 1")
+        if adapter_slots:
+            loaded_sites = _load_adapter_slots(
+                rank,
+                count=adapter_slots,
+                slot_rank=adapter_slot_rank,
+            )
+        else:
+            loaded_sites = 0
         hidden_size, vocab_size, dtype_size = _runtime_output_shape(runtime)
         model_config = getattr(_language_model(runtime.model[0]), "config", None)
 
@@ -137,6 +154,16 @@ def main(
             tree_depth=tree_depth,
             tree_seed=tree_seed,
             tree_duplicate_factor=tree_duplicate_factor,
+        )
+        requests = _route_adapter_slots(
+            requests,
+            adapter_slots=adapter_slots,
+            mode=adapter_slot_mode,
+        )
+        multi_target_requests = _route_adapter_slots(
+            multi_target_requests,
+            adapter_slots=adapter_slots,
+            mode=adapter_slot_mode,
         )
         stats_items = [rank._forward_item(request) for request in requests]
         stats_batch = _pack_forward_items(
@@ -488,53 +515,58 @@ def main(
 
         if dist.get_rank() == 0:
             token_rates = _rate_metrics(results, rate_units)
-            print(
-                json.dumps(
-                    {
-                        "world": dist.get_world_size(),
-                        "tp": int(ps.get_tensor_model_parallel_world_size()),
-                        "cp": int(ps.get_context_parallel_world_size()),
-                        "seq_len": seq_len,
-                        "prefix_families": prefix_families,
-                        "prefix_len": prefix_len,
-                        "mid_prefixes_per_family": mid_prefixes_per_family,
-                        "mid_prefix_len": mid_prefix_len,
-                        "branches_per_prefix": branches_per_prefix,
-                        "completion_len": completion_len,
-                        "head_chunk_tokens": head_chunk_tokens,
-                        "shared_prefix_max_depth": shared_prefix_max_depth,
-                        "warmup": warmup,
-                        "repeat": repeat,
-                        "target_count": target_count,
-                        "top_k": top_k,
-                        "top_k_values": top_k_values,
-                        "max_unpacked_output_gb": max_unpacked_output_gb,
-                        "mask_prefix_targets": mask_prefix_targets,
-                        "workload": workload,
-                        "tree_depth": tree_depth,
-                        "tree_seed": tree_seed,
-                        "tree_duplicate_factor": tree_duplicate_factor,
-                        "mtp_num_layers": getattr(model_config, "mtp_num_layers", None),
-                        "cross_entropy_loss_fusion": getattr(
-                            model_config, "cross_entropy_loss_fusion", None
-                        ),
-                        "cross_entropy_fusion_impl": getattr(
-                            model_config, "cross_entropy_fusion_impl", None
-                        ),
-                        **request_stats,
-                        "peak_memory_gb": round(
-                            torch.cuda.max_memory_allocated() / 1024**3,
-                            3,
-                        ),
-                        **results,
-                        **token_rates,
-                        **metadata,
-                        **planner_metadata,
-                    },
-                    sort_keys=True,
+            payload = {
+                "world": dist.get_world_size(),
+                "tp": int(ps.get_tensor_model_parallel_world_size()),
+                "cp": int(ps.get_context_parallel_world_size()),
+                "seq_len": seq_len,
+                "prefix_families": prefix_families,
+                "prefix_len": prefix_len,
+                "mid_prefixes_per_family": mid_prefixes_per_family,
+                "mid_prefix_len": mid_prefix_len,
+                "branches_per_prefix": branches_per_prefix,
+                "completion_len": completion_len,
+                "head_chunk_tokens": head_chunk_tokens,
+                "shared_prefix_max_depth": shared_prefix_max_depth,
+                "warmup": warmup,
+                "repeat": repeat,
+                "target_count": target_count,
+                "top_k": top_k,
+                "top_k_values": top_k_values,
+                "max_unpacked_output_gb": max_unpacked_output_gb,
+                "mask_prefix_targets": mask_prefix_targets,
+                "workload": workload,
+                "tree_depth": tree_depth,
+                "tree_seed": tree_seed,
+                "tree_duplicate_factor": tree_duplicate_factor,
+                "adapter_slots": adapter_slots,
+                "adapter_slot_mode": adapter_slot_mode,
+                "adapter_slot_rank": adapter_slot_rank,
+                "adapter_loaded_sites": loaded_sites,
+                "mtp_num_layers": getattr(model_config, "mtp_num_layers", None),
+                "cross_entropy_loss_fusion": getattr(
+                    model_config, "cross_entropy_loss_fusion", None
                 ),
-                flush=True,
-            )
+                "cross_entropy_fusion_impl": getattr(
+                    model_config, "cross_entropy_fusion_impl", None
+                ),
+                **request_stats,
+                "peak_memory_gb": round(
+                    torch.cuda.max_memory_allocated() / 1024**3,
+                    3,
+                ),
+                **results,
+                **token_rates,
+                **metadata,
+                **planner_metadata,
+            }
+            line = json.dumps(payload, sort_keys=True)
+            print(line, flush=True)
+            if output_jsonl:
+                output_path = Path(output_jsonl)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("a", encoding="utf-8") as output_file:
+                    output_file.write(line + "\n")
         dist.barrier()
     finally:
         if dist.is_initialized():
@@ -619,6 +651,116 @@ def _requests(
             "workload_shape": workload_shape,
         },
     )
+
+
+def _load_adapter_slots(
+    rank: TrainerRank,
+    *,
+    count: int,
+    slot_rank: int,
+) -> int:
+    loaded_sites = 0
+    for slot_index in range(count):
+        loaded_sites += rank.load_checkpoint_slot(
+            f"S{slot_index}",
+            _synthetic_adapter(
+                rank.runtime.model, slot_rank=slot_rank, seed=slot_index
+            ),
+        )
+    return loaded_sites
+
+
+def _synthetic_adapter(
+    model: Sequence[torch.nn.Module],
+    *,
+    slot_rank: int,
+    seed: int,
+) -> dict[str, torch.Tensor]:
+    from art.megatron.lora import LoRA
+
+    adapter: dict[str, torch.Tensor] = {}
+    generator = torch.Generator(device="cuda").manual_seed(10_000 + seed)
+    for chunk in model:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA):
+                continue
+            a_keys = module._expected_weight_keys("lora_A")
+            b_keys = module._expected_weight_keys("lora_B")
+            for a_key, b_key in zip(a_keys, b_keys, strict=True):
+                adapter[a_key] = (
+                    torch.randn(
+                        slot_rank,
+                        module.in_features,
+                        dtype=module.A_T.dtype,
+                        device=module.A_T.device,
+                        generator=generator,
+                    )
+                    * 0.01
+                )
+                adapter[b_key] = (
+                    torch.randn(
+                        module.out_features,
+                        slot_rank,
+                        dtype=module.B_T.dtype,
+                        device=module.B_T.device,
+                        generator=generator,
+                    )
+                    * 0.01
+                )
+    if not adapter:
+        raise RuntimeError("adapter slot stress requested, but model has no LoRA sites")
+    return adapter
+
+
+def _route_adapter_slots(
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    adapter_slots: int,
+    mode: str,
+) -> list[
+    ForwardInput[
+        torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+    ]
+]:
+    if adapter_slots == 0:
+        return list(requests)
+    if mode not in {"family", "round_robin", "single"}:
+        raise ValueError(
+            "adapter_slot_mode must be one of: family, round_robin, single"
+        )
+    return [
+        ForwardInput(
+            input_tokens=request.input_tokens,
+            target_tokens=request.target_tokens,
+            top_k=request.top_k,
+            logits=request.logits,
+            hidden_states=request.hidden_states,
+            checkpoint=f"S{_adapter_slot_index(index, request, adapter_slots, mode)}",
+        )
+        for index, request in enumerate(requests)
+    ]
+
+
+def _adapter_slot_index(
+    index: int,
+    request: ForwardInput[
+        torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+    ],
+    adapter_slots: int,
+    mode: str,
+) -> int:
+    if mode == "single":
+        return 0
+    if mode == "round_robin":
+        return index % adapter_slots
+    first_token = (
+        int(request.input_tokens[0].item()) if request.input_tokens.numel() else 0
+    )
+    return (first_token // 10_000_019) % adapter_slots
 
 
 def _workload_sequences(

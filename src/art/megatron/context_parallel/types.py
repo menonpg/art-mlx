@@ -223,6 +223,7 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
 class ContextParallelExecutionCache(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    block_mask_context: Any | None = None
     block_masks: dict[Any, Any] = Field(default_factory=dict)
     range_indices: dict[Any, torch.Tensor] = Field(default_factory=dict)
     range_meta: dict[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = Field(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 from torch.nn.attention.flex_attention import BlockMask
@@ -10,6 +12,16 @@ from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 from .types import AttnMaskKind, FlexMaskSpec
 
 _INVALID_GROUP_INDEX = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedBlockMaskContext:
+    group_ids: torch.Tensor
+    parent_ids: torch.Tensor
+    group_ids_np: np.ndarray
+    sorted_group_ids: np.ndarray
+    group_can_attend: np.ndarray
+    max_depth: int
 
 
 def _build_exact_mask_mod(
@@ -54,10 +66,18 @@ def _dense_blocks_to_ordered(
     *,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    counts = torch.from_numpy(blocks.sum(axis=-1).astype(np.int32))
-    indices = torch.from_numpy(
-        np.argsort(-blocks.astype(np.int32), axis=-1, kind="stable").astype(np.int32)
-    )
+    row_indices, column_indices = np.nonzero(blocks)
+    counts_np = np.bincount(row_indices, minlength=blocks.shape[0]).astype(np.int32)
+    indices_np = np.zeros(blocks.shape, dtype=np.int32)
+    if int(row_indices.size) > 0:
+        starts = np.concatenate(([0], np.cumsum(counts_np[:-1], dtype=np.int64)))
+        active_rows = np.flatnonzero(counts_np)
+        for row_index in active_rows:
+            start = int(starts[row_index])
+            end = start + int(counts_np[row_index])
+            indices_np[row_index, : end - start] = column_indices[start:end]
+    counts = torch.from_numpy(counts_np)
+    indices = torch.from_numpy(indices_np)
     return (
         counts.view(1, 1, -1).to(device=device),
         indices.view(1, 1, blocks.shape[0], blocks.shape[1]).to(device=device),
@@ -111,12 +131,45 @@ def _remap_group_values(
     return remapped
 
 
+def _promote_exact_full_blocks(
+    *,
+    partial_blocks: np.ndarray,
+    full_blocks: np.ndarray,
+    q_abs: np.ndarray,
+    k_abs: np.ndarray,
+    q_group_index: np.ndarray,
+    k_group_index: np.ndarray,
+    group_can_attend: np.ndarray,
+    q_block: int,
+    k_block: int,
+    q_len: int,
+    k_len: int,
+) -> None:
+    for q_block_index, k_block_index in np.argwhere(partial_blocks):
+        q_start = int(q_block_index) * q_block
+        k_start = int(k_block_index) * k_block
+        q_end = q_start + q_block
+        k_end = k_start + k_block
+        if q_end > q_len or k_end > k_len:
+            continue
+
+        q_slice = slice(q_start, q_end)
+        k_slice = slice(k_start, k_end)
+        can_attend = group_can_attend[
+            q_group_index[q_slice, None],
+            k_group_index[None, k_slice],
+        ]
+        causal = q_abs[q_slice, None] >= k_abs[None, k_slice]
+        if bool(np.all(causal & can_attend)):
+            partial_blocks[q_block_index, k_block_index] = False
+            full_blocks[q_block_index, k_block_index] = True
+
+
 def _build_sparse_block_mask(
     spec: FlexMaskSpec,
     *,
     device: torch.device,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
+    context: PreparedBlockMaskContext,
     block_size: tuple[int, int],
 ) -> BlockMask:
     q_block, k_block = block_size
@@ -136,43 +189,30 @@ def _build_sparse_block_mask(
     k_abs = k_abs_tensor.numpy()
     q_abs_sorted = _is_strictly_increasing(q_abs[q_abs >= 0])
     k_abs_sorted = _is_strictly_increasing(k_abs[k_abs >= 0])
-    flat_group_ids = group_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
-    flat_parent_ids = (
-        parent_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
-    )
-    flat_group_ids_np = flat_group_ids.numpy()
-    flat_parent_ids_np = flat_parent_ids.numpy()
     q_group = _select_with_invalid_np(
-        flat_group_ids_np,
+        context.group_ids_np,
         q_abs,
         invalid_value=-1,
     )
     k_group = _select_with_invalid_np(
-        flat_group_ids_np,
+        context.group_ids_np,
         k_abs,
         invalid_value=-1,
     )
-    row_tree = parse_shared_prefix_row(
-        group_ids=flat_group_ids,
-        parent_ids=flat_parent_ids,
-    )
-    group_ids_for_matrix, group_can_attend_values = row_tree.group_can_attend_matrix()
-    sorted_group_ids = np.asarray(group_ids_for_matrix, dtype=np.int64)
-    group_can_attend = np.asarray(group_can_attend_values, dtype=bool)
     q_group_index = _remap_group_values(
         q_group,
-        sorted_group_ids=sorted_group_ids,
+        sorted_group_ids=context.sorted_group_ids,
     )
     k_group_index = _remap_group_values(
         k_group,
-        sorted_group_ids=sorted_group_ids,
+        sorted_group_ids=context.sorted_group_ids,
     )
     mask_mod = _build_exact_mask_mod(
         q_abs=q_abs,
         k_abs=k_abs,
         q_group_index=q_group_index,
         k_group_index=k_group_index,
-        group_can_attend=group_can_attend,
+        group_can_attend=context.group_can_attend,
         device=device,
     )
     if not spec.slices:
@@ -198,15 +238,11 @@ def _build_sparse_block_mask(
         if int(q_block_indices.size) == 0 or int(k_block_indices.size) == 0:
             continue
         q_block_start = q_block_indices * q_block
-        q_block_end = np.minimum(
-            (q_block_indices + 1) * q_block,
-            int(spec.q_len),
-        )
+        q_block_end_raw = (q_block_indices + 1) * q_block
+        q_block_end = np.minimum(q_block_end_raw, int(spec.q_len))
         k_block_start = k_block_indices * k_block
-        k_block_end = np.minimum(
-            (k_block_indices + 1) * k_block,
-            int(spec.k_len),
-        )
+        k_block_end_raw = (k_block_indices + 1) * k_block
+        k_block_end = np.minimum(k_block_end_raw, int(spec.k_len))
         q_overlap_start = np.maximum(
             q_block_start,
             q_start,
@@ -233,8 +269,12 @@ def _build_sparse_block_mask(
             if k_abs_sorted
             else _block_min_max(k_abs, k_overlap_start, k_overlap_end)
         )
-        q_is_full = (q_overlap_start == q_block_start) & (q_overlap_end == q_block_end)
-        k_is_full = (k_overlap_start == k_block_start) & (k_overlap_end == k_block_end)
+        q_is_full = (q_overlap_start == q_block_start) & (
+            q_overlap_end == q_block_end_raw
+        )
+        k_is_full = (k_overlap_start == k_block_start) & (
+            k_overlap_end == k_block_end_raw
+        )
         covers_block = q_is_full[:, None] & k_is_full[None, :]
         if slice_.mask_kind == AttnMaskKind.FULL:
             has_any = np.ones(
@@ -250,10 +290,21 @@ def _build_sparse_block_mask(
         partial_blocks[q_slice, k_slice] |= has_any
         full_blocks[q_slice, k_slice] |= is_full
 
-    # Overlapping tree slices are left as partial blocks. The block-level program
-    # only decides which blocks to visit; `mask_mod` above is the exact authority.
-
     partial_blocks &= ~full_blocks
+    if context.max_depth > 1:
+        _promote_exact_full_blocks(
+            partial_blocks=partial_blocks,
+            full_blocks=full_blocks,
+            q_abs=q_abs,
+            k_abs=k_abs,
+            q_group_index=q_group_index,
+            k_group_index=k_group_index,
+            group_can_attend=context.group_can_attend,
+            q_block=q_block,
+            k_block=k_block,
+            q_len=int(spec.q_len),
+            k_len=int(spec.k_len),
+        )
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
         device=device,
@@ -282,6 +333,38 @@ def _build_sparse_block_mask(
         full_q_indices=full_q_indices,
         BLOCK_SIZE=block_size,
         mask_mod=mask_mod,
+    )
+
+
+def prepare_block_mask_context(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+) -> PreparedBlockMaskContext:
+    if group_ids.ndim != 1 or parent_ids.ndim != 1:
+        raise RuntimeError(
+            "Shared-prefix sparse block masks require rank-1 group_ids and parent_ids."
+        )
+    if int(group_ids.numel()) != int(parent_ids.numel()):
+        raise RuntimeError(
+            "Shared-prefix sparse block masks require equal group_ids and parent_ids lengths."
+        )
+    flat_group_ids = group_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    flat_parent_ids = (
+        parent_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    )
+    row_tree = parse_shared_prefix_row(
+        group_ids=flat_group_ids,
+        parent_ids=flat_parent_ids,
+    )
+    group_ids_for_matrix, group_can_attend_values = row_tree.group_can_attend_matrix()
+    return PreparedBlockMaskContext(
+        group_ids=flat_group_ids,
+        parent_ids=flat_parent_ids,
+        group_ids_np=flat_group_ids.numpy(),
+        sorted_group_ids=np.asarray(group_ids_for_matrix, dtype=np.int64),
+        group_can_attend=np.asarray(group_can_attend_values, dtype=bool),
+        max_depth=int(row_tree.max_depth),
     )
 
 
@@ -375,6 +458,23 @@ def build_block_mask(
     parent_ids: torch.Tensor,
     device: torch.device,
 ) -> BlockMask | None:
+    return build_block_mask_from_context(
+        spec,
+        context=prepare_block_mask_context(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+        ),
+        device=device,
+    )
+
+
+def build_block_mask_from_context(
+    spec: FlexMaskSpec,
+    *,
+    context: PreparedBlockMaskContext,
+    device: torch.device,
+    validate: bool = True,
+) -> BlockMask | None:
     if spec.q_len <= 0 or spec.k_len <= 0:
         return None
     if int(spec.exact_mask.q_token_indices.numel()) != int(spec.q_len):
@@ -387,12 +487,16 @@ def build_block_mask(
             "Exact stage k-token metadata length mismatch: "
             f"{int(spec.exact_mask.k_token_indices.numel())} != {int(spec.k_len)}"
         )
-    _validate_supported_mask_spec(spec, group_ids=group_ids, parent_ids=parent_ids)
+    if validate:
+        _validate_supported_mask_spec(
+            spec,
+            group_ids=context.group_ids,
+            parent_ids=context.parent_ids,
+        )
     block_size = normalize_sparse_block_size(spec.block_size)
     return _build_sparse_block_mask(
         spec,
         device=device,
-        group_ids=group_ids,
-        parent_ids=parent_ids,
+        context=context,
         block_size=block_size,
     )

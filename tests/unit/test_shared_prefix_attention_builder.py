@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import create_block_mask as torch_block_mask
 
 pytest.importorskip("megatron.core.packed_seq_params")
 
@@ -113,6 +114,77 @@ def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
     assert actual.equal(build_dense_reference_mask(row_spec=row))
 
 
+@pytest.mark.parametrize(
+    ("name", "pack"),
+    (
+        (
+            "no-sharing",
+            pack_shared_prefixes(
+                (
+                    torch.tensor([1, 2, 3]),
+                    torch.tensor([4, 5]),
+                    torch.tensor([6, 7, 8, 9]),
+                ),
+                max_depth=0,
+            ),
+        ),
+        (
+            "depth-one",
+            pack_shared_prefixes(
+                (
+                    torch.tensor([1, 2, 3, 4]),
+                    torch.tensor([1, 2, 3, 5]),
+                    torch.tensor([1, 2, 6]),
+                ),
+                max_depth=1,
+            ),
+        ),
+        (
+            "depth-three",
+            pack_shared_prefixes(
+                (
+                    torch.tensor([1, 2, 3, 4, 8]),
+                    torch.tensor([1, 2, 3, 4, 9]),
+                    torch.tensor([1, 2, 3, 5]),
+                    torch.tensor([1, 6]),
+                ),
+                max_depth=3,
+            ),
+        ),
+    ),
+)
+def test_sparse_block_mask_matches_torch_block_metadata(
+    name: str,
+    pack: SharedPrefixPack,
+) -> None:
+    del name
+    spec = build_shared_prefix_attention_spec(
+        group_ids=pack.group_ids,
+        parent_ids=pack.parent_ids,
+    )
+    row = spec.rows[0]
+    token_indices = torch.arange(row.valid_tokens, dtype=torch.long)
+    block_mask = build_block_mask(
+        FlexMaskSpec(
+            q_len=row.valid_tokens,
+            k_len=row.valid_tokens,
+            block_size=(2, 2),
+            slices=row.slices,
+            exact_mask=ExactMaskMetadata(
+                q_token_indices=token_indices,
+                k_token_indices=token_indices,
+                cache_key="torch-parity",
+            ),
+        ),
+        group_ids=pack.group_ids[0],
+        parent_ids=pack.parent_ids[0],
+        device=torch.device("cpu"),
+    )
+
+    assert block_mask is not None
+    _assert_matches_torch_block_mask(block_mask)
+
+
 def test_shared_prefix_state_builds_batched_block_mask() -> None:
     group_ids = torch.tensor(
         [
@@ -156,6 +228,7 @@ def test_shared_prefix_state_builds_batched_block_mask() -> None:
             :valid_tokens,
             :valid_tokens,
         ].equal(build_dense_reference_mask(row_spec=row_spec))
+    _assert_matches_torch_block_mask(state.block_mask, batch_size=2)
 
 
 def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
@@ -249,6 +322,7 @@ def _assert_context_parallel_stage_masks_match_dense(
 
             assert actual.equal(expected)
             assert _effective_block_mask(block_mask).equal(expected)
+            _assert_matches_torch_block_mask(block_mask)
             checked_stages += 1
             checked_remote_stages += int(not stage.is_local_stage)
 
@@ -355,6 +429,67 @@ def test_sparse_block_mask_supports_non_monotonic_remote_k_indices() -> None:
     )
 
     assert actual.equal(q_token_indices[:, None] >= k_token_indices[None, :])
+    _assert_matches_torch_block_mask(block_mask)
+
+
+def _assert_matches_torch_block_mask(
+    block_mask: BlockMask,
+    *,
+    batch_size: int = 1,
+) -> None:
+    q_len, k_len = block_mask.seq_lengths
+    reference = torch_block_mask(
+        block_mask.mask_mod,
+        B=batch_size,
+        H=1,
+        Q_LEN=q_len,
+        KV_LEN=k_len,
+        device="cpu",
+        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+    )
+    assert _effective_block_mask(block_mask).equal(_effective_block_mask(reference))
+    for counts_name, indices_name in (
+        ("kv_num_blocks", "kv_indices"),
+        ("full_kv_num_blocks", "full_kv_indices"),
+        ("q_num_blocks", "q_indices"),
+        ("full_q_num_blocks", "full_q_indices"),
+    ):
+        assert _block_entries(block_mask, counts_name, indices_name) == _block_entries(
+            reference,
+            counts_name,
+            indices_name,
+        )
+
+
+def _block_entries(
+    block_mask: BlockMask,
+    counts_name: str,
+    indices_name: str,
+) -> set[tuple[int, int, int, int]]:
+    counts = getattr(block_mask, counts_name)
+    indices = getattr(block_mask, indices_name)
+    if counts is None or indices is None:
+        return set()
+    entries = set()
+    for batch_index in range(int(counts.shape[0])):
+        for head_index in range(int(counts.shape[1])):
+            for block_index in range(int(counts.shape[2])):
+                block_count = int(counts[batch_index, head_index, block_index])
+                for other_block in indices[
+                    batch_index,
+                    head_index,
+                    block_index,
+                    :block_count,
+                ].tolist():
+                    entries.add(
+                        (
+                            batch_index,
+                            head_index,
+                            block_index,
+                            int(other_block),
+                        )
+                    )
+    return entries
 
 
 def _branching_prefix_inputs() -> tuple[torch.Tensor, torch.Tensor]:
