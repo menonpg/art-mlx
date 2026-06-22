@@ -28,6 +28,8 @@ def _iter_named_trainable_parameters(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            if getattr(param, "_art_dynamic_lora_slot", False):
+                continue
             param_id = id(param)
             if param_id in seen:
                 continue

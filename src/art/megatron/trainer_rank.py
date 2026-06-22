@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, MutableMapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from typing import TYPE_CHECKING, Generic, Literal, ParamSpec, TypeVar, cast, overload
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
         ArtContextParallelState,
         ParallelTopology,
     )
+    from art.megatron.lora import LoRASlotRef
     from art.megatron.model_support import ModelSupportHandler
     from art.megatron.shared_prefix_state import SharedPrefixAttentionState
     from art.megatron.train import TrainingRuntime
@@ -51,6 +53,15 @@ R = TypeVar("R")
 _COMPILED_FUNCTIONS: dict[Callable[..., object], Callable[..., object]] = {}
 
 
+class _Unset:
+    def __repr__(self) -> str:
+        return "Unset"
+
+
+Unset = _Unset()
+type AdapterSelection = str | None | _Unset
+
+
 @dataclass(frozen=True)
 class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     target_logprobs: LogprobsT
@@ -68,14 +79,20 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int | None = None,
         logits: bool = False,
         hidden_states: bool = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> None:
         if top_k is not None and top_k < 1:
             raise ValueError("top_k must be >= 1")
+        if checkpoint is not Unset and lora is not Unset:
+            raise ValueError("ForwardInput cannot set both checkpoint and lora")
         self.input_tokens = input_tokens
         self.target_tokens = target_tokens
         self.top_k = top_k
         self.logits = logits
         self.hidden_states = hidden_states
+        self.checkpoint = checkpoint
+        self.lora = lora
 
     @overload
     def __new__(
@@ -253,6 +270,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, torch.Tensor]": ...
 
+    @overload
     def __new__(
         cls,
         *,
@@ -261,6 +279,20 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int | None = None,
         logits: bool = False,
         hidden_states: bool = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
+    ) -> "AnyForwardInput": ...
+
+    def __new__(
+        cls,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor | None = None,
+        top_k: int | None = None,
+        logits: bool = False,
+        hidden_states: bool = False,
+        checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "AnyForwardInput":
         return super().__new__(cls)
 
@@ -289,6 +321,26 @@ class MicroBatch(Generic[ForwardInputsT]):
 
     def select(self, xs: Sequence[T]) -> Sequence[T]:
         return [xs[i] for i in self.indices]
+
+
+@dataclass(frozen=True)
+class _PushedSlot:
+    trainer: "TrainerRank"
+    ref: "LoRASlotRef"
+
+    def __enter__(self) -> "_PushedSlot":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        if not self.trainer._slot_stack or self.trainer._slot_stack[-1] != self.ref:
+            raise RuntimeError("Pushed LoRA/checkpoint stack changed before context exit")
+        self.trainer.pop_pushed_lora_or_checkpoint()
+        return False
 
 
 @dataclass(frozen=True)
@@ -350,6 +402,10 @@ class TrainerRank:
         self.head_chunk_tokens = head_chunk_tokens
         self.shared_prefix_max_depth = shared_prefix_max_depth
         self.device = next(runtime.model[0].parameters()).device
+        self._default_slot_ref: LoRASlotRef | None = None
+        self._slot_stack: list[LoRASlotRef] = []
+        self._dynamic_optimizers: dict[str, torch.optim.Optimizer] = {}
+        self._checkpoint_slot_names: set[str] = set()
         self.zero_grad()
 
     def zero_grad(self) -> None:
@@ -360,6 +416,9 @@ class TrainerRank:
         optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
         if optimizer is not None:
             optimizer.zero_grad()
+        for name in self._checkpoint_slot_names:
+            for param in self._checkpoint_slot_params(name):
+                param.grad = None
 
     def _optimizer(self) -> "MegatronOptimizer":
         optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
@@ -372,6 +431,106 @@ class TrainerRank:
 
     def _provider(self) -> "GPTModelProvider":
         return cast("GPTModelProvider", self.runtime.provider)
+
+    def set_checkpoint(self, name: str | None) -> None:
+        self._set_default_slot(self._slot_ref("checkpoint", name))
+
+    def set_lora(self, name: str | None) -> None:
+        self._set_default_slot(self._slot_ref("lora", name))
+
+    def push_checkpoint(self, name: str | None) -> _PushedSlot:
+        ref = self._slot_ref("checkpoint", name)
+        self._slot_stack.append(ref)
+        return _PushedSlot(self, ref)
+
+    def push_lora(self, name: str | None) -> _PushedSlot:
+        ref = self._slot_ref("lora", name)
+        self._slot_stack.append(ref)
+        return _PushedSlot(self, ref)
+
+    def pop_pushed_lora_or_checkpoint(self) -> None:
+        if not self._slot_stack:
+            raise RuntimeError("No pushed LoRA or checkpoint to pop")
+        self._slot_stack.pop()
+
+    def load_checkpoint_slot(
+        self,
+        name: str,
+        adapter_model: dict[str, torch.Tensor],
+        *,
+        alpha: float | None = None,
+    ) -> int:
+        loaded = self._load_slot(
+            "checkpoint", name, adapter_model, trainable=True, alpha=alpha
+        )
+        self._checkpoint_slot_names.add(name)
+        return loaded
+
+    def load_lora_slot(
+        self,
+        name: str,
+        adapter_model: dict[str, torch.Tensor],
+        *,
+        alpha: float | None = None,
+    ) -> int:
+        return self._load_slot("lora", name, adapter_model, trainable=False, alpha=alpha)
+
+    def _load_slot(
+        self,
+        kind: Literal["checkpoint", "lora"],
+        name: str,
+        adapter_model: dict[str, torch.Tensor],
+        *,
+        trainable: bool,
+        alpha: float | None,
+    ) -> int:
+        from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
+
+        return load_lora_slot_into_model(
+            self.runtime.model,
+            self._slot_ref(kind, name),
+            adapter_model,
+            alpha=LORA_ALPHA if alpha is None else alpha,
+            requires_grad=trainable,
+        )
+
+    def _set_default_slot(self, ref: "LoRASlotRef") -> None:
+        if self._slot_stack:
+            raise RuntimeError("Cannot set a LoRA/checkpoint while a slot is pushed")
+        self._default_slot_ref = ref
+
+    @staticmethod
+    def _slot_ref(kind: Literal["checkpoint", "lora"], name: str | None) -> "LoRASlotRef":
+        from art.megatron.lora import LoRASlotRef
+
+        return LoRASlotRef(kind=kind, name=name)
+
+    def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
+        if request.checkpoint is not Unset:
+            return self._slot_ref("checkpoint", cast(str | None, request.checkpoint))
+        if request.lora is not Unset:
+            return self._slot_ref("lora", cast(str | None, request.lora))
+        if self._slot_stack:
+            return self._slot_stack[-1]
+        return self._default_slot_ref
+
+    def _set_current_slot(self, ref: "LoRASlotRef | None") -> object:
+        from art.megatron.lora import set_lora_slot_context
+
+        return set_lora_slot_context(ref)
+
+    def _reset_current_slot(self, token: object) -> None:
+        from art.megatron.lora import reset_lora_slot_context
+
+        reset_lora_slot_context(token)  # type: ignore[arg-type]
+
+    @contextmanager
+    def _use_slot(self, ref: "LoRASlotRef | None") -> Iterator[None]:
+        token = self._set_current_slot(ref)
+        try:
+            yield
+        finally:
+            self._reset_current_slot(token)
 
     def micro_batches(
         self,
@@ -456,7 +615,16 @@ class TrainerRank:
         *,
         params: AdamParams,
         scale_grads: float = 1.0,
+        checkpoints: Sequence[str] | None = None,
     ) -> dict[str, float]:
+        selected_checkpoints = self._selected_dynamic_checkpoints(checkpoints)
+        if selected_checkpoints:
+            return self._dynamic_optim_step(
+                selected_checkpoints,
+                params=params,
+                scale_grads=scale_grads,
+            )
+
         from art.megatron.training.finalize_grads import (
             finalize_model_grads_extended,
             flush_param_grads_to_main_grads,
@@ -481,6 +649,128 @@ class TrainerRank:
             "num_zeros_in_grad": float(num_zeros or 0),
         }
 
+    def _selected_dynamic_checkpoints(
+        self,
+        checkpoints: Sequence[str] | None,
+    ) -> tuple[str, ...]:
+        if checkpoints is not None:
+            unknown = set(checkpoints) - self._checkpoint_slot_names
+            if unknown:
+                raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
+            return tuple(dict.fromkeys(checkpoints))
+        names = []
+        for name in sorted(self._checkpoint_slot_names):
+            local_has_grad = any(
+                param.grad is not None for param in self._checkpoint_slot_params(name)
+            )
+            has_grad = torch.tensor(
+                int(local_has_grad),
+                device=self.device,
+                dtype=torch.int32,
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(has_grad, op=dist.ReduceOp.MAX)
+            if bool(has_grad.item()):
+                names.append(name)
+        return tuple(names)
+
+    def _dynamic_optim_step(
+        self,
+        checkpoint_names: Sequence[str],
+        *,
+        params: AdamParams,
+        scale_grads: float,
+    ) -> dict[str, float]:
+        all_params: list[torch.nn.Parameter] = []
+        for name in checkpoint_names:
+            slot_params = self._checkpoint_slot_params(name)
+            self._ensure_dynamic_grads(slot_params)
+            self._reduce_dynamic_grads(slot_params)
+            if scale_grads != 1.0:
+                for param in slot_params:
+                    if param.grad is not None:
+                        param.grad.mul_(scale_grads)
+            all_params.extend(slot_params)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            all_params,
+            max_norm=params.grad_clip_norm,
+        )
+        for name in checkpoint_names:
+            optimizer = self._dynamic_optimizer(name, params)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        return {
+            "learning_rate": float(params.learning_rate),
+            "grad_norm": float(grad_norm),
+            "update_successful": 1.0,
+            "num_zeros_in_grad": 0.0,
+        }
+
+    def _dynamic_optimizer(
+        self,
+        name: str,
+        params: AdamParams,
+    ) -> torch.optim.Optimizer:
+        optimizer = self._dynamic_optimizers.get(name)
+        if optimizer is None:
+            optimizer = torch.optim.AdamW(
+                self._checkpoint_slot_params(name),
+                lr=params.learning_rate,
+                betas=(params.beta1, params.beta2),
+                weight_decay=params.weight_decay,
+            )
+            self._dynamic_optimizers[name] = optimizer
+            return optimizer
+        for group in optimizer.param_groups:
+            group["lr"] = params.learning_rate
+            group["betas"] = (params.beta1, params.beta2)
+            group["weight_decay"] = params.weight_decay
+        return optimizer
+
+    def _checkpoint_slot_params(self, name: str) -> list[torch.nn.Parameter]:
+        from art.megatron.lora import iter_lora_slot_parameters
+
+        return list(
+            iter_lora_slot_parameters(
+                self.runtime.model,
+                self._slot_ref("checkpoint", name),
+            )
+        )
+
+    @staticmethod
+    def _ensure_dynamic_grads(params: Sequence[torch.nn.Parameter]) -> None:
+        for param in params:
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+
+    def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
+        from megatron.core import parallel_state as ps
+
+        for param in params:
+            grad = param.grad
+            if grad is None:
+                continue
+            if bool(getattr(param, "allreduce", True)):
+                group = ps.get_data_parallel_group(with_context_parallel=True)
+            else:
+                group = ps.get_expert_data_parallel_group()
+            if group is not None and group.size() > 1:
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+
+            op = getattr(param, "grad_sync_op", "none")
+            if op == "none":
+                continue
+            domain = getattr(param, "grad_sync_domain", "tp_default")
+            if domain == "expert_tp":
+                tp_group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+            else:
+                tp_group = ps.get_tensor_model_parallel_group(check_initialized=False)
+            if tp_group is None or tp_group.size() <= 1:
+                continue
+            reduce_op = dist.ReduceOp.AVG if op == "avg" else dist.ReduceOp.SUM
+            dist.all_reduce(grad, op=reduce_op, group=tp_group)
+
     def _forward_flat(
         self, requests: Sequence[AnyForwardInput]
     ) -> list[AnyForwardOutput]:
@@ -504,12 +794,18 @@ class TrainerRank:
         if not active_indices:
             return outputs
 
-        items = [self._forward_item(requests[index]) for index in active_indices]
-        packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
-        prepared = self._prepare_packed_forward(packed)
-        item_outputs = self._forward_packed(items, prepared)
-        for index, output in zip(active_indices, item_outputs, strict=True):
-            outputs[index] = output
+        groups: dict[LoRASlotRef | None, list[int]] = {}
+        for index in active_indices:
+            groups.setdefault(self._resolve_slot_ref(requests[index]), []).append(index)
+
+        for slot_ref, group_indices in groups.items():
+            items = [self._forward_item(requests[index]) for index in group_indices]
+            packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
+            with self._use_slot(slot_ref):
+                prepared = self._prepare_packed_forward(packed)
+                item_outputs = self._forward_packed(items, prepared)
+            for index, output in zip(group_indices, item_outputs, strict=True):
+                outputs[index] = output
         return outputs
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
