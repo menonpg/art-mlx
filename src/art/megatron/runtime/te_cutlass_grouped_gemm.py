@@ -121,7 +121,9 @@ def _te_cutlass_grouped_gemm_fallback_reason(
     use_bias: bool,
 ) -> str | None:
     torch = _torch()
-    # Keep this in sync with TE's Hopper CUTLASS grouped-GEMM selector.
+    # Keep this in sync with TE's validated CUTLASS grouped-GEMM selector. ART
+    # currently supports the TE 2.11 SM90/Hopper path; SM100/Blackwell support
+    # should come from an upgraded Transformer Engine build using this same API.
     if not A or not B or not out:
         return "A, B, and out must all be non-empty"
     if len(layout) < 2:

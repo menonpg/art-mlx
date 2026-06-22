@@ -362,6 +362,23 @@ def _apply_art_training_runtime_prepare_defaults(provider: GPTModelProvider) -> 
     _apply_default_parallel_topology(provider)
 
 
+def _enforce_art_moe_grouped_gemm_fast_path(provider: GPTModelProvider) -> None:
+    if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:
+        return
+    # ART's MoE path relies on TE CUTLASS grouped GEMM. TE's cuBLAS grouped
+    # fallback builds a cache keyed by routed shapes and warms up slowly as
+    # routing changes; the CUTLASS grouped path uses explicit problem
+    # descriptors and does not have that cache-convergence issue. Keep grouped
+    # bias/activation epilogues off here so handlers do not accidentally leave
+    # the fast path.
+    #
+    # Current validation is for SM90/Hopper. SM100/Blackwell enablement should
+    # come from upgrading Transformer Engine's grouped-GEMM implementation,
+    # while ART keeps this same central fast-path contract.
+    provider.add_bias_linear = False
+    provider.bias_activation_fusion = False
+
+
 def _apply_art_training_runtime_finalize_defaults(
     provider: GPTModelProvider,
     runtime_env: _ProviderRuntimeEnv | None = None,
@@ -554,6 +571,7 @@ def prepare_provider_bundle(
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     _install_art_training_flex_attention(provider)
     bundle.handler.patch_provider(provider, bundle.bridge)
+    _enforce_art_moe_grouped_gemm_fast_path(provider)
     return bundle
 
 
@@ -561,6 +579,7 @@ def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
     provider = cast(GPTModelProvider, provider_bundle.provider)
     _apply_art_training_runtime_finalize_defaults(provider, runtime_env)
+    _enforce_art_moe_grouped_gemm_fast_path(provider)
     _finalize_provider_with_art_overrides(provider)
     _normalize_recompute_settings(provider)
     return provider_bundle

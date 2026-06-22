@@ -19,6 +19,9 @@ def configure_megatron_runtime_env() -> None:
         os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # The currently validated ART MoE grouped-GEMM runtime is SM90. Future
+    # SM100 support should come from the TE grouped-GEMM implementation, not
+    # ART-side kernel special casing.
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
     _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
     _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
