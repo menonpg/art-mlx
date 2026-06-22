@@ -669,14 +669,12 @@ def _build_stage_block_mask(
         if execution_spec is None
         else execution_spec
     )
-    cache_key = (
-        int(stage_plan.stage_index),
-        int(execution_spec.q_len),
-        int(execution_spec.k_len),
-        resolved_block_size,
-        None if sliding_window is None else int(sliding_window),
-        device.type,
-        device.index,
+    cache_key = _stage_block_mask_cache_key(
+        stage_plan=stage_plan,
+        execution_spec=execution_spec,
+        block_size=resolved_block_size,
+        sliding_window=sliding_window,
+        device=device,
     )
     cache = state.execution_cache.block_masks
     cached = cache.get(cache_key)
@@ -707,6 +705,61 @@ def _build_stage_block_mask(
     )
     cache[cache_key] = mask
     return mask
+
+
+def _get_prepared_stage_block_mask(
+    *,
+    stage_plan: StagePlan,
+    state: ArtContextParallelState,
+    device: torch.device,
+    execution_spec: StageExecutionSpec,
+    block_size: SparseBlockSize,
+    sliding_window: int | None,
+) -> BlockMask:
+    cache_key = _stage_block_mask_cache_key(
+        stage_plan=stage_plan,
+        execution_spec=execution_spec,
+        block_size=normalize_sparse_block_size(block_size),
+        sliding_window=sliding_window,
+        device=device,
+    )
+    cache = state.execution_cache.block_masks
+    if cache_key not in cache:
+        raise RuntimeError(
+            "ART context parallel forward hit an unprepared stage block-mask cache key. "
+            "Mask construction is CPU planning work and must finish before model forward. "
+            f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
+            f"k_len={int(execution_spec.k_len)} "
+            f"block_size={normalize_sparse_block_size(block_size)} "
+            f"sliding_window={sliding_window} device={device}"
+        )
+    block_mask = cache[cache_key]
+    if block_mask is None:
+        raise RuntimeError(
+            "ART context parallel forward found an empty prepared block mask for a non-empty stage. "
+            f"stage={int(stage_plan.stage_index)} q_len={int(execution_spec.q_len)} "
+            f"k_len={int(execution_spec.k_len)} sliding_window={sliding_window}"
+        )
+    return cast(BlockMask, block_mask)
+
+
+def _stage_block_mask_cache_key(
+    *,
+    stage_plan: StagePlan,
+    execution_spec: StageExecutionSpec,
+    block_size: tuple[int, int],
+    sliding_window: int | None,
+    device: torch.device,
+) -> tuple[int, int, int, tuple[int, int], int | None, str, int | None]:
+    return (
+        int(stage_plan.stage_index),
+        int(execution_spec.q_len),
+        int(execution_spec.k_len),
+        block_size,
+        None if sliding_window is None else int(sliding_window),
+        device.type,
+        device.index,
+    )
 
 
 def prepare_context_parallel_execution_state(
@@ -895,7 +948,7 @@ def _run_stage_attention(
         state=state,
         block_size=sparse_block_size,
     )
-    block_mask = _build_stage_block_mask(
+    block_mask = _get_prepared_stage_block_mask(
         stage_plan=stage_plan,
         state=state,
         device=q_stage.device,
@@ -903,10 +956,6 @@ def _run_stage_attention(
         block_size=sparse_block_size,
         sliding_window=sliding_window,
     )
-    if block_mask is None:
-        raise RuntimeError(
-            f"Stage {stage_plan.stage_index} unexpectedly produced an empty block mask"
-        )
     _validate_stage_block_alignment(
         q_len=int(execution_spec.q_len),
         k_len=int(execution_spec.k_len),
