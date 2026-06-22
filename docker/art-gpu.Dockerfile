@@ -99,7 +99,6 @@ ENV CUDA_HOME=/usr/local/cuda-12.8 \
 SHELL ["/bin/bash", "-c"]
 
 LABEL org.opencontainers.image.source="https://github.com/openpipe/art" \
-      org.opencontainers.image.revision="${ART_SHA}" \
       org.opencontainers.image.description="ART GPU image with warmed uv caches for SkyPilot launches." \
       org.opencontainers.image.title="art-gpu"
 
@@ -163,3 +162,6 @@ RUN mkdir -p "${HOME}/.local/bin" "${HOME}/.sky/sky_app" "${HOME}/sky_workdir" \
  && VIRTUAL_ENV="${HOME}/skypilot-runtime" UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false env -u PYTHONPATH -C "${HOME}" uv pip uninstall skypilot \
  && printf '%s\n' "${HOME}/skypilot-runtime/bin/python" > "${HOME}/.sky/python_path" \
  && VIRTUAL_ENV="${HOME}/skypilot-runtime" UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false env -u PYTHONPATH -C "${HOME}" uv run --no-project --no-config which ray > "${HOME}/.sky/ray_path"
+
+ENV ART_IMAGE_REVISION=${ART_SHA}
+LABEL org.opencontainers.image.revision="${ART_SHA}"
