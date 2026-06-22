@@ -8,7 +8,6 @@ from pydantic import BaseModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art.preprocessing.tokenize import _apply_chat_template_token_ids
-from art.preprocessing.vllm_tokens import ART_VLLM_TOKEN_METADATA_KEY
 from art.trajectories import History, Trajectory, TrajectoryGroup, get_messages
 from art.types import MessagesAndChoices, Tools
 
@@ -112,10 +111,6 @@ def _choice_with_token_metadata(
     payload["logprobs"]["content"] = _logprob_content(completion_token_ids)
     payload["prompt_token_ids"] = prompt_token_ids
     payload["token_ids"] = completion_token_ids
-    payload[ART_VLLM_TOKEN_METADATA_KEY] = {
-        "prompt_token_ids": prompt_token_ids,
-        "completion_token_ids": completion_token_ids,
-    }
     return Choice.model_validate(payload)
 
 

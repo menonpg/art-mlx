@@ -4,8 +4,6 @@ from typing import Any, cast
 
 from openai.types.chat.chat_completion import Choice
 
-ART_VLLM_TOKEN_METADATA_KEY = "art_vllm_tokens"
-
 
 def _normalize_token_ids(raw: Any, *, field_name: str) -> list[int]:
     if raw is None:
@@ -32,35 +30,27 @@ def attach_vllm_token_metadata_to_choice(
     if prompt_token_ids is None or completion_token_ids is None:
         return
     extra = cast(dict[str, Any], choice.model_extra)
-    extra[ART_VLLM_TOKEN_METADATA_KEY] = {
-        "prompt_token_ids": _normalize_token_ids(
-            prompt_token_ids,
-            field_name="prompt_token_ids",
-        ),
-        "completion_token_ids": _normalize_token_ids(
-            completion_token_ids,
-            field_name="token_ids",
-        ),
-    }
+    extra["prompt_token_ids"] = _normalize_token_ids(
+        prompt_token_ids,
+        field_name="prompt_token_ids",
+    )
+    extra["token_ids"] = _normalize_token_ids(
+        completion_token_ids,
+        field_name="token_ids",
+    )
 
 
 def choice_vllm_token_metadata(choice: Choice) -> tuple[list[int], list[int]] | None:
     extra = choice.model_extra or {}
-    metadata = extra.get(ART_VLLM_TOKEN_METADATA_KEY)
-    if not isinstance(metadata, dict):
-        if "prompt_token_ids" not in extra or "token_ids" not in extra:
-            return None
-        metadata = {
-            "prompt_token_ids": extra["prompt_token_ids"],
-            "completion_token_ids": extra["token_ids"],
-        }
+    if "prompt_token_ids" not in extra or "token_ids" not in extra:
+        return None
     return (
         _normalize_token_ids(
-            metadata.get("prompt_token_ids"),
+            extra.get("prompt_token_ids"),
             field_name="prompt_token_ids",
         ),
         _normalize_token_ids(
-            metadata.get("completion_token_ids"),
-            field_name="completion_token_ids",
+            extra.get("token_ids"),
+            field_name="token_ids",
         ),
     )

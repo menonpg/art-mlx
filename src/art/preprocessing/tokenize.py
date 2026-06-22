@@ -385,7 +385,7 @@ def tokenize_vllm_trajectory_histories(
             metadata = choice_vllm_token_metadata(choice)
             if metadata is None:
                 raise RuntimeError(
-                    "Trainable Choice is missing ART vLLM token metadata. "
+                    "Trainable Choice is missing vLLM prompt_token_ids/token_ids. "
                     "Use a vLLM endpoint with return_token_ids enabled."
                 )
             prompt_token_ids, completion_token_ids = metadata
