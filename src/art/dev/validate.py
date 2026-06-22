@@ -57,9 +57,11 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     if set(trainer_gpu_ids) & set(inference_gpu_ids):
         raise ValueError("trainer_gpu_ids and inference_gpu_ids must not overlap")
 
-    if len(inference_gpu_ids) > 1:
+    inference_tp = int(config.get("engine_args", {}).get("tensor_parallel_size", 1))
+    if len(inference_gpu_ids) > 1 and inference_tp != len(inference_gpu_ids):
         raise ValueError(
-            "Multi-GPU inference not yet supported; inference_gpu_ids must have exactly one GPU"
+            "Multi-GPU inference requires engine_args.tensor_parallel_size to "
+            "match len(inference_gpu_ids)"
         )
 
     if trainer_gpu_ids[0] != 0:

@@ -85,11 +85,24 @@ def test_overlapping_gpu_ids():
         )
 
 
-def test_multi_gpu_inference():
-    with pytest.raises(ValueError, match="Multi-GPU inference not yet supported"):
+def test_multi_gpu_inference_requires_matching_tensor_parallel_size():
+    with pytest.raises(
+        ValueError,
+        match="Multi-GPU inference requires engine_args.tensor_parallel_size",
+    ):
         validate_dedicated_config(
             InternalModelConfig(trainer_gpu_ids=[0], inference_gpu_ids=[1, 2])
         )
+
+
+def test_multi_gpu_inference_allows_matching_tensor_parallel_size():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2],
+            engine_args={"tensor_parallel_size": 2},  # type: ignore[typeddict-item]
+        )
+    )
 
 
 def test_trainer_not_starting_at_zero():
