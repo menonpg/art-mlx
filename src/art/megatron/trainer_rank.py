@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator, MutableMapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import zip_longest
 import os
 from typing import TYPE_CHECKING, Generic, Literal, ParamSpec, TypeVar, cast, overload
 
 import torch
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import torch.distributed as dist
 
 from art.megatron.shared_prefix_packing import pack_shared_prefixes
@@ -465,6 +467,7 @@ class TrainerRank:
         loaded = self._load_slot(
             "checkpoint", name, adapter_model, trainable=True, alpha=alpha
         )
+        self._validate_dynamic_slot_consistency("checkpoint", name, loaded)
         self._checkpoint_slot_names.add(name)
         return loaded
 
@@ -475,9 +478,11 @@ class TrainerRank:
         *,
         alpha: float | None = None,
     ) -> int:
-        return self._load_slot(
+        loaded = self._load_slot(
             "lora", name, adapter_model, trainable=False, alpha=alpha
         )
+        self._validate_dynamic_slot_consistency("lora", name, loaded)
+        return loaded
 
     def _load_slot(
         self,
@@ -510,6 +515,74 @@ class TrainerRank:
         from art.megatron.lora import LoRASlotRef
 
         return LoRASlotRef(kind=kind, name=name)
+
+    def _validate_dynamic_slot_consistency(
+        self,
+        kind: Literal["checkpoint", "lora"],
+        name: str,
+        loaded_sites: int,
+    ) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+
+        from art.megatron.lora import iter_lora_slot_parameters
+
+        ref = self._slot_ref(kind, name)
+        params = list(iter_lora_slot_parameters(self.runtime.model, ref))
+        local = {
+            "rank": dist.get_rank(),
+            "loaded_sites": int(loaded_sites),
+            "param_count": len(params),
+            "numel": sum(int(param.numel()) for param in params),
+            "signature": [
+                (
+                    tuple(int(dim) for dim in param.shape),
+                    str(param.dtype),
+                    bool(getattr(param, "allreduce", True)),
+                    str(getattr(param, "grad_sync_domain", "tp_default")),
+                    str(getattr(param, "grad_sync_op", "none")),
+                )
+                for param in params
+            ],
+        }
+        gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        ranks = [rank for rank in gathered if rank is not None]
+        reference = ranks[0]
+        mismatched = [
+            rank
+            for rank in ranks
+            if rank["loaded_sites"] != reference["loaded_sites"]
+            or rank["signature"] != reference["signature"]
+        ]
+        if not mismatched:
+            return
+
+        first_mismatch = None
+        for left, right in zip_longest(
+            cast(list[object], reference["signature"]),
+            cast(list[object], mismatched[0]["signature"]),
+            fillvalue=None,
+        ):
+            if left != right:
+                first_mismatch = {"expected": left, "actual": right}
+                break
+        summary = [
+            {
+                "rank": rank["rank"],
+                "loaded_sites": rank["loaded_sites"],
+                "param_count": rank["param_count"],
+                "numel": rank["numel"],
+            }
+            for rank in ranks
+        ]
+        raise RuntimeError(
+            f"Dynamic LoRA slot {kind}:{name} is not loaded consistently across "
+            "distributed ranks. This usually means a sharded/exported LoRA state "
+            "dict was passed directly to TrainerRank; gather or materialize the "
+            "full adapter state before loading a dynamic slot. "
+            f"Rank summary: {summary}. First mismatch: {first_mismatch}."
+        )
 
     def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
         if request.checkpoint is not Unset:
@@ -753,6 +826,39 @@ class TrainerRank:
     def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
         from megatron.core import parallel_state as ps
 
+        buckets: list[
+            tuple[
+                object,
+                dist.ReduceOp.RedOpType,
+                torch.dtype,
+                torch.device,
+                list[torch.Tensor],
+            ]
+        ] = []
+
+        def add_to_bucket(
+            *,
+            group: object,
+            op: dist.ReduceOp.RedOpType,
+            grad: torch.Tensor,
+        ) -> None:
+            for (
+                bucket_group,
+                bucket_op,
+                bucket_dtype,
+                bucket_device,
+                bucket_grads,
+            ) in buckets:
+                if (
+                    bucket_group is group
+                    and bucket_op == op
+                    and bucket_dtype == grad.dtype
+                    and bucket_device == grad.device
+                ):
+                    bucket_grads.append(grad)
+                    return
+            buckets.append((group, op, grad.dtype, grad.device, [grad]))
+
         for param in params:
             grad = param.grad
             if grad is None:
@@ -762,7 +868,7 @@ class TrainerRank:
             else:
                 group = ps.get_expert_data_parallel_group()
             if group is not None and group.size() > 1:
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+                add_to_bucket(group=group, op=dist.ReduceOp.SUM, grad=grad)
 
             op = getattr(param, "grad_sync_op", "none")
             if op == "none":
@@ -775,7 +881,31 @@ class TrainerRank:
             if tp_group is None or tp_group.size() <= 1:
                 continue
             reduce_op = dist.ReduceOp.AVG if op == "avg" else dist.ReduceOp.SUM
-            dist.all_reduce(grad, op=reduce_op, group=tp_group)
+            add_to_bucket(group=tp_group, op=reduce_op, grad=grad)
+
+        for group, op, _dtype, _device, grads in buckets:
+            self._coalesced_all_reduce(grads, group=group, op=op)
+
+    @staticmethod
+    def _coalesced_all_reduce(
+        grads: Sequence[torch.Tensor],
+        *,
+        group: object,
+        op: dist.ReduceOp.RedOpType,
+    ) -> None:
+        if not grads:
+            return
+        coalesced = _flatten_dense_tensors(grads)
+        reduced = (
+            coalesced.float()
+            if torch.is_floating_point(coalesced) and coalesced.dtype != torch.float32
+            else coalesced
+        )
+        dist.all_reduce(reduced, op=op, group=group)
+        if reduced is not coalesced:
+            reduced = reduced.to(dtype=coalesced.dtype)
+        for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):
+            grad.copy_(synced)
 
     def _forward_flat(
         self, requests: Sequence[AnyForwardInput]
