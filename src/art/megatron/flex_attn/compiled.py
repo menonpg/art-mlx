@@ -42,19 +42,7 @@ def normalize_flex_lse(
 
 
 _FLASH_FLEX_KERNEL_OPTIONS = cast(FlexKernelOptions, {"BACKEND": "FLASH"})
-_TRITON_FLEX_KERNEL_OPTIONS = cast(
-    FlexKernelOptions,
-    {
-        "BACKEND": "TRITON",
-        "BLOCK_M": 16,
-        "BLOCK_N": 16,
-        "bwd_BLOCK_M1": 16,
-        "bwd_BLOCK_N1": 16,
-        "bwd_BLOCK_M2": 16,
-        "bwd_BLOCK_N2": 16,
-        "num_stages": 1,
-    },
-)
+_TRITON_FLEX_KERNEL_OPTIONS = cast(FlexKernelOptions, {"BACKEND": "TRITON"})
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
     {"BACKEND": _FORCED_FLEX_BACKEND},

@@ -81,7 +81,7 @@ _HF_TEXT_EXPERT_KEY_RE = re.compile(r"(?P<layer>\.layers\.\d+)\.experts")
 class Gemma4MoeHandler(DefaultMoeHandler):
     key = "gemma4_moe"
     is_moe = True
-    native_vllm_lora_status = "wip"
+    native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
