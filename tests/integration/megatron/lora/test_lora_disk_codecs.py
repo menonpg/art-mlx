@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any, cast
@@ -29,6 +31,29 @@ from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
 VLLM_PYTHON = REPO_ROOT / "vllm_runtime/.venv/bin/python"
+
+
+def _vllm_python_cmd() -> list[str]:
+    override = os.environ.get("ART_TEST_VLLM_PYTHON")
+    if override:
+        return [override]
+    if VLLM_PYTHON.exists():
+        return [str(VLLM_PYTHON)]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            f"{VLLM_PYTHON} does not exist and uv is not available to run "
+            "the locked vLLM runtime project"
+        )
+    return [
+        uv,
+        "run",
+        "--project",
+        str(REPO_ROOT / "vllm_runtime"),
+        "--frozen",
+        "--no-dev",
+        "python",
+    ]
 
 
 def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
@@ -142,7 +167,7 @@ print(json.dumps(sorted(lora.loras)))
 """
     result = subprocess.run(
         [
-            str(VLLM_PYTHON),
+            *_vllm_python_cmd(),
             "-c",
             script,
             str(path),
