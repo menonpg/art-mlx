@@ -8,27 +8,25 @@ from art.megatron.flex_attn.compiled import normalize_sparse_block_size
 
 from .types import AttnMaskKind, FlexMaskSpec
 
-_INVALID_GROUP_INDEX = 0
+_INVALID_Q_GROUP = -(1 << 63)
+_INVALID_Q_PARENT = _INVALID_Q_GROUP + 1
+_INVALID_K_GROUP = _INVALID_Q_GROUP + 2
 
 
 def _build_exact_mask_mod(
     *,
     q_abs: np.ndarray,
     k_abs: np.ndarray,
-    q_group_index: np.ndarray,
-    k_group_index: np.ndarray,
-    group_can_attend: np.ndarray,
+    q_group: np.ndarray,
+    q_parent: np.ndarray,
+    k_group: np.ndarray,
     device: torch.device,
 ):
     q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=torch.int64)
     k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=torch.int64)
-    q_group_tensor = torch.as_tensor(q_group_index, device=device, dtype=torch.int32)
-    k_group_tensor = torch.as_tensor(k_group_index, device=device, dtype=torch.int32)
-    group_can_attend_tensor = torch.as_tensor(
-        group_can_attend,
-        device=device,
-        dtype=torch.bool,
-    )
+    q_group_tensor = torch.as_tensor(q_group, device=device, dtype=torch.int64)
+    q_parent_tensor = torch.as_tensor(q_parent, device=device, dtype=torch.int64)
+    k_group_tensor = torch.as_tensor(k_group, device=device, dtype=torch.int64)
 
     def mask_mod(
         batch_idx: torch.Tensor,
@@ -39,11 +37,9 @@ def _build_exact_mask_mod(
         del batch_idx, head_idx
         q_abs_local = q_abs_tensor[query_idx]
         k_abs_local = k_abs_tensor[kv_idx]
-        allowed_group = group_can_attend_tensor[
-            q_group_tensor[query_idx],
-            k_group_tensor[kv_idx],
-        ]
-        return (q_abs_local >= k_abs_local) & allowed_group
+        same_group = q_group_tensor[query_idx] == k_group_tensor[kv_idx]
+        parent_prefix = q_parent_tensor[query_idx] == k_group_tensor[kv_idx]
+        return (q_abs_local >= k_abs_local) & (same_group | parent_prefix)
 
     return mask_mod
 
@@ -76,74 +72,64 @@ def _select_with_invalid_np(
     return selected
 
 
-def _is_strictly_increasing(values: np.ndarray) -> bool:
-    return int(values.size) <= 1 or bool(np.all(values[1:] > values[:-1]))
-
-
-def _block_min_max(
-    values: np.ndarray,
-    starts: np.ndarray,
-    ends: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    mins = np.empty(starts.shape, dtype=values.dtype)
-    maxes = np.empty(starts.shape, dtype=values.dtype)
-    for index, (start, end) in enumerate(zip(starts, ends, strict=True)):
-        block = values[int(start) : int(end)]
-        mins[index] = block.min()
-        maxes[index] = block.max()
-    return mins, maxes
-
-
-def _build_group_can_attend(
+def _build_q_block_group_state(
     *,
-    group_ids: np.ndarray,
-    parent_ids: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    valid = group_ids >= 0
-    sorted_group_ids = np.unique(group_ids[valid]).astype(np.int64, copy=False)
-    group_to_index = {
-        int(group_id): index + 1 for index, group_id in enumerate(sorted_group_ids)
-    }
-    group_can_attend = np.zeros(
-        (int(sorted_group_ids.size) + 1, int(sorted_group_ids.size) + 1),
-        dtype=bool,
-    )
-    parent_by_group: dict[int, int | None] = {}
-    for group_id in sorted_group_ids.tolist():
-        positions = np.flatnonzero(group_ids == int(group_id))
-        parent_id = int(parent_ids[int(positions[0])])
-        parent_by_group[int(group_id)] = (
-            None if parent_id < 0 or parent_id == int(group_id) else parent_id
-        )
-
-    for group_id in sorted_group_ids.tolist():
-        query_index = group_to_index[int(group_id)]
-        cursor = int(group_id)
-        seen: set[int] = set()
-        while cursor in group_to_index:
-            group_can_attend[query_index, group_to_index[cursor]] = True
-            parent_id = parent_by_group.get(cursor)
-            if parent_id is None or parent_id in seen:
-                break
-            seen.add(cursor)
-            cursor = parent_id
-    return sorted_group_ids, group_can_attend
+    q_abs: np.ndarray,
+    q_group: np.ndarray,
+    q_parent: np.ndarray,
+    q_block: int,
+    block_idx: int,
+) -> tuple[int, dict[int, int], frozenset[int]]:
+    start = int(block_idx) * q_block
+    end = min((int(block_idx) + 1) * q_block, int(q_abs.size))
+    q = q_abs[start:end]
+    q_group_block = q_group[start:end]
+    q_parent_block = q_parent[start:end]
+    q_min = int(q.min()) if int(q.size) else 0
+    max_by_group: dict[int, int] = {}
+    all_groups: list[int] = []
+    for group_value in np.unique(np.concatenate((q_group_block, q_parent_block))):
+        allowed = (q_group_block == group_value) | (q_parent_block == group_value)
+        if bool(allowed.any()):
+            max_by_group[int(group_value)] = int(q[allowed].max())
+        if bool(allowed.all()):
+            all_groups.append(int(group_value))
+    return q_min, max_by_group, frozenset(all_groups)
 
 
-def _remap_group_values(
-    values: np.ndarray,
+def _build_k_block_group_state(
     *,
-    sorted_group_ids: np.ndarray,
-) -> np.ndarray:
-    remapped = np.full(values.shape, _INVALID_GROUP_INDEX, dtype=np.int32)
-    if int(sorted_group_ids.size) == 0:
-        return remapped
-    positions = np.searchsorted(sorted_group_ids, values)
-    in_bounds = positions < int(sorted_group_ids.size)
-    matched = np.zeros(values.shape, dtype=bool)
-    matched[in_bounds] = sorted_group_ids[positions[in_bounds]] == values[in_bounds]
-    remapped[matched] = positions[matched].astype(np.int32, copy=False) + 1
-    return remapped
+    k_abs: np.ndarray,
+    k_group: np.ndarray,
+    k_block: int,
+    block_idx: int,
+) -> tuple[int, dict[int, int], tuple[int, ...]]:
+    start = int(block_idx) * k_block
+    end = min((int(block_idx) + 1) * k_block, int(k_abs.size))
+    k = k_abs[start:end]
+    k_group_block = k_group[start:end]
+    k_max = int(k.max()) if int(k.size) else 0
+    min_by_group: dict[int, int] = {}
+    for group_value in np.unique(k_group_block):
+        min_by_group[int(group_value)] = int(k[k_group_block == group_value].min())
+    return k_max, min_by_group, tuple(min_by_group)
+
+
+def _exact_block_state(
+    *,
+    q_state: tuple[int, dict[int, int], frozenset[int]],
+    k_state: tuple[int, dict[int, int], tuple[int, ...]],
+) -> tuple[bool, bool]:
+    q_min, q_allowed_max, q_all_allowed = q_state
+    k_max, k_min, k_groups = k_state
+    if not any(
+        q_allowed_max.get(k_group_value, _INVALID_Q_GROUP) >= min_k
+        for k_group_value, min_k in k_min.items()
+    ):
+        return False, False
+    if int(q_min) < int(k_max):
+        return True, False
+    return True, all(k_group_value in q_all_allowed for k_group_value in k_groups)
 
 
 def _build_sparse_block_mask(
@@ -159,6 +145,7 @@ def _build_sparse_block_mask(
     k_blocks = (int(spec.k_len) + k_block - 1) // k_block
     partial_blocks = np.zeros((q_blocks, k_blocks), dtype=bool)
     full_blocks = np.zeros((q_blocks, k_blocks), dtype=bool)
+    touch_counts = np.zeros((q_blocks, k_blocks), dtype=np.int16)
     q_abs_tensor = spec.exact_mask.q_token_indices.detach().to(
         device="cpu",
         dtype=torch.int64,
@@ -169,8 +156,6 @@ def _build_sparse_block_mask(
     )
     q_abs = q_abs_tensor.numpy()
     k_abs = k_abs_tensor.numpy()
-    q_abs_sorted = _is_strictly_increasing(q_abs[q_abs >= 0])
-    k_abs_sorted = _is_strictly_increasing(k_abs[k_abs >= 0])
     flat_group_ids = group_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
     flat_parent_ids = (
         parent_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
@@ -180,31 +165,24 @@ def _build_sparse_block_mask(
     q_group = _select_with_invalid_np(
         flat_group_ids_np,
         q_abs,
-        invalid_value=-1,
+        invalid_value=_INVALID_Q_GROUP,
+    )
+    q_parent = _select_with_invalid_np(
+        flat_parent_ids_np,
+        q_abs,
+        invalid_value=_INVALID_Q_PARENT,
     )
     k_group = _select_with_invalid_np(
         flat_group_ids_np,
         k_abs,
-        invalid_value=-1,
-    )
-    sorted_group_ids, group_can_attend = _build_group_can_attend(
-        group_ids=flat_group_ids_np,
-        parent_ids=flat_parent_ids_np,
-    )
-    q_group_index = _remap_group_values(
-        q_group,
-        sorted_group_ids=sorted_group_ids,
-    )
-    k_group_index = _remap_group_values(
-        k_group,
-        sorted_group_ids=sorted_group_ids,
+        invalid_value=_INVALID_K_GROUP,
     )
     mask_mod = _build_exact_mask_mod(
         q_abs=q_abs,
         k_abs=k_abs,
-        q_group_index=q_group_index,
-        k_group_index=k_group_index,
-        group_can_attend=group_can_attend,
+        q_group=q_group,
+        q_parent=q_parent,
+        k_group=k_group,
         device=device,
     )
     if not spec.slices:
@@ -255,16 +233,10 @@ def _build_sparse_block_mask(
             k_block_end,
             k_end,
         )
-        q_min, q_max = (
-            (q_abs[q_overlap_start], q_abs[q_overlap_end - 1])
-            if q_abs_sorted
-            else _block_min_max(q_abs, q_overlap_start, q_overlap_end)
-        )
-        k_min, k_max = (
-            (k_abs[k_overlap_start], k_abs[k_overlap_end - 1])
-            if k_abs_sorted
-            else _block_min_max(k_abs, k_overlap_start, k_overlap_end)
-        )
+        q_min = q_abs[q_overlap_start]
+        q_max = q_abs[q_overlap_end - 1]
+        k_min = k_abs[k_overlap_start]
+        k_max = k_abs[k_overlap_end - 1]
         q_is_full = (q_overlap_start == q_block_start) & (q_overlap_end == q_block_end)
         k_is_full = (k_overlap_start == k_block_start) & (k_overlap_end == k_block_end)
         covers_block = q_is_full[:, None] & k_is_full[None, :]
@@ -279,11 +251,43 @@ def _build_sparse_block_mask(
 
         q_slice = slice(int(q_block_indices[0]), int(q_block_indices[-1]) + 1)
         k_slice = slice(int(k_block_indices[0]), int(k_block_indices[-1]) + 1)
+        touch_counts[q_slice, k_slice] += has_any.astype(np.int16)
         partial_blocks[q_slice, k_slice] |= has_any
         full_blocks[q_slice, k_slice] |= is_full
 
-    # Overlapping tree slices are left as partial blocks. The block-level program
-    # only decides which blocks to visit; `mask_mod` above is the exact authority.
+    ambiguous = (touch_counts > 1) & partial_blocks & ~full_blocks
+    q_state_cache: dict[int, tuple[int, dict[int, int], frozenset[int]]] = {}
+    k_state_cache: dict[int, tuple[int, dict[int, int], tuple[int, ...]]] = {}
+    for q_idx, k_idx in np.argwhere(ambiguous):
+        q_state = q_state_cache.get(int(q_idx))
+        if q_state is None:
+            q_state = _build_q_block_group_state(
+                q_abs=q_abs,
+                q_group=q_group,
+                q_parent=q_parent,
+                q_block=q_block,
+                block_idx=int(q_idx),
+            )
+            q_state_cache[int(q_idx)] = q_state
+        k_state = k_state_cache.get(int(k_idx))
+        if k_state is None:
+            k_state = _build_k_block_group_state(
+                k_abs=k_abs,
+                k_group=k_group,
+                k_block=k_block,
+                block_idx=int(k_idx),
+            )
+            k_state_cache[int(k_idx)] = k_state
+        has_any, is_full = _exact_block_state(
+            q_state=q_state,
+            k_state=k_state,
+        )
+        partial_blocks[q_idx, k_idx] = False
+        full_blocks[q_idx, k_idx] = False
+        if is_full:
+            full_blocks[q_idx, k_idx] = True
+        elif has_any:
+            partial_blocks[q_idx, k_idx] = True
 
     partial_blocks &= ~full_blocks
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
@@ -343,9 +347,9 @@ def _validate_exact_indices(
     valid = _valid_prefix(indices, name=name)
     if int(valid.numel()) == 0:
         return 0
-    if int(valid.unique().numel()) != int(valid.numel()):
-        raise RuntimeError(f"{name} exact token indices must not contain duplicates.")
-    max_index = int(valid.max().item())
+    if bool((valid[1:] <= valid[:-1]).any().item()):
+        raise RuntimeError(f"{name} exact token indices must be strictly increasing.")
+    max_index = int(valid[-1].item())
     if max_index >= int(source_len):
         raise RuntimeError(
             f"{name} exact token index {max_index} exceeds source metadata length {int(source_len)}."
