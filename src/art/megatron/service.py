@@ -56,6 +56,7 @@ from .runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )
+from .runtime.te_cutlass_grouped_gemm import force_te_cutlass_grouped_gemm_env
 from .runtime_config import get_megatron_runtime_config
 from .training.sft_batches import materialize_sft_batches
 
@@ -735,6 +736,7 @@ class MegatronService:
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
         env = os.environ.copy()
+        force_te_cutlass_grouped_gemm_env(env)
         if self.is_dedicated:
             trainer_gpu_ids = self.config["trainer_gpu_ids"]
             num_gpus = len(trainer_gpu_ids)
