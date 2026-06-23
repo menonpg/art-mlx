@@ -1255,7 +1255,7 @@ class TrainerRank:
                 int(topology.cp),
                 int(topology.pp),
             )
-        except (AttributeError, ImportError, RuntimeError, ValueError):
+        except (AssertionError, AttributeError, ImportError, RuntimeError, ValueError):
             return (1, 1, 1, 1)
 
     def _memory_check(self, plan: _FlatForwardPlan) -> _MemoryCheck:
