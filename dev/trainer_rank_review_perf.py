@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 import torch
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import AuxRequest, BlockMask
 from torch.nn.attention.flex_attention import create_block_mask as torch_block_mask
 import typer
 
@@ -29,7 +29,7 @@ from art.megatron.context_parallel.types import (
     FlexMaskSpec,
     ParallelTopology,
 )
-from art.megatron.flex_attn.attention import FlexAttentionWrapper
+from art.megatron.flex_attn.compiled import sparse_compiled_flex_attention
 from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 
 
@@ -422,7 +422,6 @@ def _flex_records(
             )
             for q, k, v in base_tensors
         ]
-        wrapper = FlexAttentionWrapper()
 
         def step() -> None:
             loss = torch.zeros((), device=device, dtype=torch.float32)
@@ -430,13 +429,14 @@ def _flex_records(
                 q.grad = None
                 k.grad = None
                 v.grad = None
-                out = wrapper(
+                out, _aux = sparse_compiled_flex_attention(
                     q,
                     k,
                     v,
                     block_mask=block_mask,
                     scale=float(head_dim) ** -0.5,
                     enable_gqa=False,
+                    return_aux=AuxRequest(lse=True),
                 )
                 loss = loss + out.float().sum()
             loss.backward()
