@@ -685,6 +685,7 @@ def main(
 
         memory_tracker.stop()
         memory_metadata = _distributed_memory_metadata(memory_tracker)
+        model_metadata = _model_metadata(runtime, model, layers=layers)
 
         if dist.get_rank() == 0:
             token_rates = _rate_metrics(results, rate_units)
@@ -725,7 +726,7 @@ def main(
                 "cross_entropy_fusion_impl": getattr(
                     model_config, "cross_entropy_fusion_impl", None
                 ),
-                **_model_metadata(runtime, model, layers=layers),
+                **model_metadata,
                 **request_stats,
                 **memory_metadata,
                 **results,
