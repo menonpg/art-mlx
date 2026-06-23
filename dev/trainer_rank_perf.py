@@ -1748,6 +1748,8 @@ def _target_correctness_metrics(
             if native.target_logprobs is None or candidate is None:
                 continue
             diff = (candidate.float() - native.target_logprobs.float()).abs()
+            if int(diff.numel()) == 0:
+                continue
             abs_diff_sum += diff.sum()
             reference_abs_sum += native.target_logprobs.float().abs().sum()
             value_count += float(diff.numel())
@@ -1760,6 +1762,7 @@ def _target_correctness_metrics(
     return {
         "target_hidden_vs_native_mean_abs_pct": mean_abs_pct,
         "target_hidden_vs_native_max_abs_diff": max_abs,
+        "target_hidden_vs_native_value_count": float(sums[2].item()),
     }
 
 
