@@ -97,3 +97,29 @@ def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> No
     trainable_token_ids = [token_id for token_id in labels if token_id != -100]
     assert tokenizer.decode(trainable_token_ids) == "OK"
     assert batch.num_trainable_tokens == 2
+
+
+def test_tokenize_sft_batch_passes_chat_template_kwargs() -> None:
+    tokenizer = _FakeTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "OK"},
+        ],
+    )
+
+    tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages, reward=1.0)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,  # type: ignore[arg-type]
+        instruction_part="<user>",
+        response_part="<assistant>",
+        chat_template_kwargs={
+            "enable_thinking": False,
+            "preserve_thinking": True,
+        },
+    )
+
+    assert tokenizer.apply_chat_template_kwargs[-1]["enable_thinking"] is False
+    assert tokenizer.apply_chat_template_kwargs[-1]["preserve_thinking"] is True
