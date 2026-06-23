@@ -492,6 +492,10 @@ def _run_hf_sft_step(
         device=device,
         dtype=dtype,
     )
+    hf_forward_expects_text_mm_token_type_ids = (
+        type(model).__name__ == "Gemma4ForConditionalGeneration"
+        and getattr(model.config, "model_type", None) == "gemma4"
+    )
     if dtype == torch.float32:
         _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
     route_capture = _HfMoeRoutingCapture(model)
@@ -516,10 +520,14 @@ def _run_hf_sft_step(
         input_ids = micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
         labels = micro["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
         hf_attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+        extra_forward_kwargs = {}
+        if hf_forward_expects_text_mm_token_type_ids:
+            extra_forward_kwargs["mm_token_type_ids"] = torch.zeros_like(input_ids)
         logits = model(
             input_ids=input_ids,
             attention_mask=hf_attention_mask,
             use_cache=False,
+            **extra_forward_kwargs,
         ).logits
         shifted_labels = megatron_train.shift_tensor(labels, -100)
         per_token_loss = F.cross_entropy(
