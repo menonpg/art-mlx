@@ -185,6 +185,39 @@ def test_sparse_block_mask_matches_torch_block_metadata(
     _assert_matches_torch_block_mask(block_mask)
 
 
+def test_sparse_block_mask_prunes_exact_blocks_rejected_by_group_tree() -> None:
+    group_ids = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.long)
+    parent_ids = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.long)
+    block_mask = build_block_mask(
+        FlexMaskSpec(
+            q_len=4,
+            k_len=4,
+            block_size=(2, 2),
+            slices=(
+                AttnSlice(
+                    q_range=TokenRange(start=0, end=4),
+                    k_range=TokenRange(start=0, end=4),
+                    mask_kind=AttnMaskKind.CAUSAL,
+                    row_index=0,
+                ),
+            ),
+            exact_mask=ExactMaskMetadata(
+                q_token_indices=torch.tensor([4, 5, 6, 7], dtype=torch.long),
+                k_token_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+                cache_key="all-false-cross-family",
+            ),
+        ),
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        device=torch.device("cpu"),
+    )
+
+    assert block_mask is not None
+    assert int(block_mask.kv_num_blocks.sum().item()) == 0
+    assert int(block_mask.full_kv_num_blocks.sum().item()) == 0
+    _assert_matches_torch_block_mask(block_mask)
+
+
 def test_shared_prefix_state_builds_batched_block_mask() -> None:
     group_ids = torch.tensor(
         [

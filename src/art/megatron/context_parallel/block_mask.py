@@ -131,7 +131,7 @@ def _remap_group_values(
     return remapped
 
 
-def _promote_exact_full_blocks(
+def _refine_exact_partial_blocks(
     *,
     partial_blocks: np.ndarray,
     full_blocks: np.ndarray,
@@ -160,7 +160,10 @@ def _promote_exact_full_blocks(
             k_group_index[None, k_slice],
         ]
         causal = q_abs[q_slice, None] >= k_abs[None, k_slice]
-        if bool(np.all(causal & can_attend)):
+        allowed = causal & can_attend
+        if not bool(np.any(allowed)):
+            partial_blocks[q_block_index, k_block_index] = False
+        elif bool(np.all(allowed)):
             partial_blocks[q_block_index, k_block_index] = False
             full_blocks[q_block_index, k_block_index] = True
 
@@ -291,8 +294,8 @@ def _build_sparse_block_mask(
         full_blocks[q_slice, k_slice] |= is_full
 
     partial_blocks &= ~full_blocks
-    if context.max_depth > 1:
-        _promote_exact_full_blocks(
+    if int(context.group_can_attend.shape[0]) > 2:
+        _refine_exact_partial_blocks(
             partial_blocks=partial_blocks,
             full_blocks=full_blocks,
             q_abs=q_abs,
