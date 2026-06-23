@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
 
+import numpy as np
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.attention.flex_attention import create_block_mask as torch_block_mask
 import typer
 
 from art.megatron.context_parallel.block_mask import (
+    _remap_group_values,
+    _select_with_invalid_np,
     build_block_mask_from_context,
     prepare_block_mask_context,
 )
@@ -27,7 +31,6 @@ from art.megatron.context_parallel.types import (
 )
 from art.megatron.flex_attn.attention import FlexAttentionWrapper
 from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
-from art.megatron.shared_prefix_state import create_shared_prefix_state
 
 
 def main(
@@ -49,7 +52,7 @@ def main(
     flex_token_cap: int = 8192,
     flex_heads: int = 2,
     flex_head_dim: int = 64,
-    flex_mask_variants: str = "current,flat_pair,token_group,local_or_flat_pair",
+    flex_mask_variants: str = "current,ancestor_slots,causal_abs_only",
     output_jsonl: Path = Path(".local/trainer_rank_review/block_mask_flex.jsonl"),
 ) -> None:
     if warmup < 0 or repeat < 1:
@@ -136,6 +139,8 @@ def main(
     if run_flex:
         for record in _flex_records(
             pack,
+            plan,
+            config,
             warmup=warmup,
             repeat=repeat,
             token_cap=flex_token_cap,
@@ -352,6 +357,8 @@ def _build_stage_masks(
 
 def _flex_records(
     pack: SharedPrefixPack,
+    plan: object,
+    config: ContextParallelConfig,
     *,
     warmup: int,
     repeat: int,
@@ -362,51 +369,80 @@ def _flex_records(
 ) -> list[dict[str, object]]:
     if not torch.cuda.is_available():
         return [{"case": "flex_attention_fwd_bwd", "skipped": "cuda_unavailable"}]
-    if int(pack.tokens.numel()) > int(token_cap):
+    device = torch.device("cuda")
+    stage_cases = _build_stage_flex_cases(
+        pack,
+        plan,
+        config,
+        device=device,
+    )
+    if not stage_cases:
+        return [{"case": "flex_attention_fwd_bwd", "skipped": "no_stage_masks"}]
+    largest_stage = max(max(case.q_len, case.k_len) for case in stage_cases)
+    if int(largest_stage) > int(token_cap):
         return [
             {
                 "case": "flex_attention_fwd_bwd",
-                "skipped": "packed_tokens_exceed_flex_token_cap",
+                "skipped": "stage_tokens_exceed_flex_token_cap",
                 "flex_token_cap": int(token_cap),
+                "largest_stage_tokens": int(largest_stage),
             }
         ]
-    device = torch.device("cuda")
-    group_ids = pack.group_ids.to(device)
-    parent_ids = pack.parent_ids.to(device)
-    attention_state = create_shared_prefix_state(
-        group_ids,
-        parent_ids,
-        target_device=device,
-    )
-    shape = (1, int(heads), int(pack.tokens.numel()), int(head_dim))
     records: list[dict[str, object]] = []
-    block_masks = _flex_mask_variants(
-        attention_state.block_mask,
-        pack,
-        variants=variants,
+    base_tensors = _stage_tensors(
+        stage_cases,
+        heads=heads,
+        head_dim=head_dim,
         device=device,
     )
-    for variant, block_mask in block_masks:
-        q = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
-        k = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
-        v = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+    for variant in variants:
+        block_masks = []
+        try:
+            block_masks = [
+                _stage_variant_block_mask(case, variant, device=device)
+                for case in stage_cases
+            ]
+        except Exception as exc:
+            records.append(
+                {
+                    "case": "flex_attention_fwd_bwd",
+                    "flex_mask_variant": variant,
+                    "compile_error": type(exc).__name__,
+                    "compile_error_message": str(exc).splitlines()[0][:500],
+                    "flex_heads": heads,
+                    "flex_head_dim": head_dim,
+                }
+            )
+            continue
+        qkv = [
+            (
+                q.detach().clone().requires_grad_(True),
+                k.detach().clone().requires_grad_(True),
+                v.detach().clone().requires_grad_(True),
+            )
+            for q, k, v in base_tensors
+        ]
         wrapper = FlexAttentionWrapper()
 
         def step() -> None:
-            q.grad = None
-            k.grad = None
-            v.grad = None
-            out = wrapper(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
-                scale=float(head_dim) ** -0.5,
-                enable_gqa=False,
-            )
-            out.float().sum().backward()
+            loss = torch.zeros((), device=device, dtype=torch.float32)
+            for (q, k, v), block_mask in zip(qkv, block_masks, strict=True):
+                q.grad = None
+                k.grad = None
+                v.grad = None
+                out = wrapper(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    scale=float(head_dim) ** -0.5,
+                    enable_gqa=False,
+                )
+                loss = loss + out.float().sum()
+            loss.backward()
 
         try:
+            torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
             first_started = time.perf_counter()
             step()
@@ -423,6 +459,7 @@ def _flex_records(
                     "compile_error_message": str(exc).splitlines()[0][:500],
                     "flex_heads": heads,
                     "flex_head_dim": head_dim,
+                    **_stage_flex_stats(stage_cases),
                 }
             )
             continue
@@ -435,85 +472,192 @@ def _flex_records(
                 "packed_tok_s": round(int(pack.tokens.numel()) * 1000.0 / ms, 3),
                 "flex_heads": heads,
                 "flex_head_dim": head_dim,
+                **_stage_flex_stats(stage_cases),
                 "peak_memory_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
             }
         )
     return records
 
 
-def _flex_mask_variants(
-    block_mask: BlockMask,
+@dataclass(frozen=True)
+class _StageFlexCase:
+    rank: int
+    stage_index: int
+    q_len: int
+    k_len: int
+    block_mask: BlockMask
+    q_abs: np.ndarray
+    k_abs: np.ndarray
+    q_group_index: np.ndarray
+    k_group_index: np.ndarray
+    group_can_attend: np.ndarray
+
+
+def _build_stage_flex_cases(
     pack: SharedPrefixPack,
+    plan: object,
+    config: ContextParallelConfig,
     *,
-    variants: Sequence[str],
     device: torch.device,
-) -> tuple[tuple[str, BlockMask], ...]:
-    group_ids = pack.group_ids[0].to(device=device, dtype=torch.long)
-    can_attend = _group_can_attend(pack).to(device=device)
-    token_group_can_attend = can_attend.index_select(0, group_ids)
-    stride = int(can_attend.shape[1])
-    can_attend_flat = can_attend.reshape(-1)
-    out = []
-    for variant in variants:
-        if variant == "current":
-            out.append((variant, block_mask))
-            continue
-        if variant == "flat_pair":
+) -> tuple[_StageFlexCase, ...]:
+    cases: list[_StageFlexCase] = []
+    context = prepare_block_mask_context(
+        group_ids=pack.group_ids[0],
+        parent_ids=pack.parent_ids[0],
+    )
+    for rank_plan in plan.rank_plans:
+        for stage in rank_plan.stage_plans:
+            if stage.mask_metadata is None:
+                continue
+            mask = build_block_mask_from_context(
+                FlexMaskSpec(
+                    q_len=stage.q_len,
+                    k_len=stage.k_len,
+                    block_size=config.block_size,
+                    slices=stage.slices,
+                    exact_mask=stage.mask_metadata,
+                ),
+                context=context,
+                device=device,
+                validate=False,
+            )
+            if mask is None:
+                continue
+            q_abs = (
+                stage.mask_metadata.q_token_indices.detach()
+                .to(device="cpu", dtype=torch.int64)
+                .reshape(-1)
+                .numpy()
+            )
+            k_abs = (
+                stage.mask_metadata.k_token_indices.detach()
+                .to(device="cpu", dtype=torch.int64)
+                .reshape(-1)
+                .numpy()
+            )
+            q_group = _select_with_invalid_np(
+                context.group_ids_np,
+                q_abs,
+                invalid_value=-1,
+            )
+            k_group = _select_with_invalid_np(
+                context.group_ids_np,
+                k_abs,
+                invalid_value=-1,
+            )
+            cases.append(
+                _StageFlexCase(
+                    rank=int(rank_plan.rank),
+                    stage_index=int(stage.stage_index),
+                    q_len=int(stage.q_len),
+                    k_len=int(stage.k_len),
+                    block_mask=mask,
+                    q_abs=q_abs,
+                    k_abs=k_abs,
+                    q_group_index=_remap_group_values(
+                        q_group,
+                        sorted_group_ids=context.sorted_group_ids,
+                    ),
+                    k_group_index=_remap_group_values(
+                        k_group,
+                        sorted_group_ids=context.sorted_group_ids,
+                    ),
+                    group_can_attend=context.group_can_attend,
+                )
+            )
+    return tuple(cases)
 
-            def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
-                del batch_idx, head_idx
-                q_group = group_ids[query_idx]
-                k_group = group_ids[kv_idx]
-                return (query_idx >= kv_idx) & can_attend_flat[
-                    q_group * stride + k_group
-                ]
 
-        elif variant == "token_group":
-
-            def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
-                del batch_idx, head_idx
-                k_group = group_ids[kv_idx]
-                return (query_idx >= kv_idx) & token_group_can_attend[
-                    query_idx, k_group
-                ]
-
-        elif variant == "local_or_flat_pair":
-
-            def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
-                del batch_idx, head_idx
-                q_group = group_ids[query_idx]
-                k_group = group_ids[kv_idx]
-                allowed = (q_group == k_group) | can_attend_flat[
-                    q_group * stride + k_group
-                ]
-                return (query_idx >= kv_idx) & allowed
-
-        else:
-            raise ValueError(f"unknown flex_mask_variant {variant!r}")
-        out.append((variant, _replace_block_mask_mod(block_mask, mask_mod)))
-    return tuple(out)
+def _stage_tensors(
+    cases: Sequence[_StageFlexCase],
+    *,
+    heads: int,
+    head_dim: int,
+    device: torch.device,
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+    generator = torch.Generator(device=device).manual_seed(17)
+    tensors = []
+    for case in cases:
+        q_shape = (1, int(heads), int(case.q_len), int(head_dim))
+        k_shape = (1, int(heads), int(case.k_len), int(head_dim))
+        tensors.append(
+            (
+                torch.randn(
+                    q_shape, device=device, dtype=torch.bfloat16, generator=generator
+                ),
+                torch.randn(
+                    k_shape, device=device, dtype=torch.bfloat16, generator=generator
+                ),
+                torch.randn(
+                    k_shape, device=device, dtype=torch.bfloat16, generator=generator
+                ),
+            )
+        )
+    return tuple(tensors)
 
 
-def _group_can_attend(pack: SharedPrefixPack) -> torch.Tensor:
-    group_ids = pack.group_ids[0].to(dtype=torch.long).cpu()
-    parent_ids = pack.parent_ids[0].to(dtype=torch.long).cpu()
-    max_group = int(group_ids.max().item()) if int(group_ids.numel()) else 0
-    parents = [0 for _ in range(max_group + 1)]
-    for group, parent in zip(group_ids.tolist(), parent_ids.tolist(), strict=True):
-        if int(group) >= 0:
-            parents[int(group)] = max(0, int(parent))
-    can_attend = torch.zeros((max_group + 1, max_group + 1), dtype=torch.bool)
-    for group in range(1, max_group + 1):
-        current = group
-        seen: set[int] = set()
-        while current > 0 and current not in seen:
-            seen.add(current)
-            can_attend[group, current] = True
-            parent = parents[current]
-            if parent == current:
-                break
-            current = parent
-    return can_attend
+def _stage_variant_block_mask(
+    case: _StageFlexCase,
+    variant: str,
+    *,
+    device: torch.device,
+) -> BlockMask:
+    if variant == "current":
+        return case.block_mask
+    q_abs = torch.as_tensor(case.q_abs, device=device, dtype=torch.int64)
+    k_abs = torch.as_tensor(case.k_abs, device=device, dtype=torch.int64)
+    if variant == "causal_abs_only":
+
+        def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
+            del batch_idx, head_idx
+            return q_abs[query_idx] >= k_abs[kv_idx]
+
+        return _replace_block_mask_mod(case.block_mask, mask_mod)
+    if variant == "ancestor_slots":
+        q_group = torch.as_tensor(case.q_group_index, device=device, dtype=torch.int32)
+        k_group = torch.as_tensor(case.k_group_index, device=device, dtype=torch.int32)
+        ancestor_slots = torch.as_tensor(
+            _ancestor_slots(case.group_can_attend),
+            device=device,
+            dtype=torch.int32,
+        )
+        slot_count = int(ancestor_slots.shape[1])
+
+        def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
+            del batch_idx, head_idx
+            q_group_local = q_group[query_idx]
+            k_group_local = k_group[kv_idx]
+            allowed = torch.zeros_like(q_group_local, dtype=torch.bool)
+            for slot in range(slot_count):
+                allowed = allowed | (
+                    k_group_local == ancestor_slots[q_group_local, slot]
+                )
+            return (q_abs[query_idx] >= k_abs[kv_idx]) & allowed
+
+        return _replace_block_mask_mod(case.block_mask, mask_mod)
+    raise ValueError(f"unknown flex_mask_variant {variant!r}")
+
+
+def _ancestor_slots(group_can_attend: np.ndarray) -> np.ndarray:
+    max_ancestors = max(
+        1,
+        max(int(np.count_nonzero(row)) for row in group_can_attend),
+    )
+    slots = np.full((group_can_attend.shape[0], max_ancestors), -1, dtype=np.int32)
+    for group_index, row in enumerate(group_can_attend):
+        ancestors = np.flatnonzero(row).astype(np.int32, copy=False)
+        slots[group_index, : int(ancestors.size)] = ancestors
+    return slots
+
+
+def _stage_flex_stats(cases: Sequence[_StageFlexCase]) -> dict[str, object]:
+    return {
+        "flex_stage_count": len(cases),
+        "flex_stage_q_tokens": sum(case.q_len for case in cases),
+        "flex_stage_k_tokens": sum(case.k_len for case in cases),
+        "flex_stage_max_q_tokens": max(case.q_len for case in cases),
+        "flex_stage_max_k_tokens": max(case.k_len for case in cases),
+    }
 
 
 def _replace_block_mask_mod(block_mask: BlockMask, mask_mod: object) -> BlockMask:
