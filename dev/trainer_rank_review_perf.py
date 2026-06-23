@@ -114,14 +114,15 @@ def main(
         },
     )
 
-    masks, mask_ms = _bench_cpu(
+    stage_masks, mask_ms = _bench_cpu(
         lambda: _build_stage_masks(pack, plan, config),
         warmup=warmup,
         repeat=repeat,
     )
+    masks = tuple(mask for mask, _ in stage_masks)
     if validate_torch:
-        for mask in masks:
-            _assert_matches_torch_block_mask(mask)
+        for mask, slices in stage_masks:
+            _assert_matches_torch_block_mask(mask, slices=slices)
     _write(
         output_jsonl,
         {
@@ -170,7 +171,7 @@ def main(
             repeat=1,
             before_each=_RUNTIME_PLAN_CACHE.clear,
         )
-        variant_masks, variant_mask_ms = _bench_cpu(
+        variant_stage_masks, variant_mask_ms = _bench_cpu(
             lambda pack=variant_pack, plan=variant_plan: _build_stage_masks(
                 pack,
                 plan,
@@ -179,6 +180,10 @@ def main(
             warmup=0,
             repeat=1,
         )
+        variant_masks = tuple(mask for mask, _ in variant_stage_masks)
+        if validate_torch:
+            for mask, slices in variant_stage_masks:
+                _assert_matches_torch_block_mask(mask, slices=slices)
         _write(
             output_jsonl,
             {
@@ -318,7 +323,7 @@ def _build_stage_masks(
     pack: SharedPrefixPack,
     plan: object,
     config: ContextParallelConfig,
-) -> tuple[BlockMask, ...]:
+) -> tuple[tuple[BlockMask, tuple[object, ...]], ...]:
     masks = []
     context = prepare_block_mask_context(
         group_ids=pack.group_ids[0],
@@ -341,7 +346,7 @@ def _build_stage_masks(
                 validate=False,
             )
             if mask is not None:
-                masks.append(mask)
+                masks.append((mask, tuple(stage.slices)))
     return tuple(masks)
 
 
@@ -599,10 +604,14 @@ def _block_count(block_mask: BlockMask, name: str) -> int:
     return 0 if counts is None else int(counts.sum().item())
 
 
-def _assert_matches_torch_block_mask(block_mask: BlockMask) -> None:
+def _assert_matches_torch_block_mask(
+    block_mask: BlockMask,
+    *,
+    slices: Sequence[object] = (),
+) -> None:
     q_len, k_len = block_mask.seq_lengths
     reference = torch_block_mask(
-        block_mask.mask_mod,
+        _slice_mask_mod(block_mask.mask_mod, slices),
         B=int(block_mask.kv_num_blocks.shape[0]),
         H=1,
         Q_LEN=q_len,
@@ -620,6 +629,29 @@ def _assert_matches_torch_block_mask(block_mask: BlockMask) -> None:
         expected = _block_entries(reference, counts_name, indices_name)
         if actual != expected:
             raise AssertionError(f"{counts_name}/{indices_name} mismatch")
+
+
+def _slice_mask_mod(mask_mod: object, slices: Sequence[object]) -> object:
+    if not slices:
+        return mask_mod
+
+    def sliced_mask_mod(
+        batch_idx: torch.Tensor,
+        head_idx: torch.Tensor,
+        query_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        in_slice = torch.zeros_like(query_idx, dtype=torch.bool)
+        for slice_ in slices:
+            in_slice |= (
+                (query_idx >= int(slice_.q_range.start))
+                & (query_idx < int(slice_.q_range.end))
+                & (kv_idx >= int(slice_.k_range.start))
+                & (kv_idx < int(slice_.k_range.end))
+            )
+        return in_slice & mask_mod(batch_idx, head_idx, query_idx, kv_idx)
+
+    return sliced_mask_mod
 
 
 def _block_entries(

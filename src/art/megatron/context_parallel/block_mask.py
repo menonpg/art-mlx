@@ -166,6 +166,9 @@ def _refine_exact_blocks(
                 partial_blocks[q_block_index, k_block_index] = False
                 full_blocks[q_block_index, k_block_index] = False
                 continue
+            partial_blocks[q_block_index, k_block_index] = True
+            full_blocks[q_block_index, k_block_index] = False
+            continue
         can_attend = group_can_attend[
             q_group_index[q_slice, None],
             k_group_index[None, k_slice],
