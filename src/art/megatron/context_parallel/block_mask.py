@@ -146,7 +146,32 @@ def _refine_exact_blocks(
     k_len: int,
     skip_uniform_allowed: bool,
 ) -> None:
-    for q_block_index, k_block_index in np.argwhere(partial_blocks | full_blocks):
+    candidate_blocks = partial_blocks | full_blocks
+    if skip_uniform_allowed:
+        q_starts = np.arange(candidate_blocks.shape[0], dtype=np.int64) * int(q_block)
+        k_starts = np.arange(candidate_blocks.shape[1], dtype=np.int64) * int(k_block)
+        q_ends = np.minimum(q_starts + int(q_block), int(q_len))
+        k_ends = np.minimum(k_starts + int(k_block), int(k_len))
+        q_group_min, q_group_max = _block_min_max(q_group_index, q_starts, q_ends)
+        k_group_min, k_group_max = _block_min_max(k_group_index, k_starts, k_ends)
+        q_block_indices, k_block_indices = np.nonzero(candidate_blocks)
+        homogeneous = (q_group_min[q_block_indices] == q_group_max[q_block_indices]) & (
+            k_group_min[k_block_indices] == k_group_max[k_block_indices]
+        )
+        if bool(np.any(homogeneous)):
+            homogeneous_q = q_block_indices[homogeneous]
+            homogeneous_k = k_block_indices[homogeneous]
+            allowed = group_can_attend[
+                q_group_min[homogeneous_q],
+                k_group_min[homogeneous_k],
+            ]
+            disallowed_q = homogeneous_q[~allowed]
+            disallowed_k = homogeneous_k[~allowed]
+            partial_blocks[disallowed_q, disallowed_k] = False
+            full_blocks[disallowed_q, disallowed_k] = False
+            candidate_blocks[homogeneous_q, homogeneous_k] = False
+
+    for q_block_index, k_block_index in np.argwhere(candidate_blocks):
         q_start = int(q_block_index) * q_block
         k_start = int(k_block_index) * k_block
         q_end = q_start + q_block
