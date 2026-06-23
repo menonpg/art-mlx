@@ -144,6 +144,7 @@ def _refine_exact_blocks(
     k_block: int,
     q_len: int,
     k_len: int,
+    skip_uniform_allowed: bool,
 ) -> None:
     for q_block_index, k_block_index in np.argwhere(partial_blocks | full_blocks):
         q_start = int(q_block_index) * q_block
@@ -155,15 +156,16 @@ def _refine_exact_blocks(
 
         q_slice = slice(q_start, q_end)
         k_slice = slice(k_start, k_end)
-        q_groups = np.unique(q_group_index[q_slice])
-        k_groups = np.unique(k_group_index[k_slice])
-        group_allowed = group_can_attend[np.ix_(q_groups, k_groups)]
-        if bool(np.all(group_allowed)):
-            continue
-        if not bool(np.any(group_allowed)):
-            partial_blocks[q_block_index, k_block_index] = False
-            full_blocks[q_block_index, k_block_index] = False
-            continue
+        if skip_uniform_allowed:
+            q_groups = np.unique(q_group_index[q_slice])
+            k_groups = np.unique(k_group_index[k_slice])
+            group_allowed = group_can_attend[np.ix_(q_groups, k_groups)]
+            if bool(np.all(group_allowed)):
+                continue
+            if not bool(np.any(group_allowed)):
+                partial_blocks[q_block_index, k_block_index] = False
+                full_blocks[q_block_index, k_block_index] = False
+                continue
         can_attend = group_can_attend[
             q_group_index[q_slice, None],
             k_group_index[None, k_slice],
@@ -320,6 +322,7 @@ def _build_sparse_block_mask(
             k_block=k_block,
             q_len=int(spec.q_len),
             k_len=int(spec.k_len),
+            skip_uniform_allowed=context.max_depth <= 1,
         )
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
