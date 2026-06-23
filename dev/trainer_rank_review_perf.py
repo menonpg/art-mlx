@@ -57,7 +57,7 @@ def main(
     run_flex: bool = True,
     flex_token_cap: int = 8192,
     flex_heads: int = 2,
-    flex_head_dim: int = 64,
+    flex_head_dim: int = 128,
     flex_mask_variants: str = "current,ancestor_slots,causal_abs_only",
     output_jsonl: Path = Path(".local/trainer_rank_review/block_mask_flex.jsonl"),
 ) -> None:
