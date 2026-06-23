@@ -11,37 +11,54 @@ from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 
 from .types import AttnMaskKind, FlexMaskSpec
 
-_INVALID_GROUP_INDEX = 0
+_INVALID_ABS = -(1 << 63)
+_INVALID_ENTER = -1
+_INVALID_EXIT = -1
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedBlockMaskContext:
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
-    group_ids_np: np.ndarray
-    sorted_group_ids: np.ndarray
-    group_can_attend: np.ndarray
+    group_enter_np: np.ndarray
+    group_exit_np: np.ndarray
     max_depth: int
 
 
-def _build_exact_mask_mod(
+@dataclass(frozen=True, slots=True)
+class _QBlockState:
+    abs_values: np.ndarray
+    enter_values: np.ndarray
+    min_abs: int
+    max_abs: int
+    min_enter: int
+    max_enter: int
+    all_valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _KBlockState:
+    max_abs: int
+    max_enter: int
+    min_exit: int
+    intervals: tuple[tuple[int, int, int], ...]
+    all_valid: bool
+
+
+def _build_interval_mask_mod(
     *,
     q_abs: np.ndarray,
     k_abs: np.ndarray,
-    q_group_index: np.ndarray,
-    k_group_index: np.ndarray,
-    group_can_attend: np.ndarray,
+    q_enter: np.ndarray,
+    k_enter: np.ndarray,
+    k_exit: np.ndarray,
     device: torch.device,
 ):
     q_abs_tensor = torch.as_tensor(q_abs, device=device, dtype=torch.int64)
     k_abs_tensor = torch.as_tensor(k_abs, device=device, dtype=torch.int64)
-    q_group_tensor = torch.as_tensor(q_group_index, device=device, dtype=torch.int32)
-    k_group_tensor = torch.as_tensor(k_group_index, device=device, dtype=torch.int32)
-    group_can_attend_tensor = torch.as_tensor(
-        group_can_attend,
-        device=device,
-        dtype=torch.bool,
-    )
+    q_enter_tensor = torch.as_tensor(q_enter, device=device, dtype=torch.int64)
+    k_enter_tensor = torch.as_tensor(k_enter, device=device, dtype=torch.int64)
+    k_exit_tensor = torch.as_tensor(k_exit, device=device, dtype=torch.int64)
 
     def mask_mod(
         batch_idx: torch.Tensor,
@@ -52,11 +69,13 @@ def _build_exact_mask_mod(
         del batch_idx, head_idx
         q_abs_local = q_abs_tensor[query_idx]
         k_abs_local = k_abs_tensor[kv_idx]
-        allowed_group = group_can_attend_tensor[
-            q_group_tensor[query_idx],
-            k_group_tensor[kv_idx],
-        ]
-        return (q_abs_local >= k_abs_local) & allowed_group
+        q_enter_local = q_enter_tensor[query_idx]
+        k_enter_local = k_enter_tensor[kv_idx]
+        k_exit_local = k_exit_tensor[kv_idx]
+        in_key_subtree = (k_enter_local <= q_enter_local) & (
+            q_enter_local < k_exit_local
+        )
+        return (q_abs_local >= k_abs_local) & in_key_subtree
 
     return mask_mod
 
@@ -97,6 +116,165 @@ def _select_with_invalid_np(
     return selected
 
 
+def _build_q_block_state(
+    *,
+    q_abs: np.ndarray,
+    q_enter: np.ndarray,
+    q_block: int,
+    block_idx: int,
+) -> _QBlockState:
+    start = int(block_idx) * q_block
+    end = min((int(block_idx) + 1) * q_block, int(q_abs.size))
+    abs_block = q_abs[start:end]
+    enter_block = q_enter[start:end]
+    valid = (abs_block >= 0) & (enter_block >= 0)
+    all_valid = bool(valid.all()) and int(abs_block.size) == int(q_block)
+    if not bool(valid.any()):
+        return _QBlockState(
+            abs_values=np.empty(0, dtype=np.int64),
+            enter_values=np.empty(0, dtype=np.int64),
+            min_abs=_INVALID_ABS,
+            max_abs=_INVALID_ABS,
+            min_enter=_INVALID_ENTER,
+            max_enter=_INVALID_ENTER,
+            all_valid=False,
+        )
+    valid_abs = abs_block[valid]
+    valid_enter = enter_block[valid]
+    return _QBlockState(
+        abs_values=valid_abs,
+        enter_values=valid_enter,
+        min_abs=int(valid_abs.min()),
+        max_abs=int(valid_abs.max()),
+        min_enter=int(valid_enter.min()),
+        max_enter=int(valid_enter.max()),
+        all_valid=all_valid,
+    )
+
+
+def _build_k_block_state(
+    *,
+    k_abs: np.ndarray,
+    k_enter: np.ndarray,
+    k_exit: np.ndarray,
+    k_block: int,
+    block_idx: int,
+) -> _KBlockState:
+    start = int(block_idx) * k_block
+    end = min((int(block_idx) + 1) * k_block, int(k_abs.size))
+    abs_block = k_abs[start:end]
+    enter_block = k_enter[start:end]
+    exit_block = k_exit[start:end]
+    valid = (abs_block >= 0) & (enter_block >= 0) & (exit_block > enter_block)
+    all_valid = bool(valid.all()) and int(abs_block.size) == int(k_block)
+    if not bool(valid.any()):
+        return _KBlockState(
+            max_abs=_INVALID_ABS,
+            max_enter=_INVALID_ENTER,
+            min_exit=_INVALID_EXIT,
+            intervals=(),
+            all_valid=False,
+        )
+    valid_abs = abs_block[valid]
+    valid_enter = enter_block[valid]
+    valid_exit = exit_block[valid]
+    min_abs_by_interval: dict[tuple[int, int], int] = {}
+    for abs_value, enter_value, exit_value in zip(
+        valid_abs,
+        valid_enter,
+        valid_exit,
+        strict=True,
+    ):
+        interval = (int(enter_value), int(exit_value))
+        prior = min_abs_by_interval.get(interval)
+        min_abs_by_interval[interval] = (
+            int(abs_value) if prior is None else min(prior, int(abs_value))
+        )
+    return _KBlockState(
+        max_abs=int(valid_abs.max()),
+        max_enter=int(valid_enter.max()),
+        min_exit=int(valid_exit.min()),
+        intervals=tuple(
+            (enter, exit, min_abs)
+            for (enter, exit), min_abs in min_abs_by_interval.items()
+        ),
+        all_valid=all_valid,
+    )
+
+
+def _interval_block_has_any(
+    *,
+    q_state: _QBlockState,
+    k_state: _KBlockState,
+) -> bool:
+    if int(q_state.abs_values.size) == 0 or not k_state.intervals:
+        return False
+    for enter, exit, min_abs in k_state.intervals:
+        if q_state.max_abs < min_abs:
+            continue
+        in_subtree = (q_state.enter_values >= enter) & (q_state.enter_values < exit)
+        if bool(in_subtree.any()) and int(q_state.abs_values[in_subtree].max()) >= min_abs:
+            return True
+    return False
+
+
+def _interval_block_state(
+    *,
+    q_state: _QBlockState,
+    k_state: _KBlockState,
+) -> tuple[bool, bool]:
+    has_any = _interval_block_has_any(q_state=q_state, k_state=k_state)
+    if not has_any:
+        return False, False
+    if not q_state.all_valid or not k_state.all_valid:
+        return True, False
+    causal_full = q_state.min_abs >= k_state.max_abs
+    interval_full = (
+        k_state.max_enter <= q_state.min_enter and q_state.max_enter < k_state.min_exit
+    )
+    return True, bool(causal_full and interval_full)
+
+
+def _refine_interval_blocks(
+    *,
+    partial_blocks: np.ndarray,
+    full_blocks: np.ndarray,
+    q_abs: np.ndarray,
+    k_abs: np.ndarray,
+    q_enter: np.ndarray,
+    k_enter: np.ndarray,
+    k_exit: np.ndarray,
+    q_block: int,
+    k_block: int,
+) -> None:
+    candidate_blocks = partial_blocks | full_blocks
+    q_state_cache: dict[int, _QBlockState] = {}
+    k_state_cache: dict[int, _KBlockState] = {}
+    for q_idx, k_idx in np.argwhere(candidate_blocks):
+        q_state = q_state_cache.get(int(q_idx))
+        if q_state is None:
+            q_state = _build_q_block_state(
+                q_abs=q_abs,
+                q_enter=q_enter,
+                q_block=q_block,
+                block_idx=int(q_idx),
+            )
+            q_state_cache[int(q_idx)] = q_state
+        k_state = k_state_cache.get(int(k_idx))
+        if k_state is None:
+            k_state = _build_k_block_state(
+                k_abs=k_abs,
+                k_enter=k_enter,
+                k_exit=k_exit,
+                k_block=k_block,
+                block_idx=int(k_idx),
+            )
+            k_state_cache[int(k_idx)] = k_state
+        has_any, is_full = _interval_block_state(q_state=q_state, k_state=k_state)
+        partial_blocks[q_idx, k_idx] = bool(has_any and not is_full)
+        full_blocks[q_idx, k_idx] = bool(is_full)
+
+
 def _is_strictly_increasing(values: np.ndarray) -> bool:
     return int(values.size) <= 1 or bool(np.all(values[1:] > values[:-1]))
 
@@ -115,92 +293,44 @@ def _block_min_max(
     return mins, maxes
 
 
-def _remap_group_values(
-    values: np.ndarray,
+def _build_group_interval_arrays(
     *,
-    sorted_group_ids: np.ndarray,
-) -> np.ndarray:
-    remapped = np.full(values.shape, _INVALID_GROUP_INDEX, dtype=np.int32)
-    if int(sorted_group_ids.size) == 0:
-        return remapped
-    positions = np.searchsorted(sorted_group_ids, values)
-    in_bounds = positions < int(sorted_group_ids.size)
-    matched = np.zeros(values.shape, dtype=bool)
-    matched[in_bounds] = sorted_group_ids[positions[in_bounds]] == values[in_bounds]
-    remapped[matched] = positions[matched].astype(np.int32, copy=False) + 1
-    return remapped
-
-
-def _refine_exact_blocks(
-    *,
-    partial_blocks: np.ndarray,
-    full_blocks: np.ndarray,
-    q_abs: np.ndarray,
-    k_abs: np.ndarray,
-    q_group_index: np.ndarray,
-    k_group_index: np.ndarray,
-    group_can_attend: np.ndarray,
-    q_block: int,
-    k_block: int,
-    q_len: int,
-    k_len: int,
-    skip_uniform_allowed: bool,
-) -> None:
-    candidate_blocks = partial_blocks | full_blocks
-    q_starts = np.arange(candidate_blocks.shape[0], dtype=np.int64) * int(q_block)
-    k_starts = np.arange(candidate_blocks.shape[1], dtype=np.int64) * int(k_block)
-    q_ends = np.minimum(q_starts + int(q_block), int(q_len))
-    k_ends = np.minimum(k_starts + int(k_block), int(k_len))
-    q_group_min, q_group_max = _block_min_max(q_group_index, q_starts, q_ends)
-    k_group_min, k_group_max = _block_min_max(k_group_index, k_starts, k_ends)
-    q_block_indices, k_block_indices = np.nonzero(candidate_blocks)
-    homogeneous = (q_group_min[q_block_indices] == q_group_max[q_block_indices]) & (
-        k_group_min[k_block_indices] == k_group_max[k_block_indices]
-    )
-    if bool(np.any(homogeneous)):
-        homogeneous_q = q_block_indices[homogeneous]
-        homogeneous_k = k_block_indices[homogeneous]
-        allowed = group_can_attend[
-            q_group_min[homogeneous_q],
-            k_group_min[homogeneous_k],
-        ]
-        disallowed_q = homogeneous_q[~allowed]
-        disallowed_k = homogeneous_k[~allowed]
-        partial_blocks[disallowed_q, disallowed_k] = False
-        full_blocks[disallowed_q, disallowed_k] = False
-
-    mixed_q = q_block_indices[~homogeneous]
-    mixed_k = k_block_indices[~homogeneous]
-    if skip_uniform_allowed:
-        partial_blocks[mixed_q, mixed_k] = True
-        full_blocks[mixed_q, mixed_k] = False
-        return
-
-    for q_block_index, k_block_index in zip(mixed_q, mixed_k, strict=True):
-        q_start = int(q_block_index) * q_block
-        k_start = int(k_block_index) * k_block
-        q_end = q_start + q_block
-        k_end = k_start + k_block
-        if q_end > q_len or k_end > k_len:
-            continue
-
-        q_slice = slice(q_start, q_end)
-        k_slice = slice(k_start, k_end)
-        can_attend = group_can_attend[
-            q_group_index[q_slice, None],
-            k_group_index[None, k_slice],
-        ]
-        causal = q_abs[q_slice, None] >= k_abs[None, k_slice]
-        allowed = causal & can_attend
-        if not bool(np.any(allowed)):
-            partial_blocks[q_block_index, k_block_index] = False
-            full_blocks[q_block_index, k_block_index] = False
-        elif bool(np.all(allowed)):
-            partial_blocks[q_block_index, k_block_index] = False
-            full_blocks[q_block_index, k_block_index] = True
+    row_tree,
+    length: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    enter_by_group: dict[int, int] = {}
+    exit_by_group: dict[int, int] = {}
+    segment_by_group = row_tree.segment_by_group_id()
+    children_by_group: dict[int, list[int]] = {}
+    roots: list[int] = []
+    for segment in row_tree.segments:
+        if segment.ancestors:
+            children_by_group.setdefault(segment.parent_id, []).append(segment.group_id)
         else:
-            partial_blocks[q_block_index, k_block_index] = True
-            full_blocks[q_block_index, k_block_index] = False
+            roots.append(segment.group_id)
+
+    next_enter = 0
+
+    def visit(group_id: int) -> None:
+        nonlocal next_enter
+        enter_by_group[group_id] = next_enter
+        next_enter += 1
+        children = children_by_group.get(group_id, [])
+        children.sort(key=lambda child: segment_by_group[child].start)
+        for child_group_id in children:
+            visit(child_group_id)
+        exit_by_group[group_id] = next_enter
+
+    roots.sort(key=lambda root: segment_by_group[root].start)
+    for root_group_id in roots:
+        visit(root_group_id)
+
+    enter_by_token = np.full((length,), _INVALID_ENTER, dtype=np.int64)
+    exit_by_token = np.full((length,), _INVALID_EXIT, dtype=np.int64)
+    for segment in row_tree.segments:
+        enter_by_token[segment.start : segment.end] = enter_by_group[segment.group_id]
+        exit_by_token[segment.start : segment.end] = exit_by_group[segment.group_id]
+    return enter_by_token, exit_by_token
 
 
 def _build_sparse_block_mask(
@@ -227,30 +357,27 @@ def _build_sparse_block_mask(
     k_abs = k_abs_tensor.numpy()
     q_abs_sorted = _is_strictly_increasing(q_abs[q_abs >= 0])
     k_abs_sorted = _is_strictly_increasing(k_abs[k_abs >= 0])
-    q_group = _select_with_invalid_np(
-        context.group_ids_np,
+    q_enter = _select_with_invalid_np(
+        context.group_enter_np,
         q_abs,
-        invalid_value=-1,
+        invalid_value=_INVALID_ENTER,
     )
-    k_group = _select_with_invalid_np(
-        context.group_ids_np,
+    k_enter = _select_with_invalid_np(
+        context.group_enter_np,
         k_abs,
-        invalid_value=-1,
+        invalid_value=_INVALID_ENTER,
     )
-    q_group_index = _remap_group_values(
-        q_group,
-        sorted_group_ids=context.sorted_group_ids,
+    k_exit = _select_with_invalid_np(
+        context.group_exit_np,
+        k_abs,
+        invalid_value=_INVALID_EXIT,
     )
-    k_group_index = _remap_group_values(
-        k_group,
-        sorted_group_ids=context.sorted_group_ids,
-    )
-    mask_mod = _build_exact_mask_mod(
+    mask_mod = _build_interval_mask_mod(
         q_abs=q_abs,
         k_abs=k_abs,
-        q_group_index=q_group_index,
-        k_group_index=k_group_index,
-        group_can_attend=context.group_can_attend,
+        q_enter=q_enter,
+        k_enter=k_enter,
+        k_exit=k_exit,
         device=device,
     )
     if not spec.slices:
@@ -329,21 +456,17 @@ def _build_sparse_block_mask(
         full_blocks[q_slice, k_slice] |= is_full
 
     partial_blocks &= ~full_blocks
-    if int(context.group_can_attend.shape[0]) > 2:
-        _refine_exact_blocks(
-            partial_blocks=partial_blocks,
-            full_blocks=full_blocks,
-            q_abs=q_abs,
-            k_abs=k_abs,
-            q_group_index=q_group_index,
-            k_group_index=k_group_index,
-            group_can_attend=context.group_can_attend,
-            q_block=q_block,
-            k_block=k_block,
-            q_len=int(spec.q_len),
-            k_len=int(spec.k_len),
-            skip_uniform_allowed=context.max_depth <= 1,
-        )
+    _refine_interval_blocks(
+        partial_blocks=partial_blocks,
+        full_blocks=full_blocks,
+        q_abs=q_abs,
+        k_abs=k_abs,
+        q_enter=q_enter,
+        k_enter=k_enter,
+        k_exit=k_exit,
+        q_block=q_block,
+        k_block=k_block,
+    )
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
         device=device,
@@ -396,13 +519,15 @@ def prepare_block_mask_context(
         group_ids=flat_group_ids,
         parent_ids=flat_parent_ids,
     )
-    group_ids_for_matrix, group_can_attend_values = row_tree.group_can_attend_matrix()
+    group_enter_np, group_exit_np = _build_group_interval_arrays(
+        row_tree=row_tree,
+        length=int(flat_group_ids.numel()),
+    )
     return PreparedBlockMaskContext(
         group_ids=flat_group_ids,
         parent_ids=flat_parent_ids,
-        group_ids_np=flat_group_ids.numpy(),
-        sorted_group_ids=np.asarray(group_ids_for_matrix, dtype=np.int64),
-        group_can_attend=np.asarray(group_can_attend_values, dtype=bool),
+        group_enter_np=group_enter_np,
+        group_exit_np=group_exit_np,
         max_depth=int(row_tree.max_depth),
     )
 
