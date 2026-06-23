@@ -4,7 +4,6 @@ import base64
 import io
 from typing import Any
 
-import numpy as np
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -280,6 +279,8 @@ def _normalize_routes(raw: Any, *, field_name: str) -> list[TokenRoute]:
 
 
 def _decode_vllm_routed_experts(raw: str, *, field_name: str) -> list[Any]:
+    import numpy as np
+
     try:
         array = np.load(io.BytesIO(base64.b64decode(raw)), allow_pickle=False)
     except Exception as exc:

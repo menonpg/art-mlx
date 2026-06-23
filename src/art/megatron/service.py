@@ -715,7 +715,7 @@ class MegatronService:
             raise RuntimeError(
                 "Megatron dependencies are not available in the active ART environment. "
                 "Run `setup.sh` for this worktree and build the project venv with "
-                "`uv sync --extra backend --extra megatron` before starting Megatron "
+                "`uv sync --extra megatron` before starting Megatron "
                 "training."
             ) from exc
 
