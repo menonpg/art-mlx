@@ -89,6 +89,12 @@ def _patch_art_runtime_routes() -> None:
             models.base_model_paths[0].name = name
             return JSONResponse(content={"name": name})
 
+        @router.get("/art/metrics")
+        async def art_metrics() -> JSONResponse:
+            from art_vllm_runtime.metrics import get_art_metrics_snapshot
+
+            return JSONResponse(content=get_art_metrics_snapshot())
+
         app.include_router(router)
         return app
 
