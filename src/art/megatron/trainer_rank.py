@@ -691,7 +691,12 @@ class TrainerRank:
         start = 0
         while start < len(items):
             candidate = self._select_next_micro_batch(items, start)
-            flat_outputs = iter(self._run_flat_plan_with_memory_tracking(candidate.plan))
+            flat_outputs = iter(
+                self._run_flat_plan_with_memory_tracking(
+                    candidate.plan,
+                    context="forward_micro_batches",
+                )
+            )
             outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
             stop = start + candidate.stats_global_count
             self._last_global_micro_batch_size = candidate.stats_global_count
@@ -760,7 +765,12 @@ class TrainerRank:
         materialized = _materialize(inputs)
         plan = self._plan_flat_forward(list(_flatten(materialized)))
         self._raise_if_plan_will_not_fit(plan, context="dp_rank_forward")
-        outputs = iter(self._run_flat_plan_with_memory_tracking(plan))
+        outputs = iter(
+            self._run_flat_plan_with_memory_tracking(
+                plan,
+                context="dp_rank_forward",
+            )
+        )
         return _unflatten(materialized, outputs)
 
     def dp_reduce(
@@ -1150,6 +1160,8 @@ class TrainerRank:
     def _run_flat_plan_with_memory_tracking(
         self,
         plan: _FlatForwardPlan,
+        *,
+        context: str,
     ) -> list[AnyForwardOutput]:
         if torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -1164,7 +1176,7 @@ class TrainerRank:
             self._raise_memory_error(
                 plan,
                 check,
-                context="forward",
+                context=context,
                 message="CUDA OOM occurred despite the planner estimate",
             )
             raise AssertionError("unreachable") from exc

@@ -103,7 +103,7 @@ def test_forward_micro_batches_uses_deterministic_dp_windows(monkeypatch: pytest
     monkeypatch.setattr(
         trainer,
         "_run_flat_plan_with_memory_tracking",
-        lambda plan: [
+        lambda plan, **_kwargs: [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ],
     )
@@ -122,7 +122,7 @@ def test_forward_micro_batches_outputs_match_top_level_nested_inputs(
     monkeypatch.setattr(
         trainer,
         "_run_flat_plan_with_memory_tracking",
-        lambda plan: [
+        lambda plan, **_kwargs: [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ],
     )
@@ -139,7 +139,7 @@ def test_forward_micro_batches_ramps_after_first_success(monkeypatch: pytest.Mon
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
 
-    def run(plan):
+    def run(plan, **_kwargs):
         trainer._memory_profiles[plan.signature] = 0.0
         return [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)]
 
@@ -172,7 +172,7 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
     monkeypatch.setattr(
         trainer,
         "_run_flat_plan_with_memory_tracking",
-        lambda plan: [
+        lambda plan, **_kwargs: [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ],
     )
