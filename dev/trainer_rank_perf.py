@@ -53,7 +53,7 @@ def main(
     adapter_slot_rank: int = 1,
     learning_rate: float = 1e-5,
     full_step_offload_reload: bool = False,
-    memory_sample_interval_s: float = 0.01,
+    memory_sample_interval_s: float = 0.05,
     compare_target_correctness: bool = False,
     run_adapter_sanity: bool = False,
     output_jsonl: str = "",

@@ -500,9 +500,14 @@ def _group_can_attend(pack: SharedPrefixPack) -> torch.Tensor:
     can_attend = torch.zeros((max_group + 1, max_group + 1), dtype=torch.bool)
     for group in range(1, max_group + 1):
         current = group
-        while current > 0:
+        seen: set[int] = set()
+        while current > 0 and current not in seen:
+            seen.add(current)
             can_attend[group, current] = True
-            current = parents[current]
+            parent = parents[current]
+            if parent == current:
+                break
+            current = parent
     return can_attend
 
 
