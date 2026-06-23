@@ -131,7 +131,7 @@ def _remap_group_values(
     return remapped
 
 
-def _refine_exact_partial_blocks(
+def _refine_exact_blocks(
     *,
     partial_blocks: np.ndarray,
     full_blocks: np.ndarray,
@@ -145,7 +145,7 @@ def _refine_exact_partial_blocks(
     q_len: int,
     k_len: int,
 ) -> None:
-    for q_block_index, k_block_index in np.argwhere(partial_blocks):
+    for q_block_index, k_block_index in np.argwhere(partial_blocks | full_blocks):
         q_start = int(q_block_index) * q_block
         k_start = int(k_block_index) * k_block
         q_end = q_start + q_block
@@ -163,9 +163,13 @@ def _refine_exact_partial_blocks(
         allowed = causal & can_attend
         if not bool(np.any(allowed)):
             partial_blocks[q_block_index, k_block_index] = False
+            full_blocks[q_block_index, k_block_index] = False
         elif bool(np.all(allowed)):
             partial_blocks[q_block_index, k_block_index] = False
             full_blocks[q_block_index, k_block_index] = True
+        else:
+            partial_blocks[q_block_index, k_block_index] = True
+            full_blocks[q_block_index, k_block_index] = False
 
 
 def _build_sparse_block_mask(
@@ -295,7 +299,7 @@ def _build_sparse_block_mask(
 
     partial_blocks &= ~full_blocks
     if int(context.group_can_attend.shape[0]) > 2:
-        _refine_exact_partial_blocks(
+        _refine_exact_blocks(
             partial_blocks=partial_blocks,
             full_blocks=full_blocks,
             q_abs=q_abs,
