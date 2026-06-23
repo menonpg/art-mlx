@@ -19,6 +19,7 @@ from art.megatron.context_parallel.block_mask import (
     prepare_block_mask_context,
 )
 from art.megatron.context_parallel.builder import build_shared_prefix_attention_spec
+from art.megatron.context_parallel.executor import _build_stage_execution_spec
 from art.megatron.context_parallel.runtime import (
     _RUNTIME_PLAN_CACHE,
     get_or_build_runtime_plan,
@@ -28,8 +29,13 @@ from art.megatron.context_parallel.types import (
     ContextParallelConfig,
     FlexMaskSpec,
     ParallelTopology,
+    StageExecutionSpec,
+    StagePlan,
 )
-from art.megatron.flex_attn.compiled import sparse_compiled_flex_attention
+from art.megatron.flex_attn.compiled import (
+    normalize_sparse_block_size,
+    sparse_compiled_flex_attention,
+)
 from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 
 
@@ -338,13 +344,17 @@ def _build_stage_masks(
         for stage in rank_plan.stage_plans:
             if stage.mask_metadata is None:
                 continue
+            execution_spec = _stage_execution_spec(stage, config)
+            mask_metadata = execution_spec.mask_metadata or stage.mask_metadata
+            if mask_metadata is None:
+                continue
             mask = build_block_mask_from_context(
                 FlexMaskSpec(
-                    q_len=stage.q_len,
-                    k_len=stage.k_len,
-                    block_size=config.block_size,
+                    q_len=execution_spec.q_len,
+                    k_len=execution_spec.k_len,
+                    block_size=_sparse_block_size(config),
                     slices=stage.slices,
-                    exact_mask=stage.mask_metadata,
+                    exact_mask=mask_metadata,
                 ),
                 context=context,
                 device=torch.device("cpu"),
@@ -485,6 +495,8 @@ class _StageFlexCase:
     stage_index: int
     q_len: int
     k_len: int
+    logical_q_len: int
+    logical_k_len: int
     block_mask: BlockMask
     q_abs: np.ndarray
     k_abs: np.ndarray
@@ -509,13 +521,17 @@ def _build_stage_flex_cases(
         for stage in rank_plan.stage_plans:
             if stage.mask_metadata is None:
                 continue
+            execution_spec = _stage_execution_spec(stage, config)
+            mask_metadata = execution_spec.mask_metadata or stage.mask_metadata
+            if mask_metadata is None:
+                continue
             mask = build_block_mask_from_context(
                 FlexMaskSpec(
-                    q_len=stage.q_len,
-                    k_len=stage.k_len,
-                    block_size=config.block_size,
+                    q_len=execution_spec.q_len,
+                    k_len=execution_spec.k_len,
+                    block_size=_sparse_block_size(config),
                     slices=stage.slices,
-                    exact_mask=stage.mask_metadata,
+                    exact_mask=mask_metadata,
                 ),
                 context=context,
                 device=device,
@@ -524,13 +540,13 @@ def _build_stage_flex_cases(
             if mask is None:
                 continue
             q_abs = (
-                stage.mask_metadata.q_token_indices.detach()
+                mask_metadata.q_token_indices.detach()
                 .to(device="cpu", dtype=torch.int64)
                 .reshape(-1)
                 .numpy()
             )
             k_abs = (
-                stage.mask_metadata.k_token_indices.detach()
+                mask_metadata.k_token_indices.detach()
                 .to(device="cpu", dtype=torch.int64)
                 .reshape(-1)
                 .numpy()
@@ -549,8 +565,10 @@ def _build_stage_flex_cases(
                 _StageFlexCase(
                     rank=int(rank_plan.rank),
                     stage_index=int(stage.stage_index),
-                    q_len=int(stage.q_len),
-                    k_len=int(stage.k_len),
+                    q_len=int(execution_spec.q_len),
+                    k_len=int(execution_spec.k_len),
+                    logical_q_len=int(stage.q_len),
+                    logical_k_len=int(stage.k_len),
                     block_mask=mask,
                     q_abs=q_abs,
                     k_abs=k_abs,
@@ -621,17 +639,17 @@ def _stage_variant_block_mask(
             device=device,
             dtype=torch.int32,
         )
-        slot_count = int(ancestor_slots.shape[1])
+        slot_columns = tuple(
+            ancestor_slots[:, index] for index in range(ancestor_slots.shape[1])
+        )
 
         def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
             del batch_idx, head_idx
             q_group_local = q_group[query_idx]
             k_group_local = k_group[kv_idx]
             allowed = torch.zeros_like(q_group_local, dtype=torch.bool)
-            for slot in range(slot_count):
-                allowed = allowed | (
-                    k_group_local == ancestor_slots[q_group_local, slot]
-                )
+            for slot_values in slot_columns:
+                allowed = allowed | (k_group_local == slot_values[q_group_local])
             return (q_abs[query_idx] >= k_abs[kv_idx]) & allowed
 
         return _replace_block_mask_mod(case.block_mask, mask_mod)
@@ -655,9 +673,29 @@ def _stage_flex_stats(cases: Sequence[_StageFlexCase]) -> dict[str, object]:
         "flex_stage_count": len(cases),
         "flex_stage_q_tokens": sum(case.q_len for case in cases),
         "flex_stage_k_tokens": sum(case.k_len for case in cases),
+        "flex_stage_logical_q_tokens": sum(case.logical_q_len for case in cases),
+        "flex_stage_logical_k_tokens": sum(case.logical_k_len for case in cases),
         "flex_stage_max_q_tokens": max(case.q_len for case in cases),
         "flex_stage_max_k_tokens": max(case.k_len for case in cases),
+        "flex_stage_max_logical_q_tokens": max(case.logical_q_len for case in cases),
+        "flex_stage_max_logical_k_tokens": max(case.logical_k_len for case in cases),
     }
+
+
+def _sparse_block_size(config: ContextParallelConfig) -> tuple[int, int]:
+    return normalize_sparse_block_size(
+        config.attention_sparse_block_size or config.block_size
+    )
+
+
+def _stage_execution_spec(
+    stage: StagePlan,
+    config: ContextParallelConfig,
+) -> StageExecutionSpec:
+    return _build_stage_execution_spec(
+        stage_plan=stage,
+        block_size=_sparse_block_size(config),
+    )
 
 
 def _replace_block_mask_mod(block_mask: BlockMask, mask_mod: object) -> BlockMask:
