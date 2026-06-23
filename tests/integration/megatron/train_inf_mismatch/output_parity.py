@@ -1036,6 +1036,7 @@ def _score_context_parallel_once(
     import torch
     import torch.distributed as dist
 
+    dist_any = cast(Any, dist)
     from art.megatron.context_parallel.types import ParallelTopology
     from art.megatron.training.microbatches import _prepare_current_rl_micro
     from art.megatron.training.trace import (
@@ -1103,9 +1104,9 @@ def _score_context_parallel_once(
             desired_uids=set(logical_uids),
         )
     gathered_records: list[dict[int, ScoreRecord]] = [
-        {} for _ in range(dist.get_world_size())
+        {} for _ in range(dist_any.get_world_size())
     ]
-    dist.all_gather_object(gathered_records, local_records)
+    dist_any.all_gather_object(gathered_records, local_records)
     return _score_bundle_from_records(
         records=_merge_score_records(gathered_records),
         logical_tokens=logical_tokens,

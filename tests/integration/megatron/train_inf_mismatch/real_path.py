@@ -17,7 +17,11 @@ from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
 from art.dev.model import RolloutWeightsMode
-from art.preprocessing.moe_routing import choice_moe_routing_metadata
+from art.preprocessing.moe_routing import (
+    MoeRoutingPackStats,
+    PackedMoeRoutingReplay,
+    choice_moe_routing_metadata,
+)
 from art.preprocessing.pack import DiskPackedTensors
 
 from .artifacts import REPO_ROOT
@@ -552,7 +556,6 @@ async def _score_base_real_generation_path(
 ) -> RealPathBaseDiagnosticBundle:
     import art
     from art.megatron.backend import MegatronBackend
-    from art.preprocessing.moe_routing import MoeRoutingPackStats
     from art.preprocessing.pack import packed_tensors_to_dir
 
     parity_config = config.output_parity
@@ -652,7 +655,10 @@ async def _score_base_real_generation_path(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         ).to_dir(routing_replay_dir)
         routing_replay_path = str(routing_replay_dir)
-        stats = packed_tensors["moe_routing_replay"].pack_stats
+        routing_replay = cast(
+            PackedMoeRoutingReplay, packed_tensors["moe_routing_replay"]
+        )
+        stats = routing_replay.pack_stats
     else:
         stats = MoeRoutingPackStats()
 
@@ -1196,11 +1202,11 @@ async def run_real_path_train_inf_mismatch(
             cast(dict[str, Any], disk_packed_tensors),
         )
         if is_moe:
-            routing_replay = packed_tensors["moe_routing_replay"]
+            routing_replay = cast(
+                PackedMoeRoutingReplay, packed_tensors["moe_routing_replay"]
+            )
             stats = routing_replay.pack_stats
         else:
-            from art.preprocessing.moe_routing import MoeRoutingPackStats
-
             stats = MoeRoutingPackStats()
 
         vllm_lora = _vllm_scores_from_real_choices(

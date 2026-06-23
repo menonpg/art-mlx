@@ -258,9 +258,6 @@ class _BootstrapGroup:
         return received
 
     def close(self) -> None:
-        if getattr(self, "socket", None) is not None:
-            self.socket.close()
-            self.socket = None
         self.store = None
 
 
@@ -355,44 +352,6 @@ class TrainerNcclCommunicator:
             self._nccl.abort_comm(comm)
         finally:
             self._close_bootstrap_group()
-
-    def _require_comm(self) -> Any:
-        if self._comm is None:
-            raise RuntimeError("NCCL weight transfer communicator is closed")
-        return self._comm
-
-    def _validate_collective_tensor(self, tensor: torch.Tensor) -> None:
-        if not tensor.is_cuda:
-            raise RuntimeError(
-                f"NCCL weight transfer requires a CUDA tensor, got {tensor.device}"
-            )
-        if tensor.device != self.device:
-            raise RuntimeError(
-                "NCCL weight transfer tensor device mismatch: "
-                f"expected {self.device}, got {tensor.device}"
-            )
-        if not tensor.is_contiguous():
-            raise RuntimeError("NCCL weight transfer requires contiguous tensors")
-
-    def close(self) -> None:
-        comm = self._comm
-        if comm is None:
-            return
-        self._comm = None
-        try:
-            self._nccl.destroy_comm(comm)
-        finally:
-            self._bootstrap_group.close()
-
-    def abort(self) -> None:
-        comm = self._comm
-        if comm is None:
-            return
-        self._comm = None
-        try:
-            self._nccl.abort_comm(comm)
-        finally:
-            self._bootstrap_group.close()
 
     def all_reduce(
         self,

@@ -625,6 +625,7 @@ async def run_length_trainability_async(
         if final_train_samples
         else None
     )
+    topology = cast(Topology, variant.topology)
     report = LengthTrainabilityReport(
         base_model=base_model,
         max_steps=max_steps,
@@ -633,7 +634,7 @@ async def run_length_trainability_async(
         variant_name=variant.name,
         trainer_gpu_ids=variant.trainer_gpu_ids,
         inference_gpu_ids=variant.inference_gpu_ids,
-        training_topology=cast(dict[str, int | bool], variant.topology.model_dump()),
+        training_topology=cast(dict[str, int | bool], topology.model_dump()),
         rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
         normalize_advantages=normalize_advantages,
