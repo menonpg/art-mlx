@@ -169,7 +169,11 @@ def _refine_exact_blocks(
             disallowed_k = homogeneous_k[~allowed]
             partial_blocks[disallowed_q, disallowed_k] = False
             full_blocks[disallowed_q, disallowed_k] = False
-            candidate_blocks[homogeneous_q, homogeneous_k] = False
+        mixed_q = q_block_indices[~homogeneous]
+        mixed_k = k_block_indices[~homogeneous]
+        partial_blocks[mixed_q, mixed_k] = True
+        full_blocks[mixed_q, mixed_k] = False
+        return
 
     for q_block_index, k_block_index in np.argwhere(candidate_blocks):
         q_start = int(q_block_index) * q_block
