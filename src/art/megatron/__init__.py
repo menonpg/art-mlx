@@ -5,8 +5,10 @@ _TRAINER_RANK_EXPORTS = (
     "ForwardInput",
     "ForwardOutput",
     "MicroBatch",
+    "MicroBatchStats",
     "TopK",
     "TrainerRank",
+    "TrainerRankMemoryError",
 )
 
 __all__ = ["MegatronBackend", *_TRAINER_RANK_EXPORTS]

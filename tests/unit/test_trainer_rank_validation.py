@@ -7,14 +7,31 @@ import torch
 
 from art.megatron.trainer_rank import (
     ForwardInput,
+    ForwardOutput,
     TrainerRank,
+    TrainerRankMemoryError,
     Unset,
+    _MemoryCheck,
     _validate_top_k,
 )
 
 
 class _Model:
     vocab_size = 8
+
+
+def _runtime(model: torch.nn.Module | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=[model or torch.nn.Linear(1, 1)],
+        optimizer=None,
+        provider=SimpleNamespace(hidden_size=4, num_layers=1),
+        model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
+    )
+
+
+def _target_request(token: int) -> ForwardInput[torch.Tensor, None, None, None]:
+    tokens = torch.tensor([token, token + 1], dtype=torch.long)
+    return ForwardInput(input_tokens=tokens, target_tokens=tokens)
 
 
 def test_forward_input_rejects_non_positive_top_k() -> None:
@@ -47,36 +64,196 @@ def test_validate_top_k_rejects_values_above_vocab_size() -> None:
 
 
 def test_trainer_rank_accepts_nested_shared_prefix_for_gdn_runtime() -> None:
-    runtime = SimpleNamespace(
-        model=[torch.nn.Linear(1, 1)],
-        optimizer=None,
-        model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
-    )
-
-    trainer = TrainerRank(runtime, shared_prefix_max_depth=2)  # type: ignore[arg-type]
+    trainer = TrainerRank(_runtime(), shared_prefix_max_depth=2)  # type: ignore[arg-type]
 
     assert trainer.shared_prefix_max_depth == 2
 
 
 def test_trainer_rank_accepts_zero_depth_shared_prefix_for_gdn_runtime() -> None:
-    runtime = SimpleNamespace(
-        model=[torch.nn.Linear(1, 1)],
-        optimizer=None,
-        model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
-    )
-
-    trainer = TrainerRank(runtime, shared_prefix_max_depth=0)  # type: ignore[arg-type]
+    trainer = TrainerRank(_runtime(), shared_prefix_max_depth=0)  # type: ignore[arg-type]
 
     assert trainer.shared_prefix_max_depth == 0
 
 
 def test_trainer_rank_pop_rejects_empty_adapter_stack() -> None:
-    runtime = SimpleNamespace(
-        model=[torch.nn.Linear(1, 1)],
-        optimizer=None,
-        model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
-    )
-    trainer = TrainerRank(runtime)  # type: ignore[arg-type]
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
 
     with pytest.raises(RuntimeError, match="No pushed LoRA or checkpoint"):
         trainer.pop_pushed_lora_or_checkpoint()
+
+
+def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    request_a = ForwardInput(input_tokens=torch.tensor([1]))
+    request_b = ForwardInput(input_tokens=torch.tensor([2]))
+
+    outputs = trainer.dp_rank_forward([[request_a], [request_b]])
+
+    assert len(outputs) == 2
+    assert len(outputs[0]) == 1
+    assert outputs[0][0].target_logprobs is None
+    assert outputs[1][0].target_logprobs is None
+    assert not hasattr(trainer, "forward")
+    assert not hasattr(trainer, "micro_batches")
+
+
+def test_forward_micro_batches_uses_deterministic_dp_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (1, 2))
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+
+    batches = list(trainer.forward_micro_batches([_target_request(i) for i in range(5)]))
+
+    assert [batch.indices for batch in batches] == [(1,), (3,), ()]
+    assert [len(batch.outputs) for batch in batches] == [1, 1, 0]
+
+
+def test_forward_micro_batches_outputs_match_top_level_nested_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+
+    nested = [[_target_request(1), _target_request(3)]]
+    batch = next(iter(trainer.forward_micro_batches(nested)))
+
+    assert batch.inputs == nested
+    assert len(batch.outputs) == 1
+    assert len(batch.outputs[0]) == 2
+
+
+def test_forward_micro_batches_ramps_after_first_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+
+    def run(plan):
+        trainer._memory_profiles[plan.signature] = 0.0
+        return [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)]
+
+    monkeypatch.setattr(trainer, "_run_flat_plan_with_memory_tracking", run)
+
+    batches = list(trainer.forward_micro_batches([_target_request(i) for i in range(8)]))
+
+    assert batches[0].stats.global_count == 1
+    assert batches[0].stats.cold_start
+    assert batches[1].stats.global_count > 1
+    assert not batches[1].stats.cold_start
+
+
+def test_forward_micro_batches_shrinks_to_largest_fitting_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    trainer._last_global_micro_batch_size = 4
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(trainer, "_all_ranks_have_memory_profile", lambda plan: True)
+
+    def memory_check(plan):
+        return _MemoryCheck(
+            estimated_required_bytes=plan.request_count,
+            available_bytes=3,
+            fits=plan.request_count <= 3,
+        )
+
+    monkeypatch.setattr(trainer, "_memory_check", memory_check)
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+
+    batch = next(iter(trainer.forward_micro_batches([_target_request(i) for i in range(8)])))
+
+    assert batch.stats.global_count == 3
+    assert batch.stats.rejected_candidates >= 1
+
+
+def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        trainer,
+        "_memory_check",
+        lambda plan: _MemoryCheck(
+            estimated_required_bytes=4,
+            available_bytes=3,
+            fits=False,
+        ),
+    )
+
+    with pytest.raises(TrainerRankMemoryError, match="smallest DP microbatch"):
+        next(iter(trainer.forward_micro_batches([_target_request(1)])))
+
+
+def test_forward_micro_batches_rejects_mismatched_replicated_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    import art.megatron.trainer_rank as trainer_rank
+
+    monkeypatch.setattr(trainer_rank.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trainer_rank.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_rank.dist, "get_world_size", lambda: 2)
+
+    def gather(output, value):
+        output[:] = [value, value + 1]
+
+    monkeypatch.setattr(trainer_rank.dist, "all_gather_object", gather)
+
+    with pytest.raises(ValueError, match="same top-level input count"):
+        list(trainer.forward_micro_batches([_target_request(1)]))
+
+
+def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
+    class FakeGPT(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+            self.config = SimpleNamespace(
+                hidden_size=4,
+                num_layers=1,
+                padded_vocab_size=10,
+            )
+            self.decoder = object()
+
+        def _preprocess(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    trainer = TrainerRank(_runtime(FakeGPT()))  # type: ignore[arg-type]
+    tokens = torch.tensor([1, 2, 3], dtype=torch.long)
+    labels = torch.stack((tokens, tokens + 1), dim=1)
+
+    plan = trainer._plan_flat_forward(
+        [
+            ForwardInput(
+                input_tokens=tokens,
+                target_tokens=labels,
+                top_k=5,
+                logits=True,
+                hidden_states=True,
+            )
+        ]
+    )
+
+    target_bytes = 3 * 2 * 4
+    topk_bytes = 3 * 5 * (4 + 8)
+    logits_bytes = 3 * 10 * 4
+    hidden_bytes = 3 * 4 * 4
+    assert plan.output_bytes == target_bytes + topk_bytes + logits_bytes + hidden_bytes

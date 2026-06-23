@@ -389,7 +389,9 @@ def main(
                 prepared = rank._prepare_packed_forward(batch)
                 if adapter_slots:
                     results[f"{name}_ms"] = _bench(
-                        lambda case_requests=case_requests: rank.forward(case_requests),
+                        lambda case_requests=case_requests: rank.dp_rank_forward(
+                            case_requests
+                        ),
                         warmup=warmup,
                         repeat=repeat,
                     )
@@ -1640,7 +1642,7 @@ def _target_requests_loss(
         ]
     ],
 ) -> torch.Tensor:
-    outputs = rank.forward(requests)
+    outputs = rank.dp_rank_forward(requests)
     losses = [
         -output.target_logprobs.sum()
         for output in outputs
@@ -1673,7 +1675,7 @@ def _topk_requests_loss(
         ]
     ],
 ) -> torch.Tensor:
-    outputs = rank.forward(requests)
+    outputs = rank.dp_rank_forward(requests)
     losses = [
         -output.top_k.logprobs.sum() for output in outputs if output.top_k is not None
     ]
@@ -1797,8 +1799,8 @@ def _adapter_sanity_metrics(
     for chunk in rank.runtime.model:
         chunk.eval()
     with torch.no_grad():
-        base_output = rank.forward([base_request])[0]
-        slot_output = rank.forward([slot_request])[0]
+        base_output = rank.dp_rank_forward([base_request])[0]
+        slot_output = rank.dp_rank_forward([slot_request])[0]
         if base_output.target_logprobs is None or slot_output.target_logprobs is None:
             raise RuntimeError("adapter sanity target outputs were not produced")
         output_diff = _mean_abs_pct(

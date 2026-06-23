@@ -139,14 +139,14 @@ def main(
             started_at = time.perf_counter()
             if request_case == "target_only":
                 _debug("forward-target-only")
-                outputs_a = list(rank_a.forward(local_requests))
-                outputs_b = list(rank_b.forward(local_requests))
+                outputs_a = list(rank_a.dp_rank_forward(local_requests))
+                outputs_b = list(rank_b.dp_rank_forward(local_requests))
                 oracle_outputs, actual_source_positions = _packed_oracle(
                     rank_a, local_requests
                 )
             elif stress_tokens > 0:
                 _debug("forward-a")
-                outputs_a = list(rank_a.forward(local_requests))
+                outputs_a = list(rank_a.dp_rank_forward(local_requests))
                 outputs_b = outputs_a
                 actual_source_positions = _source_positions(rank_a, local_requests)
                 oracle_outputs = [
@@ -564,7 +564,9 @@ def _independent_check_outputs(
     outputs: list[CheckOutput] = []
     for request in requests:
         source_positions = _source_positions(rank, [request])[0]
-        outputs.append(_as_check_output(source_positions, rank.forward([request])[0]))
+        outputs.append(
+            _as_check_output(source_positions, rank.dp_rank_forward([request])[0])
+        )
     return outputs
 
 

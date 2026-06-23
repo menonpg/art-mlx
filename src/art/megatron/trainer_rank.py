@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, MutableMapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -319,10 +320,30 @@ ForwardInputsT = TypeVar("ForwardInputsT", bound=ForwardInputs)
 @dataclass(frozen=True)
 class MicroBatch(Generic[ForwardInputsT]):
     inputs: Sequence[ForwardInputsT]
+    outputs: Sequence[ForwardOutputs]
     indices: Sequence[int]
+    stats: "MicroBatchStats"
 
     def select(self, xs: Sequence[T]) -> Sequence[T]:
         return [xs[i] for i in self.indices]
+
+
+@dataclass(frozen=True)
+class MicroBatchStats:
+    global_start: int
+    global_stop: int
+    global_count: int
+    local_count: int
+    packed_tokens: int
+    logical_tokens: int
+    estimated_required_bytes: int
+    available_bytes: int
+    rejected_candidates: int
+    cold_start: bool
+
+
+class TrainerRankMemoryError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -386,30 +407,80 @@ class _RowMatch:
     row_offsets: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _MemorySignature:
+    topology: tuple[int, int, int, int]
+    shared_prefix_max_depth: int
+    slot_group_count: int
+    request_mix: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class _ForwardGroupPlan:
+    slot_ref: "LoRASlotRef | None"
+    request_indices: tuple[int, ...]
+    items: tuple[_ForwardItem, ...]
+    packed: _PackedForwardBatch
+
+
+@dataclass(frozen=True)
+class _FlatForwardPlan:
+    request_count: int
+    groups: tuple[_ForwardGroupPlan, ...]
+    packed_tokens: int
+    logical_tokens: int
+    output_bytes: int
+    signature: _MemorySignature
+
+
+@dataclass(frozen=True)
+class _MemoryCheck:
+    estimated_required_bytes: int
+    available_bytes: int
+    fits: bool
+
+
+@dataclass(frozen=True)
+class _CandidateMicroBatch(Generic[ForwardInputsT]):
+    inputs: Sequence[ForwardInputsT]
+    indices: tuple[int, ...]
+    plan: _FlatForwardPlan
+    check: _MemoryCheck
+    stats_global_count: int
+    rejected_candidates: int
+    cold_start: bool
+
+
 class TrainerRank:
     def __init__(
         self,
         runtime: TrainingRuntime,
         *,
-        micro_batch_size: int = 1,
         head_chunk_tokens: int = 512,
         shared_prefix_max_depth: int = 1,
+        memory_safety_factor: float = 1.10,
+        memory_reserve_fraction: float = 0.03,
     ) -> None:
-        if micro_batch_size < 1:
-            raise ValueError("micro_batch_size must be >= 1")
         if head_chunk_tokens < 1:
             raise ValueError("head_chunk_tokens must be >= 1")
         if shared_prefix_max_depth < 0:
             raise ValueError("shared_prefix_max_depth must be >= 0")
+        if memory_safety_factor < 1.0:
+            raise ValueError("memory_safety_factor must be >= 1.0")
+        if not (0.0 <= memory_reserve_fraction < 1.0):
+            raise ValueError("memory_reserve_fraction must be in [0, 1)")
         self.runtime: TrainingRuntime = runtime
-        self.micro_batch_size = micro_batch_size
         self.head_chunk_tokens = head_chunk_tokens
         self.shared_prefix_max_depth = shared_prefix_max_depth
+        self.memory_safety_factor = memory_safety_factor
+        self.memory_reserve_fraction = memory_reserve_fraction
         self.device = next(runtime.model[0].parameters()).device
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._dynamic_optimizers: dict[str, torch.optim.Optimizer] = {}
         self._checkpoint_slot_names: set[str] = set()
+        self._memory_profiles: dict[_MemorySignature, float] = {}
+        self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
 
     def zero_grad(self) -> None:
@@ -611,31 +682,46 @@ class TrainerRank:
         finally:
             self._reset_current_slot(token)
 
-    def micro_batches(
+    def forward_micro_batches(
         self,
         inputs: Iterable[ForwardInputsT],
-    ) -> Sequence[MicroBatch[ForwardInputsT]]:
+    ) -> Iterator[MicroBatch[ForwardInputsT]]:
         items = list(inputs)
-        from megatron.core import parallel_state as ps
-
-        dp_rank = int(ps.get_data_parallel_rank())
-        dp_size = int(ps.get_data_parallel_world_size())
-        global_micro_size = self.micro_batch_size * dp_size
-        batches: list[MicroBatch[ForwardInputsT]] = []
-        for start in range(0, len(items), global_micro_size):
-            stop = min(start + global_micro_size, len(items))
-            indices = list(range(start + dp_rank, stop, dp_size))
-            batches.append(MicroBatch([items[i] for i in indices], indices))
-        return batches
+        self._validate_replicated_top_level_count(len(items))
+        start = 0
+        while start < len(items):
+            candidate = self._select_next_micro_batch(items, start)
+            flat_outputs = iter(self._run_flat_plan_with_memory_tracking(candidate.plan))
+            outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            stop = start + candidate.stats_global_count
+            self._last_global_micro_batch_size = candidate.stats_global_count
+            yield MicroBatch(
+                inputs=candidate.inputs,
+                outputs=outputs,
+                indices=candidate.indices,
+                stats=MicroBatchStats(
+                    global_start=start,
+                    global_stop=stop,
+                    global_count=candidate.stats_global_count,
+                    local_count=len(candidate.inputs),
+                    packed_tokens=candidate.plan.packed_tokens,
+                    logical_tokens=candidate.plan.logical_tokens,
+                    estimated_required_bytes=candidate.check.estimated_required_bytes,
+                    available_bytes=candidate.check.available_bytes,
+                    rejected_candidates=candidate.rejected_candidates,
+                    cold_start=candidate.cold_start,
+                ),
+            )
+            start = stop
 
     @overload
-    def forward(
+    def dp_rank_forward(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
     ) -> Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]: ...
 
     @overload
-    def forward(
+    def dp_rank_forward(
         self,
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
@@ -645,7 +731,7 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def forward(
+    def dp_rank_forward(
         self,
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
@@ -655,7 +741,7 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def forward(
+    def dp_rank_forward(
         self,
         inputs: Iterable[
             Iterable[
@@ -670,9 +756,11 @@ class TrainerRank:
         ]
     ]: ...
 
-    def forward(self, inputs: ForwardInputs) -> ForwardOutputs:
+    def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
         materialized = _materialize(inputs)
-        outputs = iter(self._forward_flat(list(_flatten(materialized))))
+        plan = self._plan_flat_forward(list(_flatten(materialized)))
+        self._raise_if_plan_will_not_fit(plan, context="dp_rank_forward")
+        outputs = iter(self._run_flat_plan_with_memory_tracking(plan))
         return _unflatten(materialized, outputs)
 
     def dp_reduce(
@@ -907,18 +995,120 @@ class TrainerRank:
         for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):
             grad.copy_(synced)
 
-    def _forward_flat(
-        self, requests: Sequence[AnyForwardInput]
-    ) -> list[AnyForwardOutput]:
-        outputs = [
-            ForwardOutput(
-                target_logprobs=None,
-                top_k=None,
-                logits=None,
-                hidden_states=None,
+    def _select_next_micro_batch(
+        self,
+        items: Sequence[ForwardInputsT],
+        start: int,
+    ) -> _CandidateMicroBatch[ForwardInputsT]:
+        dp_rank, dp_size = self._dp_rank_and_size()
+        remaining = len(items) - start
+        min_width = min(dp_size, remaining)
+        if min_width <= 0:
+            raise RuntimeError("cannot select an empty microbatch window")
+
+        cache: dict[int, _CandidateMicroBatch[ForwardInputsT]] = {}
+        rejected = 0
+
+        def candidate(width: int) -> _CandidateMicroBatch[ForwardInputsT]:
+            nonlocal rejected
+            width = max(min_width, min(width, remaining))
+            cached = cache.get(width)
+            if cached is not None:
+                return cached
+            stop = start + width
+            indices = tuple(range(start + dp_rank, stop, dp_size))
+            local_inputs = [items[index] for index in indices]
+            plan = self._plan_flat_forward(list(_flatten(local_inputs)))
+            check = self._memory_check(plan)
+            cold_start = not self._all_ranks_have_memory_profile(plan)
+            item = _CandidateMicroBatch(
+                inputs=local_inputs,
+                indices=indices,
+                plan=plan,
+                check=check,
+                stats_global_count=width,
+                rejected_candidates=rejected,
+                cold_start=cold_start,
             )
-            for _ in requests
-        ]
+            cache[width] = item
+            return item
+
+        first = candidate(min_width)
+        if not first.check.fits:
+            self._raise_memory_error(
+                first.plan,
+                first.check,
+                context="forward_micro_batches",
+                message="smallest DP microbatch is predicted to exceed available memory",
+            )
+
+        if first.cold_start:
+            return first
+
+        previous = self._last_global_micro_batch_size or min_width
+        width = min(remaining, max(min_width, previous * 2))
+        best = first
+        high_fail: int | None = None
+        while width <= remaining:
+            item = candidate(width)
+            if item.check.fits:
+                best = item
+                if width == remaining:
+                    break
+                width = min(remaining, max(width + 1, width * 2))
+                continue
+            rejected += 1
+            high_fail = width
+            break
+
+        if high_fail is None:
+            return best
+
+        low = best.stats_global_count + 1
+        high = high_fail - 1
+        while low <= high:
+            mid = (low + high) // 2
+            item = candidate(mid)
+            if item.check.fits:
+                best = item
+                low = mid + 1
+            else:
+                rejected += 1
+                high = mid - 1
+        return _CandidateMicroBatch(
+            inputs=best.inputs,
+            indices=best.indices,
+            plan=best.plan,
+            check=best.check,
+            stats_global_count=best.stats_global_count,
+            rejected_candidates=rejected,
+            cold_start=best.cold_start,
+        )
+
+    def _validate_replicated_top_level_count(self, count: int) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        counts = [0 for _ in range(dist.get_world_size())]
+        dist.all_gather_object(counts, int(count))
+        if len(set(counts)) == 1:
+            return
+        raise ValueError(
+            "forward_micro_batches requires the same top-level input count on every "
+            "distributed rank. Pass already-DP-local inputs to dp_rank_forward instead. "
+            f"Observed counts by rank: {counts}."
+        )
+
+    def _dp_rank_and_size(self) -> tuple[int, int]:
+        try:
+            from megatron.core import parallel_state as ps
+
+            return int(ps.get_data_parallel_rank()), int(
+                ps.get_data_parallel_world_size()
+            )
+        except (AssertionError, ImportError, RuntimeError, ValueError):
+            return 0, 1
+
+    def _plan_flat_forward(self, requests: Sequence[AnyForwardInput]) -> _FlatForwardPlan:
         active_indices = [
             index
             for index, request in enumerate(requests)
@@ -927,25 +1117,263 @@ class TrainerRank:
             or request.top_k is not None
             or request.hidden_states
         ]
-        if not active_indices:
-            return outputs
 
         groups: dict[LoRASlotRef | None, list[int]] = {}
         for index in active_indices:
             groups.setdefault(self._resolve_slot_ref(requests[index]), []).append(index)
 
+        plans: list[_ForwardGroupPlan] = []
+        output_bytes = 0
+        logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         for slot_ref, group_indices in groups.items():
-            items = [self._forward_item(requests[index]) for index in group_indices]
+            items = tuple(self._forward_item(requests[index]) for index in group_indices)
             packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
-            with self._use_slot(slot_ref):
-                prepared = self._prepare_packed_forward(packed)
-                item_outputs = self._forward_packed(items, prepared)
-            for index, output in zip(group_indices, item_outputs, strict=True):
+            output_bytes += self._estimate_group_output_bytes(items)
+            plans.append(
+                _ForwardGroupPlan(
+                    slot_ref=slot_ref,
+                    request_indices=tuple(group_indices),
+                    items=items,
+                    packed=packed,
+                )
+            )
+
+        return _FlatForwardPlan(
+            request_count=len(requests),
+            groups=tuple(plans),
+            packed_tokens=sum(int(plan.packed.tokens.numel()) for plan in plans),
+            logical_tokens=logical_tokens,
+            output_bytes=output_bytes,
+            signature=self._memory_signature(requests, plans),
+        )
+
+    def _run_flat_plan_with_memory_tracking(
+        self,
+        plan: _FlatForwardPlan,
+    ) -> list[AnyForwardOutput]:
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            baseline = int(torch.cuda.memory_allocated(self.device))
+            torch.cuda.reset_peak_memory_stats(self.device)
+        else:
+            baseline = 0
+        try:
+            outputs = self._execute_flat_plan(plan)
+        except torch.cuda.OutOfMemoryError as exc:
+            check = self._memory_check(plan)
+            self._raise_memory_error(
+                plan,
+                check,
+                context="forward",
+                message="CUDA OOM occurred despite the planner estimate",
+            )
+            raise AssertionError("unreachable") from exc
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            peak = int(torch.cuda.max_memory_allocated(self.device))
+            self._update_memory_profile(plan, max(0, peak - baseline))
+        return outputs
+
+    def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
+        outputs = [
+            ForwardOutput(
+                target_logprobs=None,
+                top_k=None,
+                logits=None,
+                hidden_states=None,
+            )
+            for _ in range(plan.request_count)
+        ]
+        for group in plan.groups:
+            with self._use_slot(group.slot_ref):
+                prepared = self._prepare_packed_forward(group.packed)
+                item_outputs = self._forward_packed(group.items, prepared)
+            for index, output in zip(
+                group.request_indices, item_outputs, strict=True
+            ):
                 outputs[index] = output
         return outputs
 
+    def _estimate_group_output_bytes(self, items: Sequence[_ForwardItem]) -> int:
+        model: GPTModel | None
+        try:
+            model = _language_model(self.runtime.model[0])
+        except RuntimeError:
+            model = None
+        dtype_size = _dtype_size(next(self.runtime.model[0].parameters()).dtype)
+        total = 0
+        for item in items:
+            seq_len = int(item.input_ids.numel())
+            labels = item.labels
+            if labels is not None:
+                total += int(labels.numel()) * _dtype_size(torch.float32)
+            if item.request.top_k is not None:
+                total += seq_len * int(item.request.top_k) * (
+                    _dtype_size(torch.float32) + _dtype_size(torch.long)
+                )
+            if item.request.logits:
+                if model is None:
+                    raise RuntimeError("logits output memory requires a GPT model")
+                total += seq_len * _padded_vocab_size(model) * dtype_size
+            if item.request.hidden_states:
+                hidden_size = _hidden_size(model, self.runtime.provider)
+                total += seq_len * hidden_size * dtype_size
+        return total
+
+    def _memory_signature(
+        self,
+        requests: Sequence[AnyForwardInput],
+        groups: Sequence[_ForwardGroupPlan],
+    ) -> _MemorySignature:
+        mix = Counter[str]()
+        for request in requests:
+            parts = []
+            if request.target_tokens is not None:
+                target = request.target_tokens
+                tail_shape = tuple(target.shape[request.input_tokens.ndim :])
+                parts.append(f"target:{tail_shape or 'single'}")
+            if request.top_k is not None:
+                parts.append(f"topk:{int(request.top_k)}")
+            if request.logits:
+                parts.append("logits")
+            if request.hidden_states:
+                parts.append("hidden")
+            mix["+".join(parts) if parts else "inactive"] += 1
+        return _MemorySignature(
+            topology=self._topology_key(),
+            shared_prefix_max_depth=self.shared_prefix_max_depth,
+            slot_group_count=len(groups),
+            request_mix=tuple((kind, 1) for kind in sorted(mix)),
+        )
+
+    def _topology_key(self) -> tuple[int, int, int, int]:
+        try:
+            topology = self._topology()
+            return (
+                int(topology.dp),
+                int(topology.tp),
+                int(topology.cp),
+                int(topology.pp),
+            )
+        except (AttributeError, ImportError, RuntimeError, ValueError):
+            return (1, 1, 1, 1)
+
+    def _memory_check(self, plan: _FlatForwardPlan) -> _MemoryCheck:
+        required = self._estimate_required_memory_bytes(plan)
+        available = self._available_memory_bytes()
+        if dist.is_available() and dist.is_initialized():
+            values = torch.tensor(
+                [float(required), float(available)],
+                device=self.device if self.device.type == "cuda" else "cpu",
+                dtype=torch.float64,
+            )
+            dist.all_reduce(values[0], op=dist.ReduceOp.MAX)
+            dist.all_reduce(values[1], op=dist.ReduceOp.MIN)
+            required = int(values[0].item())
+            available = int(values[1].item())
+        return _MemoryCheck(
+            estimated_required_bytes=required,
+            available_bytes=available,
+            fits=required <= available,
+        )
+
+    def _raise_if_plan_will_not_fit(
+        self,
+        plan: _FlatForwardPlan,
+        *,
+        context: str,
+    ) -> None:
+        check = self._memory_check(plan)
+        if check.fits:
+            return
+        self._raise_memory_error(
+            plan,
+            check,
+            context=context,
+            message="forward is predicted to exceed available memory",
+        )
+
+    def _raise_memory_error(
+        self,
+        plan: _FlatForwardPlan,
+        check: _MemoryCheck,
+        *,
+        context: str,
+        message: str,
+    ) -> None:
+        raise TrainerRankMemoryError(
+            f"{context}: {message}. "
+            f"packed_tokens={plan.packed_tokens} "
+            f"logical_tokens={plan.logical_tokens} "
+            f"output_gb={plan.output_bytes / 1024**3:.3f} "
+            f"estimated_required_gb={check.estimated_required_bytes / 1024**3:.3f} "
+            f"available_gb={check.available_bytes / 1024**3:.3f}. "
+            "Use smaller top-level items, reduce output requests, or call "
+            "dp_rank_forward with already-DP-local smaller inputs."
+        )
+
+    def _estimate_required_memory_bytes(self, plan: _FlatForwardPlan) -> int:
+        if plan.packed_tokens <= 0:
+            return plan.output_bytes
+        profiled = self._memory_profiles.get(plan.signature)
+        static_compute = self._static_compute_memory_bytes(plan)
+        if profiled is None:
+            compute = static_compute
+        else:
+            compute = max(static_compute, int(profiled * plan.packed_tokens))
+        return int((plan.output_bytes + compute) * self.memory_safety_factor)
+
+    def _static_compute_memory_bytes(self, plan: _FlatForwardPlan) -> int:
+        if plan.packed_tokens <= 0:
+            return 0
+        try:
+            model = _language_model(self.runtime.model[0])
+        except RuntimeError:
+            return 0
+        dtype_size = _dtype_size(next(self.runtime.model[0].parameters()).dtype)
+        hidden_size = _hidden_size(model, self.runtime.provider)
+        layers = int(
+            getattr(getattr(model, "config", None), "num_layers", 0)
+            or getattr(self.runtime.provider, "num_layers", 1)
+            or 1
+        )
+        activation_factor = max(4, min(16, layers // 4 + 4))
+        return int(plan.packed_tokens * hidden_size * dtype_size * activation_factor)
+
+    def _available_memory_bytes(self) -> int:
+        if not (torch.cuda.is_available() and self.device.type == "cuda"):
+            return 1 << 60
+        free, total = torch.cuda.mem_get_info(self.device)
+        allocated = int(torch.cuda.memory_allocated(self.device))
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        reusable_reserved = max(0, reserved - allocated)
+        reserve = int(total * self.memory_reserve_fraction)
+        return max(0, int(free) + reusable_reserved - reserve)
+
+    def _all_ranks_have_memory_profile(self, plan: _FlatForwardPlan) -> bool:
+        local = plan.packed_tokens <= 0 or plan.signature in self._memory_profiles
+        if dist.is_available() and dist.is_initialized():
+            value = torch.tensor(
+                int(local),
+                device=self.device if self.device.type == "cuda" else "cpu",
+                dtype=torch.int32,
+            )
+            dist.all_reduce(value, op=dist.ReduceOp.MIN)
+            return bool(value.item())
+        return local
+
+    def _update_memory_profile(self, plan: _FlatForwardPlan, peak_delta_bytes: int) -> None:
+        if plan.packed_tokens <= 0:
+            return
+        compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
+        bytes_per_token = compute_delta / max(1, plan.packed_tokens)
+        previous = self._memory_profiles.get(plan.signature)
+        if previous is None or bytes_per_token > previous:
+            self._memory_profiles[plan.signature] = bytes_per_token
+
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
-        _validate_top_k(request.top_k, _language_model(self.runtime.model[0]))
+        if request.top_k is not None:
+            _validate_top_k(request.top_k, _language_model(self.runtime.model[0]))
         input_ids = _as_1d_long(request.input_tokens, name="input_tokens")
         labels = (
             _as_target_tokens(request.target_tokens, request.input_tokens, input_ids)
@@ -1835,6 +2263,20 @@ def _padded_vocab_size(model: "GPTModel") -> int:
     return int(vocab_size)
 
 
+def _hidden_size(model: "GPTModel | None", provider: object) -> int:
+    for source in (getattr(model, "config", None), model, provider):
+        if source is None:
+            continue
+        hidden_size = getattr(source, "hidden_size", None)
+        if hidden_size is not None:
+            return int(hidden_size)
+    raise RuntimeError("could not determine hidden size")
+
+
+def _dtype_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
 def _target_logprobs_from_full_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -2456,6 +2898,8 @@ __all__ = [
     "ForwardInput",
     "ForwardOutput",
     "MicroBatch",
+    "MicroBatchStats",
     "TopK",
     "TrainerRank",
+    "TrainerRankMemoryError",
 ]

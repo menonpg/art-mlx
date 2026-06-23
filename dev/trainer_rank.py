@@ -17,7 +17,6 @@ def main(
     text_column: str = "text",
     samples: int = 16,
     steps: int = 1,
-    micro_batch_size: int = 1,
     lr: float = 5e-5,
     layers: int = 2,
     max_seq_length: int = 256,
@@ -71,7 +70,7 @@ def main(
             ),
             print_env=dist.get_rank() == 0,
         )
-        rank = TrainerRank(runtime, micro_batch_size=micro_batch_size)
+        rank = TrainerRank(runtime)
         if dist.get_rank() == 0:
             print(
                 "TrainerRank ready: "
@@ -83,10 +82,9 @@ def main(
         for step in range(steps):
             loss_sum = torch.tensor(0.0, device=rank.device)
             token_count = torch.tensor(0.0, device=rank.device)
-            for micro in rank.micro_batches(inputs):
-                outputs = rank.forward(micro.inputs)
+            for micro in rank.forward_micro_batches(inputs):
                 loss = torch.tensor(0.0, device=rank.device)
-                for output in outputs:
+                for output in micro.outputs:
                     assert output.target_logprobs is not None
                     loss = loss - output.target_logprobs.sum()
                     token_count += output.target_logprobs.numel()

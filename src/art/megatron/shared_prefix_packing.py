@@ -22,7 +22,7 @@ def pack_shared_prefixes(
 ) -> SharedPrefixPack:
     """Pack token sequences by storing shared prefixes once.
 
-    This is the small packing step that lets `TrainerRank.forward()` run one
+    This is the small packing step that lets `TrainerRank.dp_rank_forward()` run one
     model pass over a compact prefix tree instead of replaying the same prompt
     tokens for every request. Think of each input sequence as a path through a
     tree: when several paths start with the same tokens, this function writes
