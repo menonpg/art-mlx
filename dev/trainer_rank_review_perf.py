@@ -641,7 +641,7 @@ def _slice_mask_mod(mask_mod: object, slices: Sequence[object]) -> object:
         query_idx: torch.Tensor,
         kv_idx: torch.Tensor,
     ) -> torch.Tensor:
-        in_slice = torch.zeros_like(query_idx, dtype=torch.bool)
+        in_slice = (query_idx < 0) & (kv_idx < 0)
         for slice_ in slices:
             in_slice |= (
                 (query_idx >= int(slice_.q_range.start))
