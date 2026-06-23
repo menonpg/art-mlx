@@ -32,6 +32,18 @@ class CheckOutput:
     hidden_states: torch.Tensor | None
 
 
+@dataclass(frozen=True)
+class DiffStats:
+    max_abs_diff: float = 0.0
+    mean_abs_pct: float = 0.0
+
+    def merge(self, other: DiffStats) -> DiffStats:
+        return DiffStats(
+            max_abs_diff=max(self.max_abs_diff, other.max_abs_diff),
+            mean_abs_pct=max(self.mean_abs_pct, other.mean_abs_pct),
+        )
+
+
 def main(
     model: str = "Qwen/Qwen3-0.6B",
     layers: int = 1,
@@ -122,7 +134,7 @@ def main(
         same_layout_outputs: list[CheckOutput] | None = None
 
         torch.cuda.reset_peak_memory_stats()
-        max_diff = torch.tensor(0.0, device=rank_a.device)
+        diff_stats = DiffStats()
         with torch.no_grad():
             started_at = time.perf_counter()
             if request_case == "target_only":
@@ -161,8 +173,7 @@ def main(
                         for index, (actual, independent) in enumerate(
                             zip(outputs_a, independent_outputs, strict=True)
                         ):
-                            max_diff = torch.maximum(
-                                max_diff,
+                            diff_stats = diff_stats.merge(
                                 _assert_close(
                                     actual,
                                     independent,
@@ -177,8 +188,7 @@ def main(
                     for index, (actual, same_layout) in enumerate(
                         zip(outputs_a, same_layout_outputs, strict=True)
                     ):
-                        max_diff = torch.maximum(
-                            max_diff,
+                        diff_stats = diff_stats.merge(
                             _assert_close(
                                 actual,
                                 same_layout,
@@ -197,18 +207,21 @@ def main(
         ):
             if int(oracle.source_positions.numel()) == 0:
                 continue
-            max_diff = torch.maximum(
-                max_diff,
+            diff_stats = diff_stats.merge(
                 _assert_close(actual, chunked, f"chunk[{index}]"),
             )
-            max_diff = torch.maximum(
-                max_diff,
+            diff_stats = diff_stats.merge(
                 _assert_close(actual, oracle, f"oracle[{index}]"),
             )
 
-        dist.all_reduce(max_diff, op=dist.ReduceOp.MAX)
+        diff_tensor = torch.tensor(
+            [diff_stats.max_abs_diff, diff_stats.mean_abs_pct],
+            device=rank_a.device,
+        )
+        dist.all_reduce(diff_tensor, op=dist.ReduceOp.MAX)
         dist.all_reduce(peak_memory_gb, op=dist.ReduceOp.MAX)
-        max_diff_value = float(max_diff.item())
+        max_diff_value = float(diff_tensor[0].item())
+        mean_abs_pct_value = float(diff_tensor[1].item())
         records = _records(
             local_pairs=local_pairs,
             actual_outputs=outputs_a,
@@ -235,9 +248,14 @@ def main(
                 reconstruction_error = f"DP reconstruction missed inputs: {seen}"
             else:
                 try:
+                    reconstructed_stats = _assert_reconstructed(gathered, requests)
                     max_diff_value = max(
                         max_diff_value,
-                        _assert_reconstructed(gathered, requests),
+                        reconstructed_stats.max_abs_diff,
+                    )
+                    mean_abs_pct_value = max(
+                        mean_abs_pct_value,
+                        reconstructed_stats.mean_abs_pct,
                     )
                 except AssertionError as exc:
                     reconstruction_error = str(exc)
@@ -249,6 +267,7 @@ def main(
                             "dp": dp_size,
                             "tp": int(ps.get_tensor_model_parallel_world_size()),
                             "cp": int(ps.get_context_parallel_world_size()),
+                            "mean_abs_pct": mean_abs_pct_value,
                             "max_abs_diff": max_diff_value,
                             "records": sum(
                                 len(rank_records or []) for rank_records in gathered
@@ -826,8 +845,8 @@ def _assert_reconstructed(
             torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
         ]
     ],
-) -> float:
-    max_diff = 0.0
+) -> DiffStats:
+    diff_stats = DiffStats()
     records = [
         record
         for rank_records in gathered
@@ -868,8 +887,7 @@ def _assert_reconstructed(
                 f"{_tensor_summary(oracle_value)}"
             )
             _debug(f"reconstruct-input-{input_index}-{key}-diff-oracle")
-            max_diff = max(
-                max_diff,
+            diff_stats = diff_stats.merge(
                 _tensor_diff_value(
                     actual_value,
                     oracle_value,
@@ -885,8 +903,7 @@ def _assert_reconstructed(
                     f"{_tensor_summary(independent_value)}"
                 )
                 _debug(f"reconstruct-input-{input_index}-{key}-diff-independent")
-                max_diff = max(
-                    max_diff,
+                diff_stats = diff_stats.merge(
                     _tensor_diff_value(
                         actual_value,
                         independent_value,
@@ -912,7 +929,7 @@ def _assert_reconstructed(
                     actual_logprobs,
                     oracle_logprobs,
                     f"reconstructed[{input_index}].top_k.logprobs",
-                )
+                ).max_abs_diff
                 > 5e-6
             ):
                 raise AssertionError(
@@ -939,13 +956,13 @@ def _assert_reconstructed(
                         actual_logprobs,
                         independent_logprobs,
                         f"independent[{input_index}].top_k.logprobs",
-                    )
+                    ).max_abs_diff
                     > 5e-6
                 ):
                     raise AssertionError(
                         f"independent[{input_index}].top_k.tokens mismatch"
                     )
-    return max_diff
+    return diff_stats
 
 
 def _assemble(
@@ -993,7 +1010,7 @@ def _assert_close(
     ]
     | CheckOutput,
     label: str,
-) -> torch.Tensor:
+) -> DiffStats:
     diffs = [
         _tensor_diff(
             actual.target_logprobs, expected.target_logprobs, f"{label}.target_logprobs"
@@ -1032,7 +1049,7 @@ def _assert_close(
         diffs.append(top_k_diff)
         if (
             not torch.equal(actual.top_k.tokens, expected.top_k.tokens)
-            and float(top_k_diff.item()) > 5e-6
+            and top_k_diff.max_abs_diff > 5e-6
         ):
             mismatch = torch.nonzero(
                 actual.top_k.tokens != expected.top_k.tokens,
@@ -1047,26 +1064,26 @@ def _assert_close(
                 f"actual_logprob={float(actual.top_k.logprobs[row, col].item())} "
                 f"expected_logprob={float(expected.top_k.logprobs[row, col].item())}"
             )
-    return torch.stack(diffs).max()
+    return _merge_diff_stats(diffs)
 
 
 def _tensor_diff(
     actual: torch.Tensor | None,
     expected: torch.Tensor | None,
     label: str,
-) -> torch.Tensor:
-    return torch.tensor(_tensor_diff_value(actual, expected, label), device="cuda")
+) -> DiffStats:
+    return _tensor_diff_value(actual, expected, label)
 
 
 def _tensor_diff_value(
     actual: torch.Tensor | None,
     expected: torch.Tensor | None,
     label: str,
-) -> float:
+) -> DiffStats:
     if actual is None or expected is None:
         if actual is not expected:
             raise AssertionError(f"{label} None mismatch")
-        return 0.0
+        return DiffStats()
     if actual.shape != expected.shape:
         raise AssertionError(
             f"{label} shape mismatch: {actual.shape} != {expected.shape}"
@@ -1076,17 +1093,29 @@ def _tensor_diff_value(
     if torch.cuda.is_available():
         actual_for_diff = actual_for_diff.to(device="cuda")
         expected_for_diff = expected_for_diff.to(device="cuda")
-    diff = (
-        (actual_for_diff.float() - expected_for_diff.float()).abs().max()
-        if actual_for_diff.numel()
-        else actual_for_diff.new_tensor(0.0)
-    )
-    value = float(diff.item())
+    if actual_for_diff.numel():
+        abs_diff = (actual_for_diff.float() - expected_for_diff.float()).abs()
+        max_abs_diff = float(abs_diff.max().item())
+        denominator = float(expected_for_diff.float().abs().mean().item())
+        mean_abs_pct = float(abs_diff.mean().item()) / (denominator + 1e-18)
+    else:
+        max_abs_diff = 0.0
+        mean_abs_pct = 0.0
     tolerance = 5e-6 if "logprobs" in label else 0.0
-    _debug(f"{label} diff={value} tolerance={tolerance}")
-    if value > tolerance:
-        raise AssertionError(f"{label} max diff {value}")
-    return value
+    _debug(
+        f"{label} max_abs_diff={max_abs_diff} "
+        f"mean_abs_pct={mean_abs_pct} tolerance={tolerance}"
+    )
+    if max_abs_diff > tolerance:
+        raise AssertionError(f"{label} max diff {max_abs_diff}")
+    return DiffStats(max_abs_diff=max_abs_diff, mean_abs_pct=mean_abs_pct)
+
+
+def _merge_diff_stats(stats: list[DiffStats]) -> DiffStats:
+    merged = DiffStats()
+    for stat in stats:
+        merged = merged.merge(stat)
+    return merged
 
 
 if __name__ == "__main__":

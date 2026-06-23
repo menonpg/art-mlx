@@ -49,6 +49,7 @@ def main(
     flex_token_cap: int = 8192,
     flex_heads: int = 2,
     flex_head_dim: int = 64,
+    flex_mask_variants: str = "current,flat_pair,token_group,local_or_flat_pair",
     output_jsonl: Path = Path(".local/trainer_rank_review/block_mask_flex.jsonl"),
 ) -> None:
     if warmup < 0 or repeat < 1:
@@ -132,20 +133,16 @@ def main(
     )
 
     if run_flex:
-        _write(
-            output_jsonl,
-            {
-                **base,
-                **_flex_record(
-                    pack,
-                    warmup=warmup,
-                    repeat=repeat,
-                    token_cap=flex_token_cap,
-                    heads=flex_heads,
-                    head_dim=flex_head_dim,
-                ),
-            },
-        )
+        for record in _flex_records(
+            pack,
+            warmup=warmup,
+            repeat=repeat,
+            token_cap=flex_token_cap,
+            heads=flex_heads,
+            head_dim=flex_head_dim,
+            variants=_csv_values(flex_mask_variants),
+        ):
+            _write(output_jsonl, {**base, **record})
 
     for variant in range(shape_variants):
         variant_pack = _pack_workload(
@@ -214,6 +211,8 @@ def _pack_workload(
     sequences = (
         _austin_sequences()
         if workload == "austin_198k"
+        else _austin_varied_sequences()
+        if workload == "austin_varied"
         else _regular_sequences(
             prefix_families=prefix_families,
             prefix_len=prefix_len,
@@ -237,6 +236,29 @@ def _austin_sequences() -> tuple[torch.Tensor, ...]:
         for family in range(30)
         for branch in range(16)
     )
+
+
+def _austin_varied_sequences() -> tuple[torch.Tensor, ...]:
+    sequences: list[torch.Tensor] = []
+    for family in range(30):
+        family_base = family * 10_000_019
+        prefix_len = 4500 + ((family * 137) % 1001)
+        root = _tokens(family_base, prefix_len)
+        branch_count = 10 + ((family * 7) % 13)
+        for branch in range(branch_count):
+            completion_len = 32 + ((family * 19 + branch * 23) % 145)
+            sequences.append(
+                torch.cat(
+                    (
+                        root,
+                        _tokens(
+                            family_base + branch * 1009 + 17,
+                            completion_len,
+                        ),
+                    )
+                )
+            )
+    return tuple(sequences)
 
 
 def _regular_sequences(
@@ -323,7 +345,7 @@ def _build_stage_masks(
     return tuple(masks)
 
 
-def _flex_record(
+def _flex_records(
     pack: SharedPrefixPack,
     *,
     warmup: int,
@@ -331,15 +353,18 @@ def _flex_record(
     token_cap: int,
     heads: int,
     head_dim: int,
-) -> dict[str, object]:
+    variants: Sequence[str],
+) -> list[dict[str, object]]:
     if not torch.cuda.is_available():
-        return {"case": "flex_attention_fwd_bwd", "skipped": "cuda_unavailable"}
+        return [{"case": "flex_attention_fwd_bwd", "skipped": "cuda_unavailable"}]
     if int(pack.tokens.numel()) > int(token_cap):
-        return {
-            "case": "flex_attention_fwd_bwd",
-            "skipped": "packed_tokens_exceed_flex_token_cap",
-            "flex_token_cap": int(token_cap),
-        }
+        return [
+            {
+                "case": "flex_attention_fwd_bwd",
+                "skipped": "packed_tokens_exceed_flex_token_cap",
+                "flex_token_cap": int(token_cap),
+            }
+        ]
     device = torch.device("cuda")
     group_ids = pack.group_ids.to(device)
     parent_ids = pack.parent_ids.to(device)
@@ -349,44 +374,152 @@ def _flex_record(
         target_device=device,
     )
     shape = (1, int(heads), int(pack.tokens.numel()), int(head_dim))
-    q = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
-    wrapper = FlexAttentionWrapper()
+    records: list[dict[str, object]] = []
+    block_masks = _flex_mask_variants(
+        attention_state.block_mask,
+        pack,
+        variants=variants,
+        device=device,
+    )
+    for variant, block_mask in block_masks:
+        q = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+        wrapper = FlexAttentionWrapper()
 
-    def step() -> None:
-        q.grad = None
-        k.grad = None
-        v.grad = None
-        out = wrapper(
-            q,
-            k,
-            v,
-            block_mask=attention_state.block_mask,
-            scale=float(head_dim) ** -0.5,
-            enable_gqa=False,
+        def step() -> None:
+            q.grad = None
+            k.grad = None
+            v.grad = None
+            out = wrapper(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=float(head_dim) ** -0.5,
+                enable_gqa=False,
+            )
+            out.float().sum().backward()
+
+        try:
+            torch.cuda.synchronize()
+            first_started = time.perf_counter()
+            step()
+            torch.cuda.synchronize()
+            first_call_ms = round((time.perf_counter() - first_started) * 1000.0, 3)
+            ms = _bench_cuda(step, warmup=warmup, repeat=repeat)
+        except Exception as exc:
+            torch.cuda.empty_cache()
+            records.append(
+                {
+                    "case": "flex_attention_fwd_bwd",
+                    "flex_mask_variant": variant,
+                    "compile_error": type(exc).__name__,
+                    "compile_error_message": str(exc).splitlines()[0][:500],
+                    "flex_heads": heads,
+                    "flex_head_dim": head_dim,
+                }
+            )
+            continue
+        records.append(
+            {
+                "case": "flex_attention_fwd_bwd",
+                "flex_mask_variant": variant,
+                "first_call_ms": first_call_ms,
+                "ms": ms,
+                "packed_tok_s": round(int(pack.tokens.numel()) * 1000.0 / ms, 3),
+                "flex_heads": heads,
+                "flex_head_dim": head_dim,
+                "peak_memory_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
+            }
         )
-        out.float().sum().backward()
+    return records
 
-    try:
-        ms = _bench_cuda(step, warmup=warmup, repeat=repeat)
-    except Exception as exc:
-        torch.cuda.empty_cache()
-        return {
-            "case": "flex_attention_fwd_bwd",
-            "compile_error": type(exc).__name__,
-            "compile_error_message": str(exc).splitlines()[0][:500],
-            "flex_heads": heads,
-            "flex_head_dim": head_dim,
-        }
-    return {
-        "case": "flex_attention_fwd_bwd",
-        "ms": ms,
-        "packed_tok_s": round(int(pack.tokens.numel()) * 1000.0 / ms, 3),
-        "flex_heads": heads,
-        "flex_head_dim": head_dim,
-        "peak_memory_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
-    }
+
+def _flex_mask_variants(
+    block_mask: BlockMask,
+    pack: SharedPrefixPack,
+    *,
+    variants: Sequence[str],
+    device: torch.device,
+) -> tuple[tuple[str, BlockMask], ...]:
+    group_ids = pack.group_ids[0].to(device=device, dtype=torch.long)
+    can_attend = _group_can_attend(pack).to(device=device)
+    token_group_can_attend = can_attend.index_select(0, group_ids)
+    stride = int(can_attend.shape[1])
+    can_attend_flat = can_attend.reshape(-1)
+    out = []
+    for variant in variants:
+        if variant == "current":
+            out.append((variant, block_mask))
+            continue
+        if variant == "flat_pair":
+
+            def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
+                del batch_idx, head_idx
+                q_group = group_ids[query_idx]
+                k_group = group_ids[kv_idx]
+                return (query_idx >= kv_idx) & can_attend_flat[
+                    q_group * stride + k_group
+                ]
+
+        elif variant == "token_group":
+
+            def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
+                del batch_idx, head_idx
+                k_group = group_ids[kv_idx]
+                return (query_idx >= kv_idx) & token_group_can_attend[
+                    query_idx, k_group
+                ]
+
+        elif variant == "local_or_flat_pair":
+
+            def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
+                del batch_idx, head_idx
+                q_group = group_ids[query_idx]
+                k_group = group_ids[kv_idx]
+                allowed = (q_group == k_group) | can_attend_flat[
+                    q_group * stride + k_group
+                ]
+                return (query_idx >= kv_idx) & allowed
+
+        else:
+            raise ValueError(f"unknown flex_mask_variant {variant!r}")
+        out.append((variant, _replace_block_mask_mod(block_mask, mask_mod)))
+    return tuple(out)
+
+
+def _group_can_attend(pack: SharedPrefixPack) -> torch.Tensor:
+    group_ids = pack.group_ids[0].to(dtype=torch.long).cpu()
+    parent_ids = pack.parent_ids[0].to(dtype=torch.long).cpu()
+    max_group = int(group_ids.max().item()) if int(group_ids.numel()) else 0
+    parents = [0 for _ in range(max_group + 1)]
+    for group, parent in zip(group_ids.tolist(), parent_ids.tolist(), strict=True):
+        if int(group) >= 0:
+            parents[int(group)] = max(0, int(parent))
+    can_attend = torch.zeros((max_group + 1, max_group + 1), dtype=torch.bool)
+    for group in range(1, max_group + 1):
+        current = group
+        while current > 0:
+            can_attend[group, current] = True
+            current = parents[current]
+    return can_attend
+
+
+def _replace_block_mask_mod(block_mask: BlockMask, mask_mod: object) -> BlockMask:
+    return BlockMask(
+        seq_lengths=block_mask.seq_lengths,
+        kv_num_blocks=block_mask.kv_num_blocks,
+        kv_indices=block_mask.kv_indices,
+        full_kv_num_blocks=block_mask.full_kv_num_blocks,
+        full_kv_indices=block_mask.full_kv_indices,
+        q_num_blocks=block_mask.q_num_blocks,
+        q_indices=block_mask.q_indices,
+        full_q_num_blocks=block_mask.full_q_num_blocks,
+        full_q_indices=block_mask.full_q_indices,
+        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+        mask_mod=mask_mod,
+    )
 
 
 def _bench_cpu(
@@ -517,6 +650,13 @@ def _block_entries(
 
 def _logical_tokens(pack: SharedPrefixPack) -> int:
     return sum(int(positions.numel()) for positions in pack.positions_by_sequence)
+
+
+def _csv_values(value: str) -> tuple[str, ...]:
+    values = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not values:
+        raise ValueError("CSV option must contain at least one value")
+    return values
 
 
 def _write(path: Path, payload: dict[str, object]) -> None:

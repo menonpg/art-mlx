@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
+import threading
+import time
+from typing import Any
 
 import torch
 import torch.distributed as dist
 import typer
 
 from art.megatron.trainer_rank import (
+    AdamParams,
     ForwardInput,
     TopK,
     TrainerRank,
@@ -46,6 +51,11 @@ def main(
     adapter_slots: int = 0,
     adapter_slot_mode: str = "family",
     adapter_slot_rank: int = 1,
+    learning_rate: float = 1e-5,
+    full_step_offload_reload: bool = False,
+    memory_sample_interval_s: float = 0.01,
+    compare_target_correctness: bool = False,
+    run_adapter_sanity: bool = False,
     output_jsonl: str = "",
 ) -> None:
     os.environ.setdefault("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
@@ -107,12 +117,17 @@ def main(
                 "target_builtin_masked_fwd_bwd",
                 "target_trainer_fwd_bwd",
                 "target_hidden_fwd_bwd",
+                "target_builtin_train_step",
+                "target_trainer_train_step",
+                "target_hidden_train_step",
                 "trainer_multi_target_fwd_bwd",
+                "trainer_multi_target_train_step",
                 "trainer_target",
                 "trainer_multi_target",
                 "trainer_topk",
                 "trainer_topk_head",
                 "trainer_topk_fwd_bwd",
+                "trainer_topk_train_step",
                 "trainer_topk_sweep",
                 "trainer_target_topk",
                 "trainer_hidden",
@@ -125,9 +140,11 @@ def main(
                     "trainer_target",
                     "trainer_multi_target",
                     "trainer_multi_target_fwd_bwd",
+                    "trainer_multi_target_train_step",
                     "trainer_topk",
                     "trainer_topk_head",
                     "trainer_topk_fwd_bwd",
+                    "trainer_topk_train_step",
                     "trainer_topk_sweep",
                     "trainer_target_topk",
                     "trainer_hidden",
@@ -140,6 +157,8 @@ def main(
             raise ValueError("target_count must be >= 1")
         if top_k < 1:
             raise ValueError("top_k must be >= 1")
+        if memory_sample_interval_s < 0:
+            raise ValueError("memory_sample_interval_s must be >= 0")
         requests, multi_target_requests, request_metadata = _requests(
             seq_len=seq_len,
             prefix_families=prefix_families,
@@ -187,9 +206,7 @@ def main(
         logits_prepared = None
         if any(name.startswith("logits_") for name in benchmarks):
             logits_items = [
-                rank._forward_item(
-                    ForwardInput(input_tokens=request.input_tokens, logits=True)
-                )
+                rank._forward_item(_with_outputs(request, logits=True))
                 for request in requests
             ]
             logits_prepared = rank._prepare_packed_forward(
@@ -233,9 +250,17 @@ def main(
             "target_builtin_masked_fwd_bwd",
             "target_trainer_fwd_bwd",
             "target_hidden_fwd_bwd",
+            "target_builtin_train_step",
+            "target_trainer_train_step",
+            "target_hidden_train_step",
         ):
             register_case(name, requests, request_stats)
 
+        memory_tracker = _CudaMemoryTracker(
+            device_index=int(os.environ["LOCAL_RANK"]),
+            sample_interval_s=memory_sample_interval_s,
+        )
+        memory_tracker.start()
         torch.cuda.reset_peak_memory_stats()
         with torch.no_grad():
             if "target_builtin_fwd" in benchmarks:
@@ -299,24 +324,22 @@ def main(
                 "trainer_target": requests,
                 "trainer_multi_target": multi_target_requests,
                 "trainer_topk": [
-                    ForwardInput(input_tokens=request.input_tokens, top_k=top_k)
-                    for request in requests
+                    _with_outputs(request, top_k=top_k) for request in requests
                 ],
                 "trainer_target_topk": [
-                    ForwardInput(
-                        input_tokens=request.input_tokens,
+                    _with_outputs(
+                        request,
                         target_tokens=request.target_tokens,
                         top_k=top_k,
                     )
                     for request in requests
                 ],
                 "trainer_hidden": [
-                    ForwardInput(input_tokens=request.input_tokens, hidden_states=True)
-                    for request in requests
+                    _with_outputs(request, hidden_states=True) for request in requests
                 ],
                 "trainer_all_no_logits": [
-                    ForwardInput(
-                        input_tokens=request.input_tokens,
+                    _with_outputs(
+                        request,
                         target_tokens=multi_request.target_tokens,
                         top_k=top_k,
                         hidden_states=True,
@@ -333,8 +356,7 @@ def main(
             if "trainer_topk_sweep" in benchmarks:
                 for k in _int_values(top_k_values):
                     trainer_cases[f"trainer_topk_{k}"] = [
-                        ForwardInput(input_tokens=request.input_tokens, top_k=k)
-                        for request in requests
+                        _with_outputs(request, top_k=k) for request in requests
                     ]
             for name, case_requests in trainer_cases.items():
                 if name not in benchmarks and not (
@@ -365,18 +387,24 @@ def main(
                     ),
                 )
                 prepared = rank._prepare_packed_forward(batch)
-                results[f"{name}_ms"] = _bench(
-                    lambda items=items, prepared=prepared: rank._forward_packed(
-                        items,
-                        prepared,
-                    ),
-                    warmup=warmup,
-                    repeat=repeat,
-                )
+                if adapter_slots:
+                    results[f"{name}_ms"] = _bench(
+                        lambda case_requests=case_requests: rank.forward(case_requests),
+                        warmup=warmup,
+                        repeat=repeat,
+                    )
+                else:
+                    results[f"{name}_ms"] = _bench(
+                        lambda items=items, prepared=prepared: rank._forward_packed(
+                            items,
+                            prepared,
+                        ),
+                        warmup=warmup,
+                        repeat=repeat,
+                    )
             if "trainer_topk_head" in benchmarks:
                 case_requests = [
-                    ForwardInput(input_tokens=request.input_tokens, top_k=top_k)
-                    for request in requests
+                    _with_outputs(request, top_k=top_k) for request in requests
                 ]
                 output_gb = _request_output_gb(
                     case_requests,
@@ -440,10 +468,14 @@ def main(
                 chunk.train()
             assert target_items is not None and target_prepared is not None
             results["target_trainer_fwd_bwd_ms"] = _bench(
-                lambda: _target_trainer_loss(
-                    rank,
-                    target_items,
-                    target_prepared,
+                lambda: (
+                    _target_requests_loss(rank, requests)
+                    if adapter_slots
+                    else _target_trainer_loss(
+                        rank,
+                        target_items,
+                        target_prepared,
+                    )
                 ).backward(),
                 warmup=warmup,
                 repeat=repeat,
@@ -462,6 +494,56 @@ def main(
                 warmup=warmup,
                 repeat=repeat,
                 after=rank.zero_grad,
+            )
+        train_step_params = AdamParams(learning_rate=learning_rate)
+        offload_manager = (
+            _make_offload_manager(runtime) if full_step_offload_reload else None
+        )
+        if "target_builtin_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            assert target_items is not None and target_prepared is not None
+            results["target_builtin_train_step_ms"] = _bench(
+                lambda: _training_step(
+                    rank,
+                    lambda: _target_builtin_loss(rank, target_items, target_prepared),
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                ),
+                warmup=warmup,
+                repeat=repeat,
+            )
+        if "target_trainer_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            assert target_items is not None and target_prepared is not None
+            results["target_trainer_train_step_ms"] = _bench(
+                lambda: _training_step(
+                    rank,
+                    lambda: (
+                        _target_requests_loss(rank, requests)
+                        if adapter_slots
+                        else _target_trainer_loss(rank, target_items, target_prepared)
+                    ),
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                ),
+                warmup=warmup,
+                repeat=repeat,
+            )
+        if "target_hidden_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            assert target_items is not None and target_prepared is not None
+            results["target_hidden_train_step_ms"] = _bench(
+                lambda: _training_step(
+                    rank,
+                    lambda: _target_hidden_loss(rank, target_items, target_prepared),
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                ),
+                warmup=warmup,
+                repeat=repeat,
             )
         if "trainer_multi_target_fwd_bwd" in benchmarks:
             for chunk in runtime.model:
@@ -483,17 +565,53 @@ def main(
             )
             prepared = rank._prepare_packed_forward(batch)
             results["trainer_multi_target_fwd_bwd_ms"] = _bench(
-                lambda: _target_trainer_loss(rank, items, prepared).backward(),
+                lambda: (
+                    _target_requests_loss(rank, multi_target_requests)
+                    if adapter_slots
+                    else _target_trainer_loss(rank, items, prepared)
+                ).backward(),
                 warmup=warmup,
                 repeat=repeat,
                 after=rank.zero_grad,
+            )
+        if "trainer_multi_target_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            items = [rank._forward_item(request) for request in multi_target_requests]
+            batch = _pack_forward_items(
+                items,
+                max_depth=rank.shared_prefix_max_depth,
+            )
+            register_case(
+                "trainer_multi_target_train_step",
+                multi_target_requests,
+                _packed_request_stats(
+                    multi_target_requests,
+                    items,
+                    batch,
+                    request_metadata={},
+                ),
+            )
+            prepared = rank._prepare_packed_forward(batch)
+            results["trainer_multi_target_train_step_ms"] = _bench(
+                lambda: _training_step(
+                    rank,
+                    lambda: (
+                        _target_requests_loss(rank, multi_target_requests)
+                        if adapter_slots
+                        else _target_trainer_loss(rank, items, prepared)
+                    ),
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                ),
+                warmup=warmup,
+                repeat=repeat,
             )
         if "trainer_topk_fwd_bwd" in benchmarks:
             for chunk in runtime.model:
                 chunk.train()
             topk_requests = [
-                ForwardInput(input_tokens=request.input_tokens, top_k=top_k)
-                for request in requests
+                _with_outputs(request, top_k=top_k) for request in requests
             ]
             items = [rank._forward_item(request) for request in topk_requests]
             batch = _pack_forward_items(
@@ -507,11 +625,66 @@ def main(
             )
             prepared = rank._prepare_packed_forward(batch)
             results["trainer_topk_fwd_bwd_ms"] = _bench(
-                lambda: _trainer_topk_loss(rank, items, prepared).backward(),
+                lambda: (
+                    _topk_requests_loss(rank, topk_requests)
+                    if adapter_slots
+                    else _trainer_topk_loss(rank, items, prepared)
+                ).backward(),
                 warmup=warmup,
                 repeat=repeat,
                 after=rank.zero_grad,
             )
+        if "trainer_topk_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            topk_requests = [
+                _with_outputs(request, top_k=top_k) for request in requests
+            ]
+            items = [rank._forward_item(request) for request in topk_requests]
+            batch = _pack_forward_items(
+                items,
+                max_depth=rank.shared_prefix_max_depth,
+            )
+            register_case(
+                "trainer_topk_train_step",
+                topk_requests,
+                _packed_request_stats(topk_requests, items, batch, request_metadata={}),
+            )
+            prepared = rank._prepare_packed_forward(batch)
+            results["trainer_topk_train_step_ms"] = _bench(
+                lambda: _training_step(
+                    rank,
+                    lambda: (
+                        _topk_requests_loss(rank, topk_requests)
+                        if adapter_slots
+                        else _trainer_topk_loss(rank, items, prepared)
+                    ),
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                ),
+                warmup=warmup,
+                repeat=repeat,
+            )
+
+        if compare_target_correctness and adapter_slots:
+            metadata["target_correctness_skipped"] = "adapter_slots"
+        elif compare_target_correctness:
+            assert target_items is not None and target_prepared is not None
+            metadata.update(
+                _target_correctness_metrics(rank, target_items, target_prepared)
+            )
+        if run_adapter_sanity and adapter_slots > 0:
+            metadata.update(
+                _adapter_sanity_metrics(
+                    rank,
+                    requests,
+                    params=train_step_params,
+                    adapter_slots=adapter_slots,
+                )
+            )
+
+        memory_tracker.stop()
+        memory_metadata = _distributed_memory_metadata(memory_tracker)
 
         if dist.get_rank() == 0:
             token_rates = _rate_metrics(results, rate_units)
@@ -543,6 +716,8 @@ def main(
                 "adapter_slot_mode": adapter_slot_mode,
                 "adapter_slot_rank": adapter_slot_rank,
                 "adapter_loaded_sites": loaded_sites,
+                "learning_rate": learning_rate,
+                "full_step_offload_reload": full_step_offload_reload,
                 "mtp_num_layers": getattr(model_config, "mtp_num_layers", None),
                 "cross_entropy_loss_fusion": getattr(
                     model_config, "cross_entropy_loss_fusion", None
@@ -550,11 +725,9 @@ def main(
                 "cross_entropy_fusion_impl": getattr(
                     model_config, "cross_entropy_fusion_impl", None
                 ),
+                **_model_metadata(runtime, model, layers=layers),
                 **request_stats,
-                "peak_memory_gb": round(
-                    torch.cuda.max_memory_allocated() / 1024**3,
-                    3,
-                ),
+                **memory_metadata,
                 **results,
                 **token_rates,
                 **metadata,
@@ -728,9 +901,10 @@ def _route_adapter_slots(
 ]:
     if adapter_slots == 0:
         return list(requests)
-    if mode not in {"family", "round_robin", "single"}:
+    if mode not in {"family", "round_robin", "single", "skewed_random"}:
         raise ValueError(
-            "adapter_slot_mode must be one of: family, round_robin, single"
+            "adapter_slot_mode must be one of: family, round_robin, single, "
+            "skewed_random"
         )
     return [
         ForwardInput(
@@ -757,10 +931,43 @@ def _adapter_slot_index(
         return 0
     if mode == "round_robin":
         return index % adapter_slots
+    if mode == "skewed_random":
+        bucket = (index * 1103515245 + 12345) & 0x7FFFFFFF
+        skew = bucket % 100
+        if skew < 50:
+            return 0
+        if skew < 75:
+            return min(1, adapter_slots - 1)
+        if skew < 90:
+            return min(2, adapter_slots - 1)
+        return min(3 + (bucket % max(1, adapter_slots - 3)), adapter_slots - 1)
     first_token = (
         int(request.input_tokens[0].item()) if request.input_tokens.numel() else 0
     )
     return (first_token // 10_000_019) % adapter_slots
+
+
+def _with_outputs(
+    request: ForwardInput[
+        torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+    ],
+    *,
+    target_tokens: torch.Tensor | None = None,
+    top_k: int | None = None,
+    logits: bool = False,
+    hidden_states: bool = False,
+) -> ForwardInput[
+    torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+]:
+    return ForwardInput(
+        input_tokens=request.input_tokens,
+        target_tokens=target_tokens,
+        top_k=top_k,
+        logits=logits,
+        hidden_states=hidden_states,
+        checkpoint=request.checkpoint,
+        lora=request.lora,
+    )
 
 
 def _workload_sequences(
@@ -786,6 +993,8 @@ def _workload_sequences(
             branches_per_prefix=16,
             completion_len=100,
         )
+    if workload == "austin_varied":
+        return _austin_varied_sequences()
     if workload == "regular":
         return _regular_tree_sequences(
             prefix_families=prefix_families,
@@ -860,7 +1069,7 @@ def _workload_sequences(
         )
     raise ValueError(
         "workload must be one of: regular, single, long_root, long_mid, "
-        "many_tiny_leaves, uneven, duplicates, random, austin_198k"
+        "many_tiny_leaves, uneven, duplicates, random, austin_198k, austin_varied"
     )
 
 
@@ -905,6 +1114,31 @@ def _regular_tree_sequences(
         f"branches={branches_per_prefix}:nested={int(nested)}"
     )
     return tuple(sequences), tuple(shared_lengths), shape
+
+
+def _austin_varied_sequences() -> tuple[tuple[torch.Tensor, ...], tuple[int, ...], str]:
+    sequences: list[torch.Tensor] = []
+    shared_lengths: list[int] = []
+    for family in range(30):
+        family_base = family * 10_000_019
+        prefix_len = 4500 + ((family * 137) % 1001)
+        root = _tokens(family_base, prefix_len)
+        branch_count = 10 + ((family * 7) % 13)
+        for branch in range(branch_count):
+            completion_len = 32 + ((family * 19 + branch * 23) % 145)
+            sequences.append(
+                torch.cat(
+                    (
+                        root,
+                        _tokens(
+                            family_base + branch * 1009 + 17,
+                            completion_len,
+                        ),
+                    )
+                )
+            )
+            shared_lengths.append(int(root.numel()))
+    return tuple(sequences), tuple(shared_lengths), "austin_varied"
 
 
 def _uneven_tree_sequences(
@@ -1154,6 +1388,146 @@ def _labels(tokens: torch.Tensor, *, target_count: int) -> torch.Tensor:
     return labels[:, 0]
 
 
+class _CudaMemoryTracker:
+    def __init__(self, *, device_index: int, sample_interval_s: float) -> None:
+        self.device_index = device_index
+        self.sample_interval_s = sample_interval_s
+        self.process_peak_bytes = 0
+        self.allocated_peak_bytes = 0
+        self.reserved_peak_bytes = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.reset_peak_memory_stats()
+        self._sample()
+        if self.sample_interval_s <= 0:
+            return
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        torch.cuda.synchronize()
+        self._sample()
+        self.allocated_peak_bytes = max(
+            self.allocated_peak_bytes,
+            int(torch.cuda.max_memory_allocated()),
+        )
+        self.reserved_peak_bytes = max(
+            self.reserved_peak_bytes,
+            int(torch.cuda.max_memory_reserved()),
+        )
+
+    def _poll(self) -> None:
+        while not self._stop.wait(self.sample_interval_s):
+            self._sample()
+
+    def _sample(self) -> None:
+        self.process_peak_bytes = max(
+            self.process_peak_bytes,
+            _current_process_gpu_memory_bytes(self.device_index),
+        )
+        self.allocated_peak_bytes = max(
+            self.allocated_peak_bytes,
+            int(torch.cuda.memory_allocated()) if torch.cuda.is_available() else 0,
+        )
+        self.reserved_peak_bytes = max(
+            self.reserved_peak_bytes,
+            int(torch.cuda.memory_reserved()) if torch.cuda.is_available() else 0,
+        )
+
+
+def _current_process_gpu_memory_bytes(device_index: int) -> int:
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        pid = os.getpid()
+        processes = list(pynvml.nvmlDeviceGetComputeRunningProcesses(handle))
+        with suppress(Exception):
+            processes.extend(pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle))
+        for process in processes:
+            if int(process.pid) == pid:
+                return int(process.usedGpuMemory)
+    except Exception:
+        return 0
+    return 0
+
+
+def _distributed_memory_metadata(tracker: _CudaMemoryTracker) -> dict[str, float]:
+    values = torch.tensor(
+        [
+            tracker.allocated_peak_bytes,
+            tracker.reserved_peak_bytes,
+            tracker.process_peak_bytes,
+        ],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    return {
+        "peak_memory_allocated_gb": round(float(values[0].item()) / 1024**3, 3),
+        "peak_memory_reserved_gb": round(float(values[1].item()) / 1024**3, 3),
+        "peak_memory_process_gb": round(float(values[2].item()) / 1024**3, 3),
+        "peak_memory_gb": round(float(values[0].item()) / 1024**3, 3),
+    }
+
+
+def _mean_abs_pct(reference: torch.Tensor, candidate: torch.Tensor) -> float:
+    reference_fp32 = reference.detach().float()
+    candidate_fp32 = candidate.detach().float()
+    return float(
+        (candidate_fp32 - reference_fp32).abs().mean().item()
+        / (reference_fp32.abs().mean().item() + 1e-18)
+    )
+
+
+def _model_metadata(runtime: object, model_name: str, *, layers: int) -> dict[str, Any]:
+    from art.megatron.lora import LoRA
+
+    provider = getattr(runtime, "provider")
+    model = _language_model(getattr(runtime, "model")[0])
+    config = getattr(model, "config", None)
+    total_params = sum(
+        int(param.numel()) for chunk in runtime.model for param in chunk.parameters()
+    )
+    trainable_params = sum(
+        int(param.numel())
+        for chunk in runtime.model
+        for param in chunk.parameters()
+        if param.requires_grad
+    )
+    lora_sites = sum(
+        1
+        for chunk in runtime.model
+        for module in chunk.modules()
+        if isinstance(module, LoRA)
+    )
+    local = torch.tensor(
+        [total_params, trainable_params, lora_sites],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    dist.all_reduce(local, op=dist.ReduceOp.MAX)
+    return {
+        "model": model_name,
+        "layers_arg": layers,
+        "provider_num_layers": getattr(provider, "num_layers", None),
+        "config_num_layers": getattr(config, "num_layers", None),
+        "rank_local_param_count": int(local[0].item()),
+        "rank_local_trainable_param_count": int(local[1].item()),
+        "rank_local_lora_site_count": int(local[2].item()),
+    }
+
+
 def _bench(
     fn: Callable[[], object],
     *,
@@ -1257,6 +1631,25 @@ def _target_trainer_loss(
     return torch.stack(losses).sum()
 
 
+def _target_requests_loss(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+) -> torch.Tensor:
+    outputs = rank.forward(requests)
+    losses = [
+        -output.target_logprobs.sum()
+        for output in outputs
+        if output.target_logprobs is not None
+    ]
+    if not losses:
+        raise RuntimeError("target logprobs were not produced")
+    return torch.stack(losses).sum()
+
+
 def _trainer_topk_loss(
     rank: TrainerRank,
     items: object,
@@ -1269,6 +1662,187 @@ def _trainer_topk_loss(
     if not losses:
         raise RuntimeError("top_k logprobs were not produced")
     return torch.stack(losses).sum()
+
+
+def _topk_requests_loss(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+) -> torch.Tensor:
+    outputs = rank.forward(requests)
+    losses = [
+        -output.top_k.logprobs.sum() for output in outputs if output.top_k is not None
+    ]
+    if not losses:
+        raise RuntimeError("top_k logprobs were not produced")
+    return torch.stack(losses).sum()
+
+
+def _training_step(
+    rank: TrainerRank,
+    loss_fn: Callable[[], torch.Tensor],
+    *,
+    params: AdamParams,
+    offload_manager: object | None,
+) -> dict[str, float]:
+    if offload_manager is None:
+        return _training_step_body(rank, loss_fn, params=params)
+    with offload_manager.job():  # type: ignore[attr-defined]
+        return _training_step_body(rank, loss_fn, params=params)
+
+
+def _training_step_body(
+    rank: TrainerRank,
+    loss_fn: Callable[[], torch.Tensor],
+    *,
+    params: AdamParams,
+) -> dict[str, float]:
+    rank.zero_grad()
+    loss = loss_fn()
+    loss.backward()
+    return rank.optim_step(params=params, scale_grads=1.0)
+
+
+def _make_offload_manager(runtime: object) -> object:
+    from art.megatron.training.streaming_weight_offload import (
+        StreamingWeightOffloadConfig,
+    )
+    from art.megatron.training.weight_offload import WeightOffloadManager
+
+    manager = WeightOffloadManager.from_config(
+        model=getattr(runtime, "model"),
+        rank=dist.get_rank(),
+        compile_enabled=bool(getattr(runtime, "transformer_layers_compiled", False)),
+        offload_between_jobs=True,
+        streaming_config=StreamingWeightOffloadConfig(enabled=False),
+    )
+    manager.install()
+    manager.after_job()
+    return manager
+
+
+def _target_correctness_metrics(
+    rank: TrainerRank,
+    items: object,
+    prepared: object,
+) -> dict[str, float]:
+    for chunk in rank.runtime.model:
+        chunk.eval()
+    with torch.no_grad():
+        labels = _packed_labels(items, prepared)
+        native_outputs = rank._forward_native_target_logprobs(items, prepared, labels)
+        hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
+        head_outputs = rank._project_head(items, prepared, hidden)
+        abs_diff_sum = torch.tensor(0.0, device=rank.device)
+        reference_abs_sum = torch.tensor(0.0, device=rank.device)
+        value_count = torch.tensor(0.0, device=rank.device)
+        max_abs_diff = torch.tensor(0.0, device=rank.device)
+        for native, candidate in zip(
+            native_outputs,
+            head_outputs.target_logprobs,
+            strict=True,
+        ):
+            if native.target_logprobs is None or candidate is None:
+                continue
+            diff = (candidate.float() - native.target_logprobs.float()).abs()
+            abs_diff_sum += diff.sum()
+            reference_abs_sum += native.target_logprobs.float().abs().sum()
+            value_count += float(diff.numel())
+            max_abs_diff = torch.maximum(max_abs_diff, diff.max())
+        sums = torch.stack((abs_diff_sum, reference_abs_sum, value_count))
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(max_abs_diff, op=dist.ReduceOp.MAX)
+        mean_abs_pct = float((sums[0] / torch.clamp(sums[1], min=1e-18)).item())
+        max_abs = float(max_abs_diff.item())
+    return {
+        "target_hidden_vs_native_mean_abs_pct": mean_abs_pct,
+        "target_hidden_vs_native_max_abs_diff": max_abs,
+    }
+
+
+def _adapter_sanity_metrics(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    adapter_slots: int,
+) -> dict[str, float]:
+    target_request = next(
+        (request for request in requests if request.target_tokens is not None),
+        None,
+    )
+    if target_request is None:
+        return {"adapter_sanity_skipped": 1.0}
+    base_request = ForwardInput(
+        input_tokens=target_request.input_tokens,
+        target_tokens=target_request.target_tokens,
+        checkpoint=None,
+    )
+    slot_request = ForwardInput(
+        input_tokens=target_request.input_tokens,
+        target_tokens=target_request.target_tokens,
+        checkpoint="S0",
+    )
+    for chunk in rank.runtime.model:
+        chunk.eval()
+    with torch.no_grad():
+        base_output = rank.forward([base_request])[0]
+        slot_output = rank.forward([slot_request])[0]
+        if base_output.target_logprobs is None or slot_output.target_logprobs is None:
+            raise RuntimeError("adapter sanity target outputs were not produced")
+        output_diff = _mean_abs_pct(
+            base_output.target_logprobs,
+            slot_output.target_logprobs,
+        )
+        output_max = float(
+            (slot_output.target_logprobs.float() - base_output.target_logprobs.float())
+            .abs()
+            .max()
+            .item()
+        )
+
+    slot_params = rank._checkpoint_slot_params("S0")
+    other_params = rank._checkpoint_slot_params("S1") if adapter_slots > 1 else []
+    before = [param.detach().clone() for param in slot_params]
+    other_before = [param.detach().clone() for param in other_params]
+    for chunk in rank.runtime.model:
+        chunk.train()
+    rank.zero_grad()
+    loss = _target_requests_loss(rank, [slot_request])
+    loss.backward()
+    grad_sq = torch.tensor(0.0, device=rank.device)
+    for param in slot_params:
+        if param.grad is not None:
+            grad_sq = grad_sq + param.grad.detach().float().square().sum()
+    grad_norm = torch.sqrt(grad_sq)
+    rank.optim_step(params=params, checkpoints=["S0"])
+    slot_delta = sum(
+        float((param.detach().float() - old.float()).abs().sum().item())
+        for param, old in zip(slot_params, before, strict=True)
+    )
+    other_delta = sum(
+        float((param.detach().float() - old.float()).abs().sum().item())
+        for param, old in zip(other_params, other_before, strict=True)
+    )
+    values = torch.tensor(
+        [output_diff, output_max, float(grad_norm.item()), slot_delta, other_delta],
+        device=rank.device,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    return {
+        "adapter_sanity_output_mean_abs_pct": float(values[0].item()),
+        "adapter_sanity_output_max_abs_diff": float(values[1].item()),
+        "adapter_sanity_grad_norm": float(values[2].item()),
+        "adapter_sanity_stepped_slot_delta": float(values[3].item()),
+        "adapter_sanity_unselected_slot_delta": float(values[4].item()),
+    }
 
 
 def _runtime_output_shape(runtime: object) -> tuple[int, int, int]:
