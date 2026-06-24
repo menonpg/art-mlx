@@ -16,12 +16,9 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.tensor_parallel.mappings import (
-    reduce_from_tensor_model_parallel_region,
-    reduce_scatter_to_sequence_parallel_region,
-)
 import torch
 
+from art.megatron import lora as art_lora
 from art.megatron.lora import SelfAttentionLinearProjLoRA
 from art.megatron.model_support.handlers.default_dense import (
     DefaultDenseHandler,
@@ -1067,9 +1064,13 @@ class _Gemma4SelfAttentionLinearProjLoRA(SelfAttentionLinearProjLoRA):
         lora_output = self.lora(x)
         if self.reduce_output and self.provider.tensor_model_parallel_size > 1:
             if self.provider.sequence_parallel:
-                lora_output = reduce_scatter_to_sequence_parallel_region(lora_output)
+                lora_output = art_lora.reduce_scatter_to_sequence_parallel_region(
+                    lora_output
+                )
             else:
-                lora_output = reduce_from_tensor_model_parallel_region(lora_output)
+                lora_output = art_lora.reduce_from_tensor_model_parallel_region(
+                    lora_output
+                )
         output = base_output + lora_output
         post_layernorm = getattr(linear_proj, "post_layernorm", None)
         if post_layernorm is not None:
