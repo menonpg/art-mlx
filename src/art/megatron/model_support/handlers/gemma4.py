@@ -1636,10 +1636,52 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
             art_down_mapping=art_down_mapping,
             global_layer_indices=global_layer_indices,
         )
-        if not is_moe and _is_gemma4_moe_mapping(text_mapping):
-            continue
+        if not is_moe:
+            if _is_gemma4_moe_mapping(text_mapping):
+                continue
+            text_mapping = _gemma4_dense_mapping(text_mapping)
         language_mappings.append(text_mapping)
     return MegatronMappingRegistry(*language_mappings)
+
+
+class _ImportOnlyMapping:
+    def __init__(self, mapping: Any) -> None:
+        self._mapping = mapping
+        self.megatron_param = mapping.megatron_param
+        self.hf_param = mapping.hf_param
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._mapping, name)
+
+    def resolve(self, captures: tuple[str, ...]) -> Any:
+        return type(self)(self._mapping.resolve(captures))
+
+    def hf_to_megatron(self, hf_weights: Any, megatron_module: Any) -> Any:
+        return self._mapping.hf_to_megatron(hf_weights, megatron_module)
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: torch.Tensor | None,
+        megatron_module: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        return {}
+
+
+def _gemma4_dense_mapping(mapping: Any) -> Any:
+    megatron_param = str(getattr(mapping, "megatron_param", ""))
+    hf_param = getattr(mapping, "hf_param", None)
+    if megatron_param.endswith(".mlp.linear_fc1.layer_norm_weight") and isinstance(
+        hf_param, str
+    ):
+        cloned = copy(mapping)
+        cloned.hf_param = hf_param.replace(
+            ".post_attention_layernorm.weight",
+            ".pre_feedforward_layernorm.weight",
+        )
+        return cloned
+    if megatron_param.endswith(".pffl_weight"):
+        return _ImportOnlyMapping(mapping)
+    return mapping
 
 
 def _is_gemma4_moe_mapping(mapping: Any) -> bool:
@@ -1651,7 +1693,6 @@ def _is_gemma4_moe_mapping(mapping: Any) -> bool:
             ".mlp.router.",
             ".mlp.experts.",
             ".mlp.post_moe_layernorm.",
-            ".pffl_weight",
         )
     )
 
