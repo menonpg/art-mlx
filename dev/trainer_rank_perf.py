@@ -2194,11 +2194,15 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     }
 
     def timed(
-        key: str, calls_key: str, fn: Callable[..., object], *args: object
+        key: str,
+        calls_key: str,
+        fn: Callable[..., object],
+        *args: object,
+        **kwargs: object,
     ) -> object:
         start = time.perf_counter()
         try:
-            return fn(*args)
+            return fn(*args, **kwargs)
         finally:
             stats[key] += (time.perf_counter() - start) * 1000.0
             stats[calls_key] += 1
@@ -2209,14 +2213,13 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     original_cached_estimate = rank._cached_adaptive_estimate
     original_forward_item = rank._forward_item
     original_pack = trainer_rank_module._pack_forward_items
-    original_output_estimate = rank._estimate_group_output_bytes
-    original_signature = rank._memory_signature
+    original_output_estimate = rank._estimate_group_request_output_bytes
+    original_signature = rank._memory_signature_from_requests
     original_memory_check = rank._memory_check
     original_estimate_memory_check = rank._memory_check_estimate
-    original_memory_estimate = rank._estimate_required_memory_bytes
+    original_memory_estimate = rank._estimate_required_memory_bytes_from_values
     original_available = rank._available_memory_bytes
-    original_profile_check = rank._all_ranks_have_memory_profile
-    original_estimate_profile_check = rank._all_ranks_have_memory_profile_estimate
+    original_profile_check = rank._all_ranks_have_memory_profile_values
 
     def plan_wrapper(requests: object) -> object:
         return timed("select_plan_ms", "select_plan_calls", original_plan, requests)
@@ -2273,13 +2276,13 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
             items,
         )
 
-    def signature_wrapper(requests: object, plans: object) -> object:
+    def signature_wrapper(*args: object, **kwargs: object) -> object:
         return timed(
             "select_signature_ms",
             "select_signature_calls",
             original_signature,
-            requests,
-            plans,
+            *args,
+            **kwargs,
         )
 
     def memory_check_wrapper(plan: object) -> object:
@@ -2298,12 +2301,13 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
             estimate,
         )
 
-    def memory_estimate_wrapper(plan: object) -> object:
+    def memory_estimate_wrapper(*args: object, **kwargs: object) -> object:
         return timed(
             "select_memory_estimate_ms",
             "select_memory_estimate_calls",
             original_memory_estimate,
-            plan,
+            *args,
+            **kwargs,
         )
 
     def available_wrapper() -> object:
@@ -2313,20 +2317,13 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
             original_available,
         )
 
-    def profile_check_wrapper(plan: object) -> object:
+    def profile_check_wrapper(*args: object, **kwargs: object) -> object:
         return timed(
             "select_profile_check_ms",
             "select_profile_check_calls",
             original_profile_check,
-            plan,
-        )
-
-    def estimate_profile_check_wrapper(estimate: object) -> object:
-        return timed(
-            "select_profile_check_ms",
-            "select_profile_check_calls",
-            original_estimate_profile_check,
-            estimate,
+            *args,
+            **kwargs,
         )
 
     rank._plan_flat_forward = plan_wrapper  # type: ignore[method-assign]
@@ -2335,14 +2332,13 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     rank._cached_adaptive_estimate = cached_estimate_wrapper  # type: ignore[method-assign]
     rank._forward_item = forward_item_wrapper  # type: ignore[method-assign]
     trainer_rank_module._pack_forward_items = pack_wrapper  # type: ignore[assignment]
-    rank._estimate_group_output_bytes = output_estimate_wrapper  # type: ignore[method-assign]
-    rank._memory_signature = signature_wrapper  # type: ignore[method-assign]
+    rank._estimate_group_request_output_bytes = output_estimate_wrapper  # type: ignore[method-assign]
+    rank._memory_signature_from_requests = signature_wrapper  # type: ignore[method-assign]
     rank._memory_check = memory_check_wrapper  # type: ignore[method-assign]
     rank._memory_check_estimate = estimate_memory_check_wrapper  # type: ignore[method-assign]
-    rank._estimate_required_memory_bytes = memory_estimate_wrapper  # type: ignore[method-assign]
+    rank._estimate_required_memory_bytes_from_values = memory_estimate_wrapper  # type: ignore[method-assign]
     rank._available_memory_bytes = available_wrapper  # type: ignore[method-assign]
-    rank._all_ranks_have_memory_profile = profile_check_wrapper  # type: ignore[method-assign]
-    rank._all_ranks_have_memory_profile_estimate = estimate_profile_check_wrapper  # type: ignore[method-assign]
+    rank._all_ranks_have_memory_profile_values = profile_check_wrapper  # type: ignore[method-assign]
     try:
         yield stats
     finally:
@@ -2352,14 +2348,13 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
         rank._cached_adaptive_estimate = original_cached_estimate  # type: ignore[method-assign]
         rank._forward_item = original_forward_item  # type: ignore[method-assign]
         trainer_rank_module._pack_forward_items = original_pack  # type: ignore[assignment]
-        rank._estimate_group_output_bytes = original_output_estimate  # type: ignore[method-assign]
-        rank._memory_signature = original_signature  # type: ignore[method-assign]
+        rank._estimate_group_request_output_bytes = original_output_estimate  # type: ignore[method-assign]
+        rank._memory_signature_from_requests = original_signature  # type: ignore[method-assign]
         rank._memory_check = original_memory_check  # type: ignore[method-assign]
         rank._memory_check_estimate = original_estimate_memory_check  # type: ignore[method-assign]
-        rank._estimate_required_memory_bytes = original_memory_estimate  # type: ignore[method-assign]
+        rank._estimate_required_memory_bytes_from_values = original_memory_estimate  # type: ignore[method-assign]
         rank._available_memory_bytes = original_available  # type: ignore[method-assign]
-        rank._all_ranks_have_memory_profile = original_profile_check  # type: ignore[method-assign]
-        rank._all_ranks_have_memory_profile_estimate = original_estimate_profile_check  # type: ignore[method-assign]
+        rank._all_ranks_have_memory_profile_values = original_profile_check  # type: ignore[method-assign]
 
 
 def _timed_cuda(
