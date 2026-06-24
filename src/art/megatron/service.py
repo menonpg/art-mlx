@@ -710,18 +710,6 @@ class MegatronService:
             await self._reload_adapter(checkpoint_dir, step)
         self._latest_step = step
 
-    async def reset_training_state(self, initial_lora_path: str) -> None:
-        task = self._child_processes._tasks.pop("Megatron worker", None)
-        if task is not None:
-            task.cancel()
-        self._stop_megatron_process()
-        self._child_processes._failure = None
-        self._clear_pending_jobs()
-        for step in sorted(self._loaded_adapter_steps):
-            await self._unload_adapter(step)
-        await self.register_lora_for_step(0, initial_lora_path)
-        await self.prune_loaded_adapters(retain_steps={0})
-
     def _validate_megatron_dependencies(self) -> None:
         try:
             import megatron.bridge  # type: ignore

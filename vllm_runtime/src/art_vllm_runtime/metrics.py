@@ -129,14 +129,6 @@ class _ArtRuntimeMetricsState:
                 "metrics": metrics,
             }
 
-    def reset(self) -> None:
-        with self._lock:
-            self._record_count = 0
-            self._last_update_unix_s = 0.0
-            self._engine_gauges.clear()
-            for key in self._counters:
-                self._counters[key] = 0.0
-
 
 _STATE = _ArtRuntimeMetricsState()
 
@@ -166,7 +158,3 @@ class ArtRuntimeStatLogger(StatLoggerBase):
 
 def get_art_metrics_snapshot() -> dict[str, Any]:
     return _STATE.snapshot()
-
-
-def reset_art_metrics() -> None:
-    _STATE.reset()
