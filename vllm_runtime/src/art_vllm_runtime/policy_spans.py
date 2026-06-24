@@ -303,17 +303,28 @@ def _patch_openai_response_policy_spans() -> None:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        final_res = None
+
+        async def tracked_result_generator():
+            nonlocal final_res
+            async for res in result_generator:
+                final_res = res
+                yield res
+
         response = await original_full(
             self,
             request,
-            result_generator,
+            tracked_result_generator(),
             request_id,
             model_name,
             *args,
             **kwargs,
         )
         if isinstance(response, ChatCompletionResponse):
-            spans_by_choice = _COMPLETION_POLICY_SPANS_BY_REQUEST.pop(request_id, {})
+            spans_by_choice = _policy_spans_by_choice_from_final_output(final_res)
+            fallback_spans = _COMPLETION_POLICY_SPANS_BY_REQUEST.pop(request_id, {})
+            if not spans_by_choice:
+                spans_by_choice = fallback_spans
             for choice in response.choices:
                 spans = spans_by_choice.get(choice.index)
                 if spans:
@@ -535,3 +546,17 @@ def _record_request_output_spans(
         copied = [dict(span) for span in spans]
         setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, copied)
         by_choice[output.index] = copied
+
+
+def _policy_spans_by_choice_from_final_output(
+    final_res: Any,
+) -> dict[int, list[dict[str, Any]]]:
+    outputs = getattr(final_res, "outputs", None)
+    if not outputs:
+        return {}
+    spans_by_choice: dict[int, list[dict[str, Any]]] = {}
+    for output in outputs:
+        spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+        if spans:
+            spans_by_choice[int(output.index)] = [dict(span) for span in spans]
+    return spans_by_choice

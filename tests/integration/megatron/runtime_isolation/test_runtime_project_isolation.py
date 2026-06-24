@@ -82,6 +82,53 @@ def test_runtime_patch_always_returns_token_ids(
     }
 
 
+def test_runtime_policy_spans_read_final_request_output(artifact_dir: Path) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json; "
+                "from types import SimpleNamespace; "
+                "from art_vllm_runtime.policy_spans import ("
+                "ART_POLICY_TOKEN_SPANS_FIELD, "
+                "_policy_spans_by_choice_from_final_output"
+                "); "
+                "spans = [{'start_token': 0, 'end_token': 3, "
+                "'policy_version': 4, 'lora_slot': 'm:active', "
+                "'update_seq': 2}]; "
+                "choice = SimpleNamespace(index=1); "
+                "setattr(choice, ART_POLICY_TOKEN_SPANS_FIELD, spans); "
+                "payload = _policy_spans_by_choice_from_final_output("
+                "SimpleNamespace(outputs=[choice])"
+                "); "
+                "print(json.dumps(payload))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "policy_spans_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "policy_spans_stderr.txt").write_text(result.stderr)
+    assert json.loads(result.stdout.strip()) == {
+        "1": [
+            {
+                "start_token": 0,
+                "end_token": 3,
+                "policy_version": 4,
+                "lora_slot": "m:active",
+                "update_seq": 2,
+            }
+        ]
+    }
+
+
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
