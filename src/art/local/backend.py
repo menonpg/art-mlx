@@ -767,6 +767,7 @@ class LocalBackend(Backend):
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
+        final_training_step: int | None = None,
         # Verbosity
         verbose: bool = False,
     ) -> LocalTrainResult:
@@ -902,6 +903,7 @@ class LocalBackend(Backend):
             packed_sequence_length=packed_sequence_length,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
+            final_training_step=final_training_step,
         )
 
         # Collect metrics from training

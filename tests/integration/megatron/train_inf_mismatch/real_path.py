@@ -98,10 +98,6 @@ class RealPathBaseDiagnosticBundle(BaseModel):
     logical_prompt_count: int
     logical_token_count: int
     moe_routing_packed_tokens: int
-    moe_routing_shared_prefix_rows: int
-    moe_routing_shared_prefix_conflict_rows: int
-    moe_routing_shared_prefix_conflict_slots: int
-    moe_routing_shared_prefix_compared_slots: int
     vllm_forward_trace_dir: str | None = None
     megatron_forward_trace_dir: str | None = None
 
@@ -114,8 +110,6 @@ class RealPathTrainInfReport(BaseModel):
     base_logical_prompt_count: int | None = None
     base_logical_token_count: int | None = None
     base_moe_routing_packed_tokens: int | None = None
-    base_moe_routing_shared_prefix_conflict_rows: int | None = None
-    base_moe_routing_shared_prefix_conflict_slots: int | None = None
     adapter_path: str
     megatron_base_scores: str | None = None
     vllm_base_scores: str | None = None
@@ -126,10 +120,6 @@ class RealPathTrainInfReport(BaseModel):
     lora: PairComparison
     lora_topk: TopKComparison
     moe_routing_packed_tokens: int
-    moe_routing_shared_prefix_rows: int
-    moe_routing_shared_prefix_conflict_rows: int
-    moe_routing_shared_prefix_conflict_slots: int
-    moe_routing_shared_prefix_compared_slots: int
     mean_abs_pct_limit: float
     top20_kl_candidate_to_target_limit: float
     passed: bool
@@ -698,14 +688,6 @@ async def _score_base_real_generation_path(
         logical_prompt_count=len(logical_map.prompts),
         logical_token_count=len(logical_map.tokens),
         moe_routing_packed_tokens=int(stats.packed_tokens),
-        moe_routing_shared_prefix_rows=int(stats.shared_prefix_rows),
-        moe_routing_shared_prefix_conflict_rows=int(stats.shared_prefix_conflict_rows),
-        moe_routing_shared_prefix_conflict_slots=int(
-            stats.shared_prefix_conflict_slots
-        ),
-        moe_routing_shared_prefix_compared_slots=int(
-            stats.shared_prefix_compared_slots
-        ),
         vllm_forward_trace_dir=(
             str(vllm_forward_trace_dir) if vllm_forward_trace_dir is not None else None
         ),
@@ -1303,16 +1285,6 @@ async def run_real_path_train_inf_mismatch(
                 if base_diagnostic is not None
                 else None
             ),
-            base_moe_routing_shared_prefix_conflict_rows=(
-                base_diagnostic.moe_routing_shared_prefix_conflict_rows
-                if base_diagnostic is not None
-                else None
-            ),
-            base_moe_routing_shared_prefix_conflict_slots=(
-                base_diagnostic.moe_routing_shared_prefix_conflict_slots
-                if base_diagnostic is not None
-                else None
-            ),
             adapter_path=adapter_path,
             megatron_base_scores=(
                 base_diagnostic.megatron_score_path
@@ -1329,16 +1301,6 @@ async def run_real_path_train_inf_mismatch(
             lora=comparison,
             lora_topk=topk_comparison,
             moe_routing_packed_tokens=int(stats.packed_tokens),
-            moe_routing_shared_prefix_rows=int(stats.shared_prefix_rows),
-            moe_routing_shared_prefix_conflict_rows=int(
-                stats.shared_prefix_conflict_rows
-            ),
-            moe_routing_shared_prefix_conflict_slots=int(
-                stats.shared_prefix_conflict_slots
-            ),
-            moe_routing_shared_prefix_compared_slots=int(
-                stats.shared_prefix_compared_slots
-            ),
             mean_abs_pct_limit=mean_abs_pct_limit,
             top20_kl_candidate_to_target_limit=top20_kl_limit,
             passed=passed,

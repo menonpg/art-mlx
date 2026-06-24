@@ -55,6 +55,7 @@ from art.megatron.routing_replay import (
 from art.megatron.runtime.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
+    LORA_READY_EVENT,
     MegatronJob,
     MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
@@ -142,6 +143,7 @@ class TrainingRuntime(BaseModel):
     model: ModelChunks
     optimizer: Any | None
     optimizer_config: OptimizerConfig
+    optimizer_persistent: bool = True
     transformer_layers_compiled: bool = False
     rank: int
     world_size: int
@@ -450,7 +452,7 @@ def run_megatron_worker_loop(
             job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
         )
         if not job_names:
-            time.sleep(1)
+            time.sleep(0.05)
             continue
 
         if wait_until_ready is not None:
@@ -595,26 +597,24 @@ def run_megatron_rl_job(
                 "Correlation between old and new probabilities:",
                 step_result.probs_corr,
             )
-
-            if runtime.rank == 0:
-                with open(job.log_path, "a+", encoding="utf-8") as log_file:
-                    metrics = {
-                        "loss": step_result.reduced_loss.item(),
-                        "grad_norm": step_result.grad_norm,
-                        "probs_corr": step_result.probs_corr,
-                        TRAIN_GRADIENT_STEPS_KEY: num_steps,
-                    }
-                    if step_result.kl_policy_ref is not None:
-                        metrics["kl_policy_ref"] = step_result.kl_policy_ref
-                    log_msg = json.dumps(metrics)
-                    print("Logging", log_msg)
-                    log_file.write(log_msg + "\n")
+            _log_rl_step_result(
+                runtime.rank,
+                job.log_path,
+                step_result,
+                num_gradient_steps=num_steps,
+            )
 
         _save_lora_and_optimizer(
             runtime,
             adapter_model=adapter_model,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
+            step=job.step,
+            optimizer_save_interval=job.config.optimizer_save_interval,
+            final_training_step=job.config.final_training_step,
+            lora_ready_log_path=(
+                None if isinstance(job, MegatronMergedTrainingJob) else job.log_path
+            ),
         )
     finally:
         configure_moe_routing_replay(runtime)
@@ -732,6 +732,9 @@ def run_megatron_sft_job(
                     adapter_model=adapter_model,
                     lora_path=job.lora_path,
                     optimizer_state_path=job.optimizer_state_path,
+                    step=completed_batches,
+                    optimizer_save_interval=1,
+                    final_training_step=job.num_batches,
                 )
                 torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
 
@@ -756,6 +759,9 @@ def run_megatron_sft_job(
             adapter_model=adapter_model,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
+            step=job.num_batches,
+            optimizer_save_interval=1,
+            final_training_step=job.num_batches,
         )
     finally:
         if adapter_model is not None:
@@ -813,12 +819,17 @@ def _load_lora_and_optimizer(
     lora_path: str,
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
+    persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
     adapter_model = _load_adapter_into_model(
         runtime.model,
         lora_path,
         runtime.rank,
         handler=runtime.model_support_handler,
+        optimizer=persistent_optimizer,
     )
+    if persistent_optimizer is not None:
+        return adapter_model
+
     runtime.optimizer = _build_optimizer(
         runtime.model,
         runtime.optimizer_config,
@@ -863,6 +874,10 @@ def _save_lora_and_optimizer(
     adapter_model: dict[str, torch.Tensor],
     lora_path: str,
     optimizer_state_path: str,
+    step: int,
+    optimizer_save_interval: int | None,
+    final_training_step: int | None = None,
+    lora_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
     save_vllm_lora_from_model(
@@ -874,7 +889,68 @@ def _save_lora_and_optimizer(
         rank=runtime.rank,
         world_size=runtime.world_size,
     )
-    _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
+    if lora_ready_log_path is not None and runtime.rank == 0:
+        _write_job_event(lora_ready_log_path, LORA_READY_EVENT, step=step)
+    if _should_save_optimizer(
+        runtime,
+        step=step,
+        optimizer_state_path=optimizer_state_path,
+        optimizer_save_interval=optimizer_save_interval,
+        final_training_step=final_training_step,
+    ):
+        _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
+
+
+def _should_save_optimizer(
+    runtime: TrainingRuntime,
+    *,
+    step: int,
+    optimizer_state_path: str,
+    optimizer_save_interval: int | None,
+    final_training_step: int | None,
+) -> bool:
+    if not runtime.optimizer_persistent or optimizer_save_interval in {None, 1}:
+        return True
+    if final_training_step is not None and step >= final_training_step:
+        return True
+    optimizer_shard_path = os.path.join(
+        optimizer_state_path,
+        f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+    )
+    return (
+        step <= 1
+        or step % optimizer_save_interval == 0
+        or not os.path.exists(optimizer_shard_path)
+    )
+
+
+def _write_job_event(log_path: str, event: str, **payload: int | float | str) -> None:
+    with open(log_path, "a+", encoding="utf-8") as log_file:
+        log_file.write(json.dumps({"event": event, **payload}) + "\n")
+        log_file.flush()
+
+
+def _log_rl_step_result(
+    rank: int,
+    log_path: str,
+    step_result: TrainStepResult,
+    *,
+    num_gradient_steps: int,
+) -> None:
+    if rank != 0:
+        return
+    with open(log_path, "a+", encoding="utf-8") as log_file:
+        metrics = {
+            "loss": step_result.reduced_loss.item(),
+            "grad_norm": step_result.grad_norm,
+            "probs_corr": step_result.probs_corr,
+            TRAIN_GRADIENT_STEPS_KEY: num_gradient_steps,
+        }
+        if step_result.kl_policy_ref is not None:
+            metrics["kl_policy_ref"] = step_result.kl_policy_ref
+        log_msg = json.dumps(metrics)
+        print("Logging", log_msg)
+        log_file.write(log_msg + "\n")
 
 
 def _save_optimizer(runtime: TrainingRuntime, *, optimizer_state_path: str) -> None:
@@ -1671,6 +1747,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         rank=runtime.rank,
         compile_enabled=runtime.transformer_layers_compiled,
     )
+    runtime.optimizer_persistent = not weight_offload.offload_between_jobs
     weight_offload.install()
     wake_lock_path = os.environ.get(
         "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
@@ -1684,7 +1761,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         weight_offload.before_job()
 
     def after_job() -> None:
-        runtime.optimizer = None
+        if not runtime.optimizer_persistent:
+            runtime.optimizer = None
         weight_offload.after_job()
 
     worker_error = False

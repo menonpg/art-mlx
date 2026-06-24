@@ -35,7 +35,7 @@ async def stream_megatron_job(
     job_path: str,
     process: Any | None = None,
     process_log_path: str | None = None,
-    poll_interval: float = 0.1,
+    poll_interval: float = 0.05,
 ) -> AsyncIterator[dict[str, Any]]:
     num_lines = 0
     try:

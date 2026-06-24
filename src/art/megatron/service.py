@@ -49,6 +49,7 @@ from .runtime.client import (
     write_megatron_job,
 )
 from .runtime.jobs import (
+    LORA_READY_EVENT,
     MegatronMergedTrainingJob,
     MegatronSFTTrainingJob,
     MegatronSyncJob,
@@ -853,10 +854,6 @@ class MegatronService:
         step: int,
     ) -> str:
         self._ensure_lora_adapter_config(staging_lora_path)
-        if not self._adapter_exists_and_loads(staging_lora_path):
-            raise RuntimeError(
-                f"Megatron training did not publish LoRA adapter: {staging_lora_path}"
-            )
         checkpoint_dir = get_step_checkpoint_dir(self.output_dir, step)
         if os.path.exists(checkpoint_dir):
             raise RuntimeError(
@@ -888,6 +885,48 @@ class MegatronService:
 
         await self._reload_adapter(checkpoint_dir, step)
         self._status(f"Loaded checkpoint {step} into vLLM")
+
+    async def _handle_training_lora_ready(
+        self,
+        *,
+        checkpoint_dir: str | None,
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        if checkpoint_dir is None:
+            checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=step,
+            )
+        if self.is_dedicated and self.rollout_weights_mode == "lora":
+            await self._reload_adapter(checkpoint_dir, step)
+            self._status(f"Loaded checkpoint {step} into vLLM")
+        return checkpoint_dir
+
+    async def _finish_training_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str | None,
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        if checkpoint_dir is None:
+            checkpoint_dir = self._publish_staged_training_checkpoint(
+                staging_lora_path=staging_lora_path,
+                step=step,
+            )
+        if self.rollout_weights_mode == "merged":
+            self._latest_step = step
+        elif self.is_dedicated:
+            if self._latest_step != step:
+                await self._reload_adapter(checkpoint_dir, step)
+                self._status(f"Loaded checkpoint {step} into vLLM")
+        else:
+            await self._wake_and_reload_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                step=step,
+            )
+        return checkpoint_dir
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
@@ -947,6 +986,7 @@ class MegatronService:
                     await self._init_merged_weight_transfer()
                     job: MegatronTrainingJob | MegatronMergedTrainingJob = (
                         MegatronMergedTrainingJob(
+                            step=next_step,
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
                             optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -968,6 +1008,7 @@ class MegatronService:
                     )
                 else:
                     job = MegatronTrainingJob(
+                        step=next_step,
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
                         optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -982,22 +1023,27 @@ class MegatronService:
                         log_path=log_path,
                     )
                 write_megatron_job(job, job_path=job_path)
+                checkpoint_dir: str | None = None
                 async for result in stream_megatron_job(
                     job,
                     job_path=job_path,
                     process=self._megatron_process,
                     process_log_path=self._megatron_log_path,
                 ):
+                    if result.get("event") == LORA_READY_EVENT:
+                        checkpoint_dir = await self._handle_training_lora_ready(
+                            checkpoint_dir=checkpoint_dir,
+                            staging_lora_path=staging_lora_path,
+                            step=next_step,
+                        )
+                        continue
                     yield {key: float(value) for key, value in result.items()}
 
-                new_checkpoint_dir = self._publish_staged_training_checkpoint(
+                await self._finish_training_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
                     staging_lora_path=staging_lora_path,
                     step=next_step,
                 )
-                if self.rollout_weights_mode == "merged":
-                    self._latest_step = next_step
-                else:
-                    await self._reload_adapter(new_checkpoint_dir, next_step)
                 return
 
             lora_path = await self._prepare_for_training()
@@ -1008,6 +1054,7 @@ class MegatronService:
             )
             job_path, log_path = self._create_megatron_job_paths()
             job = MegatronTrainingJob(
+                step=next_step,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path("rl"),
@@ -1022,20 +1069,25 @@ class MegatronService:
             )
             write_megatron_job(job, job_path=job_path)
 
+            checkpoint_dir = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
                 process=self._megatron_process,
                 process_log_path=self._megatron_log_path,
             ):
+                if result.get("event") == LORA_READY_EVENT:
+                    checkpoint_dir = await self._handle_training_lora_ready(
+                        checkpoint_dir=checkpoint_dir,
+                        staging_lora_path=staging_lora_path,
+                        step=next_step,
+                    )
+                    continue
                 yield {key: float(value) for key, value in result.items()}
 
-            new_checkpoint_dir = self._publish_staged_training_checkpoint(
+            await self._finish_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
                 staging_lora_path=staging_lora_path,
-                step=next_step,
-            )
-            await self._wake_and_reload_training_checkpoint(
-                checkpoint_dir=new_checkpoint_dir,
                 step=next_step,
             )
         except BaseException:

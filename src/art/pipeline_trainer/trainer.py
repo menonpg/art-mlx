@@ -578,6 +578,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "normalize_advantages": self.normalize_advantages,
                     "save_checkpoint": should_checkpoint,
                     "adam_params": self.adam_params,
+                    "final_training_step": stop_at_step,
                 }
                 if self.kl_penalty_coef > 0.0:
                     kl_penalty_reference_step = self._kl_penalty_reference_step(

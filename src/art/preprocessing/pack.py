@@ -3,15 +3,17 @@ import random
 import time
 from typing import Any, cast
 
+import numpy as np
 import torch
 from typing_extensions import NotRequired, TypedDict, Unpack
 
 from ..types import Verbosity
 from .moe_routing import (
+    MISSING_EXPERT_ID,
+    MoeRouteArray,
+    MoeRouteSegments,
     MoeRoutingPackStats,
     PackedMoeRoutingReplay,
-    TokenRoute,
-    count_route_slot_conflicts,
 )
 from .tokenize import TokenizedResult
 
@@ -48,18 +50,9 @@ def packed_tensors_from_tokenized_results(
     pack_results: bool = True,
     include_moe_routing: bool = False,
 ) -> PackedTensors:
-    # TODO: This function could potentially be optimized with vectorized operations
-    token_ids: list[list[int]] = [[]]
-    group_ids: list[list[int]] = [[]]
-    parent_ids: list[list[int]] = [[]]
-    input_pos: list[list[int]] = [[]]
-    assistant_mask: list[list[int]] = [[]]
-    logprobs: list[list[float]] = [[]]
-    advantages: list[list[float]] = [[]]
-    weights: list[list[float]] = [[]]
-    pixel_values: list[list[torch.Tensor]] = [[]]
-    image_grid_thw: list[list[torch.Tensor]] = [[]]
-    moe_routes: list[list[TokenRoute | None]] = [[]]
+    sequences: list[list[tuple[TokenizedResult, int, int, int, int]]] = [[]]
+    sequence_lengths = [0]
+    sequence_prompt_ids: list[set[int]] = [set()]
     moe_routing_pack_stats = MoeRoutingPackStats()
 
     for result in tokenized_results:
@@ -72,101 +65,112 @@ def packed_tensors_from_tokenized_results(
                 "MoE routing replay from trajectories was requested, but a "
                 "tokenized result has no aligned routed experts"
             )
-        result_without_prompt = result.without_prompt()
-        if sum(result_without_prompt.assistant_mask) == 0:
+        if sum(result.assistant_mask[result.prompt_length :]) == 0:
             if verbosity > 1:
                 print("Result has no unique completion tokens, skipping")
             continue
-        if token_ids[-1] and (
-            not pack_results
-            or len(token_ids[-1])
-            + (
-                len(result_without_prompt.token_ids)
-                if result.prompt_id in group_ids[-1]
-                else len(result.token_ids)
-            )
-            > seq_len
+        prompt_seen = result.prompt_id in sequence_prompt_ids[-1]
+        src_start = result.prompt_length if prompt_seen else 0
+        result_len = len(result.token_ids) - src_start
+        if sequence_lengths[-1] and (
+            not pack_results or sequence_lengths[-1] + result_len > seq_len
         ):
-            token_ids.append([])
-            group_ids.append([])
-            parent_ids.append([])
-            input_pos.append([])
-            assistant_mask.append([])
-            logprobs.append([])
-            advantages.append([])
-            weights.append([])
-            pixel_values.append([])
-            image_grid_thw.append([])
-            moe_routes.append([])
+            sequences.append([])
+            sequence_lengths.append(0)
+            sequence_prompt_ids.append(set())
+            prompt_seen = False
+            src_start = 0
         group_id = random.randint(-(2**63), 2**63 - 1)
-        if result.prompt_id in group_ids[-1]:
-            if include_moe_routing:
-                _record_shared_prefix_route_conflicts(
-                    existing_group_ids=group_ids[-1],
-                    existing_routes=moe_routes[-1],
-                    result=result,
-                    stats=moe_routing_pack_stats,
-                )
-            result = result_without_prompt
-        token_ids[-1].extend(result.token_ids)
-        group_ids[-1].extend(
-            [result.prompt_id] * result.prompt_length
-            + [group_id] * (len(result.token_ids) - result.prompt_length)
-        )
-        parent_ids[-1].extend([result.prompt_id] * len(result.token_ids))
-        input_pos[-1].extend(result.input_pos)
-        assistant_mask[-1].extend(result.assistant_mask)
-        logprobs[-1].extend(result.logprobs)
-        advantages[-1].extend([result.advantage] * len(result.token_ids))
-        weights[-1].extend([result.weight] * len(result.token_ids))
-        if result.pixel_values is not None:
-            pixel_values[-1].append(result.pixel_values)
-        if result.image_grid_thw is not None:
-            image_grid_thw[-1].append(result.image_grid_thw)
-        if include_moe_routing:
-            assert result.moe_routed_experts is not None
-            moe_routes[-1].extend(result.moe_routed_experts)
+        dst_start = sequence_lengths[-1]
+        src_end = len(result.token_ids)
         if truncate_long_results:
-            token_ids[-1] = token_ids[-1][:seq_len]
-            group_ids[-1] = group_ids[-1][:seq_len]
-            parent_ids[-1] = parent_ids[-1][:seq_len]
-            input_pos[-1] = input_pos[-1][:seq_len]
-            assistant_mask[-1] = assistant_mask[-1][:seq_len]
-            logprobs[-1] = logprobs[-1][:seq_len]
-            advantages[-1] = advantages[-1][:seq_len]
-            weights[-1] = weights[-1][:seq_len]
-            if include_moe_routing:
-                moe_routes[-1] = moe_routes[-1][:seq_len]
+            src_end = min(src_end, src_start + seq_len - dst_start)
+        if src_end <= src_start:
+            continue
+        sequences[-1].append((result, src_start, src_end, dst_start, group_id))
+        sequence_lengths[-1] += src_end - src_start
+        if not prompt_seen and result.prompt_length > 0:
+            sequence_prompt_ids[-1].add(result.prompt_id)
 
-    permutation = list(range(len(token_ids)))
+    if not any(sequences):
+        raise RuntimeError("No tokenized results were packable")
+    permutation = list(range(len(sequences)))
     random.shuffle(permutation)
-    token_ids = [token_ids[i] for i in permutation]
-    group_ids = [group_ids[i] for i in permutation]
-    parent_ids = [parent_ids[i] for i in permutation]
-    input_pos = [input_pos[i] for i in permutation]
-    assistant_mask = [assistant_mask[i] for i in permutation]
-    logprobs = [logprobs[i] for i in permutation]
-    advantages = [advantages[i] for i in permutation]
-    weights = [weights[i] for i in permutation]
-    pixel_values = [pixel_values[i] for i in permutation]
-    image_grid_thw = [image_grid_thw[i] for i in permutation]
-    moe_routes = [moe_routes[i] for i in permutation]
+    num_sequences = len(permutation)
+    tokens_np = np.full((num_sequences, seq_len), pad_token_id, dtype=np.int64)
+    group_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
+    parent_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
+    input_pos_np = np.zeros((num_sequences, seq_len), dtype=np.int64)
+    assistant_mask_np = np.zeros((num_sequences, seq_len), dtype=np.bool_)
+    logprobs_np = np.full((num_sequences, seq_len), np.nan, dtype=np.float32)
+    advantages_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
+    weights_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
+    pixel_values: list[list[torch.Tensor]] = [[] for _ in permutation]
+    image_grid_thw: list[list[torch.Tensor]] = [[] for _ in permutation]
+    route_tensor_np: np.ndarray | None = None
+    route_mask_np: np.ndarray | None = None
+    route_shape = _first_moe_route_shape(sequences) if include_moe_routing else None
+    max_expert_id = 0
+    if route_shape is not None:
+        num_layers, topk = route_shape
+        route_tensor_np = np.zeros(
+            (num_sequences, seq_len, num_layers, topk), dtype=np.int32
+        )
+        route_mask_np = np.zeros((num_sequences, seq_len), dtype=np.bool_)
 
-    def pad(values: list[list], pad_value) -> list[list]:
-        max_len = seq_len
-        for value in values:
-            value.extend([pad_value] * (max_len - len(value)))
-        return values
+    for dst_seq, src_seq in enumerate(permutation):
+        for result, src_start, src_end, dst_start, group_id in sequences[src_seq]:
+            dst_end = dst_start + src_end - src_start
+            tokens_np[dst_seq, dst_start:dst_end] = result.token_ids[src_start:src_end]
+            parent_ids_np[dst_seq, dst_start:dst_end] = result.prompt_id
+            prompt_end = min(result.prompt_length, src_end)
+            if src_start < prompt_end:
+                end = dst_start + prompt_end - src_start
+                group_ids_np[dst_seq, dst_start:end] = result.prompt_id
+            if prompt_end < src_end:
+                start = dst_start + max(prompt_end - src_start, 0)
+                group_ids_np[dst_seq, start:dst_end] = group_id
+            input_pos_np[dst_seq, dst_start:dst_end] = result.input_pos[
+                src_start:src_end
+            ]
+            assistant_mask_np[dst_seq, dst_start:dst_end] = result.assistant_mask[
+                src_start:src_end
+            ]
+            logprobs_np[dst_seq, dst_start:dst_end] = result.logprobs[src_start:src_end]
+            advantages_np[dst_seq, dst_start:dst_end] = result.advantage
+            weights_np[dst_seq, dst_start:dst_end] = result.weight
+            if src_start == 0:
+                if result.pixel_values is not None:
+                    pixel_values[dst_seq].append(result.pixel_values)
+                if result.image_grid_thw is not None:
+                    image_grid_thw[dst_seq].append(result.image_grid_thw)
+            if include_moe_routing:
+                assert route_tensor_np is not None and route_mask_np is not None
+                assert route_shape is not None
+                max_expert_id = max(
+                    max_expert_id,
+                    _copy_moe_routes(
+                        route_tensor_np=route_tensor_np,
+                        route_mask_np=route_mask_np,
+                        dst_seq=dst_seq,
+                        dst_start=dst_start,
+                        src_start=src_start,
+                        src_end=src_end,
+                        raw_routes=result.moe_routed_experts,
+                        route_shape=route_shape,
+                    ),
+                )
 
-    assistant_mask_tensor = torch.tensor(pad(assistant_mask, 0), dtype=torch.bool)
-    weights_tensor = torch.tensor(pad(weights, 0.0))
+    assistant_mask_tensor = torch.from_numpy(assistant_mask_np)
+    weights_tensor = torch.from_numpy(weights_np)
     weights_tensor = torch.where(
         assistant_mask_tensor, weights_tensor, torch.zeros_like(weights_tensor)
     )
-    weights_tensor[assistant_mask_tensor] /= weights_tensor[
-        assistant_mask_tensor
-    ].mean()
-    advantages_tensor = torch.tensor(pad(advantages, 0.0))
+    if bool(assistant_mask_tensor.any()):
+        weights_tensor[assistant_mask_tensor] /= weights_tensor[
+            assistant_mask_tensor
+        ].mean()
+    advantages_tensor = torch.from_numpy(advantages_np)
     advantages_tensor = torch.where(
         assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
     )
@@ -182,18 +186,19 @@ def packed_tensors_from_tokenized_results(
             advantages_tensor,
             advantages_tensor * (1 + advantage_balance),
         )
-    advantages_tensor[assistant_mask_tensor] /= (
-        advantages_tensor[assistant_mask_tensor].abs()
-        * weights_tensor[assistant_mask_tensor]
-    ).mean()
+    if bool(assistant_mask_tensor.any()):
+        advantages_tensor[assistant_mask_tensor] /= (
+            advantages_tensor[assistant_mask_tensor].abs()
+            * weights_tensor[assistant_mask_tensor]
+        ).mean()
 
     packed_tensors: PackedTensors = {
-        "tokens": torch.tensor(pad(token_ids, pad_token_id)),
-        "group_ids": torch.tensor(pad(group_ids, -1)),
-        "parent_ids": torch.tensor(pad(parent_ids, -1)),
-        "input_pos": torch.tensor(pad(input_pos, 0)),
+        "tokens": torch.from_numpy(tokens_np),
+        "group_ids": torch.from_numpy(group_ids_np),
+        "parent_ids": torch.from_numpy(parent_ids_np),
+        "input_pos": torch.from_numpy(input_pos_np),
         "assistant_mask": assistant_mask_tensor,
-        "logprobs": torch.tensor(pad(logprobs, float("nan"))),
+        "logprobs": torch.from_numpy(logprobs_np),
         "advantages": advantages_tensor,
         "weights": weights_tensor,
         "pixel_values": [
@@ -205,107 +210,109 @@ def packed_tensors_from_tokenized_results(
         "moe_routing_replay": None,
     }
     if include_moe_routing:
-        (
-            route_tensor,
-            route_mask,
-            num_layers,
-            topk,
-            num_experts,
-        ) = _tensorize_moe_routes(moe_routes, seq_len)
-        moe_routing_pack_stats.packed_tokens = int(route_mask.sum().item())
+        assert route_tensor_np is not None and route_mask_np is not None
+        assert route_shape is not None
+        num_layers, topk = route_shape
+        if not bool(route_mask_np.any()):
+            raise RuntimeError("No MoE routes were packed")
+        moe_routing_pack_stats.packed_tokens = int(route_mask_np.sum())
         packed_tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
-            expert_indices=route_tensor,
-            token_mask=route_mask,
+            expert_indices=torch.from_numpy(route_tensor_np),
+            token_mask=torch.from_numpy(route_mask_np),
             num_layers=num_layers,
             topk=topk,
-            num_experts=num_experts,
+            num_experts=max_expert_id + 1,
             pack_stats=moe_routing_pack_stats,
         )
     return packed_tensors
 
 
-def _record_shared_prefix_route_conflicts(
-    *,
-    existing_group_ids: list[int],
-    existing_routes: list[TokenRoute | None],
-    result: TokenizedResult,
-    stats: MoeRoutingPackStats,
-) -> None:
-    assert result.moe_routed_experts is not None
-    prefix_positions = [
-        index
-        for index, group_id in enumerate(existing_group_ids)
-        if group_id == result.prompt_id
-    ]
-    if len(prefix_positions) != result.prompt_length:
-        raise RuntimeError(
-            "Shared-prefix route comparison could not find the existing packed "
-            f"prefix rows: prompt_length={result.prompt_length}, "
-            f"existing_rows={len(prefix_positions)}"
+def _first_moe_route_shape(
+    sequences: list[list[tuple[TokenizedResult, int, int, int, int]]],
+) -> tuple[int, int]:
+    for sequence in sequences:
+        for result, *_ in sequence:
+            shape = _moe_route_shape(result.moe_routed_experts)
+            if shape is not None:
+                return shape
+    raise RuntimeError("No MoE routes were packed")
+
+
+def _moe_route_shape(raw: Any) -> tuple[int, int] | None:
+    if isinstance(raw, MoeRouteSegments):
+        return int(raw.shape[1]), int(raw.shape[2])
+    routes = _coerce_moe_routes(raw)
+    if routes.shape[0] == 0:
+        return None
+    return int(routes.shape[1]), int(routes.shape[2])
+
+
+def _coerce_moe_routes(raw: Any) -> MoeRouteArray:
+    if isinstance(raw, np.ndarray):
+        routes = raw.astype(np.int32, copy=False)
+    elif isinstance(raw, list):
+        first = next((route for route in raw if route is not None), None)
+        if first is None:
+            raise RuntimeError("No MoE routes were packed")
+        routes = np.full(
+            (len(raw), len(first), len(first[0])), MISSING_EXPERT_ID, dtype=np.int32
         )
-    for prefix_offset, packed_index in enumerate(prefix_positions):
-        route = result.moe_routed_experts[prefix_offset]
-        existing = existing_routes[packed_index]
-        if route is None or existing is None:
-            raise RuntimeError("Shared-prefix MoE route is missing")
-        compared, conflicts = count_route_slot_conflicts(existing, route)
-        stats.shared_prefix_rows += 1
-        stats.shared_prefix_compared_slots += compared
-        stats.shared_prefix_conflict_slots += conflicts
-        stats.shared_prefix_conflict_rows += int(conflicts > 0)
+        for index, route in enumerate(raw):
+            if route is not None:
+                routes[index] = route
+    else:
+        raise RuntimeError(f"Expected MoE routes array, got {type(raw)}")
+    if routes.ndim != 3 or routes.shape[1] <= 0 or routes.shape[2] <= 0:
+        raise RuntimeError(f"Packed MoE routes must be rank 3, got {routes.shape}")
+    return routes
 
 
-def _tensorize_moe_routes(
-    routes_by_sequence: list[list[TokenRoute | None]],
-    seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
-    first_route = next(
-        (
-            route
-            for sequence_routes in routes_by_sequence
-            for route in sequence_routes
-            if route is not None
-        ),
-        None,
-    )
-    if first_route is None:
-        raise RuntimeError("No MoE routes were packed")
-    num_layers = len(first_route)
-    topk = len(first_route[0])
-    max_expert_id = 0
-    dense_routes: list[list[TokenRoute]] = []
-    route_masks: list[list[bool]] = []
-    zero_route: TokenRoute = [[0 for _ in range(topk)] for _ in range(num_layers)]
-    for sequence_routes in routes_by_sequence:
-        dense_sequence: list[TokenRoute] = []
-        mask_sequence: list[bool] = []
-        for route in sequence_routes:
-            if route is None:
-                dense_sequence.append(zero_route)
-                mask_sequence.append(False)
-                continue
-            if len(route) != num_layers or any(
-                len(layer_route) != topk for layer_route in route
-            ):
+def _copy_moe_routes(
+    *,
+    route_tensor_np: np.ndarray,
+    route_mask_np: np.ndarray,
+    dst_seq: int,
+    dst_start: int,
+    src_start: int,
+    src_end: int,
+    raw_routes: Any,
+    route_shape: tuple[int, int],
+) -> int:
+    if isinstance(raw_routes, MoeRouteSegments):
+        max_expert_id = 0
+        copied = np.zeros(src_end - src_start, dtype=np.bool_)
+        for segment_start, segment in raw_routes.iter_slices(src_start, src_end):
+            if tuple(segment.shape[1:]) != route_shape:
                 raise RuntimeError("Packed MoE routes must have one rectangular shape")
-            max_expert_id = max(
-                max_expert_id,
-                max(int(expert_id) for layer in route for expert_id in layer),
-            )
-            dense_sequence.append(route)
-            mask_sequence.append(True)
-        while len(dense_sequence) < seq_len:
-            dense_sequence.append(zero_route)
-            mask_sequence.append(False)
-        dense_routes.append(dense_sequence[:seq_len])
-        route_masks.append(mask_sequence[:seq_len])
-    return (
-        torch.tensor(dense_routes, dtype=torch.int32),
-        torch.tensor(route_masks, dtype=torch.bool),
-        num_layers,
-        topk,
-        max_expert_id + 1,
-    )
+            rel_start = segment_start - src_start
+            rel_end = rel_start + segment.shape[0]
+            dst_slice_start = dst_start + rel_start
+            dst_slice_end = dst_start + rel_end
+            route_tensor_np[dst_seq, dst_slice_start:dst_slice_end] = segment
+            route_mask_np[dst_seq, dst_slice_start:dst_slice_end] = True
+            copied[rel_start:rel_end] = True
+            if segment.size:
+                max_expert_id = max(max_expert_id, int(segment.max()))
+        if not bool(copied.all()):
+            missing = np.flatnonzero(~copied)[:8].tolist()
+            raise RuntimeError(f"Segmented MoE routes did not cover rows {missing}")
+        return max_expert_id
+
+    routes = _coerce_moe_routes(raw_routes)
+    route_values = routes[src_start:src_end]
+    if tuple(route_values.shape[1:]) != route_shape:
+        raise RuntimeError("Packed MoE routes must have one rectangular shape")
+    valid_routes = _moe_route_mask(route_values)
+    if not bool(valid_routes.all()):
+        route_values = route_values.copy()
+        route_values[~valid_routes] = 0
+    route_tensor_np[dst_seq, dst_start : dst_start + src_end - src_start] = route_values
+    route_mask_np[dst_seq, dst_start : dst_start + src_end - src_start] = valid_routes
+    return int(route_values[valid_routes].max()) if bool(valid_routes.any()) else 0
+
+
+def _moe_route_mask(routes: MoeRouteArray) -> np.ndarray:
+    return np.all(routes != MISSING_EXPERT_ID, axis=(1, 2))
 
 
 def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensors:
