@@ -95,6 +95,22 @@ def _patch_art_runtime_routes() -> None:
 
             return JSONResponse(content=get_art_metrics_snapshot())
 
+        @router.post("/art/reset_metrics")
+        async def reset_art_metrics_route() -> JSONResponse:
+            from art_vllm_runtime.metrics import reset_art_metrics
+
+            reset_art_metrics()
+            return JSONResponse(content={"status": "reset"})
+
+        @router.post("/art/reset_prefix_cache")
+        async def reset_prefix_cache(raw_request: Request) -> JSONResponse:
+            body = await raw_request.json()
+            success = await engine(raw_request).reset_prefix_cache(
+                reset_running_requests=bool(body.get("reset_running_requests", False)),
+                reset_connector=bool(body.get("reset_connector", True)),
+            )
+            return JSONResponse(content={"success": success})
+
         app.include_router(router)
         return app
 
