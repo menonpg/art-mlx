@@ -2553,7 +2553,7 @@ def _target_correctness_metrics(
         chunk.eval()
     with torch.no_grad():
         labels = _packed_labels(items, prepared)
-        native_outputs = rank._forward_native_target_logprobs(items, prepared, labels)
+        native_logprobs = _native_target_logprobs(rank, items, prepared, labels)
         hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
         head_outputs = rank._project_head(items, prepared, hidden)
         abs_diff_sum = torch.tensor(0.0, device=rank.device)
@@ -2561,17 +2561,17 @@ def _target_correctness_metrics(
         value_count = torch.tensor(0.0, device=rank.device)
         max_abs_diff = torch.tensor(0.0, device=rank.device)
         for native, candidate in zip(
-            native_outputs,
+            native_logprobs,
             head_outputs.target_logprobs,
             strict=True,
         ):
-            if native.target_logprobs is None or candidate is None:
+            if candidate is None:
                 continue
-            diff = (candidate.float() - native.target_logprobs.float()).abs()
+            diff = (candidate.float() - native.float()).abs()
             if int(diff.numel()) == 0:
                 continue
             abs_diff_sum += diff.sum()
-            reference_abs_sum += native.target_logprobs.float().abs().sum()
+            reference_abs_sum += native.float().abs().sum()
             value_count += float(diff.numel())
             max_abs_diff = torch.maximum(max_abs_diff, diff.max())
         sums = torch.stack((abs_diff_sum, reference_abs_sum, value_count))
@@ -2584,6 +2584,48 @@ def _target_correctness_metrics(
         "target_hidden_vs_native_max_abs_diff": max_abs,
         "target_hidden_vs_native_value_count": float(sums[2].item()),
     }
+
+
+def _native_target_logprobs(
+    rank: TrainerRank,
+    items: object,
+    prepared: object,
+    labels: torch.Tensor,
+) -> list[torch.Tensor]:
+    from art.megatron.train import _placeholder_attention_mask
+
+    per_token_loss = rank.runtime.model[0](
+        input_ids=prepared.tokens,
+        position_ids=prepared.position_ids,
+        attention_mask=_placeholder_attention_mask(rank.device),
+        labels=labels,
+        packed_seq_params=prepared.packed_seq_params,
+        **rank._handler().get_forward_kwargs(
+            rank.runtime.model[0],
+            attention_bias=prepared.attention_state,
+        ),
+    )
+    flat_logprobs = -per_token_loss.reshape(-1)
+    outputs: list[torch.Tensor] = []
+    for item, positions, source_positions in zip(
+        items,
+        prepared.positions_by_item,
+        prepared.source_positions_by_item,
+        strict=True,
+    ):
+        if item.labels is None:
+            raise RuntimeError("native target oracle requires labels")
+        item_labels = item.labels.to(device=rank.device).index_select(
+            0,
+            source_positions.to(device=rank.device),
+        )
+        outputs.append(
+            flat_logprobs.index_select(0, positions.to(device=rank.device)).masked_fill(
+                item_labels == -100,
+                0.0,
+            )
+        )
+    return outputs
 
 
 def _adapter_sanity_metrics(

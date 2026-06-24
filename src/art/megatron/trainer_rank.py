@@ -1163,7 +1163,10 @@ class TrainerRank:
             packed_tokens=sum(int(plan.packed.tokens.numel()) for plan in plans),
             logical_tokens=logical_tokens,
             output_bytes=output_bytes,
-            signature=self._memory_signature(requests, plans),
+            signature=self._memory_signature_from_requests(
+                requests,
+                slot_group_count=len(plans),
+            ),
         )
 
     def _estimate_flat_forward(
@@ -1283,16 +1286,6 @@ class TrainerRank:
                 total += seq_len * hidden_size * dtype_size
         return total
 
-    def _memory_signature(
-        self,
-        requests: Sequence[AnyForwardInput],
-        groups: Sequence[_ForwardGroupPlan],
-    ) -> _MemorySignature:
-        return self._memory_signature_from_requests(
-            requests,
-            slot_group_count=len(groups),
-        )
-
     def _memory_signature_from_requests(
         self,
         requests: Sequence[AnyForwardInput],
@@ -1322,7 +1315,11 @@ class TrainerRank:
             return (1, 1, 1, 1)
 
     def _memory_check(self, plan: _FlatForwardPlan) -> _MemoryCheck:
-        required = self._estimate_required_memory_bytes(plan)
+        required = self._estimate_required_memory_bytes_from_values(
+            packed_tokens=plan.packed_tokens,
+            output_bytes=plan.output_bytes,
+            signature=plan.signature,
+        )
         return self._memory_check_required(required)
 
     def _memory_check_estimate(self, estimate: _FlatForwardEstimate) -> _MemoryCheck:
@@ -1386,13 +1383,6 @@ class TrainerRank:
             "dp_rank_forward with already-DP-local smaller inputs."
         )
 
-    def _estimate_required_memory_bytes(self, plan: _FlatForwardPlan) -> int:
-        return self._estimate_required_memory_bytes_from_values(
-            packed_tokens=plan.packed_tokens,
-            output_bytes=plan.output_bytes,
-            signature=plan.signature,
-        )
-
     def _estimate_required_memory_bytes_from_values(
         self,
         *,
@@ -1409,9 +1399,6 @@ class TrainerRank:
         else:
             compute = max(static_compute, int(profiled * packed_tokens))
         return int((output_bytes + compute) * self.memory_safety_factor)
-
-    def _static_compute_memory_bytes(self, plan: _FlatForwardPlan) -> int:
-        return self._static_compute_memory_bytes_for_tokens(plan.packed_tokens)
 
     def _static_compute_memory_bytes_for_tokens(self, packed_tokens: int) -> int:
         if packed_tokens <= 0:

@@ -273,6 +273,59 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     assert candidate.rejected_candidates <= 8
 
 
+def test_forward_micro_batches_shrinks_when_memory_budget_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=2)  # type: ignore[arg-type]
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda plan: True)
+    monkeypatch.setattr(
+        rank,
+        "_all_ranks_have_memory_profile_estimate",
+        lambda estimate: True,
+    )
+    available = {"requests": 8}
+    plan_calls = 0
+    original_plan = rank._plan_flat_forward
+
+    def plan(requests):
+        nonlocal plan_calls
+        plan_calls += 1
+        return original_plan(requests)
+
+    def check(candidate):
+        limit = available["requests"]
+        return _MemoryCheck(
+            estimated_required_bytes=candidate.request_count,
+            available_bytes=limit,
+            fits=candidate.request_count <= limit,
+        )
+
+    def run(plan, **_kwargs):
+        if available["requests"] == 8:
+            available["requests"] = 3
+        return [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ]
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    monkeypatch.setattr(rank, "_memory_check", check)
+    monkeypatch.setattr(rank, "_memory_check_estimate", check)
+    monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
+    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(14)]
+
+    batches = list(rank.forward_micro_batches(inputs))
+
+    assert [batch.stats.global_count for batch in batches] == [8, 3, 3]
+    assert [batch.stats.available_bytes for batch in batches] == [8, 3, 3]
+    assert [batch.indices for batch in batches] == [
+        tuple(range(8)),
+        (8, 9, 10),
+        (11, 12, 13),
+    ]
+    assert plan_calls == len(batches)
+
+
 def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -401,4 +454,4 @@ def test_no_output_requests_do_not_pack_or_consume_compute_memory() -> None:
 
     assert plan.groups == ()
     assert plan.packed_tokens == 0
-    assert rank._estimate_required_memory_bytes(plan) == 0
+    assert rank._memory_check(plan).estimated_required_bytes == 0
