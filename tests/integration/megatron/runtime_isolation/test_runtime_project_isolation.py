@@ -129,6 +129,59 @@ def test_runtime_policy_spans_read_final_request_output(artifact_dir: Path) -> N
     }
 
 
+def test_runtime_policy_spans_accumulate_engine_core_outputs(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json; "
+                "from types import SimpleNamespace; "
+                "from art_vllm_runtime.policy_spans import ("
+                "ART_POLICY_TOKEN_SPANS_FIELD, "
+                "_engine_core_policy_spans_by_request"
+                "); "
+                "spans = [{'start_token': 0, 'end_token': 1, "
+                "'policy_version': 2, 'lora_slot': 'm:active', "
+                "'update_seq': 5}]; "
+                "flat = SimpleNamespace(request_id='flat'); "
+                "nested = SimpleNamespace(request_id='nested'); "
+                "setattr(flat, ART_POLICY_TOKEN_SPANS_FIELD, spans); "
+                "setattr(nested, ART_POLICY_TOKEN_SPANS_FIELD, spans); "
+                "payload = _engine_core_policy_spans_by_request(["
+                "flat, SimpleNamespace(outputs=[nested])"
+                "]); "
+                "print(json.dumps(payload, sort_keys=True))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "engine_core_policy_spans_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "engine_core_policy_spans_stderr.txt").write_text(result.stderr)
+    expected = [
+        {
+            "start_token": 0,
+            "end_token": 1,
+            "policy_version": 2,
+            "lora_slot": "m:active",
+            "update_seq": 5,
+        }
+    ]
+    assert json.loads(result.stdout.strip()) == {
+        "flat": expected,
+        "nested": expected,
+    }
+
+
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject

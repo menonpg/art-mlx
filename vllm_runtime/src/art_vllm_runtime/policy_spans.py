@@ -185,7 +185,7 @@ def _patch_worker_policy_span_capture() -> None:
             output = original_sample_tokens(self, *args, **kwargs)
             if context and output is not None:
                 if isinstance(output, AsyncOutput):
-                    setattr(output, "_art_policy_span_context", context)
+                    _attach_policy_span_context_to_sample_output(output, context)
                 else:
                     _attach_policy_spans_to_model_output(output, context)
             return output
@@ -199,7 +199,7 @@ def _patch_worker_policy_span_capture() -> None:
 
     def get_output(self: Any) -> Any:
         output = original_get_output(self)
-        context = getattr(self, "_art_policy_span_context", None)
+        context = _policy_span_context_from_sample_output(self)
         if context:
             _attach_policy_spans_to_model_output(output, context)
         return output
@@ -245,11 +245,9 @@ def _patch_output_processor_policy_span_accumulation() -> None:
         ):
             global _CURRENT_ENGINE_POLICY_SPANS
             previous = _CURRENT_ENGINE_POLICY_SPANS
-            _CURRENT_ENGINE_POLICY_SPANS = {
-                output.request_id: output.art_policy_token_spans
-                for output in engine_core_outputs
-                if getattr(output, "art_policy_token_spans", None)
-            }
+            _CURRENT_ENGINE_POLICY_SPANS = _engine_core_policy_spans_by_request(
+                engine_core_outputs
+            )
             try:
                 return original_process_outputs(
                     self, engine_core_outputs, *args, **kwargs
@@ -478,6 +476,34 @@ def _attach_policy_spans_to_model_output(
         ]
     if spans_by_req:
         setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, spans_by_req)
+
+
+def _attach_policy_span_context_to_sample_output(
+    output: Any, context: dict[str, dict[str, Any]]
+) -> None:
+    target = getattr(output, "model_runner_output", output)
+    setattr(target, "_art_policy_span_context", context)
+
+
+def _policy_span_context_from_sample_output(output: Any) -> dict[str, dict[str, Any]]:
+    target = getattr(output, "model_runner_output", output)
+    context = getattr(target, "_art_policy_span_context", None)
+    return context if isinstance(context, dict) else {}
+
+
+def _engine_core_policy_spans_by_request(
+    engine_core_outputs: list[Any],
+) -> dict[str, list[dict[str, Any]]]:
+    spans_by_request: dict[str, list[dict[str, Any]]] = {}
+    for item in engine_core_outputs:
+        outputs = getattr(item, "outputs", None)
+        if outputs is None:
+            outputs = (item,)
+        for output in outputs:
+            spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+            if spans:
+                spans_by_request[output.request_id] = spans
+    return spans_by_request
 
 
 def _trim_step_spans(
