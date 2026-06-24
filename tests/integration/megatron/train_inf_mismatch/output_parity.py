@@ -26,12 +26,14 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     # Gemma 4 MoE long-prompt SWA native-LoRA runs showed high variation, with
     # repeated samples reaching 7.6% mean_abs_pct and 0.0076 KL.
+    "gemma4_dense": 8.0,
     "gemma4_moe": 8.0,
     "qwen3_moe": 7.0,
     "qwen3_5_moe": 5.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
+    "gemma4_dense": 0.003,
     "gemma4_moe": 0.008,
 }
 MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
