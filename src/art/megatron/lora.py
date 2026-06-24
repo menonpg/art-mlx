@@ -1182,6 +1182,59 @@ def _expert_grouped_lora_dual_forward(
     )
 
 
+def _linear_weight(linear: Any) -> torch.Tensor:
+    weight = getattr(linear, "weight0", None)
+    if weight is None:
+        weight = getattr(linear, "weight", None)
+    assert isinstance(weight, torch.Tensor)
+    return weight
+
+
+def _parallel_lora(
+    *,
+    adapter_model_prefix: str,
+    linear: Any,
+    out_features: int,
+    rank: int,
+    alpha: float,
+    layout: Literal["column", "row"],
+    shard_domain: ShardDomain = "tp",
+    grad_sync_domain: GradSyncDomain = TP_DEFAULT_GRAD_SYNC_DOMAIN,
+    allreduce: bool = True,
+    num_local_experts: int = 1,
+) -> LoRA:
+    weight = _linear_weight(linear)
+    row_layout = layout == "row"
+    a_parallel_spec = LoRAParallelSpec(
+        shard_domain=shard_domain,
+        sharded=row_layout,
+        shard_dim=-2 if row_layout else None,
+        grad_sync_domain=grad_sync_domain,
+        grad_sync_op=GRAD_SYNC_OP_NONE if row_layout else GRAD_SYNC_OP_SUM,
+    )
+    b_parallel_spec = a_parallel_spec.model_copy(
+        update={
+            "sharded": not row_layout,
+            "shard_dim": None if row_layout else -1,
+            "grad_sync_domain": grad_sync_domain,
+            "grad_sync_op": GRAD_SYNC_OP_SUM if row_layout else GRAD_SYNC_OP_NONE,
+        }
+    )
+    return LoRA(
+        adapter_model_prefix=adapter_model_prefix,
+        in_features=linear.in_features,
+        out_features=out_features,
+        rank=rank,
+        alpha=alpha,
+        dtype=weight.dtype,
+        device=weight.device,
+        num_local_experts=num_local_experts,
+        a_parallel_spec=a_parallel_spec,
+        b_parallel_spec=b_parallel_spec,
+        allreduce=allreduce,
+    )
+
+
 class SelfAttentionLinearProjLoRA(torch.nn.Module):
     def __init__(
         self,
@@ -1196,33 +1249,13 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         self.provider = provider
         self.linear_proj = linear_proj
         self.reduce_output = reduce_output
-        assert isinstance(linear_proj.weight, torch.Tensor)
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="tp",
-            sharded=True,
-            shard_dim=-2,
-            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_NONE,  # only need DP-type reductions
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": False,
-                "shard_dim": None,
-                "grad_sync_op": GRAD_SYNC_OP_SUM,  # sum replicated TP contributions
-            }
-        )
-        self.lora = LoRA(
+        self.lora = _parallel_lora(
             adapter_model_prefix=adapter_model_prefix,
-            in_features=linear_proj.in_features,
+            linear=linear_proj,
             out_features=linear_proj.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_proj.weight.dtype,
-            device=linear_proj.weight.device,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            # Non-expert LoRA params use Megatron's dense DP/CP gradient buckets.
-            allreduce=True,
+            layout="row",
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1293,64 +1326,29 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             self.provider.num_attention_heads // self.provider.num_query_groups
         )
         self.hidden_size_per_attention_head = self.provider.kv_channels
-        self.q_proj_lora = self._build_qkv_lora(
+        self.q_proj_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
-            linear_qkv=linear_qkv,
-            rank=rank,
-            alpha=alpha,
+            linear=linear_qkv,
             out_features=q_and_gate_out_features_per_rank,
+            rank=rank,
+            alpha=alpha,
+            layout="column",
         )
-        self.k_proj_lora = self._build_qkv_lora(
+        self.k_proj_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.k_proj",
-            linear_qkv=linear_qkv,
+            linear=linear_qkv,
+            out_features=kv_out_features_per_rank,
             rank=rank,
             alpha=alpha,
-            out_features=kv_out_features_per_rank,
+            layout="column",
         )
-        self.v_proj_lora = self._build_qkv_lora(
+        self.v_proj_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.v_proj",
-            linear_qkv=linear_qkv,
-            rank=rank,
-            alpha=alpha,
+            linear=linear_qkv,
             out_features=kv_out_features_per_rank,
-        )
-
-    @staticmethod
-    def _build_qkv_lora(
-        *,
-        adapter_model_prefix: str,
-        linear_qkv: TELayerNormColumnParallelLinear,
-        rank: int,
-        alpha: float,
-        out_features: int,
-    ) -> LoRA:
-        assert isinstance(linear_qkv.weight, torch.Tensor)
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="tp",
-            sharded=False,
-            shard_dim=None,
-            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_SUM,  # sum replicated TP contributions
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": True,
-                "shard_dim": -1,
-                "grad_sync_op": GRAD_SYNC_OP_NONE,  # only need DP-type reductions
-            }
-        )
-        return LoRA(
-            adapter_model_prefix=adapter_model_prefix,
-            in_features=linear_qkv.in_features,
-            out_features=out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_qkv.weight.dtype,
-            device=linear_qkv.weight.device,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            # Non-expert LoRA params use Megatron's dense DP/CP gradient buckets.
-            allreduce=True,
+            layout="column",
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1416,13 +1414,13 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         z_out_features_per_partition = (
             gated_delta_net.v_dim // ps.get_tensor_model_parallel_world_size()
         )
-        assert isinstance(in_proj.weight, torch.Tensor)
-        self.qkv_lora = self._build_in_proj_lora(
+        self.qkv_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.in_proj_qkv",
-            in_proj=in_proj,
+            linear=in_proj,
+            out_features=qkv_out_features_per_partition,
             rank=rank,
             alpha=alpha,
-            out_features=qkv_out_features_per_partition,
+            layout="column",
         )
         _set_lora_shard_strategy_metadata(
             self.qkv_lora.B_T,
@@ -1433,49 +1431,13 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
                 gated_delta_net.v_dim,
             ),
         )
-        self.z_lora = self._build_in_proj_lora(
+        self.z_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.in_proj_z",
-            in_proj=in_proj,
-            rank=rank,
-            alpha=alpha,
+            linear=in_proj,
             out_features=z_out_features_per_partition,
-        )
-
-    @staticmethod
-    def _build_in_proj_lora(
-        *,
-        adapter_model_prefix: str,
-        in_proj: TELayerNormColumnParallelLinear,
-        rank: int,
-        alpha: float,
-        out_features: int,
-    ) -> LoRA:
-        assert isinstance(in_proj.weight, torch.Tensor)
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="tp",
-            sharded=False,
-            shard_dim=None,
-            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_SUM,
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": True,
-                "shard_dim": -1,
-                "grad_sync_op": GRAD_SYNC_OP_NONE,
-            }
-        )
-        return LoRA(
-            adapter_model_prefix=adapter_model_prefix,
-            in_features=in_proj.in_features,
-            out_features=out_features,
             rank=rank,
             alpha=alpha,
-            dtype=in_proj.weight.dtype,
-            device=in_proj.weight.device,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            allreduce=True,
+            layout="column",
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1509,62 +1471,31 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         super().__init__()
         assert linear_fc1 is not None
         self.linear_fc1 = linear_fc1
-        self.gate_lora = self._build_fc1_lora(
+        self.gate_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_proj",
-            linear_fc1=linear_fc1,
-            rank=rank,
-            alpha=alpha,
-            num_local_experts=num_local_experts,
-        )
-        self.up_lora = self._build_fc1_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
-            linear_fc1=linear_fc1,
-            rank=rank,
-            alpha=alpha,
-            num_local_experts=num_local_experts,
-        )
-        self.uses_direct_quack_grouped_lora_dual = True
-
-    @staticmethod
-    def _build_fc1_lora(
-        *,
-        adapter_model_prefix: str,
-        linear_fc1: TEColumnParallelGroupedLinear,
-        rank: int,
-        alpha: float,
-        num_local_experts: int,
-    ) -> LoRA:
-        assert linear_fc1 is not None
-        assert isinstance(linear_fc1.weight0, torch.Tensor)
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="expert_tp",
-            sharded=False,
-            shard_dim=None,
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_SUM,  # we handle this with extended finalize_grads
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": True,
-                "shard_dim": -1,
-                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
-                "grad_sync_op": GRAD_SYNC_OP_NONE,  # only need DP-type reductions
-            }
-        )
-        return LoRA(
-            adapter_model_prefix=adapter_model_prefix,
-            in_features=linear_fc1.in_features,
+            linear=linear_fc1,
             out_features=linear_fc1.out_features // 2,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight0.dtype,
-            device=linear_fc1.weight0.device,
+            layout="column",
+            shard_domain="expert_tp",
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             num_local_experts=num_local_experts,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            # Expert LoRA params use Megatron's expert-DP gradient buckets.
             allreduce=False,
         )
+        self.up_lora = _parallel_lora(
+            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
+            linear=linear_fc1,
+            out_features=linear_fc1.out_features // 2,
+            rank=rank,
+            alpha=alpha,
+            layout="column",
+            shard_domain="expert_tp",
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+            num_local_experts=num_local_experts,
+            allreduce=False,
+        )
+        self.uses_direct_quack_grouped_lora_dual = True
 
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
@@ -1585,34 +1516,17 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         assert linear_fc1 is not None
-        assert isinstance(linear_fc1.weight0, torch.Tensor)
         self.linear_fc1 = linear_fc1
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="expert_tp",
-            sharded=False,
-            shard_dim=None,
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_SUM,
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": True,
-                "shard_dim": -1,
-                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
-                "grad_sync_op": GRAD_SYNC_OP_NONE,
-            }
-        )
-        self.lora = LoRA(
+        self.lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
-            in_features=linear_fc1.in_features,
+            linear=linear_fc1,
             out_features=linear_fc1.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight0.dtype,
-            device=linear_fc1.weight0.device,
+            layout="column",
+            shard_domain="expert_tp",
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             num_local_experts=num_local_experts,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
             allreduce=False,
         )
         gate_out_features = linear_fc1.out_features // 2
@@ -1647,35 +1561,17 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         assert linear_fc2 is not None
-        assert isinstance(linear_fc2.weight0, torch.Tensor)
         self.linear_fc2 = linear_fc2
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="expert_tp",
-            sharded=True,
-            shard_dim=-2,
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_NONE,  # only need DP-type reductions
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": False,
-                "shard_dim": None,
-                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
-                "grad_sync_op": GRAD_SYNC_OP_SUM,  # we handle this with extended finalize_grads
-            }
-        )
-        self.lora = LoRA(
+        self.lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.down_proj",
-            in_features=linear_fc2.in_features,
+            linear=linear_fc2,
             out_features=linear_fc2.out_features,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc2.weight0.dtype,
-            device=linear_fc2.weight0.device,
+            layout="row",
+            shard_domain="expert_tp",
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             num_local_experts=num_local_experts,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            # Expert LoRA params use Megatron's expert-DP gradient buckets.
             allreduce=False,
         )
 
@@ -1704,53 +1600,21 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             linear_fc1.return_layernorm_output = True
             linear_fc1.return_layernorm_output_gathered = True
         self.linear_fc1 = linear_fc1
-        self.gate_lora = self._build_fc1_lora(
+        self.gate_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.gate_proj",
-            linear_fc1=linear_fc1,
-            rank=rank,
-            alpha=alpha,
-        )
-        self.up_lora = self._build_fc1_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
-            linear_fc1=linear_fc1,
-            rank=rank,
-            alpha=alpha,
-        )
-
-    @staticmethod
-    def _build_fc1_lora(
-        *,
-        adapter_model_prefix: str,
-        linear_fc1: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
-        rank: int,
-        alpha: float,
-    ) -> LoRA:
-        assert isinstance(linear_fc1.weight, torch.Tensor)
-        a_parallel_spec = LoRAParallelSpec(
-            shard_domain="tp",
-            sharded=False,
-            shard_dim=None,
-            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_SUM,
-        )
-        b_parallel_spec = a_parallel_spec.model_copy(
-            update={
-                "sharded": True,
-                "shard_dim": -1,
-                "grad_sync_op": GRAD_SYNC_OP_NONE,
-            }
-        )
-        return LoRA(
-            adapter_model_prefix=adapter_model_prefix,
-            in_features=linear_fc1.in_features,
+            linear=linear_fc1,
             out_features=linear_fc1.out_features // 2,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight.dtype,
-            device=linear_fc1.weight.device,
-            a_parallel_spec=a_parallel_spec,
-            b_parallel_spec=b_parallel_spec,
-            allreduce=True,
+            layout="column",
+        )
+        self.up_lora = _parallel_lora(
+            adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
+            linear=linear_fc1,
+            out_features=linear_fc1.out_features // 2,
+            rank=rank,
+            alpha=alpha,
+            layout="column",
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
