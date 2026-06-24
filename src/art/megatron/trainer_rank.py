@@ -450,9 +450,7 @@ class _FlatForwardPlan:
 
 @dataclass(frozen=True)
 class _FlatForwardEstimate:
-    request_count: int
     packed_tokens: int
-    logical_tokens: int
     output_bytes: int
     signature: _MemorySignature
 
@@ -1058,7 +1056,6 @@ class TrainerRank:
             ),
             memory_check=memory_check,
             memory_check_estimate=memory_check_estimate,
-            estimate_matches_plan=self._estimate_matches_plan,
             has_memory_profile=lambda plan: self._all_ranks_have_memory_profile_values(
                 packed_tokens=plan.packed_tokens,
                 signature=plan.signature,
@@ -1190,7 +1187,6 @@ class TrainerRank:
         groups = self._group_active_request_indices(requests)
         packed_tokens = 0
         output_bytes = 0
-        logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         for _, group_indices in groups:
             group_packed_tokens = estimate_shared_prefix_packed_tokens(
                 (requests[index].input_tokens for index in group_indices),
@@ -1204,9 +1200,7 @@ class TrainerRank:
             )
 
         return _FlatForwardEstimate(
-            request_count=len(requests),
             packed_tokens=packed_tokens,
-            logical_tokens=logical_tokens,
             output_bytes=output_bytes,
             signature=self._memory_signature_from_requests(
                 requests,
@@ -1413,19 +1407,6 @@ class TrainerRank:
         )
         activation_factor = max(4, min(16, layers // 4 + 4))
         return int(packed_tokens * hidden_size * dtype_size * activation_factor)
-
-    @staticmethod
-    def _estimate_matches_plan(
-        estimate: _FlatForwardEstimate,
-        plan: _FlatForwardPlan,
-    ) -> bool:
-        return (
-            estimate.request_count == plan.request_count
-            and estimate.packed_tokens == plan.packed_tokens
-            and estimate.logical_tokens == plan.logical_tokens
-            and estimate.output_bytes == plan.output_bytes
-            and estimate.signature == plan.signature
-        )
 
     def _available_memory_bytes(self) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
@@ -1768,55 +1749,6 @@ class TrainerRank:
                 label_rows,
                 target_logprobs,
             )
-            return
-
-        reference_target_labels = (
-            _reference_row_labels(
-                label_rows,
-                row_matches,
-                row_count=int(rows.numel()),
-                device=rows.device,
-            )
-            if _can_use_reference_target_ce(items, label_rows)
-            else None
-        )
-        if reference_target_labels is not None:
-            for start in range(0, int(rows.numel()), self.head_chunk_tokens):
-                chunk_rows = rows[start : start + self.head_chunk_tokens]
-                local_logits = self._local_logits_from_hidden_rows(
-                    model,
-                    _select_positions(hidden_by_row, chunk_rows),
-                    output_weight=output_weight,
-                )
-                chunk_reference_labels = reference_target_labels[
-                    start : start + int(chunk_rows.numel())
-                ]
-                reference_loss = model.compute_language_model_loss(
-                    chunk_reference_labels.unsqueeze(0),
-                    local_logits.unsqueeze(1),
-                ).reshape(-1)
-                reference_logits = _vocab_parallel_target_logits(
-                    local_logits,
-                    chunk_reference_labels,
-                )
-                log_z = reference_logits + reference_loss
-                for index, item_logprobs in enumerate(target_logprobs):
-                    labels = label_rows[index]
-                    if item_logprobs is None or labels is None:
-                        continue
-                    offsets, chunk_offsets = _match_chunk_offsets(
-                        row_matches[index],
-                        start=start,
-                        end=start + int(chunk_rows.numel()),
-                    )
-                    if int(offsets.numel()) == 0:
-                        continue
-                    item_logprobs[offsets] = _vocab_parallel_target_logprobs(
-                        local_logits,
-                        labels.index_select(0, offsets),
-                        log_z.index_select(0, chunk_offsets),
-                        row_offsets=chunk_offsets,
-                    )
             return
 
         max_top_k = max(
@@ -2407,58 +2339,6 @@ def _can_use_fused_target_ce(
     )
 
 
-def _can_use_reference_target_ce(
-    items: Sequence[_ForwardItem],
-    label_rows: Sequence[torch.Tensor | None],
-) -> bool:
-    return (
-        os.environ.get("ART_TRAINER_RANK_REFERENCE_TARGET_CE", "0").lower()
-        not in {"0", "false"}
-        and all(
-            item.request.top_k is None and not item.request.logits for item in items
-        )
-        and any(labels is not None and labels.ndim > 1 for labels in label_rows)
-    )
-
-
-def _reference_row_labels(
-    label_rows: Sequence[torch.Tensor | None],
-    row_matches: Sequence[_RowMatch],
-    *,
-    row_count: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    references = torch.full((row_count,), -100, dtype=torch.long, device=device)
-    for labels, match in zip(label_rows, row_matches, strict=True):
-        if labels is None or int(match.source_offsets.numel()) == 0:
-            continue
-        selected = labels.index_select(0, match.source_offsets).reshape(
-            int(match.source_offsets.numel()),
-            -1,
-        )
-        valid = selected != -100
-        has_label = valid.any(dim=1)
-        if not bool(has_label.any()):
-            continue
-        candidates = selected.gather(
-            1,
-            valid.to(torch.int64).argmax(dim=1, keepdim=True),
-        ).squeeze(1)
-        row_offsets = match.row_offsets.index_select(
-            0,
-            torch.nonzero(has_label, as_tuple=False).reshape(-1),
-        )
-        candidates = candidates.masked_select(has_label)
-        unset = references.index_select(0, row_offsets) == -100
-        if bool(unset.any()):
-            references[row_offsets.masked_select(unset)] = candidates.masked_select(
-                unset
-            )
-    if bool((references == -100).any()):
-        return None
-    return references
-
-
 def _consistent_row_labels(
     label_rows: Sequence[torch.Tensor | None],
     row_matches: Sequence[_RowMatch],
@@ -2583,27 +2463,13 @@ def _vocab_parallel_topk(
     start, _ = _vocab_range(local_logits)
     local_k = min(k, int(local_logits.shape[1]))
     local_values, local_tokens = torch.topk(local_logits.float(), k=local_k, dim=-1)
-    local_values = local_values - log_z.unsqueeze(1)
-    local_tokens = local_tokens + start
-
-    from megatron.core import parallel_state as ps
-
-    tp_size = int(ps.get_tensor_model_parallel_world_size())
-    if tp_size <= 1:
-        return TopK(logprobs=local_values, tokens=local_tokens)
-
-    from torch.distributed.nn.functional import all_gather
-
-    group = ps.get_tensor_model_parallel_group(check_initialized=False)
-    gathered_values = cast(tuple[torch.Tensor, ...], all_gather(local_values, group))
-    gathered_tokens = [torch.empty_like(local_tokens) for _ in range(tp_size)]
-    dist.all_gather(gathered_tokens, local_tokens, group=group)
-    values = torch.cat(gathered_values, dim=1)
-    tokens = torch.cat(gathered_tokens, dim=1)
-    if k > int(values.shape[1]):
-        raise ValueError(f"top_k={k} exceeds vocabulary size {int(values.shape[1])}")
-    top_values, top_offsets = torch.topk(values, k=k, dim=-1)
-    return TopK(logprobs=top_values, tokens=tokens.gather(1, top_offsets))
+    return _vocab_parallel_topk_from_local(
+        local_values,
+        local_tokens,
+        k=k,
+        log_z=log_z,
+        vocab_start=start,
+    )
 
 
 def _try_triton_local_topk_stats(
@@ -2868,27 +2734,10 @@ def _local_position_pairs(
     flat = local_global_positions.reshape(-1).to(device=item_positions.device)
     local_positions = torch.nonzero(flat >= 0, as_tuple=False).reshape(-1)
     global_positions = flat.index_select(0, local_positions)
-    sort_order = global_positions.argsort()
-    sorted_global_positions = global_positions.index_select(0, sort_order)
-    sorted_local_positions = local_positions.index_select(0, sort_order)
-
-    indices = torch.searchsorted(sorted_global_positions, item_positions)
-    in_bounds = indices < int(sorted_global_positions.numel())
-    source_offsets = torch.arange(
-        int(item_positions.numel()),
-        device=item_positions.device,
-        dtype=torch.long,
-    )[in_bounds]
-    found = indices[in_bounds]
-    keep = sorted_global_positions.index_select(
-        0, found
-    ) == item_positions.index_select(
-        0,
-        source_offsets,
-    )
+    source_offsets, local_offsets = _matching_offsets(item_positions, global_positions)
     return (
-        sorted_local_positions.index_select(0, found[keep]).to("cpu"),
-        source_offsets[keep].to("cpu"),
+        local_positions.index_select(0, local_offsets).to("cpu"),
+        source_offsets.to("cpu"),
     )
 
 

@@ -169,7 +169,9 @@ def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
     estimate = rank._estimate_flat_forward(flat)
 
     assert estimate is not None
-    assert rank._estimate_matches_plan(estimate, plan)
+    assert estimate.packed_tokens == plan.packed_tokens
+    assert estimate.output_bytes == plan.output_bytes
+    assert estimate.signature == plan.signature
     assert plan.request_count == 12
     assert plan.signature.request_mix == (
         "target:(2,)",
@@ -189,7 +191,7 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     monkeypatch.setattr(
         rank,
         "_memory_check",
-        lambda plan: _MemoryCheck(plan.request_count, 10, True),
+        lambda plan: _MemoryCheck(plan.packed_tokens, 10_000, True),
     )
     monkeypatch.setattr(
         rank,
@@ -224,6 +226,17 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     estimate_calls = 0
     original_plan = rank._plan_flat_forward
     original_estimate = rank._estimate_flat_forward
+    inputs = [
+        _target_request(
+            _tokens(1, 2, 3, index % 7, index),
+            target_count=2 if index % 5 == 0 else 1,
+            top_k=3 if index % 4 == 0 else None,
+            hidden_states=index % 9 == 0,
+        )
+        for index in range(96)
+    ]
+    limit = rank._estimate_flat_forward(inputs[:40])
+    assert limit is not None
 
     def plan(requests):
         nonlocal plan_calls
@@ -237,23 +250,14 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
 
     def check(candidate):
         return _MemoryCheck(
-            estimated_required_bytes=candidate.request_count,
-            available_bytes=40,
-            fits=candidate.request_count <= 40,
+            estimated_required_bytes=candidate.packed_tokens,
+            available_bytes=limit.packed_tokens,
+            fits=candidate.packed_tokens <= limit.packed_tokens,
         )
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
     monkeypatch.setattr(rank, "_memory_check", check)
-    inputs = [
-        _target_request(
-            _tokens(1, 2, 3, index % 7, index),
-            target_count=2 if index % 5 == 0 else 1,
-            top_k=3 if index % 4 == 0 else None,
-            hidden_states=index % 9 == 0,
-        )
-        for index in range(96)
-    ]
 
     candidate = rank._select_next_micro_batch(inputs, 0)
 
@@ -271,7 +275,12 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     monkeypatch.setattr(
         rank, "_all_ranks_have_memory_profile_values", lambda **_kwargs: True
     )
-    available = {"requests": 8}
+    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(14)]
+    first_limit = rank._estimate_flat_forward(inputs[:8])
+    tail_limit = rank._estimate_flat_forward(inputs[8:11])
+    assert first_limit is not None
+    assert tail_limit is not None
+    available = {"packed_tokens": first_limit.packed_tokens}
     plan_calls = 0
     original_plan = rank._plan_flat_forward
 
@@ -281,16 +290,16 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
         return original_plan(requests)
 
     def check(candidate):
-        limit = available["requests"]
+        limit = available["packed_tokens"]
         return _MemoryCheck(
-            estimated_required_bytes=candidate.request_count,
+            estimated_required_bytes=candidate.packed_tokens,
             available_bytes=limit,
-            fits=candidate.request_count <= limit,
+            fits=candidate.packed_tokens <= limit,
         )
 
     def run(plan, **_kwargs):
-        if available["requests"] == 8:
-            available["requests"] = 3
+        if available["packed_tokens"] == first_limit.packed_tokens:
+            available["packed_tokens"] = tail_limit.packed_tokens
         return [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
@@ -298,12 +307,15 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_memory_check", check)
     monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
-    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(14)]
 
     batches = list(rank.forward_micro_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [8, 3, 3]
-    assert [batch.stats.available_bytes for batch in batches] == [8, 3, 3]
+    assert [batch.stats.available_bytes for batch in batches] == [
+        first_limit.packed_tokens,
+        tail_limit.packed_tokens,
+        tail_limit.packed_tokens,
+    ]
     assert [batch.indices for batch in batches] == [
         tuple(range(8)),
         (8, 9, 10),
@@ -333,7 +345,9 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     estimate = rank._estimate_flat_forward(requests)
 
     assert estimate is not None
-    assert rank._estimate_matches_plan(estimate, plan)
+    assert estimate.packed_tokens == plan.packed_tokens
+    assert estimate.output_bytes == plan.output_bytes
+    assert estimate.signature == plan.signature
     assert plan.signature.slot_group_count == 4
     assert {group.slot_ref for group in plan.groups} == {
         ("checkpoint", "student"),

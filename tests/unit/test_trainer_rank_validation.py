@@ -176,9 +176,9 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
 
     def memory_check(plan):
         return _MemoryCheck(
-            estimated_required_bytes=plan.request_count,
-            available_bytes=3,
-            fits=plan.request_count <= 3,
+            estimated_required_bytes=plan.packed_tokens,
+            available_bytes=6,
+            fits=plan.packed_tokens <= 6,
         )
 
     monkeypatch.setattr(trainer, "_memory_check", memory_check)
@@ -226,7 +226,7 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
         nonlocal memory_checks
         memory_checks += 1
         return _MemoryCheck(
-            estimated_required_bytes=plan.request_count,
+            estimated_required_bytes=plan.packed_tokens,
             available_bytes=10,
             fits=True,
         )

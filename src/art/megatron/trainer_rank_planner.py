@@ -46,7 +46,6 @@ def select_next_micro_batch(
     ],
     memory_check: Callable[[PlanT], _MemoryCheck],
     memory_check_estimate: Callable[[EstimateT], _MemoryCheck],
-    estimate_matches_plan: Callable[[EstimateT, PlanT], bool],
     has_memory_profile: Callable[[PlanT], bool],
     has_memory_profile_estimate: Callable[[EstimateT], bool],
     raise_smallest_batch_error: Callable[[PlanT, _MemoryCheck], None],
@@ -78,10 +77,7 @@ def select_next_micro_batch(
         indices, local_inputs = local_slice(width)
         plan = plan_for_local_inputs(indices, local_inputs)
         check = (
-            estimated_check.check
-            if estimated_check is not None
-            and estimate_matches_plan(estimated_check.estimate, plan)
-            else memory_check(plan)
+            estimated_check.check if estimated_check is not None else memory_check(plan)
         )
         item = _CandidateMicroBatch(
             inputs=local_inputs,
