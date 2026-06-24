@@ -445,19 +445,6 @@ def _indexed_intersections(
     return intersections
 
 
-def _causal_piece_pair_count(
-    *,
-    q_range: TokenRange,
-    k_range: TokenRange,
-) -> int:
-    return _causal_piece_pair_count_from_bounds(
-        q_start=int(q_range.start),
-        q_end=int(q_range.end),
-        k_start=int(k_range.start),
-        k_end=int(k_range.end),
-    )
-
-
 def _causal_piece_pair_count_from_bounds(
     *,
     q_start: int,
@@ -1692,12 +1679,6 @@ def _search_chunk_assignment(
             wave_assignment=best_waves,
         )
     return best_owners, best_waves, best_eval
-
-
-def _concatenate_peer_ranges(
-    ranges_by_peer: list[tuple[TokenRange, ...]] | tuple[tuple[TokenRange, ...], ...],
-) -> tuple[tuple[TokenRange, ...], ...]:
-    return tuple(tuple(ranges) for ranges in ranges_by_peer)
 
 
 def _flatten_ranges_by_peer(

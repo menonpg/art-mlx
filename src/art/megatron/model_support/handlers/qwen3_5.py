@@ -573,10 +573,6 @@ def _from_vllm_key(key: str) -> str:
     )
 
 
-def _is_lora_weight_key(key: str) -> bool:
-    return key.endswith((".lora_A.weight", ".lora_B.weight"))
-
-
 def _is_self_attn_q_proj_lora_b(key: str) -> bool:
     return key.endswith(".self_attn.q_proj.lora_B.weight")
 

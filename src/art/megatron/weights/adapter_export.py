@@ -1,3 +1,4 @@
+from collections.abc import Callable
 import math
 from typing import Any
 
@@ -162,6 +163,31 @@ def _fused_pair_adapter_weight(
     )
 
 
+def _set_adapter_weights(
+    out: dict[str, list[Any]],
+    base_prefix: str,
+    *weights: AdapterWeight,
+    weight_suffix: str = ".weight",
+) -> None:
+    out[f"{base_prefix}{weight_suffix}"] = list(weights)
+
+
+def _set_expert_adapter_weights(
+    out: dict[str, list[Any]],
+    base_prefix: str,
+    lora: LoRA,
+    build_weight: Callable[[int], AdapterWeight],
+) -> None:
+    for local_expert_idx in range(lora.num_local_experts):
+        global_expert_idx = local_expert_idx + lora._expert_offset
+        _set_adapter_weights(
+            out,
+            base_prefix,
+            build_weight(local_expert_idx),
+            weight_suffix=f".weight{global_expert_idx}",
+        )
+
+
 def add_standard_self_attention_adapter_weights(
     adapter_weights_by_base: dict[str, list[Any]],
     *,
@@ -171,30 +197,27 @@ def add_standard_self_attention_adapter_weights(
     linear_proj = getattr(self_attention, "linear_proj", None)
     if isinstance(linear_proj, SelfAttentionLinearProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.linear_proj"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, linear_proj.lora)
-        ]
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(base_prefix, linear_proj.lora),
+        )
 
     linear_qkv = getattr(self_attention, "linear_qkv", None)
     if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
         base_prefix = f"{layer_prefix}.self_attention.linear_qkv"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                linear_qkv.q_proj_lora,
-                adapter_key="adapter_q",
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            *(
+                _simple_adapter_weight(base_prefix, lora, adapter_key=key)
+                for lora, key in (
+                    (linear_qkv.q_proj_lora, "adapter_q"),
+                    (linear_qkv.k_proj_lora, "adapter_k"),
+                    (linear_qkv.v_proj_lora, "adapter_v"),
+                )
             ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_qkv.k_proj_lora,
-                adapter_key="adapter_k",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_qkv.v_proj_lora,
-                adapter_key="adapter_v",
-            ),
-        ]
+        )
 
 
 def add_gated_delta_net_adapter_weights(
@@ -206,14 +229,20 @@ def add_gated_delta_net_adapter_weights(
     out_proj = getattr(self_attention, "out_proj", None)
     if isinstance(out_proj, SelfAttentionLinearProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.out_proj"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, out_proj.lora)
-        ]
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(base_prefix, out_proj.lora),
+        )
 
     in_proj = getattr(self_attention, "in_proj", None)
     if isinstance(in_proj, GatedDeltaNetInProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.in_proj"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
+        input_dim = int(in_proj.qkv_lora.A_T.shape[-2])
+        output_dim = int(in_proj.num_value_heads_per_partition)
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
             _simple_adapter_weight(
                 base_prefix,
                 in_proj.qkv_lora,
@@ -224,21 +253,17 @@ def add_gated_delta_net_adapter_weights(
                 in_proj.z_lora,
                 adapter_key="adapter_z",
             ),
-            _zero_adapter_weight(
-                base_prefix=base_prefix,
-                adapter_key="adapter_b",
-                input_dim=int(in_proj.qkv_lora.A_T.shape[-2]),
-                output_dim=int(in_proj.num_value_heads_per_partition),
-                like=in_proj.qkv_lora.B_T,
+            *(
+                _zero_adapter_weight(
+                    base_prefix=base_prefix,
+                    adapter_key=adapter_key,
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    like=in_proj.qkv_lora.B_T,
+                )
+                for adapter_key in ("adapter_b", "adapter_a")
             ),
-            _zero_adapter_weight(
-                base_prefix=base_prefix,
-                adapter_key="adapter_a",
-                input_dim=int(in_proj.qkv_lora.A_T.shape[-2]),
-                output_dim=int(in_proj.num_value_heads_per_partition),
-                like=in_proj.qkv_lora.B_T,
-            ),
-        ]
+        )
 
 
 def add_grouped_moe_adapter_weights(
@@ -248,43 +273,76 @@ def add_grouped_moe_adapter_weights(
     experts: Any,
 ) -> None:
     linear_fc1 = getattr(experts, "linear_fc1", None)
+    base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
     if isinstance(linear_fc1, MLPExpertsLinearFC1FusedLoRA):
-        base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
-        for local_expert_idx in range(linear_fc1.lora.num_local_experts):
-            global_expert_idx = local_expert_idx + linear_fc1.lora._expert_offset
-            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
-                _simple_adapter_weight(
-                    base_prefix,
-                    linear_fc1.lora,
-                    expert_idx=local_expert_idx,
-                )
-            ]
+        _set_expert_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            linear_fc1.lora,
+            lambda local_expert_idx: _simple_adapter_weight(
+                base_prefix,
+                linear_fc1.lora,
+                expert_idx=local_expert_idx,
+            ),
+        )
     elif isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
-        base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
-        for local_expert_idx in range(linear_fc1.gate_lora.num_local_experts):
-            global_expert_idx = local_expert_idx + linear_fc1.gate_lora._expert_offset
-            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
-                _fused_pair_adapter_weight(
-                    base_prefix,
-                    linear_fc1.gate_lora,
-                    linear_fc1.up_lora,
-                    first_expert_idx=local_expert_idx,
-                    second_expert_idx=local_expert_idx,
-                )
-            ]
+        _set_expert_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            linear_fc1.gate_lora,
+            lambda local_expert_idx: _fused_pair_adapter_weight(
+                base_prefix,
+                linear_fc1.gate_lora,
+                linear_fc1.up_lora,
+                first_expert_idx=local_expert_idx,
+                second_expert_idx=local_expert_idx,
+            ),
+        )
 
     linear_fc2 = getattr(experts, "linear_fc2", None)
     if isinstance(linear_fc2, MLPExpertsLinearFC2LoRA):
         base_prefix = f"{layer_prefix}.mlp.experts.linear_fc2"
-        for local_expert_idx in range(linear_fc2.lora.num_local_experts):
-            global_expert_idx = local_expert_idx + linear_fc2.lora._expert_offset
-            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
-                _simple_adapter_weight(
-                    base_prefix,
-                    linear_fc2.lora,
-                    expert_idx=local_expert_idx,
+        _set_expert_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            linear_fc2.lora,
+            lambda local_expert_idx: _simple_adapter_weight(
+                base_prefix,
+                linear_fc2.lora,
+                expert_idx=local_expert_idx,
+            ),
+        )
+
+
+def _add_split_mlp_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    base_prefix: str,
+    mlp: Any,
+) -> None:
+    linear_fc1 = getattr(mlp, "linear_fc1", None)
+    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
+        fc1_prefix = f"{base_prefix}.linear_fc1"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            fc1_prefix,
+            *(
+                _simple_adapter_weight(fc1_prefix, lora, adapter_key=adapter_key)
+                for lora, adapter_key in (
+                    (linear_fc1.gate_lora, "adapter_gate"),
+                    (linear_fc1.up_lora, "adapter_up"),
                 )
-            ]
+            ),
+        )
+
+    linear_fc2 = getattr(mlp, "linear_fc2", None)
+    if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
+        fc2_prefix = f"{base_prefix}.linear_fc2"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            fc2_prefix,
+            _simple_adapter_weight(fc2_prefix, linear_fc2.row_parallel_lora.lora),
+        )
 
 
 def add_dense_mlp_adapter_weights(
@@ -293,28 +351,11 @@ def add_dense_mlp_adapter_weights(
     layer_prefix: str,
     mlp: Any,
 ) -> None:
-    linear_fc1 = getattr(mlp, "linear_fc1", None)
-    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
-        base_prefix = f"{layer_prefix}.mlp.linear_fc1"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.gate_lora,
-                adapter_key="adapter_gate",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.up_lora,
-                adapter_key="adapter_up",
-            ),
-        ]
-
-    linear_fc2 = getattr(mlp, "linear_fc2", None)
-    if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
-        base_prefix = f"{layer_prefix}.mlp.linear_fc2"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, linear_fc2.row_parallel_lora.lora)
-        ]
+    _add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        base_prefix=f"{layer_prefix}.mlp",
+        mlp=mlp,
+    )
 
 
 def add_shared_experts_adapter_weights(
@@ -323,25 +364,8 @@ def add_shared_experts_adapter_weights(
     layer_prefix: str,
     shared_experts: Any,
 ) -> None:
-    linear_fc1 = getattr(shared_experts, "linear_fc1", None)
-    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
-        base_prefix = f"{layer_prefix}.mlp.shared_experts.linear_fc1"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.gate_lora,
-                adapter_key="adapter_gate",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.up_lora,
-                adapter_key="adapter_up",
-            ),
-        ]
-
-    linear_fc2 = getattr(shared_experts, "linear_fc2", None)
-    if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
-        base_prefix = f"{layer_prefix}.mlp.shared_experts.linear_fc2"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, linear_fc2.row_parallel_lora.lora)
-        ]
+    _add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        base_prefix=f"{layer_prefix}.mlp.shared_experts",
+        mlp=shared_experts,
+    )
