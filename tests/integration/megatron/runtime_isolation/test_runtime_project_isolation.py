@@ -200,6 +200,9 @@ def test_runtime_policy_spans_declares_model_runner_output_field(
                 "ART_POLICY_TOKEN_SPANS_FIELD, patch_policy_token_spans"
                 "); "
                 "patch_policy_token_spans(); "
+                "import vllm.v1.outputs as outputs_mod; "
+                "import vllm.v1.worker.gpu_model_runner as active_runner; "
+                "import vllm.v1.worker.gpu_worker as gpu_worker; "
                 "from vllm.v1.outputs import ModelRunnerOutput; "
                 "spans = {'r': [{'start_token': 0, 'end_token': 2, "
                 "'policy_version': 7, 'lora_slot': 'm:active', "
@@ -210,6 +213,17 @@ def test_runtime_policy_spans_declares_model_runner_output_field(
                 "); "
                 "roundtrip = pickle.loads(pickle.dumps(output)); "
                 "print(json.dumps({"
+                "'active_async_patched': getattr("
+                "active_runner.AsyncGPUModelRunnerOutput.get_output, "
+                "'__art_policy_spans_patched__', False), "
+                "'active_sample_patched': getattr("
+                "active_runner.GPUModelRunner.sample_tokens, "
+                "'__art_policy_spans_patched__', False), "
+                "'class_shared': active_runner.ModelRunnerOutput is "
+                "ModelRunnerOutput and gpu_worker.ModelRunnerOutput is "
+                "ModelRunnerOutput, "
+                "'empty_shared': active_runner.EMPTY_MODEL_RUNNER_OUTPUT is "
+                "outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT, "
                 "'has_field': ART_POLICY_TOKEN_SPANS_FIELD in "
                 "[field.name for field in fields(ModelRunnerOutput)], "
                 "'spans': getattr(output, ART_POLICY_TOKEN_SPANS_FIELD), "
@@ -225,6 +239,10 @@ def test_runtime_policy_spans_declares_model_runner_output_field(
     (artifact_dir / "model_runner_policy_spans_stdout.txt").write_text(result.stdout)
     (artifact_dir / "model_runner_policy_spans_stderr.txt").write_text(result.stderr)
     assert json.loads(result.stdout.strip()) == {
+        "active_async_patched": True,
+        "active_sample_patched": True,
+        "class_shared": True,
+        "empty_shared": True,
         "has_field": True,
         "spans": {
             "r": [

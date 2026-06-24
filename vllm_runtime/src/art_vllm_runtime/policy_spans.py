@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import importlib
 import re
 import sys
 from typing import Any
@@ -23,6 +24,20 @@ _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
 _COMPLETION_POLICY_SPANS_BY_REQUEST: dict[str, dict[int, list[dict[str, Any]]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
 _WORKER_LORA_UPDATE_SEQ = 0
+
+_MODEL_RUNNER_OUTPUT_MODULES = (
+    "vllm.v1.outputs",
+    "vllm.v1.worker.gpu_model_runner",
+    "vllm.v1.worker.gpu.model_runner",
+    "vllm.v1.worker.gpu.async_utils",
+    "vllm.v1.worker.gpu_worker",
+    "vllm.v1.core.sched.scheduler",
+)
+
+_GPU_MODEL_RUNNER_MODULES = (
+    "vllm.v1.worker.gpu_model_runner",
+    "vllm.v1.worker.gpu.model_runner",
+)
 
 
 def patch_policy_token_spans() -> None:
@@ -54,14 +69,19 @@ def _patch_model_runner_output_type() -> None:
     ModelRunnerOutput.__module__ = outputs_mod.__name__
     ModelRunnerOutput.__qualname__ = "ModelRunnerOutput"
     outputs_mod.ModelRunnerOutput = ModelRunnerOutput
-    for module_name in (
-        "vllm.v1.worker.gpu.model_runner",
-        "vllm.v1.worker.gpu.async_utils",
-        "vllm.v1.core.sched.scheduler",
-    ):
+    outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
+        req_ids=[], req_id_to_index={}
+    )
+    for module_name in _MODEL_RUNNER_OUTPUT_MODULES:
         module = sys.modules.get(module_name)
         if module is not None:
             setattr(module, "ModelRunnerOutput", ModelRunnerOutput)
+            if hasattr(module, "EMPTY_MODEL_RUNNER_OUTPUT"):
+                setattr(
+                    module,
+                    "EMPTY_MODEL_RUNNER_OUTPUT",
+                    outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT,
+                )
     setattr(outputs_mod, "_art_policy_token_spans_model_runner_patched", True)
 
 
@@ -193,7 +213,6 @@ def _patch_engine_core_output_type() -> None:
 def _patch_worker_policy_span_capture() -> None:
     from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
     from vllm.v1.worker.gpu.async_utils import AsyncOutput
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     original_add_adapter = LRUCacheWorkerLoRAManager.add_adapter
     if not getattr(original_add_adapter, "__art_policy_spans_patched__", False):
@@ -208,35 +227,57 @@ def _patch_worker_policy_span_capture() -> None:
         add_adapter.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
         LRUCacheWorkerLoRAManager.add_adapter = add_adapter  # type: ignore[method-assign]
 
-    original_sample_tokens = GPUModelRunner.sample_tokens
-    if not getattr(original_sample_tokens, "__art_policy_spans_patched__", False):
+    for module_name in _GPU_MODEL_RUNNER_MODULES:
+        module = importlib.import_module(module_name)
+        gpu_model_runner_cls = module.GPUModelRunner
+        original_sample_tokens = gpu_model_runner_cls.sample_tokens
+        if getattr(original_sample_tokens, "__art_policy_spans_patched__", False):
+            continue
 
-        def sample_tokens(self: Any, *args: Any, **kwargs: Any) -> Any:
-            context = _policy_context_from_runner(self)
-            output = original_sample_tokens(self, *args, **kwargs)
-            if context and output is not None:
-                if isinstance(output, AsyncOutput):
-                    _attach_policy_span_context_to_sample_output(output, context)
-                else:
-                    _attach_policy_spans_to_model_output(output, context)
-            return output
+        def make_sample_tokens(original: Any):
+            def sample_tokens(self: Any, *args: Any, **kwargs: Any) -> Any:
+                context = _policy_context_from_runner(self)
+                output = original(self, *args, **kwargs)
+                if context and output is not None:
+                    if hasattr(output, "get_output"):
+                        _attach_policy_span_context_to_sample_output(output, context)
+                    else:
+                        _attach_policy_spans_to_model_output(output, context)
+                return output
+
+            return sample_tokens
+
+        sample_tokens = make_sample_tokens(original_sample_tokens)
 
         sample_tokens.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-        GPUModelRunner.sample_tokens = sample_tokens  # type: ignore[method-assign]
+        gpu_model_runner_cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
 
-    original_get_output = AsyncOutput.get_output
-    if getattr(original_get_output, "__art_policy_spans_patched__", False):
-        return
+    async_output_classes = [AsyncOutput]
+    active_runner = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if active_runner is not None and hasattr(
+        active_runner, "AsyncGPUModelRunnerOutput"
+    ):
+        async_output_classes.append(active_runner.AsyncGPUModelRunnerOutput)
 
-    def get_output(self: Any) -> Any:
-        output = original_get_output(self)
-        context = _policy_span_context_from_sample_output(self)
-        if context:
-            _attach_policy_spans_to_model_output(output, context)
-        return output
+    for async_output_cls in async_output_classes:
+        original_get_output = async_output_cls.get_output
+        if getattr(original_get_output, "__art_policy_spans_patched__", False):
+            continue
 
-    get_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-    AsyncOutput.get_output = get_output  # type: ignore[method-assign]
+        def make_get_output(original: Any):
+            def get_output(self: Any) -> Any:
+                output = original(self)
+                context = _policy_span_context_from_sample_output(self)
+                if context:
+                    _attach_policy_spans_to_model_output(output, context)
+                return output
+
+            return get_output
+
+        get_output = make_get_output(original_get_output)
+
+        get_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
+        async_output_cls.get_output = get_output  # type: ignore[method-assign]
 
 
 def _patch_scheduler_policy_span_transport() -> None:
@@ -512,14 +553,23 @@ def _attach_policy_spans_to_model_output(
 def _attach_policy_span_context_to_sample_output(
     output: Any, context: dict[str, dict[str, Any]]
 ) -> None:
-    target = getattr(output, "model_runner_output", output)
-    setattr(target, "_art_policy_span_context", context)
+    setattr(output, "_art_policy_span_context", context)
+    for field in ("model_runner_output", "_model_runner_output"):
+        target = getattr(output, field, None)
+        if target is not None:
+            setattr(target, "_art_policy_span_context", context)
 
 
 def _policy_span_context_from_sample_output(output: Any) -> dict[str, dict[str, Any]]:
-    target = getattr(output, "model_runner_output", output)
-    context = getattr(target, "_art_policy_span_context", None)
-    return context if isinstance(context, dict) else {}
+    context = getattr(output, "_art_policy_span_context", None)
+    if isinstance(context, dict):
+        return context
+    for field in ("model_runner_output", "_model_runner_output"):
+        target = getattr(output, field, None)
+        context = getattr(target, "_art_policy_span_context", None)
+        if isinstance(context, dict):
+            return context
+    return {}
 
 
 def _engine_core_policy_spans_by_request(
