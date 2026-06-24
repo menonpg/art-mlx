@@ -43,9 +43,10 @@ class _RecordingAsyncClient:
         url: str,
         *,
         params: dict[str, object] | None = None,
+        json: dict[str, object] | None = None,
         timeout: float,
     ) -> _AsyncOkResponse:
-        self._posts.append((url, params, timeout))
+        self._posts.append((url, json if json is not None else params, timeout))
         return _AsyncOkResponse()
 
 
@@ -76,6 +77,58 @@ def test_megatron_default_lora_adapter_config_uses_model_lora_config(
 
     assert config.r == 8
     assert config.target_modules == {"q_proj", "down_proj"}
+
+
+def test_megatron_in_flight_lora_uses_derived_slot_name(tmp_path: Path) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "rollout_weight_update_mode": "in_flight_lora",
+        },
+        output_dir=str(tmp_path),
+    )
+    service._latest_step = 3
+
+    assert service._in_flight_lora_slot == "test-model:active"
+    assert service._initial_served_model_name == "test-model:active"
+
+
+@pytest.mark.asyncio
+async def test_megatron_in_flight_lora_update_uses_derived_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="test-model",
+        base_model="Qwen/Qwen3-0.6B",
+        config={
+            "rollout_weights_mode": "lora",
+            "rollout_weight_update_mode": "in_flight_lora",
+        },
+        output_dir=str(tmp_path),
+    )
+    service._vllm_runtime.port = 8123
+    posts: list[tuple[str, dict[str, object] | None, float]] = []
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: _RecordingAsyncClient(posts))
+
+    await service._update_in_flight_adapter("/tmp/art/checkpoints/4", 4)
+
+    assert posts == [
+        (
+            "http://127.0.0.1:8123/art/in_flight_lora_update",
+            {
+                "model_name": "test-model@4",
+                "lora_slot": "test-model:active",
+                "lora_path": "/tmp/art/checkpoints/4",
+                "policy_version": 4,
+            },
+            60.0,
+        )
+    ]
+    assert service._latest_step == 4
+    assert service._loaded_adapter_steps == {4}
 
 
 @pytest.mark.asyncio

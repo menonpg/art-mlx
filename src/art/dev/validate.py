@@ -1,6 +1,10 @@
 """Validation functions for model configuration."""
 
-from .model import InternalModelConfig, RolloutWeightsMode
+from .model import (
+    InternalModelConfig,
+    RolloutWeightsMode,
+    RolloutWeightUpdateMode,
+)
 
 
 def is_dedicated_mode(config: InternalModelConfig) -> bool:
@@ -15,6 +19,17 @@ def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
     raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
 
 
+def _rollout_weight_update_mode(
+    config: InternalModelConfig,
+) -> RolloutWeightUpdateMode:
+    mode = config.get("rollout_weight_update_mode", "step_lora")
+    if mode in {"step_lora", "in_flight_lora"}:
+        return mode
+    raise ValueError(
+        "rollout_weight_update_mode must be either 'step_lora' or 'in_flight_lora'"
+    )
+
+
 def validate_dedicated_config(config: InternalModelConfig) -> None:
     """Validate dedicated mode GPU configuration.
 
@@ -24,6 +39,7 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     has_trainer = "trainer_gpu_ids" in config
     has_inference = "inference_gpu_ids" in config
     rollout_weights_mode = _rollout_weights_mode(config)
+    rollout_weight_update_mode = _rollout_weight_update_mode(config)
 
     if has_trainer != has_inference:
         raise ValueError(
@@ -34,6 +50,15 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         raise ValueError(
             "rollout_weights_mode='merged' requires dedicated mode "
             "(set both trainer_gpu_ids and inference_gpu_ids)"
+        )
+
+    if (
+        rollout_weight_update_mode == "in_flight_lora"
+        and rollout_weights_mode != "lora"
+    ):
+        raise ValueError(
+            "rollout_weight_update_mode='in_flight_lora' requires "
+            "rollout_weights_mode='lora'"
         )
 
     if "fast_inference" in config.get("init_args", {}):
