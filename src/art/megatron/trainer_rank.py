@@ -460,7 +460,6 @@ class _FlatForwardEstimate:
 
 @dataclass(frozen=True)
 class _AdaptivePlanCacheKey:
-    top_level_ids: tuple[int, ...]
     local_indices: tuple[int, ...]
     default_slot_ref: "LoRASlotRef | None"
     slot_stack: tuple["LoRASlotRef", ...]
@@ -1063,18 +1062,7 @@ class TrainerRank:
         indices: tuple[int, ...],
         local_inputs: Sequence[ForwardInputsT],
     ) -> _FlatForwardPlan:
-        top_level_ids = tuple(id(item) for item in items)
-        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
-            self._adaptive_plan_cache.clear()
-            self._adaptive_estimate_cache.clear()
-            self._adaptive_plan_cache_top_level_ids = top_level_ids
-        key = _AdaptivePlanCacheKey(
-            top_level_ids=top_level_ids,
-            local_indices=indices,
-            default_slot_ref=self._default_slot_ref,
-            slot_stack=tuple(self._slot_stack),
-            shared_prefix_max_depth=self.shared_prefix_max_depth,
-        )
+        key = self._adaptive_cache_key(items, indices)
         cached = self._adaptive_plan_cache.get(key)
         if cached is not None:
             return cached
@@ -1090,18 +1078,7 @@ class TrainerRank:
         indices: tuple[int, ...],
         local_inputs: Sequence[ForwardInputsT],
     ) -> _FlatForwardEstimate | None:
-        top_level_ids = tuple(id(item) for item in items)
-        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
-            self._adaptive_plan_cache.clear()
-            self._adaptive_estimate_cache.clear()
-            self._adaptive_plan_cache_top_level_ids = top_level_ids
-        key = _AdaptivePlanCacheKey(
-            top_level_ids=top_level_ids,
-            local_indices=indices,
-            default_slot_ref=self._default_slot_ref,
-            slot_stack=tuple(self._slot_stack),
-            shared_prefix_max_depth=self.shared_prefix_max_depth,
-        )
+        key = self._adaptive_cache_key(items, indices)
         if key in self._adaptive_estimate_cache:
             return self._adaptive_estimate_cache[key]
         estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
@@ -1109,6 +1086,23 @@ class TrainerRank:
             self._adaptive_estimate_cache.pop(next(iter(self._adaptive_estimate_cache)))
         self._adaptive_estimate_cache[key] = estimate
         return estimate
+
+    def _adaptive_cache_key(
+        self,
+        items: Sequence[ForwardInputsT],
+        indices: tuple[int, ...],
+    ) -> _AdaptivePlanCacheKey:
+        top_level_ids = tuple(id(item) for item in items)
+        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
+            self._adaptive_plan_cache.clear()
+            self._adaptive_estimate_cache.clear()
+            self._adaptive_plan_cache_top_level_ids = top_level_ids
+        return _AdaptivePlanCacheKey(
+            local_indices=indices,
+            default_slot_ref=self._default_slot_ref,
+            slot_stack=tuple(self._slot_stack),
+            shared_prefix_max_depth=self.shared_prefix_max_depth,
+        )
 
     def _validate_replicated_top_level_count(self, count: int) -> None:
         if not (dist.is_available() and dist.is_initialized()):
