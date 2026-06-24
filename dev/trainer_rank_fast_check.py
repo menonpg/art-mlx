@@ -3,7 +3,6 @@ from __future__ import annotations
 import subprocess
 import sys
 
-
 FAST_TESTS = (
     "tests/unit/test_trainer_rank_validation.py",
     "tests/unit/test_trainer_rank_weird_shapes.py",

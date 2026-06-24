@@ -17,8 +17,8 @@ from art.megatron.trainer_rank import (
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
-    _MemoryCheck,
     _flatten,
+    _MemoryCheck,
 )
 
 
@@ -60,9 +60,13 @@ def _target_request(
     checkpoint: object = Unset,
     lora: object = Unset,
 ) -> ForwardInput:
-    labels = tokens if target_count == 1 else torch.stack(
-        tuple(tokens + offset for offset in range(target_count)),
-        dim=-1,
+    labels = (
+        tokens
+        if target_count == 1
+        else torch.stack(
+            tuple(tokens + offset for offset in range(target_count)),
+            dim=-1,
+        )
     )
     return ForwardInput(
         input_tokens=tokens,
@@ -145,10 +149,12 @@ def test_pack_estimator_matches_ternary_and_random_trees(max_depth: int) -> None
     for sequences in cases:
         pack = pack_shared_prefixes(sequences, max_depth=max_depth)
 
-        assert estimate_shared_prefix_packed_tokens(sequences, max_depth=max_depth) == int(
-            pack.tokens.numel()
-        )
-        for sequence, positions in zip(sequences, pack.positions_by_sequence, strict=True):
+        assert estimate_shared_prefix_packed_tokens(
+            sequences, max_depth=max_depth
+        ) == int(pack.tokens.numel())
+        for sequence, positions in zip(
+            sequences, pack.positions_by_sequence, strict=True
+        ):
             torch.testing.assert_close(pack.tokens.reshape(-1)[positions], sequence)
 
 
