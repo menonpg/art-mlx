@@ -36,32 +36,11 @@ class SharedPrefixRowTree:
     def max_depth(self) -> int:
         return max((segment.depth for segment in self.segments), default=0)
 
-    @property
-    def is_flat_family_tree(self) -> bool:
-        return self.max_depth <= 1
-
     def segment_by_group_id(self) -> dict[int, SharedPrefixSegment]:
         segments: dict[int, SharedPrefixSegment] = {}
         for segment in self.segments:
             segments.setdefault(segment.group_id, segment)
         return segments
-
-    def group_can_attend_matrix(
-        self,
-    ) -> tuple[tuple[int, ...], tuple[tuple[bool, ...], ...]]:
-        group_ids = tuple(sorted({segment.group_id for segment in self.segments}))
-        group_index = {group_id: index + 1 for index, group_id in enumerate(group_ids)}
-        matrix = [
-            [False for _ in range(len(group_ids) + 1)]
-            for _ in range(len(group_ids) + 1)
-        ]
-        for segment in self.segments:
-            query_index = group_index[segment.group_id]
-            for group_id in (*segment.ancestors, segment.group_id):
-                key_index = group_index.get(group_id)
-                if key_index is not None:
-                    matrix[query_index][key_index] = True
-        return group_ids, tuple(tuple(row) for row in matrix)
 
 
 def parse_shared_prefix_tree(

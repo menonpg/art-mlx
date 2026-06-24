@@ -638,17 +638,6 @@ def parse_gdn_shared_prefix_segments(
     )
 
 
-def _build_segment_bucket_plans(
-    segment_buckets: tuple[tuple[GdnSegmentSpec, ...], ...],
-    *,
-    device: torch.device | str,
-) -> tuple[GdnSegmentBucketPlan, ...]:
-    return tuple(
-        _build_segment_bucket_plan(bucket[0].length, bucket, device=device)
-        for bucket in segment_buckets
-    )
-
-
 def _attention_source_layout(
     spec: GdnPackedExecutionSpec,
     *,
@@ -675,25 +664,6 @@ def _attention_source_layout(
             cp_size=cp_size,
             planner_config=planner_config,
         )
-    )
-
-
-def _can_chain_segment(
-    segment: GdnSegmentSpec,
-    *,
-    cp_size: int,
-    planner_config: GdnPlannerConfig,
-) -> bool:
-    min_tokens = (
-        planner_config.cp_chain_min_prefix_only_tokens
-        if segment.kind == "prefix"
-        else planner_config.cp_chain_min_total_tokens
-    )
-    return _can_chain_segment_with_min_tokens(
-        segment,
-        cp_size=cp_size,
-        min_tokens=min_tokens,
-        planner_config=planner_config,
     )
 
 
@@ -1191,16 +1161,15 @@ def _build_tree_segment_bucket_plans(
         max_padding_ratio=planner_config.max_padding_ratio,
         max_segments_per_batch=planner_config.max_segments_per_batch,
     )
-    plans = _build_segment_bucket_plans(segment_buckets, device=device)
     return tuple(
         _bucket_with_tree_parent_indices(
-            plan,
+            _build_segment_bucket_plan(bucket, device=device),
             bucket,
             tree_parent_indices,
             tree_has_children,
             device=device,
         )
-        for plan, bucket in zip(plans, segment_buckets, strict=True)
+        for bucket in segment_buckets
     )
 
 
@@ -1230,22 +1199,21 @@ def _build_tree_position_bucket_plans(
             max_segments_per_batch=planner_config.max_segments_per_batch,
         )
     )
-    plans = _build_position_bucket_plans(
-        segment_buckets,
-        local_token_ranges,
-        sequence_length=sequence_length,
-        device=device,
-        token_ranges_by_rank=token_ranges_by_rank,
-    )
     return tuple(
         _bucket_with_tree_parent_indices(
-            plan,
+            _build_position_bucket_plan(
+                bucket,
+                local_token_ranges,
+                sequence_length=sequence_length,
+                device=device,
+                token_ranges_by_rank=token_ranges_by_rank,
+            ),
             bucket,
             tree_parent_indices,
             tree_has_children,
             device=device,
         )
-        for plan, bucket in zip(plans, segment_buckets, strict=True)
+        for bucket in segment_buckets
     )
 
 
@@ -1272,26 +1240,6 @@ def _bucket_with_tree_parent_indices(
     )
 
 
-def _build_position_bucket_plans(
-    segment_buckets: tuple[tuple[GdnSegmentSpec, ...], ...],
-    local_token_ranges: tuple[tuple[int, int, int], ...],
-    *,
-    sequence_length: int,
-    device: torch.device | str,
-    token_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...] | None = None,
-) -> tuple[GdnSegmentBucketPlan, ...]:
-    return tuple(
-        _build_position_bucket_plan(
-            bucket,
-            local_token_ranges,
-            sequence_length=sequence_length,
-            device=device,
-            token_ranges_by_rank=token_ranges_by_rank,
-        )
-        for bucket in segment_buckets
-    )
-
-
 def _build_position_bucket_plan(
     segments: tuple[GdnSegmentSpec, ...],
     local_token_ranges: tuple[tuple[int, int, int], ...],
@@ -1300,17 +1248,42 @@ def _build_position_bucket_plan(
     device: torch.device | str,
     token_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...] | None = None,
 ) -> GdnSegmentBucketPlan:
-    exact_plan = _build_exact_range_position_bucket_plan(
-        segments,
-        local_token_ranges,
-        sequence_length=sequence_length,
-        device=device,
-        token_ranges_by_rank=token_ranges_by_rank,
-    )
-    if exact_plan is not None:
-        return exact_plan
-    local_positions_by_segment = []
-    lengths = []
+    range_positions = {
+        (start, end): position for start, end, position in local_token_ranges
+    }
+    starts: list[int] = []
+    lengths: list[int] = []
+    for segment in segments:
+        token_start = _segment_token_start(segment, sequence_length)
+        token_end = token_start + segment.length
+        position_start = range_positions.get((token_start, token_end))
+        if position_start is None:
+            break
+        starts.append(position_start)
+        lengths.append(segment.length)
+    else:
+        starts_cpu = torch.tensor(starts, dtype=torch.long)
+        lengths_cpu = torch.tensor(lengths, dtype=torch.long)
+        offsets_cpu = torch.arange(max(lengths), dtype=torch.long).unsqueeze(1)
+        position_indices_cpu = torch.where(
+            offsets_cpu < lengths_cpu.unsqueeze(0),
+            starts_cpu.unsqueeze(0) + offsets_cpu,
+            torch.zeros_like(offsets_cpu),
+        )
+        return _build_bucket_plan(
+            segments,
+            lengths_cpu=lengths_cpu,
+            row_indices_cpu=torch.zeros_like(position_indices_cpu),
+            position_indices_cpu=position_indices_cpu,
+            lengths_by_rank_cpu=_bucket_lengths_by_rank_cpu(
+                segments,
+                token_ranges_by_rank,
+                sequence_length=sequence_length,
+            ),
+            device=device,
+        )
+
+    local_positions_by_segment: list[torch.Tensor] = []
     local_range_ends = tuple(token_end for _, token_end, _ in local_token_ranges)
     for segment in segments:
         positions = _local_positions_for_segment(
@@ -1319,107 +1292,32 @@ def _build_position_bucket_plan(
             local_token_ranges=local_token_ranges,
             local_range_ends=local_range_ends,
         )
-        length = int(positions.numel())
-        if not length:
+        if not int(positions.numel()):
             raise ValueError(
                 "planned GDN bucket contains a segment with no local tokens; "
                 f"family={segment.family_index} kind={segment.kind}"
             )
         local_positions_by_segment.append(positions)
-        lengths.append(length)
-    max_length = max(lengths)
-    lengths_cpu = torch.tensor(lengths, dtype=torch.long)
-    offsets_cpu = torch.arange(max_length, dtype=torch.long).unsqueeze(1)
-    real_mask_cpu = offsets_cpu < lengths_cpu.unsqueeze(0)
+
+    lengths_cpu = torch.tensor(
+        [int(positions.numel()) for positions in local_positions_by_segment],
+        dtype=torch.long,
+    )
+    max_length = int(lengths_cpu.max().item())
     position_indices_cpu = torch.zeros(max_length, len(segments), dtype=torch.long)
     for column, positions in enumerate(local_positions_by_segment):
         position_indices_cpu[: int(positions.numel()), column] = positions
-    cu_seqlens_cpu = torch.cat(
-        [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
-    )
-    lengths_by_rank_cpu = _bucket_lengths_by_rank_cpu(
+    return _build_bucket_plan(
         segments,
-        token_ranges_by_rank,
-        sequence_length=sequence_length,
-    )
-    row_indices_cpu = torch.zeros(max_length, len(segments), dtype=torch.long)
-    family_indices_cpu = torch.tensor(
-        [segment.family_index for segment in segments],
-        dtype=torch.long,
-    )
-    return GdnSegmentBucketPlan.model_construct(
-        length=max_length,
-        lengths=_move_planner_tensor(lengths_cpu, device),
         lengths_cpu=lengths_cpu,
-        lengths_by_rank_cpu=lengths_by_rank_cpu,
-        real_mask=_move_planner_tensor(real_mask_cpu, device),
-        cu_seqlens=_move_planner_tensor(cu_seqlens_cpu, device),
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        row_indices=_move_planner_tensor(row_indices_cpu, device),
-        position_indices=_move_planner_tensor(position_indices_cpu, device),
-        family_indices=_move_planner_tensor(family_indices_cpu, device),
-        family_indices_cpu=family_indices_cpu,
-        real_token_count_static=sum(lengths),
-    )
-
-
-def _build_exact_range_position_bucket_plan(
-    segments: tuple[GdnSegmentSpec, ...],
-    local_token_ranges: tuple[tuple[int, int, int], ...],
-    *,
-    sequence_length: int,
-    device: torch.device | str,
-    token_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...] | None = None,
-) -> GdnSegmentBucketPlan | None:
-    range_positions = {
-        (start, end): position for start, end, position in local_token_ranges
-    }
-    starts = []
-    lengths = []
-    for segment in segments:
-        token_start = _segment_token_start(segment, sequence_length)
-        token_end = token_start + segment.length
-        position_start = range_positions.get((token_start, token_end))
-        if position_start is None:
-            return None
-        starts.append(position_start)
-        lengths.append(segment.length)
-    max_length = max(lengths)
-    starts_cpu = torch.tensor(starts, dtype=torch.long)
-    lengths_cpu = torch.tensor(lengths, dtype=torch.long)
-    offsets_cpu = torch.arange(max_length, dtype=torch.long).unsqueeze(1)
-    real_mask_cpu = offsets_cpu < lengths_cpu.unsqueeze(0)
-    position_indices_cpu = torch.where(
-        real_mask_cpu,
-        starts_cpu.unsqueeze(0) + offsets_cpu,
-        torch.zeros_like(offsets_cpu),
-    )
-    cu_seqlens_cpu = torch.cat(
-        [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
-    )
-    lengths_by_rank_cpu = _bucket_lengths_by_rank_cpu(
-        segments,
-        token_ranges_by_rank,
-        sequence_length=sequence_length,
-    )
-    row_indices_cpu = torch.zeros(max_length, len(segments), dtype=torch.long)
-    family_indices_cpu = torch.tensor(
-        [segment.family_index for segment in segments],
-        dtype=torch.long,
-    )
-    return GdnSegmentBucketPlan.model_construct(
-        length=max_length,
-        lengths=_move_planner_tensor(lengths_cpu, device),
-        lengths_cpu=lengths_cpu,
-        lengths_by_rank_cpu=lengths_by_rank_cpu,
-        real_mask=_move_planner_tensor(real_mask_cpu, device),
-        cu_seqlens=_move_planner_tensor(cu_seqlens_cpu, device),
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        row_indices=_move_planner_tensor(row_indices_cpu, device),
-        position_indices=_move_planner_tensor(position_indices_cpu, device),
-        family_indices=_move_planner_tensor(family_indices_cpu, device),
-        family_indices_cpu=family_indices_cpu,
-        real_token_count_static=sum(lengths),
+        row_indices_cpu=torch.zeros_like(position_indices_cpu),
+        position_indices_cpu=position_indices_cpu,
+        lengths_by_rank_cpu=_bucket_lengths_by_rank_cpu(
+            segments,
+            token_ranges_by_rank,
+            sequence_length=sequence_length,
+        ),
+        device=device,
     )
 
 
@@ -1524,41 +1422,58 @@ def _batch_tree_segments_by_padded_work(
 
 
 def _build_segment_bucket_plan(
-    length: int, segments: tuple[GdnSegmentSpec, ...], *, device: torch.device | str
+    segments: tuple[GdnSegmentSpec, ...], *, device: torch.device | str
 ) -> GdnSegmentBucketPlan:
-    max_length = max(segment.length for segment in segments)
     lengths_cpu = torch.tensor(
         [segment.length for segment in segments], dtype=torch.long
     )
+    max_length = int(lengths_cpu.max().item())
     starts_cpu = torch.tensor([segment.start for segment in segments], dtype=torch.long)
     rows_cpu = torch.tensor(
         [segment.row_index for segment in segments], dtype=torch.long
     )
     offsets_cpu = torch.arange(max_length, dtype=torch.long).unsqueeze(1)
+    return _build_bucket_plan(
+        segments,
+        lengths_cpu=lengths_cpu,
+        row_indices_cpu=rows_cpu.unsqueeze(0).expand(max_length, -1).contiguous(),
+        position_indices_cpu=starts_cpu.unsqueeze(0) + offsets_cpu,
+        device=device,
+    )
+
+
+def _build_bucket_plan(
+    segments: tuple[GdnSegmentSpec, ...],
+    *,
+    lengths_cpu: torch.Tensor,
+    row_indices_cpu: torch.Tensor,
+    position_indices_cpu: torch.Tensor,
+    device: torch.device | str,
+    lengths_by_rank_cpu: torch.Tensor | None = None,
+) -> GdnSegmentBucketPlan:
+    max_length = int(lengths_cpu.max().item())
+    offsets_cpu = torch.arange(max_length, dtype=torch.long).unsqueeze(1)
     real_mask_cpu = offsets_cpu < lengths_cpu.unsqueeze(0)
-    positions_cpu = starts_cpu.unsqueeze(0) + offsets_cpu
+    cu_seqlens_cpu = torch.cat(
+        [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
+    )
     family_indices_cpu = torch.tensor(
         [segment.family_index for segment in segments],
         dtype=torch.long,
-    )
-    cu_seqlens_cpu = torch.cat(
-        [lengths_cpu.new_zeros(1), torch.cumsum(lengths_cpu, dim=0)]
     )
     return GdnSegmentBucketPlan.model_construct(
         length=max_length,
         lengths=_move_planner_tensor(lengths_cpu, device),
         lengths_cpu=lengths_cpu,
-        lengths_by_rank_cpu=None,
+        lengths_by_rank_cpu=lengths_by_rank_cpu,
         real_mask=_move_planner_tensor(real_mask_cpu, device),
         cu_seqlens=_move_planner_tensor(cu_seqlens_cpu, device),
         cu_seqlens_cpu=cu_seqlens_cpu,
-        row_indices=_move_planner_tensor(
-            rows_cpu.unsqueeze(0).expand(max_length, -1).contiguous(), device
-        ),
-        position_indices=_move_planner_tensor(positions_cpu, device),
+        row_indices=_move_planner_tensor(row_indices_cpu, device),
+        position_indices=_move_planner_tensor(position_indices_cpu, device),
         family_indices=_move_planner_tensor(family_indices_cpu, device),
         family_indices_cpu=family_indices_cpu,
-        real_token_count_static=sum(segment.length for segment in segments),
+        real_token_count_static=int(lengths_cpu.sum().item()),
     )
 
 

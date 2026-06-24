@@ -1560,12 +1560,6 @@ def _local_layout_token_count_for_hidden(
     return (real_count + _tp_world_size(projection) - 1) // _tp_world_size(projection)
 
 
-def _attention_original_shape_from_plan(
-    hidden_states: Tensor, plan: GdnRankExecutionPlan
-) -> tuple[int, int, int]:
-    return (int(plan.attention_token_count), 1, int(hidden_states.shape[-1]))
-
-
 def _restore_hidden_from_cp_flat(
     flat: Tensor, original_shape: tuple[int, int, int]
 ) -> Tensor:
