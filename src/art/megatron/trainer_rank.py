@@ -23,6 +23,11 @@ from art.megatron.shared_prefix_packing import (
     estimate_shared_prefix_packed_tokens,
     pack_shared_prefixes,
 )
+from art.megatron.trainer_rank_planner import (
+    _CandidateMicroBatch,
+    _MemoryCheck,
+    select_next_micro_batch,
+)
 
 if TYPE_CHECKING:
     from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -460,30 +465,6 @@ class _AdaptivePlanCacheKey:
     default_slot_ref: "LoRASlotRef | None"
     slot_stack: tuple["LoRASlotRef", ...]
     shared_prefix_max_depth: int
-
-
-@dataclass(frozen=True)
-class _MemoryCheck:
-    estimated_required_bytes: int
-    available_bytes: int
-    fits: bool
-
-
-@dataclass(frozen=True)
-class _CandidateMicroBatch(Generic[ForwardInputsT]):
-    inputs: Sequence[ForwardInputsT]
-    indices: tuple[int, ...]
-    plan: _FlatForwardPlan
-    check: _MemoryCheck
-    stats_global_count: int
-    rejected_candidates: int
-    cold_start: bool
-
-
-@dataclass(frozen=True)
-class _EstimatedMemoryCheck:
-    estimate: _FlatForwardEstimate
-    check: _MemoryCheck
 
 
 class TrainerRank:
@@ -1049,183 +1030,32 @@ class TrainerRank:
         self,
         items: Sequence[ForwardInputsT],
         start: int,
-    ) -> _CandidateMicroBatch[ForwardInputsT]:
+    ) -> _CandidateMicroBatch[ForwardInputsT, _FlatForwardPlan]:
         dp_rank, dp_size = self._dp_rank_and_size()
-        remaining = len(items) - start
-        min_width = min(dp_size, remaining)
-        if min_width <= 0:
-            raise RuntimeError("cannot select an empty microbatch window")
-
-        cache: dict[int, _CandidateMicroBatch[ForwardInputsT]] = {}
-        rejected = 0
-
-        def candidate(
-            width: int,
-            estimated_check: _EstimatedMemoryCheck | None = None,
-        ) -> _CandidateMicroBatch[ForwardInputsT]:
-            nonlocal rejected
-            width = max(min_width, min(width, remaining))
-            cached = cache.get(width)
-            if cached is not None:
-                return cached
-            stop = start + width
-            indices = tuple(range(start + dp_rank, stop, dp_size))
-            local_inputs = [items[index] for index in indices]
-            plan = self._cached_adaptive_plan(items, indices, local_inputs)
-            check = (
-                estimated_check.check
-                if estimated_check is not None
-                and self._estimate_matches_plan(estimated_check.estimate, plan)
-                else self._memory_check(plan)
-            )
-            cold_start = not self._all_ranks_have_memory_profile(plan)
-            item = _CandidateMicroBatch(
-                inputs=local_inputs,
-                indices=indices,
-                plan=plan,
-                check=check,
-                stats_global_count=width,
-                rejected_candidates=rejected,
-                cold_start=cold_start,
-            )
-            cache[width] = item
-            return item
-
-        def estimate_check(width: int) -> _EstimatedMemoryCheck | None:
-            width = max(min_width, min(width, remaining))
-            stop = start + width
-            indices = tuple(range(start + dp_rank, stop, dp_size))
-            local_inputs = [items[index] for index in indices]
-            estimate = self._cached_adaptive_estimate(items, indices, local_inputs)
-            if estimate is None:
-                return None
-            return _EstimatedMemoryCheck(
-                estimate=estimate,
-                check=self._memory_check_estimate(estimate),
-            )
-
-        first_estimated_check = estimate_check(min_width)
-        if first_estimated_check is not None:
-            if not first_estimated_check.check.fits:
-                first = candidate(min_width, first_estimated_check)
-                self._raise_memory_error(
-                    first.plan,
-                    first.check,
-                    context="forward_micro_batches",
-                    message=(
-                        "smallest DP microbatch is predicted to exceed available memory"
-                    ),
-                )
-            if self._all_ranks_have_memory_profile_estimate(
-                first_estimated_check.estimate
-            ):
-                best: _CandidateMicroBatch[ForwardInputsT] | None = None
-                best_estimated_check: _EstimatedMemoryCheck | None = (
-                    first_estimated_check
-                )
-                best_width = min_width
-            else:
-                first = candidate(min_width, first_estimated_check)
-                if first.cold_start:
-                    return first
-                best = first
-                best_estimated_check = None
-                best_width = first.stats_global_count
-        else:
-            first = candidate(min_width)
-            if not first.check.fits:
-                self._raise_memory_error(
-                    first.plan,
-                    first.check,
-                    context="forward_micro_batches",
-                    message=(
-                        "smallest DP microbatch is predicted to exceed available memory"
-                    ),
-                )
-
-            if first.cold_start:
-                return first
-
-            best = first
-            best_estimated_check = None
-            best_width = first.stats_global_count
-        high_fail: int | None = None
-        previous = self._last_global_micro_batch_size or min_width
-        width = min(remaining, max(min_width, previous * 2))
-        while width <= remaining:
-            check = estimate_check(width)
-            if check is not None and not check.check.fits:
-                rejected += 1
-                high_fail = width
-                break
-            if check is not None:
-                best_width = width
-                best_estimated_check = check
-                best = None
-                if width == remaining:
-                    break
-                width = min(remaining, max(width + 1, width * 2))
-                continue
-            item = candidate(width, check)
-            if item.check.fits:
-                best = item
-                best_width = width
-                best_estimated_check = None
-                if width == remaining:
-                    break
-                width = min(remaining, max(width + 1, width * 2))
-                continue
-            rejected += 1
-            high_fail = width
-            break
-
-        def finalize_best() -> _CandidateMicroBatch[ForwardInputsT]:
-            selected = (
-                candidate(best_width, best_estimated_check)
-                if best is None
-                or best_width != best.stats_global_count
-                or best_estimated_check is not None
-                else best
-            )
-            return _CandidateMicroBatch(
-                inputs=selected.inputs,
-                indices=selected.indices,
-                plan=selected.plan,
-                check=selected.check,
-                stats_global_count=selected.stats_global_count,
-                rejected_candidates=rejected,
-                cold_start=selected.cold_start,
-            )
-
-        if high_fail is None:
-            return finalize_best()
-
-        low = best_width + 1
-        high = high_fail - 1
-        while low <= high:
-            mid = (low + high) // 2
-            check = estimate_check(mid)
-            if check is not None and not check.check.fits:
-                rejected += 1
-                high = mid - 1
-                continue
-            if check is not None:
-                best_width = mid
-                best_estimated_check = check
-                best = None
-                low = mid + 1
-                continue
-            item = candidate(mid, check)
-            if item.check.fits:
-                best = item
-                best_width = mid
-                best_estimated_check = None
-                low = mid + 1
-            else:
-                rejected += 1
-                high = mid - 1
-
-        return finalize_best()
+        return select_next_micro_batch(
+            items,
+            start,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            previous_global_micro_batch_size=self._last_global_micro_batch_size,
+            plan_for_local_inputs=lambda indices, local_inputs: (
+                self._cached_adaptive_plan(items, indices, local_inputs)
+            ),
+            estimate_for_local_inputs=lambda indices, local_inputs: (
+                self._cached_adaptive_estimate(items, indices, local_inputs)
+            ),
+            memory_check=self._memory_check,
+            memory_check_estimate=self._memory_check_estimate,
+            estimate_matches_plan=self._estimate_matches_plan,
+            has_memory_profile=self._all_ranks_have_memory_profile,
+            has_memory_profile_estimate=self._all_ranks_have_memory_profile_estimate,
+            raise_smallest_batch_error=lambda plan, check: self._raise_memory_error(
+                plan,
+                check,
+                context="forward_micro_batches",
+                message="smallest DP microbatch is predicted to exceed available memory",
+            ),
+        )
 
     def _cached_adaptive_plan(
         self,

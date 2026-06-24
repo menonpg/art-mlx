@@ -217,6 +217,62 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
 
 
+def test_adaptive_planner_materializes_only_final_large_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=3)  # type: ignore[arg-type]
+    rank._last_global_micro_batch_size = 32
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda plan: True)
+    monkeypatch.setattr(
+        rank,
+        "_all_ranks_have_memory_profile_estimate",
+        lambda estimate: True,
+    )
+    plan_calls = 0
+    estimate_calls = 0
+    original_plan = rank._plan_flat_forward
+    original_estimate = rank._estimate_flat_forward
+
+    def plan(requests):
+        nonlocal plan_calls
+        plan_calls += 1
+        return original_plan(requests)
+
+    def estimate(requests):
+        nonlocal estimate_calls
+        estimate_calls += 1
+        return original_estimate(requests)
+
+    def check(candidate):
+        return _MemoryCheck(
+            estimated_required_bytes=candidate.request_count,
+            available_bytes=40,
+            fits=candidate.request_count <= 40,
+        )
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
+    monkeypatch.setattr(rank, "_memory_check", check)
+    monkeypatch.setattr(rank, "_memory_check_estimate", check)
+    inputs = [
+        _target_request(
+            _tokens(1, 2, 3, index % 7, index),
+            target_count=2 if index % 5 == 0 else 1,
+            top_k=3 if index % 4 == 0 else None,
+            hidden_states=index % 9 == 0,
+        )
+        for index in range(96)
+    ]
+
+    candidate = rank._select_next_micro_batch(inputs, 0)
+
+    assert candidate.stats_global_count == 40
+    assert plan_calls == 1
+    assert estimate_calls <= 10
+    assert candidate.rejected_candidates <= 8
+
+
 def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
