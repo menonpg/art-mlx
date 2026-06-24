@@ -12,7 +12,10 @@ import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import torch.distributed as dist
 
-from art.megatron.shared_prefix_packing import pack_shared_prefixes
+from art.megatron.shared_prefix_packing import (
+    estimate_shared_prefix_packed_tokens,
+    pack_shared_prefixes,
+)
 
 if TYPE_CHECKING:
     from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -435,6 +438,15 @@ class _FlatForwardPlan:
 
 
 @dataclass(frozen=True)
+class _FlatForwardEstimate:
+    request_count: int
+    packed_tokens: int
+    logical_tokens: int
+    output_bytes: int
+    signature: _MemorySignature
+
+
+@dataclass(frozen=True)
 class _AdaptivePlanCacheKey:
     top_level_ids: tuple[int, ...]
     local_indices: tuple[int, ...]
@@ -459,6 +471,12 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     stats_global_count: int
     rejected_candidates: int
     cold_start: bool
+
+
+@dataclass(frozen=True)
+class _EstimatedMemoryCheck:
+    estimate: _FlatForwardEstimate
+    check: _MemoryCheck
 
 
 class TrainerRank:
@@ -492,6 +510,9 @@ class TrainerRank:
         self._memory_profiles: dict[_MemorySignature, float] = {}
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
+        self._adaptive_estimate_cache: dict[
+            _AdaptivePlanCacheKey, _FlatForwardEstimate | None
+        ] = {}
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
 
@@ -1031,7 +1052,10 @@ class TrainerRank:
         cache: dict[int, _CandidateMicroBatch[ForwardInputsT]] = {}
         rejected = 0
 
-        def candidate(width: int) -> _CandidateMicroBatch[ForwardInputsT]:
+        def candidate(
+            width: int,
+            estimated_check: _EstimatedMemoryCheck | None = None,
+        ) -> _CandidateMicroBatch[ForwardInputsT]:
             nonlocal rejected
             width = max(min_width, min(width, remaining))
             cached = cache.get(width)
@@ -1041,7 +1065,12 @@ class TrainerRank:
             indices = tuple(range(start + dp_rank, stop, dp_size))
             local_inputs = [items[index] for index in indices]
             plan = self._cached_adaptive_plan(items, indices, local_inputs)
-            check = self._memory_check(plan)
+            check = (
+                estimated_check.check
+                if estimated_check is not None
+                and self._estimate_matches_plan(estimated_check.estimate, plan)
+                else self._memory_check(plan)
+            )
             cold_start = not self._all_ranks_have_memory_profile(plan)
             item = _CandidateMicroBatch(
                 inputs=local_inputs,
@@ -1054,6 +1083,19 @@ class TrainerRank:
             )
             cache[width] = item
             return item
+
+        def estimate_check(width: int) -> _EstimatedMemoryCheck | None:
+            width = max(min_width, min(width, remaining))
+            stop = start + width
+            indices = tuple(range(start + dp_rank, stop, dp_size))
+            local_inputs = [items[index] for index in indices]
+            estimate = self._cached_adaptive_estimate(items, indices, local_inputs)
+            if estimate is None:
+                return None
+            return _EstimatedMemoryCheck(
+                estimate=estimate,
+                check=self._memory_check_estimate(estimate),
+            )
 
         first = candidate(min_width)
         if not first.check.fits:
@@ -1072,7 +1114,12 @@ class TrainerRank:
         best = first
         high_fail: int | None = None
         while width <= remaining:
-            item = candidate(width)
+            check = estimate_check(width)
+            if check is not None and not check.check.fits:
+                rejected += 1
+                high_fail = width
+                break
+            item = candidate(width, check)
             if item.check.fits:
                 best = item
                 if width == remaining:
@@ -1090,7 +1137,12 @@ class TrainerRank:
         high = high_fail - 1
         while low <= high:
             mid = (low + high) // 2
-            item = candidate(mid)
+            check = estimate_check(mid)
+            if check is not None and not check.check.fits:
+                rejected += 1
+                high = mid - 1
+                continue
+            item = candidate(mid, check)
             if item.check.fits:
                 best = item
                 low = mid + 1
@@ -1116,6 +1168,7 @@ class TrainerRank:
         top_level_ids = tuple(id(item) for item in items)
         if top_level_ids != self._adaptive_plan_cache_top_level_ids:
             self._adaptive_plan_cache.clear()
+            self._adaptive_estimate_cache.clear()
             self._adaptive_plan_cache_top_level_ids = top_level_ids
         key = _AdaptivePlanCacheKey(
             top_level_ids=top_level_ids,
@@ -1132,6 +1185,32 @@ class TrainerRank:
             self._adaptive_plan_cache.pop(next(iter(self._adaptive_plan_cache)))
         self._adaptive_plan_cache[key] = plan
         return plan
+
+    def _cached_adaptive_estimate(
+        self,
+        items: Sequence[ForwardInputsT],
+        indices: tuple[int, ...],
+        local_inputs: Sequence[ForwardInputsT],
+    ) -> _FlatForwardEstimate | None:
+        top_level_ids = tuple(id(item) for item in items)
+        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
+            self._adaptive_plan_cache.clear()
+            self._adaptive_estimate_cache.clear()
+            self._adaptive_plan_cache_top_level_ids = top_level_ids
+        key = _AdaptivePlanCacheKey(
+            top_level_ids=top_level_ids,
+            local_indices=indices,
+            default_slot_ref=self._default_slot_ref,
+            slot_stack=tuple(self._slot_stack),
+            shared_prefix_max_depth=self.shared_prefix_max_depth,
+        )
+        if key in self._adaptive_estimate_cache:
+            return self._adaptive_estimate_cache[key]
+        estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
+        if len(self._adaptive_estimate_cache) >= _ADAPTIVE_PLAN_CACHE_MAX_ENTRIES:
+            self._adaptive_estimate_cache.pop(next(iter(self._adaptive_estimate_cache)))
+        self._adaptive_estimate_cache[key] = estimate
+        return estimate
 
     def _validate_replicated_top_level_count(self, count: int) -> None:
         if not (dist.is_available() and dist.is_initialized()):
@@ -1195,6 +1274,48 @@ class TrainerRank:
             signature=self._memory_signature(requests, plans),
         )
 
+    def _estimate_flat_forward(
+        self, requests: Sequence[AnyForwardInput]
+    ) -> _FlatForwardEstimate | None:
+        active_indices = [
+            index
+            for index, request in enumerate(requests)
+            if request.target_tokens is not None
+            or request.logits
+            or request.top_k is not None
+            or request.hidden_states
+        ]
+
+        groups: dict[LoRASlotRef | None, list[int]] = {}
+        for index in active_indices:
+            groups.setdefault(self._resolve_slot_ref(requests[index]), []).append(index)
+
+        packed_tokens = 0
+        output_bytes = 0
+        logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
+        for group_indices in groups.values():
+            group_packed_tokens = estimate_shared_prefix_packed_tokens(
+                (requests[index].input_tokens for index in group_indices),
+                max_depth=self.shared_prefix_max_depth,
+            )
+            if group_packed_tokens is None:
+                return None
+            packed_tokens += group_packed_tokens
+            output_bytes += self._estimate_group_request_output_bytes(
+                [requests[index] for index in group_indices]
+            )
+
+        return _FlatForwardEstimate(
+            request_count=len(requests),
+            packed_tokens=packed_tokens,
+            logical_tokens=logical_tokens,
+            output_bytes=output_bytes,
+            signature=self._memory_signature_from_requests(
+                requests,
+                slot_group_count=len(groups),
+            ),
+        )
+
     def _run_flat_plan_with_memory_tracking(
         self,
         plan: _FlatForwardPlan,
@@ -1244,6 +1365,34 @@ class TrainerRank:
                 outputs[index] = output
         return outputs
 
+    def _estimate_group_request_output_bytes(
+        self,
+        requests: Sequence[AnyForwardInput],
+    ) -> int:
+        model: GPTModel | None
+        try:
+            model = _language_model(self.runtime.model[0])
+        except RuntimeError:
+            model = None
+        dtype_size = _dtype_size(next(self.runtime.model[0].parameters()).dtype)
+        total = 0
+        for request in requests:
+            seq_len = int(request.input_tokens.numel())
+            if request.target_tokens is not None:
+                total += int(request.target_tokens.numel()) * _dtype_size(torch.float32)
+            if request.top_k is not None:
+                total += seq_len * int(request.top_k) * (
+                    _dtype_size(torch.float32) + _dtype_size(torch.long)
+                )
+            if request.logits:
+                if model is None:
+                    raise RuntimeError("logits output memory requires a GPT model")
+                total += seq_len * _padded_vocab_size(model) * dtype_size
+            if request.hidden_states:
+                hidden_size = _hidden_size(model, self.runtime.provider)
+                total += seq_len * hidden_size * dtype_size
+        return total
+
     def _estimate_group_output_bytes(self, items: Sequence[_ForwardItem]) -> int:
         model: GPTModel | None
         try:
@@ -1275,6 +1424,17 @@ class TrainerRank:
         requests: Sequence[AnyForwardInput],
         groups: Sequence[_ForwardGroupPlan],
     ) -> _MemorySignature:
+        return self._memory_signature_from_requests(
+            requests,
+            slot_group_count=len(groups),
+        )
+
+    def _memory_signature_from_requests(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        slot_group_count: int,
+    ) -> _MemorySignature:
         mix = Counter[str]()
         for request in requests:
             parts = []
@@ -1292,7 +1452,7 @@ class TrainerRank:
         return _MemorySignature(
             topology=self._topology_key(),
             shared_prefix_max_depth=self.shared_prefix_max_depth,
-            slot_group_count=len(groups),
+            slot_group_count=slot_group_count,
             request_mix=tuple((kind, 1) for kind in sorted(mix)),
         )
 
@@ -1310,6 +1470,17 @@ class TrainerRank:
 
     def _memory_check(self, plan: _FlatForwardPlan) -> _MemoryCheck:
         required = self._estimate_required_memory_bytes(plan)
+        return self._memory_check_required(required)
+
+    def _memory_check_estimate(self, estimate: _FlatForwardEstimate) -> _MemoryCheck:
+        required = self._estimate_required_memory_bytes_from_values(
+            packed_tokens=estimate.packed_tokens,
+            output_bytes=estimate.output_bytes,
+            signature=estimate.signature,
+        )
+        return self._memory_check_required(required)
+
+    def _memory_check_required(self, required: int) -> _MemoryCheck:
         available = self._available_memory_bytes()
         if dist.is_available() and dist.is_initialized():
             values = torch.tensor(
@@ -1363,18 +1534,34 @@ class TrainerRank:
         )
 
     def _estimate_required_memory_bytes(self, plan: _FlatForwardPlan) -> int:
-        if plan.packed_tokens <= 0:
-            return plan.output_bytes
-        profiled = self._memory_profiles.get(plan.signature)
-        static_compute = self._static_compute_memory_bytes(plan)
+        return self._estimate_required_memory_bytes_from_values(
+            packed_tokens=plan.packed_tokens,
+            output_bytes=plan.output_bytes,
+            signature=plan.signature,
+        )
+
+    def _estimate_required_memory_bytes_from_values(
+        self,
+        *,
+        packed_tokens: int,
+        output_bytes: int,
+        signature: _MemorySignature,
+    ) -> int:
+        if packed_tokens <= 0:
+            return output_bytes
+        profiled = self._memory_profiles.get(signature)
+        static_compute = self._static_compute_memory_bytes_for_tokens(packed_tokens)
         if profiled is None:
             compute = static_compute
         else:
-            compute = max(static_compute, int(profiled * plan.packed_tokens))
-        return int((plan.output_bytes + compute) * self.memory_safety_factor)
+            compute = max(static_compute, int(profiled * packed_tokens))
+        return int((output_bytes + compute) * self.memory_safety_factor)
 
     def _static_compute_memory_bytes(self, plan: _FlatForwardPlan) -> int:
-        if plan.packed_tokens <= 0:
+        return self._static_compute_memory_bytes_for_tokens(plan.packed_tokens)
+
+    def _static_compute_memory_bytes_for_tokens(self, packed_tokens: int) -> int:
+        if packed_tokens <= 0:
             return 0
         try:
             model = _language_model(self.runtime.model[0])
@@ -1388,7 +1575,20 @@ class TrainerRank:
             or 1
         )
         activation_factor = max(4, min(16, layers // 4 + 4))
-        return int(plan.packed_tokens * hidden_size * dtype_size * activation_factor)
+        return int(packed_tokens * hidden_size * dtype_size * activation_factor)
+
+    @staticmethod
+    def _estimate_matches_plan(
+        estimate: _FlatForwardEstimate,
+        plan: _FlatForwardPlan,
+    ) -> bool:
+        return (
+            estimate.request_count == plan.request_count
+            and estimate.packed_tokens == plan.packed_tokens
+            and estimate.logical_tokens == plan.logical_tokens
+            and estimate.output_bytes == plan.output_bytes
+            and estimate.signature == plan.signature
+        )
 
     def _available_memory_bytes(self) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):

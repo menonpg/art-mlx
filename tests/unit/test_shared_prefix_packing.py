@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from art.megatron.shared_prefix_packing import (
+    estimate_shared_prefix_packed_tokens,
     pack_shared_prefixes,
     visualize_shared_prefix_pack,
 )
@@ -95,6 +96,51 @@ def test_packing_handles_empty_sequences() -> None:
     assert pack.group_ids.tolist() == [[]]
     assert pack.parent_ids.tolist() == [[]]
     assert [positions.tolist() for positions in pack.positions_by_sequence] == [[], []]
+
+
+def test_packed_token_estimator_matches_real_packing() -> None:
+    cases = [
+        (torch.tensor([1, 2, 3]), torch.tensor([1, 2, 4]), torch.tensor([5])),
+        (
+            torch.tensor([1, 2, 3, 4]),
+            torch.tensor([1, 2, 3, 5]),
+            torch.tensor([1, 2, 6, 7]),
+            torch.tensor([1, 8]),
+        ),
+        (
+            torch.tensor([9, 1, 2]),
+            torch.tensor([9, 1, 3]),
+            torch.tensor([9, 4, 5]),
+            torch.tensor([6, 7]),
+            torch.tensor([], dtype=torch.long),
+        ),
+    ]
+
+    for inputs in cases:
+        for depth in range(5):
+            pack = pack_shared_prefixes(inputs, max_depth=depth)
+
+            assert estimate_shared_prefix_packed_tokens(inputs, max_depth=depth) == int(
+                pack.tokens.numel()
+            )
+
+
+def test_packed_token_estimator_matches_randomized_packing() -> None:
+    generator = torch.Generator().manual_seed(123)
+    inputs = []
+    for family in range(5):
+        prefix = torch.randint(1, 100, (4,), generator=generator)
+        for branch in range(4):
+            middle = torch.tensor([family, branch])
+            suffix = torch.randint(1, 100, (3,), generator=generator)
+            inputs.append(torch.cat((prefix, middle, suffix)))
+
+    for depth in range(5):
+        pack = pack_shared_prefixes(inputs, max_depth=depth)
+
+        assert estimate_shared_prefix_packed_tokens(inputs, max_depth=depth) == int(
+            pack.tokens.numel()
+        )
 
 
 def test_packing_rejects_non_1d_sequences() -> None:

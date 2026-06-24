@@ -172,6 +172,91 @@ def pack_shared_prefixes(
     )
 
 
+def estimate_shared_prefix_packed_tokens(
+    sequences: Iterable[torch.Tensor],
+    *,
+    max_depth: int,
+) -> int | None:
+    """Return the exact packed token count without building a packed batch.
+
+    The estimator intentionally only handles CPU tensors. For CUDA tensors, many
+    tiny prefix probes would launch many tiny kernels, so callers should fall
+    back to full packing instead.
+    """
+    if max_depth < 0:
+        raise ValueError("max_depth must be >= 0")
+
+    tensors = tuple(_sequence_tensor(sequence) for sequence in sequences)
+    if not tensors:
+        return 0
+    if any(tensor.device.type != "cpu" for tensor in tensors):
+        return None
+
+    lengths = tuple(int(tensor.numel()) for tensor in tensors)
+    if max(lengths, default=0) == 0:
+        return 0
+
+    def shared_end(indices: tuple[int, ...], start: int) -> int:
+        end = min(lengths[index] for index in indices)
+        if start >= end or len(indices) == 1:
+            return end
+        first = tensors[indices[0]]
+        low = start
+        high = end
+        while low < high:
+            mid = (low + high + 1) // 2
+            prefix = first[start:mid]
+            if all(torch.equal(tensors[index][start:mid], prefix) for index in indices[1:]):
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def branch_groups(indices: tuple[int, ...], start: int) -> list[tuple[int, ...]]:
+        groups: dict[int, list[int]] = {}
+        order: list[int] = []
+        for index in indices:
+            symbol = int(tensors[index][start].item())
+            if symbol not in groups:
+                groups[symbol] = []
+                order.append(symbol)
+            groups[symbol].append(index)
+        return [tuple(groups[symbol]) for symbol in order]
+
+    def walk(
+        indices: tuple[int, ...],
+        start: int,
+        *,
+        has_parent: bool,
+        depth: int,
+    ) -> int:
+        active = tuple(index for index in indices if lengths[index] > start)
+        if not active:
+            return 0
+        if (
+            max_depth == 0
+            or len(active) == 1
+            or (has_parent and depth >= max_depth)
+        ):
+            return sum(lengths[index] - start for index in active)
+
+        end = shared_end(active, start)
+        if end > start:
+            return (end - start) + walk(
+                active,
+                end,
+                has_parent=True,
+                depth=depth + 1,
+            )
+
+        return sum(
+            walk(group, start, has_parent=has_parent, depth=depth)
+            for group in branch_groups(active, start)
+        )
+
+    return walk(tuple(range(len(tensors))), 0, has_parent=False, depth=0)
+
+
 def visualize_shared_prefix_pack(pack: SharedPrefixPack) -> str:
     rows = ["pos token group parent source_pos"]
     for position, (token, group, parent, source_pos) in enumerate(

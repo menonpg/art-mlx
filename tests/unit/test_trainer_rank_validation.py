@@ -169,7 +169,15 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
             fits=plan.request_count <= 3,
         )
 
+    def estimate_memory_check(estimate):
+        return _MemoryCheck(
+            estimated_required_bytes=estimate.request_count,
+            available_bytes=3,
+            fits=estimate.request_count <= 3,
+        )
+
     monkeypatch.setattr(trainer, "_memory_check", memory_check)
+    monkeypatch.setattr(trainer, "_memory_check_estimate", estimate_memory_check)
     monkeypatch.setattr(
         trainer,
         "_run_flat_plan_with_memory_tracking",
