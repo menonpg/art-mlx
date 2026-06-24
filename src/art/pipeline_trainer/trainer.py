@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -83,7 +85,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         num_rollout_workers: int = 16,
         min_batch_size: int = 4,
         max_batch_size: int | None = None,
-        max_steps_off_policy: int = 4,
+        max_steps_off_policy: int | None = 4,
+        limit_mean_steps_off_policy: float | None = None,
         queue_maxsize: int | None = None,
         # Training
         learning_rate: float = 1e-5,
@@ -117,8 +120,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("max_batch_size must be > 0")
         if max_batch_size is not None and max_batch_size < min_batch_size:
             raise ValueError("max_batch_size must be >= min_batch_size")
-        if max_steps_off_policy < 0:
+        if max_steps_off_policy is not None and max_steps_off_policy < 0:
             raise ValueError("max_steps_off_policy must be >= 0")
+        if limit_mean_steps_off_policy is not None and limit_mean_steps_off_policy < 0:
+            raise ValueError("limit_mean_steps_off_policy must be >= 0")
         if queue_maxsize is not None and queue_maxsize <= 0:
             raise ValueError("queue_maxsize must be > 0")
         if eval_every_n_steps < 0:
@@ -144,6 +149,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             max_batch_size if max_batch_size is not None else 10 * min_batch_size
         )
         self.max_steps_off_policy = max_steps_off_policy
+        self.limit_mean_steps_off_policy = limit_mean_steps_off_policy
         self.queue_maxsize = queue_maxsize
         self.learning_rate = learning_rate
         self.loss_fn = loss_fn
@@ -217,7 +223,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         queue_maxsize = (
             self.queue_maxsize
             if self.queue_maxsize is not None
-            else max(1, self.max_steps_off_policy * self.max_batch_size)
+            else max(1, self._freshness_queue_window() * self.max_batch_size)
         )
         self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
@@ -370,6 +376,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return scenario
 
     async def _wait_for_policy(self) -> None:
+        if self.max_steps_off_policy is None:
+            return
         async with self.state.policy_updated:
             while (
                 not self.state.done
@@ -447,7 +455,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await self._release_scheduled_eval_lease(step)
 
     def _retained_adapter_steps(self, current_step: int) -> set[int]:
-        min_step = max(0, current_step - self.max_steps_off_policy)
+        min_step = max(0, current_step - self._retention_window_steps())
         return set(range(min_step, current_step + 1))
 
     def _kl_penalty_reference_step(self, current_step: int) -> int:
@@ -667,7 +675,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         batch: list[TrajectoryGroup] = []
         discarded = 0
         saw_sentinel = False
-        min_version = current_step - self.max_steps_off_policy
 
         while len(batch) < self.min_batch_size:
             item = await self._output_queue.get()
@@ -676,7 +683,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 break
             self._status.note_group_dequeued(item)
             self._check_all_failed(item)
-            if self._is_group_stale(item, min_version):
+            if self._is_group_stale(item, current_step):
                 discarded += 1
                 continue
             if self._group_zero_variance(item):
@@ -695,7 +702,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 break
             self._status.note_group_dequeued(item)
             self._check_all_failed(item)
-            if self._is_group_stale(item, min_version):
+            if self._is_group_stale(item, current_step):
                 discarded += 1
                 continue
             if self._group_zero_variance(item):
@@ -871,11 +878,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         context = " ".join(fields)
         return f" [{context}]" if context else ""
 
-    def _is_group_stale(self, group: TrajectoryGroup, min_version: int) -> bool:
-        group_version = self._group_initial_version(group)
-        if group_version is None:
+    def _is_group_stale(self, group: TrajectoryGroup, current_step: int) -> bool:
+        if self.max_steps_off_policy is not None:
+            group_version = self._group_initial_version(group)
+            if (
+                group_version is not None
+                and group_version < current_step - self.max_steps_off_policy
+            ):
+                return True
+        if self.limit_mean_steps_off_policy is None:
             return False
-        return group_version < min_version
+        mean_steps = self._group_mean_steps_off_policy(current_step, group)
+        return mean_steps is not None and mean_steps > self.limit_mean_steps_off_policy
 
     def _record_zero_variance(self, group: TrajectoryGroup) -> bool:
         self._discard_queue.append(group)
@@ -939,15 +953,100 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     def _average_steps_off_policy(
         self, current_step: int, batch: list[TrajectoryGroup]
     ) -> float:
-        steps: list[int] = []
+        steps: list[float] = []
         for group in batch:
-            group_version = self._group_initial_version(group)
-            if group_version is None:
+            mean_steps = self._group_mean_steps_off_policy(current_step, group)
+            if mean_steps is None:
                 continue
-            steps.append(current_step - group_version)
+            steps.append(mean_steps)
         if not steps:
             return 0.0
         return sum(steps) / len(steps)
+
+    def _freshness_queue_window(self) -> int:
+        if self.max_steps_off_policy is not None:
+            return self.max_steps_off_policy
+        if self.limit_mean_steps_off_policy is not None:
+            return math.ceil(self.limit_mean_steps_off_policy)
+        return 1
+
+    def _retention_window_steps(self) -> int:
+        if self.max_steps_off_policy is not None:
+            return self.max_steps_off_policy
+        if self.limit_mean_steps_off_policy is not None:
+            return math.ceil(self.limit_mean_steps_off_policy)
+        return 0
+
+    def _group_mean_steps_off_policy(
+        self, current_step: int, group: TrajectoryGroup
+    ) -> float | None:
+        weighted_age_sum = 0.0
+        weight_sum = 0.0
+        for trajectory in group.trajectories:
+            stats = self._trajectory_policy_age_stats(current_step, trajectory)
+            if stats is None:
+                continue
+            age_sum, weight = stats
+            weighted_age_sum += age_sum
+            weight_sum += weight
+        if weight_sum <= 0:
+            return None
+        return weighted_age_sum / weight_sum
+
+    def _trajectory_policy_age_stats(
+        self, current_step: int, trajectory: art.Trajectory
+    ) -> tuple[float, float] | None:
+        span_stats = self._trajectory_policy_span_age_stats(current_step, trajectory)
+        if span_stats is not None:
+            return span_stats
+        if trajectory.initial_policy_version is None:
+            return None
+        weight = self._trajectory_completion_weight(trajectory)
+        age = float(current_step - trajectory.initial_policy_version)
+        return age * weight, weight
+
+    def _trajectory_policy_span_age_stats(
+        self, current_step: int, trajectory: art.Trajectory
+    ) -> tuple[float, float] | None:
+        age_sum = 0.0
+        weight_sum = 0.0
+        for item in self._trajectory_messages_and_choices(trajectory):
+            extra = getattr(item, "model_extra", None)
+            if not isinstance(extra, Mapping):
+                continue
+            spans = extra.get("policy_token_spans")
+            if not isinstance(spans, list):
+                continue
+            for span in spans:
+                if not isinstance(span, Mapping):
+                    continue
+                try:
+                    policy_version = int(span["policy_version"])
+                    weight = int(span["end_token"]) - int(span["start_token"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if weight <= 0:
+                    continue
+                age_sum += float(current_step - policy_version) * weight
+                weight_sum += float(weight)
+        if weight_sum <= 0:
+            return None
+        return age_sum, weight_sum
+
+    @staticmethod
+    def _trajectory_messages_and_choices(trajectory: art.Trajectory) -> Iterable[Any]:
+        yield from trajectory.messages_and_choices
+        for history in trajectory.additional_histories:
+            yield from history.messages_and_choices
+
+    @staticmethod
+    def _trajectory_completion_weight(trajectory: art.Trajectory) -> float:
+        value = trajectory.metrics.get("completion_tokens")
+        if isinstance(value, bool):
+            return 1.0
+        if isinstance(value, int | float) and value > 0:
+            return float(value)
+        return 1.0
 
     def _should_eval_step(self, step: int) -> bool:
         if self.eval_fn is None:
