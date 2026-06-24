@@ -184,6 +184,51 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
     assert batch.stats.rejected_candidates >= 1
 
 
+def test_forward_micro_batches_reuses_cached_candidate_plans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(trainer, "_all_ranks_have_memory_profile", lambda plan: True)
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+    original_plan = trainer._plan_flat_forward
+    plan_calls = 0
+    memory_checks = 0
+
+    def plan(requests):
+        nonlocal plan_calls
+        plan_calls += 1
+        return original_plan(requests)
+
+    def memory_check(plan):
+        nonlocal memory_checks
+        memory_checks += 1
+        return _MemoryCheck(
+            estimated_required_bytes=plan.request_count,
+            available_bytes=10,
+            fits=True,
+        )
+
+    monkeypatch.setattr(trainer, "_plan_flat_forward", plan)
+    monkeypatch.setattr(trainer, "_memory_check", memory_check)
+    inputs = [_target_request(i) for i in range(8)]
+
+    list(trainer.forward_micro_batches(inputs))
+    first_plan_calls = plan_calls
+    first_memory_checks = memory_checks
+    list(trainer.forward_micro_batches(inputs))
+
+    assert first_plan_calls > 0
+    assert plan_calls == first_plan_calls
+    assert memory_checks > first_memory_checks
+
+
 def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

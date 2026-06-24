@@ -2103,6 +2103,14 @@ def _profiled_adaptive_micro_batch_training_step_body(
             - select_profile["select_memory_check_ms"]
             - select_profile["select_profile_check_ms"],
         )
+        select_profile["select_plan_cache_miss_calls"] = select_profile[
+            "select_plan_calls"
+        ]
+        select_profile["select_plan_cache_hit_calls"] = max(
+            0,
+            int(select_profile["select_memory_check_calls"])
+            - int(select_profile["select_plan_calls"]),
+        )
         flat_outputs, execute_ms = _timed_cuda(
             rank,
             lambda: rank._run_flat_plan_with_memory_tracking(

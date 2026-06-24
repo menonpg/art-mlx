@@ -54,6 +54,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 _COMPILED_FUNCTIONS: dict[Callable[..., object], Callable[..., object]] = {}
+_ADAPTIVE_PLAN_CACHE_MAX_ENTRIES = 256
 
 
 class _Unset:
@@ -434,6 +435,15 @@ class _FlatForwardPlan:
 
 
 @dataclass(frozen=True)
+class _AdaptivePlanCacheKey:
+    top_level_ids: tuple[int, ...]
+    local_indices: tuple[int, ...]
+    default_slot_ref: "LoRASlotRef | None"
+    slot_stack: tuple["LoRASlotRef", ...]
+    shared_prefix_max_depth: int
+
+
+@dataclass(frozen=True)
 class _MemoryCheck:
     estimated_required_bytes: int
     available_bytes: int
@@ -480,6 +490,8 @@ class TrainerRank:
         self._dynamic_optimizers: dict[str, torch.optim.Optimizer] = {}
         self._checkpoint_slot_names: set[str] = set()
         self._memory_profiles: dict[_MemorySignature, float] = {}
+        self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
+        self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
 
@@ -1028,7 +1040,7 @@ class TrainerRank:
             stop = start + width
             indices = tuple(range(start + dp_rank, stop, dp_size))
             local_inputs = [items[index] for index in indices]
-            plan = self._plan_flat_forward(list(_flatten(local_inputs)))
+            plan = self._cached_adaptive_plan(items, indices, local_inputs)
             check = self._memory_check(plan)
             cold_start = not self._all_ranks_have_memory_profile(plan)
             item = _CandidateMicroBatch(
@@ -1094,6 +1106,32 @@ class TrainerRank:
             rejected_candidates=rejected,
             cold_start=best.cold_start,
         )
+
+    def _cached_adaptive_plan(
+        self,
+        items: Sequence[ForwardInputsT],
+        indices: tuple[int, ...],
+        local_inputs: Sequence[ForwardInputsT],
+    ) -> _FlatForwardPlan:
+        top_level_ids = tuple(id(item) for item in items)
+        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
+            self._adaptive_plan_cache.clear()
+            self._adaptive_plan_cache_top_level_ids = top_level_ids
+        key = _AdaptivePlanCacheKey(
+            top_level_ids=top_level_ids,
+            local_indices=indices,
+            default_slot_ref=self._default_slot_ref,
+            slot_stack=tuple(self._slot_stack),
+            shared_prefix_max_depth=self.shared_prefix_max_depth,
+        )
+        cached = self._adaptive_plan_cache.get(key)
+        if cached is not None:
+            return cached
+        plan = self._plan_flat_forward(list(_flatten(local_inputs)))
+        if len(self._adaptive_plan_cache) >= _ADAPTIVE_PLAN_CACHE_MAX_ENTRIES:
+            self._adaptive_plan_cache.pop(next(iter(self._adaptive_plan_cache)))
+        self._adaptive_plan_cache[key] = plan
+        return plan
 
     def _validate_replicated_top_level_count(self, count: int) -> None:
         if not (dist.is_available() and dist.is_initialized()):
