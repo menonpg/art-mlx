@@ -53,6 +53,8 @@ def main(
     adapter_slot_rank: int = 1,
     learning_rate: float = 1e-5,
     full_step_offload_reload: bool = False,
+    memory_safety_factor: float = 1.10,
+    memory_reserve_fraction: float = 0.03,
     memory_sample_interval_s: float = 0.05,
     compare_target_correctness: bool = False,
     run_adapter_sanity: bool = False,
@@ -85,6 +87,8 @@ def main(
             runtime,
             head_chunk_tokens=head_chunk_tokens,
             shared_prefix_max_depth=shared_prefix_max_depth,
+            memory_safety_factor=memory_safety_factor,
+            memory_reserve_fraction=memory_reserve_fraction,
         )
         if adapter_slots < 0:
             raise ValueError("adapter_slots must be >= 0")
@@ -904,6 +908,8 @@ def main(
                 "adapter_loaded_sites": loaded_sites,
                 "learning_rate": learning_rate,
                 "full_step_offload_reload": full_step_offload_reload,
+                "memory_safety_factor": memory_safety_factor,
+                "memory_reserve_fraction": memory_reserve_fraction,
                 "mtp_num_layers": getattr(model_config, "mtp_num_layers", None),
                 "cross_entropy_loss_fusion": getattr(
                     model_config, "cross_entropy_loss_fusion", None
@@ -1984,6 +1990,10 @@ def _adaptive_micro_batch_training_step_body(
                 "local_count": int(micro_batch.stats.local_count),
                 "packed_tokens": int(micro_batch.stats.packed_tokens),
                 "logical_tokens": int(micro_batch.stats.logical_tokens),
+                "estimated_required_bytes": int(
+                    micro_batch.stats.estimated_required_bytes
+                ),
+                "available_bytes": int(micro_batch.stats.available_bytes),
                 "rejected_candidates": int(micro_batch.stats.rejected_candidates),
                 "cold_start": bool(micro_batch.stats.cold_start),
             }
@@ -2052,6 +2062,10 @@ def _record_micro_batch_stats(
     local_counts = [int(stat["local_count"]) for stat in stats]
     packed_tokens = [int(stat["packed_tokens"]) for stat in stats]
     rejected = [int(stat["rejected_candidates"]) for stat in stats]
+    estimated_required = [
+        int(stat.get("estimated_required_bytes", 0)) for stat in stats
+    ]
+    available = [int(stat.get("available_bytes", 0)) for stat in stats]
     metadata[f"{name}_micro_window_count"] = len(stats)
     metadata[f"{name}_micro_global_count_first"] = global_counts[0]
     metadata[f"{name}_micro_global_count_last"] = global_counts[-1]
@@ -2062,6 +2076,10 @@ def _record_micro_batch_stats(
     metadata[f"{name}_micro_packed_tokens_min"] = min(packed_tokens)
     metadata[f"{name}_micro_packed_tokens_max"] = max(packed_tokens)
     metadata[f"{name}_micro_rejected_candidates_total"] = sum(rejected)
+    metadata[f"{name}_micro_estimated_required_gb_max"] = round(
+        max(estimated_required) / 1024**3, 3
+    )
+    metadata[f"{name}_micro_available_gb_min"] = round(min(available) / 1024**3, 3)
     metadata[f"{name}_micro_cold_start_count"] = sum(
         int(bool(stat["cold_start"])) for stat in stats
     )
