@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -186,13 +187,17 @@ def estimate_shared_prefix_packed_tokens(
     if max_depth < 0:
         raise ValueError("max_depth must be >= 0")
 
-    tensors = tuple(_sequence_tensor(sequence) for sequence in sequences)
-    if not tensors:
-        return 0
-    if any(tensor.device.type != "cpu" for tensor in tensors):
-        return None
+    arrays: list[np.ndarray] = []
+    for sequence in sequences:
+        tensor = _sequence_tensor(sequence)
+        if tensor.device.type != "cpu":
+            return None
+        arrays.append(tensor.numpy())
 
-    lengths = tuple(int(tensor.numel()) for tensor in tensors)
+    if not arrays:
+        return 0
+
+    lengths = tuple(int(array.shape[0]) for array in arrays)
     if max(lengths, default=0) == 0:
         return 0
 
@@ -200,13 +205,16 @@ def estimate_shared_prefix_packed_tokens(
         end = min(lengths[index] for index in indices)
         if start >= end or len(indices) == 1:
             return end
-        first = tensors[indices[0]]
+        first = arrays[indices[0]]
         low = start
         high = end
         while low < high:
             mid = (low + high + 1) // 2
             prefix = first[start:mid]
-            if all(torch.equal(tensors[index][start:mid], prefix) for index in indices[1:]):
+            if all(
+                np.array_equal(arrays[index][start:mid], prefix)
+                for index in indices[1:]
+            ):
                 low = mid
             else:
                 high = mid - 1
@@ -216,7 +224,7 @@ def estimate_shared_prefix_packed_tokens(
         groups: dict[int, list[int]] = {}
         order: list[int] = []
         for index in indices:
-            symbol = int(tensors[index][start].item())
+            symbol = int(arrays[index][start])
             if symbol not in groups:
                 groups[symbol] = []
                 order.append(symbol)
@@ -254,7 +262,7 @@ def estimate_shared_prefix_packed_tokens(
             for group in branch_groups(active, start)
         )
 
-    return walk(tuple(range(len(tensors))), 0, has_parent=False, depth=0)
+    return walk(tuple(range(len(arrays))), 0, has_parent=False, depth=0)
 
 
 def visualize_shared_prefix_pack(pack: SharedPrefixPack) -> str:
