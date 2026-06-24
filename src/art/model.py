@@ -26,6 +26,7 @@ from .metrics_taxonomy import (
     summarize_trajectory_groups,
 )
 from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+from .preprocessing.policy_spans import attach_policy_token_metadata_to_choice
 from .preprocessing.vllm_tokens import attach_vllm_token_metadata_to_choice
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
@@ -74,6 +75,11 @@ def _attach_response_art_metadata(response: Any) -> None:
             choice_index=choice_index,
         )
         attach_moe_routing_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
+        attach_policy_token_metadata_to_choice(
             choice=choice,
             response_payload=response_payload,
             choice_index=choice_index,

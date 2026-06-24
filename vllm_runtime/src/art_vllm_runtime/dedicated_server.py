@@ -104,6 +104,54 @@ def _patch_art_runtime_routes() -> None:
             )
             return JSONResponse(content={"success": success})
 
+        @router.post("/art/in_flight_lora_update")
+        async def in_flight_lora_update(raw_request: Request) -> JSONResponse:
+            from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+            from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
+
+            from art_vllm_runtime.policy_spans import register_lora_alias
+
+            body = await raw_request.json()
+            public_model_name = body["model_name"]
+            lora_path = body["lora_path"]
+            policy_version = body.get("policy_version")
+            lora_slot = body.get("lora_slot") or public_model_name.rsplit("@", 1)[0]
+            assert isinstance(public_model_name, str) and public_model_name
+            assert isinstance(lora_path, str) and lora_path
+            assert isinstance(lora_slot, str) and lora_slot
+            if policy_version is not None:
+                policy_version = int(policy_version)
+
+            models = raw_request.app.state.openai_serving_models
+            load_result = await models.load_lora_adapter(
+                LoadLoRAAdapterRequest(
+                    lora_name=lora_slot,
+                    lora_path=lora_path,
+                    load_inplace=lora_slot in models.lora_requests,
+                    is_3d_lora_weight=bool(body.get("is_3d_lora_weight", False)),
+                ),
+                base_model_name=body.get("base_model_name"),
+            )
+            if isinstance(load_result, ErrorResponse):
+                return JSONResponse(
+                    content=load_result.model_dump(mode="python"),
+                    status_code=load_result.error.code,
+                )
+            register_lora_alias(
+                models,
+                public_model_name=public_model_name,
+                lora_slot=lora_slot,
+                policy_version=policy_version,
+            )
+            return JSONResponse(
+                content={
+                    "status": "updated",
+                    "model_name": public_model_name,
+                    "lora_slot": lora_slot,
+                    "policy_version": policy_version,
+                }
+            )
+
         app.include_router(router)
         return app
 
