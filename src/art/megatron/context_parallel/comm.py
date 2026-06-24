@@ -449,29 +449,6 @@ def range_gather_per_peer(
     return torch.cat(chunks, dim=0).contiguous()
 
 
-def _split_tensor_to_peer(
-    input_tensor: torch.Tensor,
-    splits: tuple[int, ...],
-) -> torch.Tensor:
-    if int(sum(splits)) == 0:
-        return input_tensor.new_empty((0, *input_tensor.shape[1:]))
-    if int(input_tensor.shape[0]) == int(sum(splits)):
-        return input_tensor.contiguous()
-    if len([split for split in splits if split > 0]) > 1:
-        raise RuntimeError(
-            f"Expected at most one non-zero send split for dKV reduce, got {splits}"
-        )
-    pieces: list[torch.Tensor] = []
-    cursor = 0
-    for split in splits:
-        if split == 0:
-            pieces.append(input_tensor.new_empty((0, *input_tensor.shape[1:])))
-            continue
-        pieces.append(input_tensor[cursor : cursor + split])
-        cursor += split
-    return torch.cat(pieces, dim=0).contiguous()
-
-
 def _pack_gathered_tensors_per_peer(
     *,
     left_tensor: torch.Tensor,

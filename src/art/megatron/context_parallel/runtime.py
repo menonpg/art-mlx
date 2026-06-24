@@ -445,20 +445,6 @@ def _indexed_intersections(
     return intersections
 
 
-def _slice_pair_count(
-    *,
-    mask_kind: AttnMaskKind,
-    q_range: TokenRange,
-    k_range: TokenRange,
-) -> int:
-    if mask_kind is AttnMaskKind.FULL:
-        return int(q_range.size()) * int(k_range.size())
-    return _causal_piece_pair_count(
-        q_range=q_range,
-        k_range=k_range,
-    )
-
-
 def _causal_piece_pair_count(
     *,
     q_range: TokenRange,
@@ -1125,31 +1111,6 @@ def _chunk_mask_stats(
             continue
         in_run = False
     return token_count, range_count
-
-
-def _merge_chunk_ranges_from_mask(
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-    chunk_mask: torch.Tensor,
-) -> tuple[TokenRange, ...]:
-    chunk_indices = torch.nonzero(chunk_mask, as_tuple=False).flatten()
-    if int(chunk_indices.numel()) == 0:
-        return tuple()
-    ordered_chunk_indices = chunk_indices.tolist()
-    first_range = chunk_ranges[int(ordered_chunk_indices[0])]
-    current_start = int(first_range.start)
-    current_end = int(first_range.end)
-    merged: list[TokenRange] = []
-    for chunk_index in ordered_chunk_indices[1:]:
-        range_ = chunk_ranges[int(chunk_index)]
-        if int(range_.start) <= current_end:
-            current_end = max(current_end, int(range_.end))
-            continue
-        merged.append(TokenRange(start=current_start, end=current_end))
-        current_start = int(range_.start)
-        current_end = int(range_.end)
-    merged.append(TokenRange(start=current_start, end=current_end))
-    return tuple(merged)
 
 
 def _stage_cost_ms(
@@ -2690,101 +2651,6 @@ def _set_stage_token_indices(
             f"{int(source_indices[mismatch_offset].item())}"
         )
     current_indices.copy_(source_indices)
-
-
-def _token_costs(row_spec: PackedRowAttentionSpec) -> list[float]:
-    costs = [0.0] * row_spec.valid_tokens
-    for slice_ in row_spec.slices:
-        q_range = slice_.q_range
-        k_range = slice_.k_range
-        if slice_.mask_kind is AttnMaskKind.FULL:
-            cost = float(k_range.size())
-            for q_idx in range(q_range.start, q_range.end):
-                costs[q_idx] += cost
-            continue
-        if q_range.size() != k_range.size():
-            raise RuntimeError(
-                "The current planner only supports causal slices with matched q/k sizes, got "
-                f"{q_range} vs {k_range}"
-            )
-        for q_idx in range(q_range.start, q_range.end):
-            costs[q_idx] += float(q_idx - q_range.start + 1)
-    return costs
-
-
-def _split_row_by_cost(
-    row_spec: PackedRowAttentionSpec,
-    *,
-    cp_size: int,
-    block_size: int,
-) -> tuple[TokenRange | None, ...]:
-    if cp_size == 1:
-        return (TokenRange(start=0, end=row_spec.valid_tokens),)
-    if row_spec.valid_tokens == 0:
-        return tuple(None for _ in range(cp_size))
-
-    costs = _token_costs(row_spec)
-    prefix = [0.0]
-    for cost in costs:
-        prefix.append(prefix[-1] + cost)
-    total_cost = prefix[-1]
-    boundaries = [0]
-    block_aligned_split = int(block_size) > 1 and row_spec.valid_tokens >= (
-        cp_size * int(block_size)
-    )
-    for split_index in range(1, cp_size):
-        remaining_ranks = cp_size - split_index
-        min_boundary = boundaries[-1]
-        max_boundary = row_spec.valid_tokens - remaining_ranks
-        if max_boundary <= min_boundary:
-            boundaries.append(min_boundary)
-            continue
-        target = (
-            total_cost * split_index / cp_size
-            if total_cost > 0.0
-            else row_spec.valid_tokens * split_index / cp_size
-        )
-        best_boundary = min_boundary + 1
-        best_error = float("inf")
-        candidate_boundaries = range(min_boundary + 1, max_boundary + 1)
-        if block_aligned_split:
-            aligned_start = (
-                (min_boundary + 1 + block_size - 1) // block_size
-            ) * block_size
-            aligned_end = (max_boundary // block_size) * block_size
-            if aligned_start <= aligned_end:
-                candidate_boundaries = range(aligned_start, aligned_end + 1, block_size)
-        for boundary in candidate_boundaries:
-            current = prefix[boundary] if total_cost > 0.0 else float(boundary)
-            error = abs(current - target)
-            if error < best_error:
-                best_error = error
-                best_boundary = boundary
-        boundaries.append(best_boundary)
-    boundaries.append(row_spec.valid_tokens)
-
-    ranges: list[TokenRange | None] = []
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        if end <= start:
-            ranges.append(None)
-        else:
-            ranges.append(TokenRange(start=start, end=end))
-    return tuple(ranges)
-
-
-def _intersections(
-    base_range: TokenRange,
-    owner_ranges: tuple[TokenRange | None, ...],
-) -> list[tuple[int, TokenRange]]:
-    intersections: list[tuple[int, TokenRange]] = []
-    for rank, owner_range in enumerate(owner_ranges):
-        if owner_range is None:
-            continue
-        start = max(base_range.start, owner_range.start)
-        end = min(base_range.end, owner_range.end)
-        if end > start:
-            intersections.append((rank, TokenRange(start=start, end=end)))
-    return intersections
 
 
 def _resolve_stage_mask_kind(

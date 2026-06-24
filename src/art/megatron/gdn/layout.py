@@ -920,17 +920,6 @@ def _exchange_rank_tensor_local(
     )
 
 
-def _copy_rank_self_transfers(
-    local_tensor: Tensor,
-    plan: GdnCpExchangePlan,
-    *,
-    rank: int,
-) -> Tensor:
-    return _init_rank_exchange_output(
-        local_tensor, plan, rank=rank, accumulate=False, zero_init=False
-    )
-
-
 def _init_rank_exchange_output(
     local_tensor: Tensor,
     plan: GdnCpExchangePlan,

@@ -781,30 +781,6 @@ def prepare_context_parallel_execution_state(
         )
 
 
-def _causal_slice_pair_count(slice_: AttnSlice) -> int:
-    q_start = int(slice_.q_range.start)
-    q_end = int(slice_.q_range.end)
-    k_start = int(slice_.k_range.start)
-    k_end = int(slice_.k_range.end)
-    if q_end <= q_start or k_end <= k_start:
-        return 0
-
-    k_len = k_end - k_start
-    partial_q_start = max(q_start, k_start)
-    partial_q_end = min(q_end - 1, k_end - 2)
-    partial = 0
-    if partial_q_start <= partial_q_end:
-        count = partial_q_end - partial_q_start + 1
-        partial = count * (partial_q_start + partial_q_end + 2 - 2 * k_start) // 2
-
-    full_q_start = max(q_start, k_end - 1)
-    full_q_end = q_end - 1
-    full = 0
-    if full_q_start <= full_q_end:
-        full = (full_q_end - full_q_start + 1) * k_len
-    return int(partial + full)
-
-
 def _validate_stage_block_alignment(
     *,
     q_len: int,
