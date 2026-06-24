@@ -2645,9 +2645,11 @@ def _scatter_row_target_logprobs(
             continue
         if int(match.source_offsets.numel()) == 0:
             continue
-        item_logprobs[match.source_offsets] = row_target_logprobs.index_select(
-            0,
-            match.row_offsets,
+        selected = row_target_logprobs.index_select(0, match.row_offsets)
+        selected_labels = labels.index_select(0, match.source_offsets)
+        item_logprobs[match.source_offsets] = selected.masked_fill(
+            selected_labels == -100,
+            0.0,
         )
 
 
