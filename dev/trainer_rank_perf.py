@@ -21,6 +21,7 @@ from art.megatron.trainer_rank import (
     _batch_seq_logits,
     _language_model,
     _pack_forward_items,
+    _unflatten,
 )
 
 
@@ -125,6 +126,7 @@ def main(
                 "target_trainer_train_step",
                 "target_trainer_fixed_train_step",
                 "target_trainer_adaptive_train_step",
+                "target_trainer_adaptive_profile_train_step",
                 "target_hidden_train_step",
                 "trainer_multi_target_fwd_bwd",
                 "trainer_multi_target_train_step",
@@ -268,6 +270,7 @@ def main(
             "target_trainer_train_step",
             "target_trainer_fixed_train_step",
             "target_trainer_adaptive_train_step",
+            "target_trainer_adaptive_profile_train_step",
             "target_hidden_train_step",
         ):
             register_case(name, requests, request_stats)
@@ -586,6 +589,32 @@ def main(
             )
             _record_micro_batch_stats(
                 metadata, "target_trainer_adaptive_train_step", adaptive_stats
+            )
+        if "target_trainer_adaptive_profile_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            adaptive_stats: list[dict[str, int | bool | float]] = []
+            results["target_trainer_adaptive_profile_train_step_ms"] = _bench(
+                lambda: _profiled_adaptive_micro_batch_training_step(
+                    rank,
+                    requests,
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                    loss_kind="target",
+                    stats_sink=adaptive_stats,
+                ),
+                warmup=warmup,
+                repeat=repeat,
+            )
+            _record_micro_batch_stats(
+                metadata,
+                "target_trainer_adaptive_profile_train_step",
+                adaptive_stats,
+            )
+            _record_profile_stats(
+                metadata,
+                "target_trainer_adaptive_profile_train_step",
+                adaptive_stats,
             )
         if "target_hidden_train_step" in benchmarks:
             for chunk in runtime.model:
@@ -2002,6 +2031,124 @@ def _adaptive_micro_batch_training_step_body(
     return rank.optim_step(params=params, scale_grads=1.0)
 
 
+def _profiled_adaptive_micro_batch_training_step(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    offload_manager: object | None,
+    loss_kind: str,
+    stats_sink: list[dict[str, int | bool | float]],
+) -> dict[str, float]:
+    def body() -> dict[str, float]:
+        return _profiled_adaptive_micro_batch_training_step_body(
+            rank,
+            requests,
+            params=params,
+            loss_kind=loss_kind,
+            stats_sink=stats_sink,
+        )
+
+    if offload_manager is None:
+        return body()
+    with offload_manager.job():  # type: ignore[attr-defined]
+        return body()
+
+
+def _profiled_adaptive_micro_batch_training_step_body(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    loss_kind: str,
+    stats_sink: list[dict[str, int | bool | float]],
+) -> dict[str, float]:
+    rank.zero_grad()
+    items = list(requests)
+    rank._validate_replicated_top_level_count(len(items))
+    start = 0
+    stats: list[dict[str, int | bool | float]] = []
+    while start < len(items):
+        candidate, select_ms = _timed_cuda(
+            rank, lambda: rank._select_next_micro_batch(items, start)
+        )
+        flat_outputs, execute_ms = _timed_cuda(
+            rank,
+            lambda: rank._run_flat_plan_with_memory_tracking(
+                candidate.plan,
+                context="target_trainer_adaptive_profile_train_step",
+            ),
+        )
+        def unflatten_outputs() -> list[object]:
+            flat_iter = iter(flat_outputs)
+            return [_unflatten(item, flat_iter) for item in candidate.inputs]
+
+        outputs, unflatten_ms = _timed_cuda(
+            rank,
+            unflatten_outputs,
+        )
+        loss, loss_ms = _timed_cuda(
+            rank, lambda: _micro_batch_loss(rank, outputs, loss_kind=loss_kind)
+        )
+        if loss.requires_grad:
+            _, backward_ms = _timed_cuda(rank, loss.backward)
+        else:
+            backward_ms = 0.0
+        stats.append(
+            {
+                "global_count": int(candidate.stats_global_count),
+                "local_count": int(len(candidate.inputs)),
+                "packed_tokens": int(candidate.plan.packed_tokens),
+                "logical_tokens": int(candidate.plan.logical_tokens),
+                "estimated_required_bytes": int(
+                    candidate.check.estimated_required_bytes
+                ),
+                "available_bytes": int(candidate.check.available_bytes),
+                "rejected_candidates": int(candidate.rejected_candidates),
+                "cold_start": bool(candidate.cold_start),
+                "select_ms": select_ms,
+                "execute_ms": execute_ms,
+                "unflatten_ms": unflatten_ms,
+                "loss_ms": loss_ms,
+                "backward_ms": backward_ms,
+                "optim_ms": 0.0,
+            }
+        )
+        rank._last_global_micro_batch_size = candidate.stats_global_count
+        start += candidate.stats_global_count
+    metrics, optim_ms = _timed_cuda(
+        rank, lambda: rank.optim_step(params=params, scale_grads=1.0)
+    )
+    if stats:
+        stats[-1]["optim_ms"] = optim_ms
+    stats_sink[:] = stats
+    return metrics
+
+
+def _timed_cuda(
+    rank: TrainerRank,
+    fn: Callable[[], object],
+) -> tuple[object, float]:
+    _sync_cuda(rank)
+    start = time.perf_counter()
+    result = fn()
+    _sync_cuda(rank)
+    return result, (time.perf_counter() - start) * 1000.0
+
+
+def _sync_cuda(rank: TrainerRank) -> None:
+    if torch.cuda.is_available() and rank.device.type == "cuda":
+        torch.cuda.synchronize(rank.device)
+
+
 def _micro_batch_loss(
     rank: TrainerRank,
     outputs: object,
@@ -2053,7 +2200,7 @@ def _logical_input_tokens(
 def _record_micro_batch_stats(
     metadata: dict[str, object],
     name: str,
-    stats: Sequence[dict[str, int | bool]],
+    stats: Sequence[dict[str, int | bool | float]],
 ) -> None:
     if not stats:
         metadata[f"{name}_micro_window_count"] = 0
@@ -2086,6 +2233,28 @@ def _record_micro_batch_stats(
     metadata[f"{name}_micro_global_counts_head"] = ",".join(
         str(count) for count in global_counts[:8]
     )
+
+
+def _record_profile_stats(
+    metadata: dict[str, object],
+    name: str,
+    stats: Sequence[dict[str, int | bool | float]],
+) -> None:
+    fields = (
+        "select_ms",
+        "execute_ms",
+        "unflatten_ms",
+        "loss_ms",
+        "backward_ms",
+        "optim_ms",
+    )
+    for field in fields:
+        total = sum(float(stat.get(field, 0.0)) for stat in stats)
+        metadata[f"{name}_{field}_sum"] = round(total, 3)
+        metadata[f"{name}_{field}_max"] = round(
+            max((float(stat.get(field, 0.0)) for stat in stats), default=0.0),
+            3,
+        )
 
 
 def _training_step(
