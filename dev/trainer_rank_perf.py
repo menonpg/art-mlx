@@ -119,15 +119,21 @@ def main(
                 "target_hidden_fwd_bwd",
                 "target_builtin_train_step",
                 "target_trainer_train_step",
+                "target_trainer_fixed_train_step",
+                "target_trainer_adaptive_train_step",
                 "target_hidden_train_step",
                 "trainer_multi_target_fwd_bwd",
                 "trainer_multi_target_train_step",
+                "trainer_multi_target_fixed_train_step",
+                "trainer_multi_target_adaptive_train_step",
                 "trainer_target",
                 "trainer_multi_target",
                 "trainer_topk",
                 "trainer_topk_head",
                 "trainer_topk_fwd_bwd",
                 "trainer_topk_train_step",
+                "trainer_topk_fixed_train_step",
+                "trainer_topk_adaptive_train_step",
                 "trainer_topk_sweep",
                 "trainer_target_topk",
                 "trainer_hidden",
@@ -141,10 +147,14 @@ def main(
                     "trainer_multi_target",
                     "trainer_multi_target_fwd_bwd",
                     "trainer_multi_target_train_step",
+                    "trainer_multi_target_fixed_train_step",
+                    "trainer_multi_target_adaptive_train_step",
                     "trainer_topk",
                     "trainer_topk_head",
                     "trainer_topk_fwd_bwd",
                     "trainer_topk_train_step",
+                    "trainer_topk_fixed_train_step",
+                    "trainer_topk_adaptive_train_step",
                     "trainer_topk_sweep",
                     "trainer_target_topk",
                     "trainer_hidden",
@@ -252,6 +262,8 @@ def main(
             "target_hidden_fwd_bwd",
             "target_builtin_train_step",
             "target_trainer_train_step",
+            "target_trainer_fixed_train_step",
+            "target_trainer_adaptive_train_step",
             "target_hidden_train_step",
         ):
             register_case(name, requests, request_stats)
@@ -533,6 +545,44 @@ def main(
                 warmup=warmup,
                 repeat=repeat,
             )
+        if "target_trainer_fixed_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            fixed_stats: list[dict[str, int | bool]] = []
+            results["target_trainer_fixed_train_step_ms"] = _bench(
+                lambda: _fixed_micro_batch_training_step(
+                    rank,
+                    requests,
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                    loss_kind="target",
+                    stats_sink=fixed_stats,
+                ),
+                warmup=warmup,
+                repeat=repeat,
+            )
+            _record_micro_batch_stats(
+                metadata, "target_trainer_fixed_train_step", fixed_stats
+            )
+        if "target_trainer_adaptive_train_step" in benchmarks:
+            for chunk in runtime.model:
+                chunk.train()
+            adaptive_stats: list[dict[str, int | bool]] = []
+            results["target_trainer_adaptive_train_step_ms"] = _bench(
+                lambda: _adaptive_micro_batch_training_step(
+                    rank,
+                    requests,
+                    params=train_step_params,
+                    offload_manager=offload_manager,
+                    loss_kind="target",
+                    stats_sink=adaptive_stats,
+                ),
+                warmup=warmup,
+                repeat=repeat,
+            )
+            _record_micro_batch_stats(
+                metadata, "target_trainer_adaptive_train_step", adaptive_stats
+            )
         if "target_hidden_train_step" in benchmarks:
             for chunk in runtime.model:
                 chunk.train()
@@ -609,6 +659,73 @@ def main(
                 warmup=warmup,
                 repeat=repeat,
             )
+        if (
+            "trainer_multi_target_fixed_train_step" in benchmarks
+            or "trainer_multi_target_adaptive_train_step" in benchmarks
+        ):
+            items = [rank._forward_item(request) for request in multi_target_requests]
+            batch = _pack_forward_items(
+                items,
+                max_depth=rank.shared_prefix_max_depth,
+            )
+            multi_target_stats = _packed_request_stats(
+                multi_target_requests,
+                items,
+                batch,
+                request_metadata={},
+            )
+            if "trainer_multi_target_fixed_train_step" in benchmarks:
+                register_case(
+                    "trainer_multi_target_fixed_train_step",
+                    multi_target_requests,
+                    multi_target_stats,
+                )
+                for chunk in runtime.model:
+                    chunk.train()
+                fixed_stats = []
+                results["trainer_multi_target_fixed_train_step_ms"] = _bench(
+                    lambda: _fixed_micro_batch_training_step(
+                        rank,
+                        multi_target_requests,
+                        params=train_step_params,
+                        offload_manager=offload_manager,
+                        loss_kind="target",
+                        stats_sink=fixed_stats,
+                    ),
+                    warmup=warmup,
+                    repeat=repeat,
+                )
+                _record_micro_batch_stats(
+                    metadata,
+                    "trainer_multi_target_fixed_train_step",
+                    fixed_stats,
+                )
+            if "trainer_multi_target_adaptive_train_step" in benchmarks:
+                register_case(
+                    "trainer_multi_target_adaptive_train_step",
+                    multi_target_requests,
+                    multi_target_stats,
+                )
+                for chunk in runtime.model:
+                    chunk.train()
+                adaptive_stats = []
+                results["trainer_multi_target_adaptive_train_step_ms"] = _bench(
+                    lambda: _adaptive_micro_batch_training_step(
+                        rank,
+                        multi_target_requests,
+                        params=train_step_params,
+                        offload_manager=offload_manager,
+                        loss_kind="target",
+                        stats_sink=adaptive_stats,
+                    ),
+                    warmup=warmup,
+                    repeat=repeat,
+                )
+                _record_micro_batch_stats(
+                    metadata,
+                    "trainer_multi_target_adaptive_train_step",
+                    adaptive_stats,
+                )
         if "trainer_topk_fwd_bwd" in benchmarks:
             for chunk in runtime.model:
                 chunk.train()
@@ -667,6 +784,72 @@ def main(
                 warmup=warmup,
                 repeat=repeat,
             )
+        if (
+            "trainer_topk_fixed_train_step" in benchmarks
+            or "trainer_topk_adaptive_train_step" in benchmarks
+        ):
+            topk_requests = [
+                _with_outputs(request, top_k=top_k) for request in requests
+            ]
+            items = [rank._forward_item(request) for request in topk_requests]
+            batch = _pack_forward_items(
+                items,
+                max_depth=rank.shared_prefix_max_depth,
+            )
+            topk_stats = _packed_request_stats(
+                topk_requests,
+                items,
+                batch,
+                request_metadata={},
+            )
+            if "trainer_topk_fixed_train_step" in benchmarks:
+                register_case(
+                    "trainer_topk_fixed_train_step",
+                    topk_requests,
+                    topk_stats,
+                )
+                for chunk in runtime.model:
+                    chunk.train()
+                fixed_stats = []
+                results["trainer_topk_fixed_train_step_ms"] = _bench(
+                    lambda: _fixed_micro_batch_training_step(
+                        rank,
+                        topk_requests,
+                        params=train_step_params,
+                        offload_manager=offload_manager,
+                        loss_kind="topk",
+                        stats_sink=fixed_stats,
+                    ),
+                    warmup=warmup,
+                    repeat=repeat,
+                )
+                _record_micro_batch_stats(
+                    metadata, "trainer_topk_fixed_train_step", fixed_stats
+                )
+            if "trainer_topk_adaptive_train_step" in benchmarks:
+                register_case(
+                    "trainer_topk_adaptive_train_step",
+                    topk_requests,
+                    topk_stats,
+                )
+                for chunk in runtime.model:
+                    chunk.train()
+                adaptive_stats = []
+                results["trainer_topk_adaptive_train_step_ms"] = _bench(
+                    lambda: _adaptive_micro_batch_training_step(
+                        rank,
+                        topk_requests,
+                        params=train_step_params,
+                        offload_manager=offload_manager,
+                        loss_kind="topk",
+                        stats_sink=adaptive_stats,
+                    ),
+                    warmup=warmup,
+                    repeat=repeat,
+                )
+                _record_micro_batch_stats(
+                    metadata, "trainer_topk_adaptive_train_step", adaptive_stats
+                )
 
         if compare_target_correctness and adapter_slots:
             metadata["target_correctness_skipped"] = "adapter_slots"
@@ -1682,6 +1865,209 @@ def _topk_requests_loss(
     if not losses:
         raise RuntimeError("top_k logprobs were not produced")
     return torch.stack(losses).sum()
+
+
+def _fixed_micro_batch_training_step(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    offload_manager: object | None,
+    loss_kind: str,
+    stats_sink: list[dict[str, int | bool]],
+) -> dict[str, float]:
+    def body() -> dict[str, float]:
+        return _fixed_micro_batch_training_step_body(
+            rank,
+            requests,
+            params=params,
+            loss_kind=loss_kind,
+            stats_sink=stats_sink,
+        )
+
+    if offload_manager is None:
+        return body()
+    with offload_manager.job():  # type: ignore[attr-defined]
+        return body()
+
+
+def _fixed_micro_batch_training_step_body(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    loss_kind: str,
+    stats_sink: list[dict[str, int | bool]],
+) -> dict[str, float]:
+    rank.zero_grad()
+    dp_rank, dp_size = rank._dp_rank_and_size()
+    stats: list[dict[str, int | bool]] = []
+    for start in range(0, len(requests), dp_size):
+        stop = min(start + dp_size, len(requests))
+        indices = tuple(range(start + dp_rank, stop, dp_size))
+        local_requests = [requests[index] for index in indices]
+        outputs = rank.dp_rank_forward(local_requests)
+        loss = _micro_batch_loss(rank, outputs, loss_kind=loss_kind)
+        if loss.requires_grad:
+            loss.backward()
+        stats.append(
+            {
+                "global_count": stop - start,
+                "local_count": len(local_requests),
+                "packed_tokens": _logical_input_tokens(local_requests),
+                "logical_tokens": _logical_input_tokens(local_requests),
+                "rejected_candidates": 0,
+                "cold_start": False,
+            }
+        )
+    stats_sink[:] = stats
+    return rank.optim_step(params=params, scale_grads=1.0)
+
+
+def _adaptive_micro_batch_training_step(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    offload_manager: object | None,
+    loss_kind: str,
+    stats_sink: list[dict[str, int | bool]],
+) -> dict[str, float]:
+    def body() -> dict[str, float]:
+        return _adaptive_micro_batch_training_step_body(
+            rank,
+            requests,
+            params=params,
+            loss_kind=loss_kind,
+            stats_sink=stats_sink,
+        )
+
+    if offload_manager is None:
+        return body()
+    with offload_manager.job():  # type: ignore[attr-defined]
+        return body()
+
+
+def _adaptive_micro_batch_training_step_body(
+    rank: TrainerRank,
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+    *,
+    params: AdamParams,
+    loss_kind: str,
+    stats_sink: list[dict[str, int | bool]],
+) -> dict[str, float]:
+    rank.zero_grad()
+    stats: list[dict[str, int | bool]] = []
+    for micro_batch in rank.forward_micro_batches(requests):
+        loss = _micro_batch_loss(rank, micro_batch.outputs, loss_kind=loss_kind)
+        if loss.requires_grad:
+            loss.backward()
+        stats.append(
+            {
+                "global_count": int(micro_batch.stats.global_count),
+                "local_count": int(micro_batch.stats.local_count),
+                "packed_tokens": int(micro_batch.stats.packed_tokens),
+                "logical_tokens": int(micro_batch.stats.logical_tokens),
+                "rejected_candidates": int(micro_batch.stats.rejected_candidates),
+                "cold_start": bool(micro_batch.stats.cold_start),
+            }
+        )
+    stats_sink[:] = stats
+    return rank.optim_step(params=params, scale_grads=1.0)
+
+
+def _micro_batch_loss(
+    rank: TrainerRank,
+    outputs: object,
+    *,
+    loss_kind: str,
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for output in _iter_outputs(outputs):
+        if loss_kind == "target":
+            target_logprobs = getattr(output, "target_logprobs", None)
+            if target_logprobs is not None:
+                losses.append(-target_logprobs.sum())
+        elif loss_kind == "topk":
+            top_k = getattr(output, "top_k", None)
+            if top_k is not None:
+                losses.append(-top_k.logprobs.sum())
+        else:
+            raise ValueError(f"unknown loss_kind: {loss_kind}")
+    if not losses:
+        return torch.tensor(0.0, device=rank.device)
+    return torch.stack(losses).sum()
+
+
+def _iter_outputs(value: object) -> Sequence[object]:
+    if hasattr(value, "target_logprobs") and hasattr(value, "top_k"):
+        return (value,)
+    if isinstance(value, Sequence):
+        outputs: list[object] = []
+        for item in value:
+            outputs.extend(_iter_outputs(item))
+        return outputs
+    raise TypeError(f"unexpected TrainerRank output value: {type(value)!r}")
+
+
+def _logical_input_tokens(
+    requests: Sequence[
+        ForwardInput[
+            torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
+        ]
+    ],
+) -> int:
+    return sum(
+        int(request.input_tokens.numel())
+        for request in requests
+        if request.input_tokens is not None
+    )
+
+
+def _record_micro_batch_stats(
+    metadata: dict[str, object],
+    name: str,
+    stats: Sequence[dict[str, int | bool]],
+) -> None:
+    if not stats:
+        metadata[f"{name}_micro_window_count"] = 0
+        return
+    global_counts = [int(stat["global_count"]) for stat in stats]
+    local_counts = [int(stat["local_count"]) for stat in stats]
+    packed_tokens = [int(stat["packed_tokens"]) for stat in stats]
+    rejected = [int(stat["rejected_candidates"]) for stat in stats]
+    metadata[f"{name}_micro_window_count"] = len(stats)
+    metadata[f"{name}_micro_global_count_first"] = global_counts[0]
+    metadata[f"{name}_micro_global_count_last"] = global_counts[-1]
+    metadata[f"{name}_micro_global_count_min"] = min(global_counts)
+    metadata[f"{name}_micro_global_count_max"] = max(global_counts)
+    metadata[f"{name}_micro_local_count_min"] = min(local_counts)
+    metadata[f"{name}_micro_local_count_max"] = max(local_counts)
+    metadata[f"{name}_micro_packed_tokens_min"] = min(packed_tokens)
+    metadata[f"{name}_micro_packed_tokens_max"] = max(packed_tokens)
+    metadata[f"{name}_micro_rejected_candidates_total"] = sum(rejected)
+    metadata[f"{name}_micro_cold_start_count"] = sum(
+        int(bool(stat["cold_start"])) for stat in stats
+    )
+    metadata[f"{name}_micro_global_counts_head"] = ",".join(
+        str(count) for count in global_counts[:8]
+    )
 
 
 def _training_step(
