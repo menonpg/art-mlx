@@ -3007,17 +3007,6 @@ def _select_positions(values: torch.Tensor, positions: torch.Tensor) -> torch.Te
     return values.index_select(0, positions.to(device=values.device))
 
 
-def _gather_target_logprobs(
-    logprobs: torch.Tensor,
-    labels: torch.Tensor,
-) -> torch.Tensor:
-    if int(labels.shape[0]) == 0:
-        return torch.empty(labels.shape, device=logprobs.device, dtype=logprobs.dtype)
-    flat_labels = labels.clamp_min(0).reshape(int(labels.shape[0]), -1)
-    selected = logprobs.gather(1, flat_labels).reshape(labels.shape)
-    return selected.masked_fill(labels == -100, 0.0)
-
-
 def _batch_seq_logits(logits: torch.Tensor, *, seq_len: int) -> torch.Tensor:
     if int(logits.ndim) != 3:
         raise RuntimeError(
