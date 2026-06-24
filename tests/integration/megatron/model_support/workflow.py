@@ -58,6 +58,7 @@ ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "qwen3_dense": "Qwen/Qwen3-32B",
     "qwen3_5_moe": "Qwen/Qwen3.5-35B-A3B",
     "qwen3_5_dense": "Qwen/Qwen3.5-27B",
+    "gemma4_moe": "google/gemma-4-26B-A4B-it",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(
     {
