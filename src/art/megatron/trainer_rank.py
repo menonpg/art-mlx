@@ -1679,10 +1679,10 @@ class TrainerRank:
                     if int(valid_offsets.numel()):
                         local_rows.append(positions.index_select(0, valid_offsets))
             if item.request.logits:
-                logits[index] = _empty_logits_like_positions(
-                    positions,
-                    model,
-                    hidden_by_row,
+                logits[index] = torch.empty(
+                    (int(positions.numel()), _padded_vocab_size(model)),
+                    device=hidden_by_row.device,
+                    dtype=hidden_by_row.dtype,
                 )
 
         full_row_tensor = (
@@ -2354,18 +2354,6 @@ def _language_model(model: torch.nn.Module) -> "GPTModel":
     if language_model is not None:
         return cast("GPTModel", language_model)
     raise RuntimeError("expected a Megatron GPT model")
-
-
-def _empty_logits_like_positions(
-    positions: torch.Tensor,
-    model: "GPTModel",
-    like: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty(
-        (int(positions.numel()), _padded_vocab_size(model)),
-        device=like.device,
-        dtype=like.dtype,
-    )
 
 
 def _padded_vocab_size(model: "GPTModel") -> int:

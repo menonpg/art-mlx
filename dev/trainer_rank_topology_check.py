@@ -14,7 +14,6 @@ from art.megatron.trainer_rank import (
     ForwardOutput,
     TopK,
     TrainerRank,
-    _empty_logits_like_positions,
     _language_model,
     _pack_forward_items,
     _PackedForwardBatch,
@@ -52,6 +51,25 @@ def _gather_target_logprobs(
     flat_labels = labels.clamp_min(0).reshape(int(labels.shape[0]), -1)
     selected = logprobs.gather(1, flat_labels).reshape(labels.shape)
     return selected.masked_fill(labels == -100, 0.0)
+
+
+def _empty_logits_like_positions(
+    positions: torch.Tensor,
+    model: object,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    vocab_size = getattr(
+        getattr(model, "config", None),
+        "padded_vocab_size",
+        None,
+    ) or getattr(model, "vocab_size", None)
+    if vocab_size is None:
+        raise RuntimeError("could not determine full padded vocabulary size")
+    return torch.empty(
+        (int(positions.numel()), int(vocab_size)),
+        device=like.device,
+        dtype=like.dtype,
+    )
 
 
 def main(
