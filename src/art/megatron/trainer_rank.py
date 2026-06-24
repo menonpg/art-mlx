@@ -1097,31 +1097,75 @@ class TrainerRank:
                 check=self._memory_check_estimate(estimate),
             )
 
-        first = candidate(min_width)
-        if not first.check.fits:
-            self._raise_memory_error(
-                first.plan,
-                first.check,
-                context="forward_micro_batches",
-                message="smallest DP microbatch is predicted to exceed available memory",
-            )
+        first_estimated_check = estimate_check(min_width)
+        if first_estimated_check is not None:
+            if not first_estimated_check.check.fits:
+                first = candidate(min_width, first_estimated_check)
+                self._raise_memory_error(
+                    first.plan,
+                    first.check,
+                    context="forward_micro_batches",
+                    message=(
+                        "smallest DP microbatch is predicted to exceed "
+                        "available memory"
+                    ),
+                )
+            if self._all_ranks_have_memory_profile_estimate(
+                first_estimated_check.estimate
+            ):
+                best: _CandidateMicroBatch[ForwardInputsT] | None = None
+                best_estimated_check: _EstimatedMemoryCheck | None = (
+                    first_estimated_check
+                )
+                best_width = min_width
+            else:
+                first = candidate(min_width, first_estimated_check)
+                if first.cold_start:
+                    return first
+                best = first
+                best_estimated_check = None
+                best_width = first.stats_global_count
+        else:
+            first = candidate(min_width)
+            if not first.check.fits:
+                self._raise_memory_error(
+                    first.plan,
+                    first.check,
+                    context="forward_micro_batches",
+                    message=(
+                        "smallest DP microbatch is predicted to exceed "
+                        "available memory"
+                    ),
+                )
 
-        if first.cold_start:
-            return first
+            if first.cold_start:
+                return first
 
+            best = first
+            best_estimated_check = None
+            best_width = first.stats_global_count
+        high_fail: int | None = None
         previous = self._last_global_micro_batch_size or min_width
         width = min(remaining, max(min_width, previous * 2))
-        best = first
-        high_fail: int | None = None
         while width <= remaining:
             check = estimate_check(width)
             if check is not None and not check.check.fits:
                 rejected += 1
                 high_fail = width
                 break
+            if check is not None:
+                best_width = width
+                best_estimated_check = check
+                best = None
+                if width == remaining:
+                    break
+                width = min(remaining, max(width + 1, width * 2))
+                continue
             item = candidate(width, check)
             if item.check.fits:
                 best = item
+                best_width = width
+                best_estimated_check = None
                 if width == remaining:
                     break
                 width = min(remaining, max(width + 1, width * 2))
@@ -1130,10 +1174,28 @@ class TrainerRank:
             high_fail = width
             break
 
-        if high_fail is None:
-            return best
+        def finalize_best() -> _CandidateMicroBatch[ForwardInputsT]:
+            selected = (
+                candidate(best_width, best_estimated_check)
+                if best is None
+                or best_width != best.stats_global_count
+                or best_estimated_check is not None
+                else best
+            )
+            return _CandidateMicroBatch(
+                inputs=selected.inputs,
+                indices=selected.indices,
+                plan=selected.plan,
+                check=selected.check,
+                stats_global_count=selected.stats_global_count,
+                rejected_candidates=rejected,
+                cold_start=selected.cold_start,
+            )
 
-        low = best.stats_global_count + 1
+        if high_fail is None:
+            return finalize_best()
+
+        low = best_width + 1
         high = high_fail - 1
         while low <= high:
             mid = (low + high) // 2
@@ -1142,22 +1204,23 @@ class TrainerRank:
                 rejected += 1
                 high = mid - 1
                 continue
+            if check is not None:
+                best_width = mid
+                best_estimated_check = check
+                best = None
+                low = mid + 1
+                continue
             item = candidate(mid, check)
             if item.check.fits:
                 best = item
+                best_width = mid
+                best_estimated_check = None
                 low = mid + 1
             else:
                 rejected += 1
                 high = mid - 1
-        return _CandidateMicroBatch(
-            inputs=best.inputs,
-            indices=best.indices,
-            plan=best.plan,
-            check=best.check,
-            stats_global_count=best.stats_global_count,
-            rejected_candidates=rejected,
-            cold_start=best.cold_start,
-        )
+
+        return finalize_best()
 
     def _cached_adaptive_plan(
         self,
@@ -1601,7 +1664,27 @@ class TrainerRank:
         return max(0, int(free) + reusable_reserved - reserve)
 
     def _all_ranks_have_memory_profile(self, plan: _FlatForwardPlan) -> bool:
-        local = plan.packed_tokens <= 0 or plan.signature in self._memory_profiles
+        return self._all_ranks_have_memory_profile_values(
+            packed_tokens=plan.packed_tokens,
+            signature=plan.signature,
+        )
+
+    def _all_ranks_have_memory_profile_estimate(
+        self,
+        estimate: _FlatForwardEstimate,
+    ) -> bool:
+        return self._all_ranks_have_memory_profile_values(
+            packed_tokens=estimate.packed_tokens,
+            signature=estimate.signature,
+        )
+
+    def _all_ranks_have_memory_profile_values(
+        self,
+        *,
+        packed_tokens: int,
+        signature: _MemorySignature,
+    ) -> bool:
+        local = packed_tokens <= 0 or signature in self._memory_profiles
         if dist.is_available() and dist.is_initialized():
             value = torch.tensor(
                 int(local),

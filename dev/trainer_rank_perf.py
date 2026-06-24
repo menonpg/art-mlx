@@ -2213,6 +2213,7 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     original_memory_estimate = rank._estimate_required_memory_bytes
     original_available = rank._available_memory_bytes
     original_profile_check = rank._all_ranks_have_memory_profile
+    original_estimate_profile_check = rank._all_ranks_have_memory_profile_estimate
 
     def plan_wrapper(requests: object) -> object:
         return timed("select_plan_ms", "select_plan_calls", original_plan, requests)
@@ -2317,6 +2318,14 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
             plan,
         )
 
+    def estimate_profile_check_wrapper(estimate: object) -> object:
+        return timed(
+            "select_profile_check_ms",
+            "select_profile_check_calls",
+            original_estimate_profile_check,
+            estimate,
+        )
+
     rank._plan_flat_forward = plan_wrapper  # type: ignore[method-assign]
     rank._cached_adaptive_plan = cached_plan_wrapper  # type: ignore[method-assign]
     rank._estimate_flat_forward = estimate_wrapper  # type: ignore[method-assign]
@@ -2330,6 +2339,7 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     rank._estimate_required_memory_bytes = memory_estimate_wrapper  # type: ignore[method-assign]
     rank._available_memory_bytes = available_wrapper  # type: ignore[method-assign]
     rank._all_ranks_have_memory_profile = profile_check_wrapper  # type: ignore[method-assign]
+    rank._all_ranks_have_memory_profile_estimate = estimate_profile_check_wrapper  # type: ignore[method-assign]
     try:
         yield stats
     finally:
@@ -2346,6 +2356,7 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
         rank._estimate_required_memory_bytes = original_memory_estimate  # type: ignore[method-assign]
         rank._available_memory_bytes = original_available  # type: ignore[method-assign]
         rank._all_ranks_have_memory_profile = original_profile_check  # type: ignore[method-assign]
+        rank._all_ranks_have_memory_profile_estimate = original_estimate_profile_check  # type: ignore[method-assign]
 
 
 def _timed_cuda(

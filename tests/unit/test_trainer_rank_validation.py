@@ -200,6 +200,11 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
     monkeypatch.setattr(trainer, "_all_ranks_have_memory_profile", lambda plan: True)
     monkeypatch.setattr(
         trainer,
+        "_all_ranks_have_memory_profile_estimate",
+        lambda estimate: True,
+    )
+    monkeypatch.setattr(
+        trainer,
         "_run_flat_plan_with_memory_tracking",
         lambda plan, **_kwargs: [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
@@ -225,6 +230,7 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
 
     monkeypatch.setattr(trainer, "_plan_flat_forward", plan)
     monkeypatch.setattr(trainer, "_memory_check", memory_check)
+    monkeypatch.setattr(trainer, "_memory_check_estimate", memory_check)
     inputs = [_target_request(i) for i in range(8)]
 
     list(trainer.forward_micro_batches(inputs))
@@ -233,6 +239,7 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
     list(trainer.forward_micro_batches(inputs))
 
     assert first_plan_calls > 0
+    assert first_plan_calls == 1
     assert plan_calls == first_plan_calls
     assert memory_checks > first_memory_checks
 
@@ -246,6 +253,15 @@ def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
         trainer,
         "_memory_check",
         lambda plan: _MemoryCheck(
+            estimated_required_bytes=4,
+            available_bytes=3,
+            fits=False,
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_memory_check_estimate",
+        lambda estimate: _MemoryCheck(
             estimated_required_bytes=4,
             available_bytes=3,
             fits=False,
