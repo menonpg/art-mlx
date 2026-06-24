@@ -188,11 +188,6 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
     monkeypatch.setattr(
         rank,
-        "_memory_check_estimate",
-        lambda estimate: _MemoryCheck(estimate.request_count, 10, True),
-    )
-    monkeypatch.setattr(
-        rank,
         "_memory_check",
         lambda plan: _MemoryCheck(plan.request_count, 10, True),
     )
@@ -250,7 +245,6 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
     monkeypatch.setattr(rank, "_memory_check", check)
-    monkeypatch.setattr(rank, "_memory_check_estimate", check)
     inputs = [
         _target_request(
             _tokens(1, 2, 3, index % 7, index),
@@ -303,7 +297,6 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_memory_check", check)
-    monkeypatch.setattr(rank, "_memory_check_estimate", check)
     monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
     inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(14)]
 
@@ -398,11 +391,6 @@ def test_memory_error_includes_actionable_shape_context(
 ) -> None:
     rank = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank,
-        "_memory_check_estimate",
-        lambda estimate: _MemoryCheck(99, 1, False),
-    )
     monkeypatch.setattr(rank, "_memory_check", lambda plan: _MemoryCheck(99, 1, False))
 
     with pytest.raises(TrainerRankMemoryError) as exc_info:

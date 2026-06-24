@@ -181,15 +181,7 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
             fits=plan.request_count <= 3,
         )
 
-    def estimate_memory_check(estimate):
-        return _MemoryCheck(
-            estimated_required_bytes=estimate.request_count,
-            available_bytes=3,
-            fits=estimate.request_count <= 3,
-        )
-
     monkeypatch.setattr(trainer, "_memory_check", memory_check)
-    monkeypatch.setattr(trainer, "_memory_check_estimate", estimate_memory_check)
     monkeypatch.setattr(
         trainer,
         "_run_flat_plan_with_memory_tracking",
@@ -241,7 +233,6 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
 
     monkeypatch.setattr(trainer, "_plan_flat_forward", plan)
     monkeypatch.setattr(trainer, "_memory_check", memory_check)
-    monkeypatch.setattr(trainer, "_memory_check_estimate", memory_check)
     inputs = [_target_request(i) for i in range(8)]
 
     list(trainer.forward_micro_batches(inputs))
@@ -269,16 +260,6 @@ def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
             fits=False,
         ),
     )
-    monkeypatch.setattr(
-        trainer,
-        "_memory_check_estimate",
-        lambda estimate: _MemoryCheck(
-            estimated_required_bytes=4,
-            available_bytes=3,
-            fits=False,
-        ),
-    )
-
     with pytest.raises(TrainerRankMemoryError, match="smallest DP microbatch"):
         next(iter(trainer.forward_micro_batches([_target_request(1)])))
 

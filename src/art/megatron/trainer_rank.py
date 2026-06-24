@@ -1031,6 +1031,13 @@ class TrainerRank:
         start: int,
     ) -> _CandidateMicroBatch[ForwardInputsT, _FlatForwardPlan]:
         dp_rank, dp_size = self._dp_rank_and_size()
+
+        def memory_check(plan: _FlatForwardPlan) -> _MemoryCheck:
+            return self._memory_check(plan)
+
+        def memory_check_estimate(estimate: _FlatForwardEstimate) -> _MemoryCheck:
+            return self._memory_check(estimate)
+
         return select_next_micro_batch(
             items,
             start,
@@ -1043,8 +1050,8 @@ class TrainerRank:
             estimate_for_local_inputs=lambda indices, local_inputs: (
                 self._cached_adaptive_estimate(items, indices, local_inputs)
             ),
-            memory_check=self._memory_check,
-            memory_check_estimate=self._memory_check_estimate,
+            memory_check=memory_check,
+            memory_check_estimate=memory_check_estimate,
             estimate_matches_plan=self._estimate_matches_plan,
             has_memory_profile=lambda plan: self._all_ranks_have_memory_profile_values(
                 packed_tokens=plan.packed_tokens,
@@ -1316,19 +1323,13 @@ class TrainerRank:
         except (AssertionError, AttributeError, ImportError, RuntimeError, ValueError):
             return (1, 1, 1, 1)
 
-    def _memory_check(self, plan: _FlatForwardPlan) -> _MemoryCheck:
+    def _memory_check(
+        self, forward: _FlatForwardPlan | _FlatForwardEstimate
+    ) -> _MemoryCheck:
         required = self._estimate_required_memory_bytes_from_values(
-            packed_tokens=plan.packed_tokens,
-            output_bytes=plan.output_bytes,
-            signature=plan.signature,
-        )
-        return self._memory_check_required(required)
-
-    def _memory_check_estimate(self, estimate: _FlatForwardEstimate) -> _MemoryCheck:
-        required = self._estimate_required_memory_bytes_from_values(
-            packed_tokens=estimate.packed_tokens,
-            output_bytes=estimate.output_bytes,
-            signature=estimate.signature,
+            packed_tokens=forward.packed_tokens,
+            output_bytes=forward.output_bytes,
+            signature=forward.signature,
         )
         return self._memory_check_required(required)
 
