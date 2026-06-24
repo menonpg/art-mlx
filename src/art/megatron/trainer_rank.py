@@ -1481,11 +1481,6 @@ class TrainerRank:
         items: Sequence[_ForwardItem],
         prepared: _PreparedPackedForward,
     ) -> list[AnyForwardOutput]:
-        if _is_native_target_only(items):
-            labels = self._consistent_packed_labels(items, prepared)
-            if labels is not None:
-                return self._forward_native_target_logprobs(items, prepared, labels)
-
         hidden_by_row = self._gather_sequence_parallel_hidden(
             self._decoder_hidden(prepared)
         )
@@ -1508,87 +1503,6 @@ class TrainerRank:
                 )
             )
         return outputs
-
-    def _forward_native_target_logprobs(
-        self,
-        items: Sequence[_ForwardItem],
-        prepared: _PreparedPackedForward,
-        labels: torch.Tensor,
-    ) -> list[AnyForwardOutput]:
-        from art.megatron.train import _placeholder_attention_mask
-
-        per_token_loss = self.runtime.model[0](
-            input_ids=prepared.tokens,
-            position_ids=prepared.position_ids,
-            attention_mask=_placeholder_attention_mask(self.device),
-            labels=labels,
-            packed_seq_params=prepared.packed_seq_params,
-            **self._handler().get_forward_kwargs(
-                self.runtime.model[0],
-                attention_bias=prepared.attention_state,
-            ),
-        )
-        flat_logprobs = -per_token_loss.reshape(-1)
-        outputs: list[AnyForwardOutput] = []
-        for item, positions, source_positions in zip(
-            items,
-            prepared.positions_by_item,
-            prepared.source_positions_by_item,
-            strict=True,
-        ):
-            if item.labels is None:
-                raise RuntimeError("native target path requires labels")
-            item_labels = item.labels.to(device=self.device).index_select(
-                0,
-                source_positions.to(device=self.device),
-            )
-            target_logprobs = _select_positions(flat_logprobs, positions).masked_fill(
-                item_labels == -100,
-                0.0,
-            )
-            outputs.append(
-                ForwardOutput(
-                    target_logprobs=target_logprobs,
-                    top_k=None,
-                    logits=None,
-                    hidden_states=None,
-                )
-            )
-        return outputs
-
-    def _consistent_packed_labels(
-        self,
-        items: Sequence[_ForwardItem],
-        prepared: _PreparedPackedForward,
-    ) -> torch.Tensor | None:
-        labels = torch.full_like(prepared.tokens, -100)
-        flat_labels = labels.reshape(-1)
-        has_label = torch.zeros_like(flat_labels, dtype=torch.bool)
-        for item, positions, source_positions in zip(
-            items,
-            prepared.positions_by_item,
-            prepared.source_positions_by_item,
-            strict=True,
-        ):
-            if item.labels is None:
-                continue
-            item_positions = positions.to(device=labels.device)
-            item_labels = item.labels.to(device=labels.device).index_select(
-                0,
-                source_positions.to(device=labels.device),
-            )
-            keep = item_labels != -100
-            if not bool(keep.any().item()):
-                continue
-            kept_positions = item_positions[keep]
-            kept_labels = item_labels[keep]
-            existing = flat_labels.index_select(0, kept_positions)
-            seen = has_label.index_select(0, kept_positions)
-            if bool(((existing != kept_labels) & seen).any().item()):
-                return None
-            flat_labels.index_copy_(0, kept_positions, kept_labels)
-            has_label.index_fill_(0, kept_positions, True)
-        return labels
 
     def _decoder_hidden(
         self,
@@ -2271,17 +2185,6 @@ def _request_mix_key(request: AnyForwardInput) -> str:
     if request.hidden_states:
         parts.append("hidden")
     return "+".join(parts) if parts else "inactive"
-
-
-def _is_native_target_only(items: Sequence[_ForwardItem]) -> bool:
-    return all(
-        item.labels is not None
-        and item.labels.ndim == 1
-        and item.request.top_k is None
-        and not item.request.logits
-        and not item.request.hidden_states
-        for item in items
-    )
 
 
 def _pack_forward_items(
