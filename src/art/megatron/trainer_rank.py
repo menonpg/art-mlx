@@ -482,7 +482,9 @@ class TrainerRank:
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._dynamic_optimizers: dict[str, torch.optim.Optimizer] = {}
-        self._checkpoint_slot_names: set[str] = set()
+        self._checkpoint_slot_params_by_name: dict[
+            str, tuple[torch.nn.Parameter, ...]
+        ] = {}
         self._memory_profiles: dict[_MemorySignature, float] = {}
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
@@ -500,8 +502,8 @@ class TrainerRank:
         optimizer = cast("MegatronOptimizer | None", self.runtime.optimizer)
         if optimizer is not None:
             optimizer.zero_grad()
-        for name in self._checkpoint_slot_names:
-            for param in self._checkpoint_slot_params(name):
+        for params in self._checkpoint_slot_params_by_name.values():
+            for param in params:
                 param.grad = None
 
     def _optimizer(self) -> "MegatronOptimizer":
@@ -547,8 +549,10 @@ class TrainerRank:
         loaded = self._load_slot(
             "checkpoint", name, adapter_model, trainable=True, alpha=alpha
         )
-        self._validate_dynamic_slot_consistency("checkpoint", name, loaded)
-        self._checkpoint_slot_names.add(name)
+        self._checkpoint_slot_params_by_name[name] = (
+            self._validate_dynamic_slot_consistency("checkpoint", name, loaded)
+        )
+        self._dynamic_optimizers.pop(name, None)
         return loaded
 
     def load_lora_slot(
@@ -601,14 +605,14 @@ class TrainerRank:
         kind: Literal["checkpoint", "lora"],
         name: str,
         loaded_sites: int,
-    ) -> None:
-        if not (dist.is_available() and dist.is_initialized()):
-            return
-
+    ) -> tuple[torch.nn.Parameter, ...]:
         from art.megatron.lora import iter_lora_slot_parameters
 
         ref = self._slot_ref(kind, name)
-        params = list(iter_lora_slot_parameters(self.runtime.model, ref))
+        params = tuple(iter_lora_slot_parameters(self.runtime.model, ref))
+        if not (dist.is_available() and dist.is_initialized()):
+            return params
+
         local = {
             "rank": dist.get_rank(),
             "loaded_sites": int(loaded_sites),
@@ -636,7 +640,7 @@ class TrainerRank:
             or rank["signature"] != reference["signature"]
         ]
         if not mismatched:
-            return
+            return params
 
         first_mismatch = None
         for left, right in zip_longest(
@@ -829,15 +833,13 @@ class TrainerRank:
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
         if checkpoints is not None:
-            unknown = set(checkpoints) - self._checkpoint_slot_names
+            unknown = set(checkpoints) - self._checkpoint_slot_params_by_name.keys()
             if unknown:
                 raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
             return tuple(dict.fromkeys(checkpoints))
         names = []
-        for name in sorted(self._checkpoint_slot_names):
-            local_has_grad = any(
-                param.grad is not None for param in self._checkpoint_slot_params(name)
-            )
+        for name, params in sorted(self._checkpoint_slot_params_by_name.items()):
+            local_has_grad = any(param.grad is not None for param in params)
             has_grad = torch.tensor(
                 int(local_has_grad),
                 device=self.device,
@@ -858,7 +860,7 @@ class TrainerRank:
     ) -> dict[str, float]:
         all_params: list[torch.nn.Parameter] = []
         for name in checkpoint_names:
-            slot_params = self._checkpoint_slot_params(name)
+            slot_params = self._checkpoint_slot_params_by_name[name]
             for param in slot_params:
                 if param.grad is None:
                     param.grad = torch.zeros_like(param)
@@ -892,7 +894,7 @@ class TrainerRank:
         optimizer = self._dynamic_optimizers.get(name)
         if optimizer is None:
             optimizer = torch.optim.AdamW(
-                self._checkpoint_slot_params(name),
+                self._checkpoint_slot_params_by_name[name],
                 lr=params.learning_rate,
                 betas=(params.beta1, params.beta2),
                 weight_decay=params.weight_decay,
@@ -904,16 +906,6 @@ class TrainerRank:
             group["betas"] = (params.beta1, params.beta2)
             group["weight_decay"] = params.weight_decay
         return optimizer
-
-    def _checkpoint_slot_params(self, name: str) -> list[torch.nn.Parameter]:
-        from art.megatron.lora import iter_lora_slot_parameters
-
-        return list(
-            iter_lora_slot_parameters(
-                self.runtime.model,
-                self._slot_ref("checkpoint", name),
-            )
-        )
 
     def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
         from megatron.core import parallel_state as ps
@@ -990,13 +982,6 @@ class TrainerRank:
         start: int,
     ) -> _CandidateMicroBatch[ForwardInputsT, _FlatForwardPlan]:
         dp_rank, dp_size = self._dp_rank_and_size()
-
-        def memory_check(plan: _FlatForwardPlan) -> _MemoryCheck:
-            return self._memory_check(plan)
-
-        def memory_check_estimate(estimate: _FlatForwardEstimate) -> _MemoryCheck:
-            return self._memory_check(estimate)
-
         return select_next_micro_batch(
             items,
             start,
@@ -1009,8 +994,13 @@ class TrainerRank:
             estimate_for_local_inputs=lambda indices, local_inputs: (
                 self._cached_adaptive_estimate(items, indices, local_inputs)
             ),
-            memory_check=memory_check,
-            memory_check_estimate=memory_check_estimate,
+            memory_check=cast(
+                Callable[[_FlatForwardPlan], _MemoryCheck], self._memory_check
+            ),
+            memory_check_estimate=cast(
+                Callable[[_FlatForwardEstimate], _MemoryCheck],
+                self._memory_check,
+            ),
             has_memory_profile=lambda plan: self._all_ranks_have_memory_profile_values(
                 packed_tokens=plan.packed_tokens,
                 signature=plan.signature,

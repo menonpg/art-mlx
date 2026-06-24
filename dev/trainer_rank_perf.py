@@ -2654,8 +2654,10 @@ def _adapter_sanity_metrics(
             .item()
         )
 
-    slot_params = rank._checkpoint_slot_params("S0")
-    other_params = rank._checkpoint_slot_params("S1") if adapter_slots > 1 else []
+    slot_params = list(rank._checkpoint_slot_params_by_name["S0"])
+    other_params = (
+        list(rank._checkpoint_slot_params_by_name["S1"]) if adapter_slots > 1 else []
+    )
     before = [param.detach().clone() for param in slot_params]
     other_before = [param.detach().clone() for param in other_params]
     for chunk in rank.runtime.model:

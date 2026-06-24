@@ -73,6 +73,7 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
             ref_a, ref_b, lora, megatron_checkpoint, False
         )
         _assert_step_updates_only(ref_a, ref_b, lora, trainer)
+        _assert_reload_replaces_slot_optimizer(ref_a, lora, trainer)
 
 
 def _adapter(prefix: str, *, rank: int, seed: int) -> dict[str, torch.Tensor]:
@@ -136,6 +137,24 @@ def _assert_step_updates_only(
     )
 
 
+def _assert_reload_replaces_slot_optimizer(
+    ref: LoRASlotRef,
+    lora: LoRA,
+    trainer: TrainerRank,
+) -> None:
+    assert ref.name is not None
+    old_params = trainer._checkpoint_slot_params_by_name[ref.name]
+    assert ref.name in trainer._dynamic_optimizers
+
+    trainer.load_checkpoint_slot(ref.name, _adapter("dense", rank=3, seed=9))
+
+    new_params = trainer._checkpoint_slot_params_by_name[ref.name]
+    assert ref.name not in trainer._dynamic_optimizers
+    assert [tuple(param.shape) for param in new_params] == [(4, 3), (3, 5)]
+    assert all(old is not new for old, new in zip(old_params, new_params, strict=True))
+    assert lora._slot(ref).rank == 3  # type: ignore[union-attr]
+
+
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer = TrainerRank.__new__(TrainerRank)
     trainer.runtime = SimpleNamespace(model=[lora], optimizer=None)
@@ -143,7 +162,10 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer._slot_stack = []
     trainer._default_slot_ref = None
     trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_names = {"A", "B"}
+    trainer._checkpoint_slot_params_by_name = {
+        "A": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "A"))),
+        "B": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "B"))),
+    }
     return trainer
 
 

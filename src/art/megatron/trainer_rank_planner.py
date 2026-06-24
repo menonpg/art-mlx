@@ -27,12 +27,6 @@ class _CandidateMicroBatch(Generic[InputT, PlanT]):
     cold_start: bool
 
 
-@dataclass(frozen=True)
-class _EstimatedMemoryCheck(Generic[EstimateT]):
-    estimate: EstimateT
-    check: _MemoryCheck
-
-
 def select_next_micro_batch(
     items: Sequence[InputT],
     start: int,
@@ -68,7 +62,7 @@ def select_next_micro_batch(
 
     def candidate(
         width: int,
-        estimated_check: _EstimatedMemoryCheck[EstimateT] | None = None,
+        estimated_check: tuple[EstimateT, _MemoryCheck] | None = None,
     ) -> _CandidateMicroBatch[InputT, PlanT]:
         width = clamp_width(width)
         cached = cache.get(width)
@@ -77,7 +71,7 @@ def select_next_micro_batch(
         indices, local_inputs = local_slice(width)
         plan = plan_for_local_inputs(indices, local_inputs)
         check = (
-            estimated_check.check if estimated_check is not None else memory_check(plan)
+            estimated_check[1] if estimated_check is not None else memory_check(plan)
         )
         item = _CandidateMicroBatch(
             inputs=local_inputs,
@@ -91,24 +85,22 @@ def select_next_micro_batch(
         cache[width] = item
         return item
 
-    def estimate_check(width: int) -> _EstimatedMemoryCheck[EstimateT] | None:
+    def estimate_check(width: int) -> tuple[EstimateT, _MemoryCheck] | None:
         indices, local_inputs = local_slice(width)
         estimate = estimate_for_local_inputs(indices, local_inputs)
         if estimate is None:
             return None
-        return _EstimatedMemoryCheck(
-            estimate=estimate,
-            check=memory_check_estimate(estimate),
-        )
+        return estimate, memory_check_estimate(estimate)
 
     first_estimated_check = estimate_check(min_width)
     if first_estimated_check is not None:
-        if not first_estimated_check.check.fits:
+        first_estimate, first_check = first_estimated_check
+        if not first_check.fits:
             first = candidate(min_width, first_estimated_check)
             raise_smallest_batch_error(first.plan, first.check)
-        if has_memory_profile_estimate(first_estimated_check.estimate):
+        if has_memory_profile_estimate(first_estimate):
             best: _CandidateMicroBatch[InputT, PlanT] | None = None
-            best_estimated_check: _EstimatedMemoryCheck[EstimateT] | None = (
+            best_estimated_check: tuple[EstimateT, _MemoryCheck] | None = (
                 first_estimated_check
             )
             best_width = min_width
@@ -135,20 +127,20 @@ def select_next_micro_batch(
         max(min_width, (previous_global_micro_batch_size or min_width) * 2),
     )
     while width <= remaining:
-        check = estimate_check(width)
-        if check is not None and not check.check.fits:
+        estimated = estimate_check(width)
+        if estimated is not None and not estimated[1].fits:
             rejected += 1
             high_fail = width
             break
-        if check is not None:
+        if estimated is not None:
             best_width = width
-            best_estimated_check = check
+            best_estimated_check = estimated
             best = None
             if width == remaining:
                 break
             width = min(remaining, max(width + 1, width * 2))
             continue
-        item = candidate(width, check)
+        item = candidate(width)
         if item.check.fits:
             best = item
             best_width = width
@@ -186,18 +178,18 @@ def select_next_micro_batch(
     high = high_fail - 1
     while low <= high:
         mid = (low + high) // 2
-        check = estimate_check(mid)
-        if check is not None and not check.check.fits:
+        estimated = estimate_check(mid)
+        if estimated is not None and not estimated[1].fits:
             rejected += 1
             high = mid - 1
             continue
-        if check is not None:
+        if estimated is not None:
             best_width = mid
-            best_estimated_check = check
+            best_estimated_check = estimated
             best = None
             low = mid + 1
             continue
-        item = candidate(mid, check)
+        item = candidate(mid)
         if item.check.fits:
             best = item
             best_width = mid
