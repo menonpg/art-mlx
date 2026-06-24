@@ -358,7 +358,7 @@ GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
 
 class Gemma4DenseHandler(DefaultDenseHandler):
     key = "gemma4_dense"
-    native_vllm_lora_status = "wip"
+    native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
