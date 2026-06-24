@@ -1046,8 +1046,16 @@ class TrainerRank:
             memory_check=self._memory_check,
             memory_check_estimate=self._memory_check_estimate,
             estimate_matches_plan=self._estimate_matches_plan,
-            has_memory_profile=self._all_ranks_have_memory_profile,
-            has_memory_profile_estimate=self._all_ranks_have_memory_profile_estimate,
+            has_memory_profile=lambda plan: self._all_ranks_have_memory_profile_values(
+                packed_tokens=plan.packed_tokens,
+                signature=plan.signature,
+            ),
+            has_memory_profile_estimate=(
+                lambda estimate: self._all_ranks_have_memory_profile_values(
+                    packed_tokens=estimate.packed_tokens,
+                    signature=estimate.signature,
+                )
+            ),
             raise_smallest_batch_error=lambda plan, check: self._raise_memory_error(
                 plan,
                 check,
@@ -1433,21 +1441,6 @@ class TrainerRank:
         reusable_reserved = max(0, reserved - allocated)
         reserve = int(total * self.memory_reserve_fraction)
         return max(0, int(free) + reusable_reserved - reserve)
-
-    def _all_ranks_have_memory_profile(self, plan: _FlatForwardPlan) -> bool:
-        return self._all_ranks_have_memory_profile_values(
-            packed_tokens=plan.packed_tokens,
-            signature=plan.signature,
-        )
-
-    def _all_ranks_have_memory_profile_estimate(
-        self,
-        estimate: _FlatForwardEstimate,
-    ) -> bool:
-        return self._all_ranks_have_memory_profile_values(
-            packed_tokens=estimate.packed_tokens,
-            signature=estimate.signature,
-        )
 
     def _all_ranks_have_memory_profile_values(
         self,

@@ -170,7 +170,9 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     trainer._last_global_micro_batch_size = 4
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(trainer, "_all_ranks_have_memory_profile", lambda plan: True)
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile_values", lambda **_kwargs: True
+    )
 
     def memory_check(plan):
         return _MemoryCheck(
@@ -209,11 +211,8 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
 ) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(trainer, "_all_ranks_have_memory_profile", lambda plan: True)
     monkeypatch.setattr(
-        trainer,
-        "_all_ranks_have_memory_profile_estimate",
-        lambda estimate: True,
+        trainer, "_all_ranks_have_memory_profile_values", lambda **_kwargs: True
     )
     monkeypatch.setattr(
         trainer,
