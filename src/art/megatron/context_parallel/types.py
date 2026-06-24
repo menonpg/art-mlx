@@ -69,7 +69,6 @@ class PlannerCpOverride(BaseModel):
     planner_chunk_budget_base: int | None = None
     planner_chunk_budget_per_cp_rank: int | None = None
     planner_assignment_strategy: str | None = None
-    planner_stripe_group_size: int | None = None
     planner_max_search_steps: int | None = None
     planner_candidate_chunk_limit: int | None = None
     planner_max_remote_waves: int | None = None
@@ -100,7 +99,6 @@ class ContextParallelConfig(BaseModel):
     planner_chunk_budget_base: int = 128
     planner_chunk_budget_per_cp_rank: int = 16
     planner_assignment_strategy: str = "search"
-    planner_stripe_group_size: int = 16
     planner_max_search_steps: int = 8
     planner_candidate_chunk_limit: int = 8
     planner_max_remote_waves: int = 4

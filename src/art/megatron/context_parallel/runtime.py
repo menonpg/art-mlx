@@ -471,91 +471,15 @@ def _causal_piece_pair_count_from_bounds(
     return int(partial + full)
 
 
-def _chunk_piece_decomposition(
-    *,
-    start: int,
-    end: int,
-    chunk_size: int,
-) -> tuple[
-    int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], int
-]:
-    first = start // chunk_size
-    last = (end - 1) // chunk_size
-    piece_starts: list[int] = []
-    piece_ends: list[int] = []
-    piece_lengths: list[int] = []
-    piece_prefix_lengths: list[int] = []
-    running_len = 0
-    for chunk_index in range(first, last + 1):
-        piece_start = start if chunk_index == first else chunk_index * chunk_size
-        piece_end = end if chunk_index == last else (chunk_index + 1) * chunk_size
-        piece_len = piece_end - piece_start
-        if piece_len <= 0:
-            continue
-        running_len += piece_len
-        piece_starts.append(piece_start)
-        piece_ends.append(piece_end)
-        piece_lengths.append(piece_len)
-        piece_prefix_lengths.append(running_len)
-    return (
-        first,
-        tuple(piece_starts),
-        tuple(piece_ends),
-        tuple(piece_lengths),
-        tuple(piece_prefix_lengths),
-        running_len,
-    )
-
-
-def _can_use_shared_prefix_chunk_pair_program(
-    row_spec: PackedRowAttentionSpec,
-) -> bool:
-    slices = row_spec.slices
-    index = 0
-    while index < len(slices):
-        prompt_slice = slices[index]
-        if (
-            prompt_slice.family_index is None
-            or prompt_slice.mask_kind is not AttnMaskKind.CAUSAL
-            or prompt_slice.q_range != prompt_slice.k_range
-        ):
-            return False
-        prompt_family_index = prompt_slice.family_index
-        if prompt_family_index is None:
-            raise RuntimeError("shared-prefix prompt slices must carry family_index")
-        family_index = int(prompt_family_index)
-        prompt_start = int(prompt_slice.q_range.start)
-        prompt_end = int(prompt_slice.q_range.end)
-        index += 1
-        while index < len(slices):
-            family_value = slices[index].family_index
-            if family_value is None or int(family_value) != family_index:
-                break
-            if index + 1 >= len(slices):
-                return False
-            full_slice = slices[index]
-            causal_slice = slices[index + 1]
-            if (
-                full_slice.family_index != prompt_slice.family_index
-                or causal_slice.family_index != prompt_slice.family_index
-                or full_slice.mask_kind is not AttnMaskKind.FULL
-                or causal_slice.mask_kind is not AttnMaskKind.CAUSAL
-                or full_slice.q_range != causal_slice.q_range
-                or causal_slice.q_range != causal_slice.k_range
-                or int(full_slice.k_range.start) != prompt_start
-                or int(full_slice.k_range.end) != prompt_end
-            ):
-                return False
-            index += 2
-    return True
-
-
-def _build_chunk_pair_program_generic(
+def _build_chunk_pair_program(
     row_spec: PackedRowAttentionSpec,
     *,
-    chunk_count: int,
-    chunk_size: int,
+    chunk_ranges: tuple[TokenRange, ...],
 ) -> tuple[torch.Tensor, list[float]]:
+    chunk_count = len(chunk_ranges)
+    if chunk_count == 0:
+        return torch.zeros((0, 0), dtype=torch.int64), []
+    chunk_size = int(chunk_ranges[0].size())
     pair_rows = [[0 for _ in range(chunk_count)] for _ in range(chunk_count)]
     q_weights = [0.0 for _ in range(chunk_count)]
 
@@ -651,138 +575,6 @@ def _build_chunk_pair_program_generic(
 
             if q_total > 0:
                 q_weights[q_chunk_index] += float(q_total)
-    return torch.tensor(pair_rows, dtype=torch.int64), q_weights
-
-
-def _build_chunk_pair_program(
-    row_spec: PackedRowAttentionSpec,
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-) -> tuple[torch.Tensor, list[float]]:
-    chunk_count = len(chunk_ranges)
-    if chunk_count == 0:
-        return torch.zeros((0, 0), dtype=torch.int64), []
-    chunk_size = int(chunk_ranges[0].size())
-    if not _can_use_shared_prefix_chunk_pair_program(row_spec):
-        return _build_chunk_pair_program_generic(
-            row_spec,
-            chunk_count=chunk_count,
-            chunk_size=chunk_size,
-        )
-
-    pair_rows = [[0 for _ in range(chunk_count)] for _ in range(chunk_count)]
-    q_weights = [0.0 for _ in range(chunk_count)]
-    slices = row_spec.slices
-    index = 0
-    while index < len(slices):
-        prompt_slice = slices[index]
-        (
-            prompt_first,
-            prompt_starts,
-            prompt_ends,
-            prompt_lengths,
-            prompt_prefix,
-            prompt_total,
-        ) = _chunk_piece_decomposition(
-            start=int(prompt_slice.q_range.start),
-            end=int(prompt_slice.q_range.end),
-            chunk_size=chunk_size,
-        )
-        for offset, q_chunk_index in enumerate(
-            range(prompt_first, prompt_first + len(prompt_lengths))
-        ):
-            q_piece_len = prompt_lengths[offset]
-            row = pair_rows[q_chunk_index]
-            q_total = 0
-            if offset > 0:
-                for k_offset in range(offset):
-                    row[prompt_first + k_offset] += (
-                        q_piece_len * prompt_lengths[k_offset]
-                    )
-                q_total += q_piece_len * prompt_prefix[offset - 1]
-            pair_count = _causal_piece_pair_count_from_bounds(
-                q_start=prompt_starts[offset],
-                q_end=prompt_ends[offset],
-                k_start=prompt_starts[offset],
-                k_end=prompt_ends[offset],
-            )
-            if pair_count > 0:
-                row[q_chunk_index] += pair_count
-                q_total += pair_count
-            if q_total > 0:
-                q_weights[q_chunk_index] += float(q_total)
-
-        prompt_family_index = prompt_slice.family_index
-        if prompt_family_index is None:
-            raise RuntimeError("shared-prefix prompt slices must carry family_index")
-        family_index = int(prompt_family_index)
-        index += 1
-        completion_chunk_indices: list[int] = []
-        completion_chunk_totals: list[int] = []
-        while index < len(slices):
-            family_value = slices[index].family_index
-            if family_value is None or int(family_value) != family_index:
-                break
-            full_slice = slices[index]
-            (
-                completion_first,
-                completion_starts,
-                completion_ends,
-                completion_lengths,
-                completion_prefix,
-                _,
-            ) = _chunk_piece_decomposition(
-                start=int(full_slice.q_range.start),
-                end=int(full_slice.q_range.end),
-                chunk_size=chunk_size,
-            )
-            for offset, q_chunk_index in enumerate(
-                range(completion_first, completion_first + len(completion_lengths))
-            ):
-                q_piece_len = completion_lengths[offset]
-                if (
-                    completion_chunk_indices
-                    and completion_chunk_indices[-1] == q_chunk_index
-                ):
-                    completion_chunk_totals[-1] += q_piece_len
-                else:
-                    completion_chunk_indices.append(q_chunk_index)
-                    completion_chunk_totals.append(q_piece_len)
-
-            for offset, q_chunk_index in enumerate(
-                range(completion_first, completion_first + len(completion_lengths))
-            ):
-                q_piece_len = completion_lengths[offset]
-                row = pair_rows[q_chunk_index]
-                q_total = 0
-                if offset > 0:
-                    for k_offset in range(offset):
-                        row[completion_first + k_offset] += (
-                            q_piece_len * completion_lengths[k_offset]
-                        )
-                    q_total += q_piece_len * completion_prefix[offset - 1]
-                pair_count = _causal_piece_pair_count_from_bounds(
-                    q_start=completion_starts[offset],
-                    q_end=completion_ends[offset],
-                    k_start=completion_starts[offset],
-                    k_end=completion_ends[offset],
-                )
-                if pair_count > 0:
-                    row[q_chunk_index] += pair_count
-                    q_total += pair_count
-                if q_total > 0:
-                    q_weights[q_chunk_index] += float(q_total)
-            index += 2
-
-        for q_chunk_index, total_q_len in zip(
-            completion_chunk_indices,
-            completion_chunk_totals,
-            strict=True,
-        ):
-            row = pair_rows[q_chunk_index]
-            for k_offset, k_piece_len in enumerate(prompt_lengths):
-                row[prompt_first + k_offset] += total_q_len * k_piece_len
-            q_weights[q_chunk_index] += float(total_q_len * prompt_total)
     return torch.tensor(pair_rows, dtype=torch.int64), q_weights
 
 
@@ -964,22 +756,6 @@ def _bucket_chunk_assignment(
         rank_loads[rank] += q_weights[chunk_index]
         rank_chunk_counts[rank] += 1
     return tuple(int(owner) for owner in owners)
-
-
-def _striped_chunk_assignment(
-    *,
-    chunk_count: int,
-    cp_size: int,
-    group_size: int,
-) -> tuple[int, ...]:
-    if chunk_count == 0:
-        return tuple()
-    if cp_size <= 1:
-        return tuple(0 for _ in range(chunk_count))
-    group_size = max(1, int(group_size))
-    return tuple(
-        ((chunk_index // group_size) % cp_size) for chunk_index in range(chunk_count)
-    )
 
 
 def _assignment_uses_all_ranks(
@@ -1469,31 +1245,6 @@ def _evaluate_plan(
     }
 
 
-def _evaluate_plan_for_search(
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-    pair_matrix: list[list[int]] | torch.Tensor,
-    owners: tuple[int, ...],
-    wave_assignment: tuple[int, ...],
-    cp_size: int,
-    config: ContextParallelConfig,
-    pair_positive: torch.Tensor | None = None,
-    chunk_lengths: tuple[int, ...] | None = None,
-    chunk_lengths_tensor: torch.Tensor | None = None,
-) -> dict[str, Any]:
-    return _evaluate_plan(
-        chunk_ranges=chunk_ranges,
-        pair_matrix=pair_matrix,
-        owners=owners,
-        wave_assignment=wave_assignment,
-        cp_size=cp_size,
-        config=config,
-        pair_positive=pair_positive,
-        chunk_lengths=chunk_lengths,
-        chunk_lengths_tensor=chunk_lengths_tensor,
-    )
-
-
 def _search_chunk_assignment(
     *,
     chunk_ranges: tuple[TokenRange, ...],
@@ -1533,7 +1284,7 @@ def _search_chunk_assignment(
         cached = eval_cache.get(cache_key)
         if cached is not None:
             return cached
-        cached = _evaluate_plan_for_search(
+        cached = _evaluate_plan(
             chunk_ranges=chunk_ranges,
             pair_matrix=pair_counts,
             owners=owners,
@@ -1571,23 +1322,17 @@ def _search_chunk_assignment(
         return best_wave_assignment, best_eval_local
 
     strategy = str(config.planner_assignment_strategy).strip().lower()
-    striped_owners = _striped_chunk_assignment(
-        chunk_count=len(chunk_ranges),
-        cp_size=cp_size,
-        group_size=int(config.planner_stripe_group_size),
-    )
     fixed_owners_by_strategy = {
         "contiguous": _contiguous_chunk_assignment(
             q_weights=q_weights, cp_size=cp_size
         ),
         "bucket": _bucket_chunk_assignment(q_weights=q_weights, cp_size=cp_size),
-        "striped": striped_owners,
     }
     if strategy in fixed_owners_by_strategy:
         owners = fixed_owners_by_strategy[strategy]
         best_waves, best_eval = _best_wave_assignment_for_owners(owners)
         return owners, best_waves, best_eval
-    if strategy not in {"search", "search_with_striped_seed"}:
+    if strategy != "search":
         raise ValueError(
             "Unsupported planner_assignment_strategy="
             f"{config.planner_assignment_strategy!r}."

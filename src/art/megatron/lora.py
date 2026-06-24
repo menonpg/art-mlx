@@ -1235,6 +1235,64 @@ def _parallel_lora(
     )
 
 
+def _expert_parallel_lora(
+    *,
+    adapter_model_prefix: str,
+    linear: Any,
+    out_features: int,
+    rank: int,
+    alpha: float,
+    layout: Literal["column", "row"],
+    num_local_experts: int,
+) -> LoRA:
+    return _parallel_lora(
+        adapter_model_prefix=adapter_model_prefix,
+        linear=linear,
+        out_features=out_features,
+        rank=rank,
+        alpha=alpha,
+        layout=layout,
+        shard_domain="expert_tp",
+        grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+        num_local_experts=num_local_experts,
+        allreduce=False,
+    )
+
+
+def _parallel_lora_pair(
+    *,
+    adapter_model_prefix: str,
+    linear: Any,
+    out_features: int,
+    rank: int,
+    alpha: float,
+    layout: Literal["column", "row"],
+    suffixes: tuple[str, str],
+    num_local_experts: int = 1,
+) -> tuple[LoRA, LoRA]:
+    make_lora = _expert_parallel_lora if num_local_experts > 1 else _parallel_lora
+    return (
+        make_lora(
+            adapter_model_prefix=f"{adapter_model_prefix}.{suffixes[0]}",
+            linear=linear,
+            out_features=out_features,
+            rank=rank,
+            alpha=alpha,
+            layout=layout,
+            num_local_experts=num_local_experts,
+        ),
+        make_lora(
+            adapter_model_prefix=f"{adapter_model_prefix}.{suffixes[1]}",
+            linear=linear,
+            out_features=out_features,
+            rank=rank,
+            alpha=alpha,
+            layout=layout,
+            num_local_experts=num_local_experts,
+        ),
+    )
+
+
 class SelfAttentionLinearProjLoRA(torch.nn.Module):
     def __init__(
         self,
@@ -1471,29 +1529,15 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         super().__init__()
         assert linear_fc1 is not None
         self.linear_fc1 = linear_fc1
-        self.gate_lora = _parallel_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_proj",
+        self.gate_lora, self.up_lora = _parallel_lora_pair(
+            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}",
             linear=linear_fc1,
             out_features=linear_fc1.out_features // 2,
             rank=rank,
             alpha=alpha,
             layout="column",
-            shard_domain="expert_tp",
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+            suffixes=("gate_proj", "up_proj"),
             num_local_experts=num_local_experts,
-            allreduce=False,
-        )
-        self.up_lora = _parallel_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
-            linear=linear_fc1,
-            out_features=linear_fc1.out_features // 2,
-            rank=rank,
-            alpha=alpha,
-            layout="column",
-            shard_domain="expert_tp",
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-            num_local_experts=num_local_experts,
-            allreduce=False,
         )
         self.uses_direct_quack_grouped_lora_dual = True
 
@@ -1517,17 +1561,14 @@ class MLPExpertsLinearFC1FusedLoRA(torch.nn.Module):
         super().__init__()
         assert linear_fc1 is not None
         self.linear_fc1 = linear_fc1
-        self.lora = _parallel_lora(
+        self.lora = _expert_parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
             linear=linear_fc1,
             out_features=linear_fc1.out_features,
             rank=rank,
             alpha=alpha,
             layout="column",
-            shard_domain="expert_tp",
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             num_local_experts=num_local_experts,
-            allreduce=False,
         )
         gate_out_features = linear_fc1.out_features // 2
         expert_tp_world_size = _get_shard_world_size("expert_tp")
@@ -1562,17 +1603,14 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         super().__init__()
         assert linear_fc2 is not None
         self.linear_fc2 = linear_fc2
-        self.lora = _parallel_lora(
+        self.lora = _expert_parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.down_proj",
             linear=linear_fc2,
             out_features=linear_fc2.out_features,
             rank=rank,
             alpha=alpha,
             layout="row",
-            shard_domain="expert_tp",
-            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             num_local_experts=num_local_experts,
-            allreduce=False,
         )
 
     def forward(
@@ -1600,21 +1638,14 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             linear_fc1.return_layernorm_output = True
             linear_fc1.return_layernorm_output_gathered = True
         self.linear_fc1 = linear_fc1
-        self.gate_lora = _parallel_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.gate_proj",
+        self.gate_lora, self.up_lora = _parallel_lora_pair(
+            adapter_model_prefix=adapter_model_prefix,
             linear=linear_fc1,
             out_features=linear_fc1.out_features // 2,
             rank=rank,
             alpha=alpha,
             layout="column",
-        )
-        self.up_lora = _parallel_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
-            linear=linear_fc1,
-            out_features=linear_fc1.out_features // 2,
-            rank=rank,
-            alpha=alpha,
-            layout="column",
+            suffixes=("gate_proj", "up_proj"),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1783,17 +1814,11 @@ def wrap_grouped_moe_experts(
             num_local_experts=experts.num_local_experts,
         )
     if _targets_include(target_modules, "down_proj"):
-        mlp_experts_linear_fc2 = _unwrap_attr(
-            experts.linear_fc2,
-            "linear_fc2",
-            TERowParallelGroupedLinear,  # type: ignore[arg-type]
-        )
-        experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-            linear_fc2=mlp_experts_linear_fc2,
+        _wrap_grouped_moe_fc2_lora(
+            experts,
+            adapter_model_prefix=adapter_model_prefix,
             rank=rank,
             alpha=alpha,
-            num_local_experts=experts.num_local_experts,
         )
 
 
@@ -1818,18 +1843,33 @@ def wrap_grouped_moe_experts_3d(
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
         )
-        mlp_experts_linear_fc2 = _unwrap_attr(
-            experts.linear_fc2,
-            "linear_fc2",
-            TERowParallelGroupedLinear,  # type: ignore[arg-type]
-        )
-        experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-            linear_fc2=mlp_experts_linear_fc2,
+        _wrap_grouped_moe_fc2_lora(
+            experts,
+            adapter_model_prefix=adapter_model_prefix,
             rank=rank,
             alpha=alpha,
-            num_local_experts=experts.num_local_experts,
         )
+
+
+def _wrap_grouped_moe_fc2_lora(
+    experts: TEGroupedMLP,
+    *,
+    adapter_model_prefix: str,
+    rank: int,
+    alpha: int,
+) -> None:
+    linear_fc2 = _unwrap_attr(
+        experts.linear_fc2,
+        "linear_fc2",
+        TERowParallelGroupedLinear,  # type: ignore[arg-type]
+    )
+    experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+        linear_fc2=linear_fc2,
+        rank=rank,
+        alpha=alpha,
+        num_local_experts=experts.num_local_experts,
+    )
 
 
 def wrap_dense_mlp(
@@ -1841,31 +1881,14 @@ def wrap_dense_mlp(
     rank: int,
     alpha: int,
 ) -> None:
-    if _targets_include(target_modules, "gate_proj", "up_proj"):
-        mlp_linear_fc1 = _unwrap_attr(
-            mlp.linear_fc1,
-            "linear_fc1",
-            (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
-        )
-        mlp.linear_fc1 = SharedExpertsLinearFC1LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp",
-            linear_fc1=mlp_linear_fc1,
-            rank=rank,
-            alpha=alpha,
-        )
-    if _targets_include(target_modules, "down_proj"):
-        mlp_linear_fc2 = _unwrap_attr(
-            mlp.linear_fc2,
-            "linear_fc2",
-            TERowParallelLinear,
-        )
-        mlp.linear_fc2 = SharedExpertsLinearFC2LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp",
-            linear_fc2=mlp_linear_fc2,
-            rank=rank,
-            alpha=alpha,
-            provider=provider,
-        )
+    _wrap_split_mlp_lora(
+        mlp,
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp",
+        provider=provider,
+        target_modules=target_modules,
+        rank=rank,
+        alpha=alpha,
+    )
 
 
 def wrap_shared_experts_mlp(
@@ -1877,27 +1900,46 @@ def wrap_shared_experts_mlp(
     rank: int,
     alpha: int,
 ) -> None:
+    _wrap_split_mlp_lora(
+        shared_experts,
+        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
+        provider=provider,
+        target_modules=target_modules,
+        rank=rank,
+        alpha=alpha,
+    )
+
+
+def _wrap_split_mlp_lora(
+    mlp: Any,
+    *,
+    adapter_model_prefix: str,
+    provider: GPTModelProvider,
+    target_modules: set[str],
+    rank: int,
+    alpha: int,
+) -> None:
     if _targets_include(target_modules, "gate_proj", "up_proj"):
-        shared_experts_linear_fc1 = _unwrap_attr(
-            shared_experts.linear_fc1,
+        linear_fc1 = _unwrap_attr(
+            mlp.linear_fc1,
             "linear_fc1",
             (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
         )
-        shared_experts.linear_fc1 = SharedExpertsLinearFC1LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
-            linear_fc1=shared_experts_linear_fc1,
+        mlp.linear_fc1 = SharedExpertsLinearFC1LoRA(
+            adapter_model_prefix=adapter_model_prefix,
+            linear_fc1=linear_fc1,
             rank=rank,
             alpha=alpha,
         )
     if _targets_include(target_modules, "down_proj"):
-        shared_experts_linear_fc2 = _unwrap_attr(
-            shared_experts.linear_fc2,
+        linear_fc2 = _unwrap_attr(
+            mlp.linear_fc2,
             "linear_fc2",
             TERowParallelLinear,
         )
-        shared_experts.linear_fc2 = SharedExpertsLinearFC2LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
-            linear_fc2=shared_experts_linear_fc2,
+        mlp.linear_fc2 = SharedExpertsLinearFC2LoRA(
+            adapter_model_prefix=adapter_model_prefix,
+            linear_fc2=linear_fc2,
             rank=rank,
             alpha=alpha,
             provider=provider,

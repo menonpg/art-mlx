@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import copy
 from functools import lru_cache
 import re
@@ -50,6 +51,9 @@ _VLLM_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
 )
+_ART_MOE_MODULES = ("gate_up_proj", "down_proj")
+_VLLM_EXPERT_MODULES = ("gate_proj", "up_proj", "down_proj")
+_LORA_NAMES = ("lora_A", "lora_B")
 
 
 class Qwen35BaseHandler(DefaultDenseHandler):
@@ -80,7 +84,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        if _group_art_moe_tensors(tensors):
+        if _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE):
             raise TypeError("Dense Qwen3.5 handler received MoE LoRA tensors")
         transformed: dict[str, torch.Tensor] = {}
         for key, tensor in tensors.items():
@@ -650,12 +654,16 @@ def _vllm_moe_config(
     return config
 
 
-def _group_art_moe_tensors(
+type _ExpertLoraGroups = dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]]
+
+
+def _group_expert_lora_tensors(
     tensors: dict[str, torch.Tensor],
-) -> dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]]:
-    grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+    pattern: re.Pattern[str],
+) -> _ExpertLoraGroups:
+    grouped: _ExpertLoraGroups = {}
     for key, tensor in tensors.items():
-        match = _ART_MOE_EXPERT_KEY_RE.match(key)
+        match = pattern.match(key)
         if match is None:
             continue
         grouped.setdefault(match.group("prefix"), {}).setdefault(
@@ -665,27 +673,57 @@ def _group_art_moe_tensors(
     return grouped
 
 
+def _expert_lora_key(prefix: str, expert: int, module: str, lora_name: str) -> str:
+    return f"{prefix}.{expert}.{module}.{lora_name}.weight"
+
+
+def _convert_remaining_lora_tensors(
+    transformed: dict[str, torch.Tensor],
+    tensors: dict[str, torch.Tensor],
+    *,
+    used_keys: set[str],
+    convert: Callable[
+        [str, torch.Tensor],
+        tuple[str, torch.Tensor],
+    ],
+    reject_fused_moe: bool = False,
+) -> None:
+    for key, tensor in tensors.items():
+        if key in used_keys:
+            continue
+        if reject_fused_moe and _VLLM_MOE_KEY_RE.match(key) is not None:
+            raise RuntimeError(
+                "Mixed fused and per-expert Qwen3.5 vLLM MoE LoRA tensors"
+            )
+        converted_key, converted = convert(key, tensor)
+        if converted_key in transformed:
+            raise RuntimeError(
+                f"Duplicate Qwen3.5 LoRA tensor after conversion: {converted_key}"
+            )
+        transformed[converted_key] = converted
+
+
 def _to_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    grouped = _group_art_moe_tensors(tensors)
+    grouped = _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
     has_shared_experts = _has_shared_expert_lora_tensors(tensors)
     transformed: dict[str, torch.Tensor] = {}
+    convert = lambda key, tensor: _to_vllm_lora_tensor(
+        key,
+        tensor,
+        adapter_config=adapter_config,
+    )
     if not grouped:
         has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in tensors)
-        for key, tensor in tensors.items():
-            vllm_key, tensor = _to_vllm_lora_tensor(
-                key,
-                tensor,
-                adapter_config=adapter_config,
-            )
-            if vllm_key in transformed:
-                raise RuntimeError(
-                    f"Duplicate Qwen3.5 LoRA tensor after conversion: {vllm_key}"
-                )
-            transformed[vllm_key] = tensor
+        _convert_remaining_lora_tensors(
+            transformed,
+            tensors,
+            used_keys=set(),
+            convert=convert,
+        )
         return transformed, (
             _vllm_moe_config(
                 adapter_config,
@@ -697,17 +735,21 @@ def _to_vllm_lora_tensors(
     used_keys: set[str] = set()
     for prefix, experts in grouped.items():
         vllm_prefix = _to_vllm_key(prefix)
-        gate_up_a: list[torch.Tensor] = []
-        gate_up_b: list[torch.Tensor] = []
-        down_a: list[torch.Tensor] = []
-        down_b: list[torch.Tensor] = []
+        blocks = {
+            ("gate_up_proj", "lora_A"): [],
+            ("gate_up_proj", "lora_B"): [],
+            ("down_proj", "lora_A"): [],
+            ("down_proj", "lora_B"): [],
+        }
         for expert in sorted(experts):
             modules = experts[expert]
             try:
-                gate_up_a_tensor = modules["gate_up_proj"]["lora_A"]
                 gate_up_b_tensor = modules["gate_up_proj"]["lora_B"]
-                d_a = modules["down_proj"]["lora_A"]
-                d_b = modules["down_proj"]["lora_B"]
+                expert_tensors = {
+                    (module_name, lora_name): modules[module_name][lora_name]
+                    for module_name in _ART_MOE_MODULES
+                    for lora_name in _LORA_NAMES
+                }
             except KeyError as exc:
                 raise RuntimeError(
                     f"Incomplete Qwen3.5 MoE LoRA block for {prefix}.{expert}"
@@ -717,34 +759,29 @@ def _to_vllm_lora_tensors(
                     f"{prefix}.{expert}: gate/up lora_B rows "
                     f"{gate_up_b_tensor.shape[0]} are not even"
                 )
-            gate_up_a.append(gate_up_a_tensor.contiguous())
-            gate_up_b.append(gate_up_b_tensor.contiguous())
-            down_a.append(d_a.contiguous())
-            down_b.append(d_b.contiguous())
-            for module_name in ("gate_up_proj", "down_proj"):
-                for lora_name in ("lora_A", "lora_B"):
-                    used_keys.add(f"{prefix}.{expert}.{module_name}.{lora_name}.weight")
+            for slot, tensor in expert_tensors.items():
+                blocks[slot].append(tensor.contiguous())
+                used_keys.add(_expert_lora_key(prefix, expert, *slot))
         transformed[f"{vllm_prefix}.base_layer.lora_A.weight"] = torch.cat(
-            gate_up_a,
+            blocks[("gate_up_proj", "lora_A")],
             dim=0,
         ).contiguous()
         transformed[f"{vllm_prefix}.base_layer.lora_B.weight"] = _pack_vllm_3d_lora_b(
-            gate_up_b
+            blocks[("gate_up_proj", "lora_B")]
         )
         transformed[f"{vllm_prefix}.lora_A.weight"] = torch.cat(
-            down_a,
+            blocks[("down_proj", "lora_A")],
             dim=0,
         ).contiguous()
-        transformed[f"{vllm_prefix}.lora_B.weight"] = _pack_vllm_3d_lora_b(down_b)
-    for key, tensor in tensors.items():
-        if key in used_keys:
-            continue
-        vllm_key, tensor = _to_vllm_lora_tensor(
-            key,
-            tensor,
-            adapter_config=adapter_config,
+        transformed[f"{vllm_prefix}.lora_B.weight"] = _pack_vllm_3d_lora_b(
+            blocks[("down_proj", "lora_B")]
         )
-        transformed[vllm_key] = tensor
+    _convert_remaining_lora_tensors(
+        transformed,
+        tensors,
+        used_keys=used_keys,
+        convert=convert,
+    )
     return transformed, _vllm_moe_config(
         adapter_config,
         has_shared_experts=has_shared_experts,
@@ -756,15 +793,12 @@ def _from_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
-    expert_grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
-    for key, tensor in tensors.items():
-        match = _VLLM_MOE_EXPERT_KEY_RE.match(key)
-        if match is None:
-            continue
-        expert_grouped.setdefault(match.group("prefix"), {}).setdefault(
-            int(match.group("expert")),
-            {},
-        ).setdefault(match.group("module"), {})[match.group("lora")] = tensor
+    convert = lambda key, tensor: _from_vllm_lora_tensor(
+        key,
+        tensor,
+        adapter_config=adapter_config,
+    )
+    expert_grouped = _group_expert_lora_tensors(tensors, _VLLM_MOE_EXPERT_KEY_RE)
     if expert_grouped:
         transformed: dict[str, torch.Tensor] = {}
         used_keys: set[str] = set()
@@ -772,16 +806,17 @@ def _from_vllm_lora_tensors(
             art_prefix = _from_vllm_key(prefix)
             for expert, modules in experts.items():
                 try:
-                    gate_a = modules["gate_proj"]["lora_A"]
-                    gate_b = modules["gate_proj"]["lora_B"]
-                    up_a = modules["up_proj"]["lora_A"]
-                    up_b = modules["up_proj"]["lora_B"]
-                    down_a = modules["down_proj"]["lora_A"]
-                    down_b = modules["down_proj"]["lora_B"]
+                    expert_tensors = {
+                        (module_name, lora_name): modules[module_name][lora_name]
+                        for module_name in _VLLM_EXPERT_MODULES
+                        for lora_name in _LORA_NAMES
+                    }
                 except KeyError as exc:
                     raise RuntimeError(
                         f"Incomplete Qwen3.5 vLLM MoE LoRA block for {prefix}.{expert}"
                     ) from exc
+                gate_a = expert_tensors[("gate_proj", "lora_A")]
+                up_a = expert_tensors[("up_proj", "lora_A")]
                 if not torch.equal(gate_a, up_a):
                     raise RuntimeError(
                         "Qwen3.5 Megatron gate_up_proj requires gate/up "
@@ -791,32 +826,29 @@ def _from_vllm_lora_tensors(
                     _clone(gate_a)
                 )
                 transformed[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"] = (
-                    torch.cat([gate_b, up_b], dim=0).contiguous()
+                    torch.cat(
+                        [
+                            expert_tensors[("gate_proj", "lora_B")],
+                            expert_tensors[("up_proj", "lora_B")],
+                        ],
+                        dim=0,
+                    ).contiguous()
                 )
                 transformed[f"{art_prefix}.{expert}.down_proj.lora_A.weight"] = _clone(
-                    down_a
+                    expert_tensors[("down_proj", "lora_A")]
                 )
                 transformed[f"{art_prefix}.{expert}.down_proj.lora_B.weight"] = _clone(
-                    down_b
+                    expert_tensors[("down_proj", "lora_B")]
                 )
-                for module_name in ("gate_proj", "up_proj", "down_proj"):
-                    for lora_name in ("lora_A", "lora_B"):
-                        used_keys.add(
-                            f"{prefix}.{expert}.{module_name}.{lora_name}.weight"
-                        )
-        for key, tensor in tensors.items():
-            if key in used_keys:
-                continue
-            if _VLLM_MOE_KEY_RE.match(key) is not None:
-                raise RuntimeError(
-                    "Mixed fused and per-expert Qwen3.5 vLLM MoE LoRA tensors"
-                )
-            art_key, tensor = _from_vllm_lora_tensor(
-                key,
-                tensor,
-                adapter_config=adapter_config,
-            )
-            transformed[art_key] = tensor
+                for slot in expert_tensors:
+                    used_keys.add(_expert_lora_key(prefix, expert, *slot))
+        _convert_remaining_lora_tensors(
+            transformed,
+            tensors,
+            used_keys=used_keys,
+            convert=convert,
+            reject_fused_moe=True,
+        )
         return transformed
 
     grouped: dict[str, dict[str, torch.Tensor]] = {}
@@ -830,13 +862,12 @@ def _from_vllm_lora_tensors(
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
     if not grouped:
         transformed: dict[str, torch.Tensor] = {}
-        for key, tensor in tensors.items():
-            art_key, tensor = _from_vllm_lora_tensor(
-                key,
-                tensor,
-                adapter_config=adapter_config,
-            )
-            transformed[art_key] = tensor
+        _convert_remaining_lora_tensors(
+            transformed,
+            tensors,
+            used_keys=set(),
+            convert=convert,
+        )
         return transformed
 
     rank = int(adapter_config["r"])
@@ -895,15 +926,12 @@ def _from_vllm_lora_tensors(
                 f"{prefix}.lora_B.weight",
             }
         )
-    for key, tensor in tensors.items():
-        if key in used_keys:
-            continue
-        art_key, tensor = _from_vllm_lora_tensor(
-            key,
-            tensor,
-            adapter_config=adapter_config,
-        )
-        transformed[art_key] = tensor
+    _convert_remaining_lora_tensors(
+        transformed,
+        tensors,
+        used_keys=used_keys,
+        convert=convert,
+    )
     return transformed
 
 
