@@ -784,7 +784,14 @@ class TrainerRank:
     def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
         materialized = _materialize(inputs)
         plan = self._plan_flat_forward(list(_flatten(materialized)))
-        self._raise_if_plan_will_not_fit(plan, context="dp_rank_forward")
+        check = self._memory_check(plan)
+        if not check.fits:
+            self._raise_memory_error(
+                plan,
+                check,
+                context="dp_rank_forward",
+                message="forward is predicted to exceed available memory",
+            )
         outputs = iter(
             self._run_flat_plan_with_memory_tracking(
                 plan,
@@ -1214,7 +1221,12 @@ class TrainerRank:
     ) -> tuple[tuple["LoRASlotRef | None", tuple[int, ...]], ...]:
         groups: dict[LoRASlotRef | None, list[int]] = {}
         for index, request in enumerate(requests):
-            if _request_has_outputs(request):
+            if (
+                request.target_tokens is not None
+                or request.logits
+                or request.top_k is not None
+                or request.hidden_states
+            ):
                 groups.setdefault(self._resolve_slot_ref(request), []).append(index)
         return tuple((slot_ref, tuple(indices)) for slot_ref, indices in groups.items())
 
@@ -1349,22 +1361,6 @@ class TrainerRank:
             estimated_required_bytes=required,
             available_bytes=available,
             fits=required <= available,
-        )
-
-    def _raise_if_plan_will_not_fit(
-        self,
-        plan: _FlatForwardPlan,
-        *,
-        context: str,
-    ) -> None:
-        check = self._memory_check(plan)
-        if check.fits:
-            return
-        self._raise_memory_error(
-            plan,
-            check,
-            context=context,
-            message="forward is predicted to exceed available memory",
         )
 
     def _raise_memory_error(
@@ -2262,15 +2258,6 @@ def _validate_top_k(top_k: int | None, model: "GPTModel") -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
-
-
-def _request_has_outputs(request: AnyForwardInput) -> bool:
-    return (
-        request.target_tokens is not None
-        or request.logits
-        or request.top_k is not None
-        or request.hidden_states
-    )
 
 
 def _request_mix_key(request: AnyForwardInput) -> str:
