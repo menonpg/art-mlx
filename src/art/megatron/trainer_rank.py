@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import (
     Callable,
     Iterable,
@@ -428,7 +427,7 @@ class _MemorySignature:
     topology: tuple[int, int, int, int]
     shared_prefix_max_depth: int
     slot_group_count: int
-    request_mix: tuple[tuple[str, int], ...]
+    request_mix: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1313,14 +1312,13 @@ class TrainerRank:
         *,
         slot_group_count: int,
     ) -> _MemorySignature:
-        mix = Counter[str]()
-        for request in requests:
-            mix[_request_mix_key(request)] += 1
         return _MemorySignature(
             topology=self._topology_key(),
             shared_prefix_max_depth=self.shared_prefix_max_depth,
             slot_group_count=slot_group_count,
-            request_mix=tuple((kind, 1) for kind in sorted(mix)),
+            request_mix=tuple(
+                sorted({_request_mix_key(request) for request in requests})
+            ),
         )
 
     def _topology_key(self) -> tuple[int, int, int, int]:

@@ -172,9 +172,9 @@ def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
     assert rank._estimate_matches_plan(estimate, plan)
     assert plan.request_count == 12
     assert plan.signature.request_mix == (
-        ("target:(2,)", 1),
-        ("target:single+hidden", 1),
-        ("target:single+topk:5", 1),
+        "target:(2,)",
+        "target:single+hidden",
+        "target:single+topk:5",
     )
 
 
