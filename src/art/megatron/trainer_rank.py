@@ -8,7 +8,6 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import zip_longest
 import os
@@ -674,24 +673,6 @@ class TrainerRank:
             return self._slot_stack[-1]
         return self._default_slot_ref
 
-    def _set_current_slot(self, ref: "LoRASlotRef | None") -> object:
-        from art.megatron.lora import set_lora_slot_context
-
-        return set_lora_slot_context(ref)
-
-    def _reset_current_slot(self, token: object) -> None:
-        from art.megatron.lora import reset_lora_slot_context
-
-        reset_lora_slot_context(token)  # type: ignore[arg-type]
-
-    @contextmanager
-    def _use_slot(self, ref: "LoRASlotRef | None") -> Iterator[None]:
-        token = self._set_current_slot(ref)
-        try:
-            yield
-        finally:
-            self._reset_current_slot(token)
-
     def forward_micro_batches(
         self,
         inputs: Iterable[ForwardInputsT],
@@ -878,7 +859,9 @@ class TrainerRank:
         all_params: list[torch.nn.Parameter] = []
         for name in checkpoint_names:
             slot_params = self._checkpoint_slot_params(name)
-            self._ensure_dynamic_grads(slot_params)
+            for param in slot_params:
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
             self._reduce_dynamic_grads(slot_params)
             if scale_grads != 1.0:
                 for param in slot_params:
@@ -932,24 +915,13 @@ class TrainerRank:
             )
         )
 
-    @staticmethod
-    def _ensure_dynamic_grads(params: Sequence[torch.nn.Parameter]) -> None:
-        for param in params:
-            if param.grad is None:
-                param.grad = torch.zeros_like(param)
-
     def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
         from megatron.core import parallel_state as ps
 
-        buckets: list[
-            tuple[
-                object,
-                dist.ReduceOp.RedOpType,
-                torch.dtype,
-                torch.device,
-                list[torch.Tensor],
-            ]
-        ] = []
+        buckets: dict[
+            tuple[int, str, torch.dtype, torch.device],
+            tuple[object, dist.ReduceOp.RedOpType, list[torch.Tensor]],
+        ] = {}
 
         def add_to_bucket(
             *,
@@ -957,22 +929,12 @@ class TrainerRank:
             op: dist.ReduceOp.RedOpType,
             grad: torch.Tensor,
         ) -> None:
-            for (
-                bucket_group,
-                bucket_op,
-                bucket_dtype,
-                bucket_device,
-                bucket_grads,
-            ) in buckets:
-                if (
-                    bucket_group is group
-                    and bucket_op == op
-                    and bucket_dtype == grad.dtype
-                    and bucket_device == grad.device
-                ):
-                    bucket_grads.append(grad)
-                    return
-            buckets.append((group, op, grad.dtype, grad.device, [grad]))
+            key = (id(group), str(op), grad.dtype, grad.device)
+            bucket = buckets.get(key)
+            if bucket is None:
+                buckets[key] = (group, op, [grad])
+            else:
+                bucket[2].append(grad)
 
         for param in params:
             grad = param.grad
@@ -998,7 +960,7 @@ class TrainerRank:
             reduce_op = dist.ReduceOp.AVG if op == "avg" else dist.ReduceOp.SUM
             add_to_bucket(group=tp_group, op=reduce_op, grad=grad)
 
-        for group, op, _dtype, _device, grads in buckets:
+        for group, op, grads in buckets.values():
             self._coalesced_all_reduce(grads, group=group, op=op)
 
     @staticmethod
@@ -1256,7 +1218,9 @@ class TrainerRank:
             for _ in range(plan.request_count)
         ]
         for group in plan.groups:
-            with self._use_slot(group.slot_ref):
+            from art.megatron.lora import use_lora_slot
+
+            with use_lora_slot(group.slot_ref):
                 prepared = self._prepare_packed_forward(group.packed)
                 item_outputs = self._forward_packed(group.items, prepared)
             for index, output in zip(group.request_indices, item_outputs, strict=True):
