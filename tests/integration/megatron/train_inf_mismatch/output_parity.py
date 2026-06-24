@@ -1126,55 +1126,65 @@ def score_context_parallel_runtime(
     rollout_mode: RolloutMode | None = "native_lora",
     global_grad_accumulation_sequences: int,
 ) -> ScoreBundle:
-    import torch
+    from art.megatron.training.microbatches import (
+        _clone_packed_tensors,
+        _zero_contribution_inputs,
+        build_micro_sample_indices,
+        select_indexed_inputs,
+        select_micro_inputs,
+    )
 
     controller = runtime.moe_routing_replay_controller
-    if controller is None:
-        return _score_context_parallel_once(
-            runtime=runtime,
-            packed_tensors=packed_tensors,
-            logical_tokens=logical_map.tokens,
-            sample_id_to_row=None,
-            side="megatron",
-            weight_state=weight_state,
-            rollout_mode=rollout_mode,
-        )
-
     target_logprobs: list[float] = []
     topk: list[TokenTopK] = []
     tokens_by_sample: dict[int, list[LogicalToken]] = {}
     for token in logical_map.tokens:
         tokens_by_sample.setdefault(token.sample_id, []).append(token)
     num_sequences = int(packed_tensors["tokens"].shape[0])
-    for sample_index in range(num_sequences):
-        sample_tensors = {
-            key: (
-                value[sample_index : sample_index + 1]
-                if isinstance(value, torch.Tensor)
-                and value.shape[:1] == packed_tensors["tokens"].shape[:1]
-                else value
-            )
-            for key, value in packed_tensors.items()
-        }
-        step_index = sample_index // global_grad_accumulation_sequences
-        controller.set_step(
+    template = _clone_packed_tensors(
+        select_indexed_inputs(cast(Any, packed_tensors), 0)
+    )
+    zero_template = _zero_contribution_inputs(template)
+    num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    for step_index in range(num_steps):
+        micro_indices = build_micro_sample_indices(
             step_index=step_index,
-            sample_index=sample_index,
+            num_sequences=num_sequences,
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
-        controller.begin_micro(sample_index, sample_index)
-        sample_score = _score_context_parallel_once(
-            runtime=runtime,
-            packed_tensors=sample_tensors,
-            logical_tokens=tokens_by_sample.get(sample_index, []),
-            sample_id_to_row={sample_index: 0},
-            side="megatron",
-            weight_state=weight_state,
-            rollout_mode=rollout_mode,
+        micro_inputs = select_micro_inputs(
+            cast(Any, packed_tensors),
+            micro_indices,
+            zero_template,
         )
-        controller.finalize_step()
-        target_logprobs.extend(sample_score.target_logprobs)
-        topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.set_step(
+                step_index=step_index,
+                sample_index=micro_indices,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
+        for micro_order, (sample_index, micro_input) in enumerate(
+            zip(micro_indices, micro_inputs, strict=True)
+        ):
+            if controller is not None:
+                controller.begin_micro(sample_index, micro_order)
+            sample_score = _score_context_parallel_once(
+                runtime=runtime,
+                packed_tensors=cast(dict[str, Any], micro_input),
+                logical_tokens=(
+                    []
+                    if sample_index is None
+                    else tokens_by_sample.get(sample_index, [])
+                ),
+                sample_id_to_row=({} if sample_index is None else {sample_index: 0}),
+                side="megatron",
+                weight_state=weight_state,
+                rollout_mode=rollout_mode,
+            )
+            target_logprobs.extend(sample_score.target_logprobs)
+            topk.extend(sample_score.topk)
+        if controller is not None:
+            controller.finalize_step()
     return ScoreBundle(
         side="megatron",
         weight_state=weight_state,
