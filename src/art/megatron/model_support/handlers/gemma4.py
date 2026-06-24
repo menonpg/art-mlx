@@ -37,6 +37,7 @@ from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     ExpertPackedLoraSlot,
+    FlexAttentionCompileCrashConfig,
     LayerFamilyInstance,
 )
 
@@ -48,6 +49,11 @@ _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "flex_token_dispatch_combine",
     "te_triton_permute_with_mask_map",
 )
+_GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES = {
+    # google/gemma-4-31B-it: Triton flex attention raises "No valid triton
+    # configs" for global attention head_dim=512 with backend-only options.
+    ("dense", 60, 5376, 32, 256, 512, 4),
+}
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
@@ -530,6 +536,19 @@ class Gemma4DenseHandler(DefaultDenseHandler):
             disable_compile=False,
         )
 
+    def flex_attention_compile_crash_config(
+        self,
+        provider: Any,
+    ) -> FlexAttentionCompileCrashConfig:
+        if (
+            _gemma4_compile_crash_signature(provider)
+            in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES
+        ):
+            return FlexAttentionCompileCrashConfig(
+                triton_num_stages_2_head_dims=(int(provider.global_head_dim),)
+            )
+        return FlexAttentionCompileCrashConfig()
+
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
         return _gemma4_forward_kwargs(model, **kwargs)
 
@@ -957,6 +976,18 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
     if len(pattern) == 1:
         return (int(pattern[0]), 0)
     return (int(pattern[0]), int(pattern[1]))
+
+
+def _gemma4_compile_crash_signature(provider: Any) -> tuple[Any, ...]:
+    return (
+        "moe" if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else "dense",
+        int(provider.num_layers),
+        int(provider.hidden_size),
+        int(provider.num_attention_heads),
+        int(provider.kv_channels),
+        int(getattr(provider, "global_head_dim", 0) or 0),
+        int(getattr(provider, "num_global_key_value_heads", 0) or 0),
+    )
 
 
 def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:
