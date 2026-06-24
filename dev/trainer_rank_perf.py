@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 import json
 import os
 from pathlib import Path
@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import typer
 
+import art.megatron.trainer_rank as trainer_rank_module
 from art.megatron.trainer_rank import (
     AdamParams,
     ForwardInput,
@@ -2077,8 +2078,30 @@ def _profiled_adaptive_micro_batch_training_step_body(
     start = 0
     stats: list[dict[str, int | bool | float]] = []
     while start < len(items):
-        candidate, select_ms = _timed_cuda(
-            rank, lambda: rank._select_next_micro_batch(items, start)
+        with _profile_adaptive_selection(rank) as select_profile:
+            candidate, select_ms = _timed_cuda(
+                rank, lambda: rank._select_next_micro_batch(items, start)
+            )
+        select_profile["select_plan_residual_ms"] = max(
+            0.0,
+            select_profile["select_plan_ms"]
+            - select_profile["select_forward_item_ms"]
+            - select_profile["select_pack_ms"]
+            - select_profile["select_output_estimate_ms"]
+            - select_profile["select_signature_ms"],
+        )
+        select_profile["select_memory_check_residual_ms"] = max(
+            0.0,
+            select_profile["select_memory_check_ms"]
+            - select_profile["select_memory_estimate_ms"]
+            - select_profile["select_available_memory_ms"],
+        )
+        select_profile["select_residual_ms"] = max(
+            0.0,
+            select_ms
+            - select_profile["select_plan_ms"]
+            - select_profile["select_memory_check_ms"]
+            - select_profile["select_profile_check_ms"],
         )
         flat_outputs, execute_ms = _timed_cuda(
             rank,
@@ -2120,6 +2143,7 @@ def _profiled_adaptive_micro_batch_training_step_body(
                 "loss_ms": loss_ms,
                 "backward_ms": backward_ms,
                 "optim_ms": 0.0,
+                **select_profile,
             }
         )
         rank._last_global_micro_batch_size = candidate.stats_global_count
@@ -2131,6 +2155,137 @@ def _profiled_adaptive_micro_batch_training_step_body(
         stats[-1]["optim_ms"] = optim_ms
     stats_sink[:] = stats
     return metrics
+
+
+@contextmanager
+def _profile_adaptive_selection(rank: TrainerRank) -> Any:
+    stats = {
+        "select_plan_ms": 0.0,
+        "select_plan_calls": 0,
+        "select_forward_item_ms": 0.0,
+        "select_forward_item_calls": 0,
+        "select_pack_ms": 0.0,
+        "select_pack_calls": 0,
+        "select_output_estimate_ms": 0.0,
+        "select_output_estimate_calls": 0,
+        "select_signature_ms": 0.0,
+        "select_signature_calls": 0,
+        "select_memory_check_ms": 0.0,
+        "select_memory_check_calls": 0,
+        "select_memory_estimate_ms": 0.0,
+        "select_memory_estimate_calls": 0,
+        "select_available_memory_ms": 0.0,
+        "select_available_memory_calls": 0,
+        "select_profile_check_ms": 0.0,
+        "select_profile_check_calls": 0,
+    }
+
+    def timed(key: str, calls_key: str, fn: Callable[..., object], *args: object) -> object:
+        start = time.perf_counter()
+        try:
+            return fn(*args)
+        finally:
+            stats[key] += (time.perf_counter() - start) * 1000.0
+            stats[calls_key] += 1
+
+    original_plan = rank._plan_flat_forward
+    original_forward_item = rank._forward_item
+    original_pack = trainer_rank_module._pack_forward_items
+    original_output_estimate = rank._estimate_group_output_bytes
+    original_signature = rank._memory_signature
+    original_memory_check = rank._memory_check
+    original_memory_estimate = rank._estimate_required_memory_bytes
+    original_available = rank._available_memory_bytes
+    original_profile_check = rank._all_ranks_have_memory_profile
+
+    def plan_wrapper(requests: object) -> object:
+        return timed("select_plan_ms", "select_plan_calls", original_plan, requests)
+
+    def forward_item_wrapper(request: object) -> object:
+        return timed(
+            "select_forward_item_ms",
+            "select_forward_item_calls",
+            original_forward_item,
+            request,
+        )
+
+    def pack_wrapper(*args: object, **kwargs: object) -> object:
+        start = time.perf_counter()
+        try:
+            return original_pack(*args, **kwargs)
+        finally:
+            stats["select_pack_ms"] += (time.perf_counter() - start) * 1000.0
+            stats["select_pack_calls"] += 1
+
+    def output_estimate_wrapper(items: object) -> object:
+        return timed(
+            "select_output_estimate_ms",
+            "select_output_estimate_calls",
+            original_output_estimate,
+            items,
+        )
+
+    def signature_wrapper(requests: object, plans: object) -> object:
+        return timed(
+            "select_signature_ms",
+            "select_signature_calls",
+            original_signature,
+            requests,
+            plans,
+        )
+
+    def memory_check_wrapper(plan: object) -> object:
+        return timed(
+            "select_memory_check_ms",
+            "select_memory_check_calls",
+            original_memory_check,
+            plan,
+        )
+
+    def memory_estimate_wrapper(plan: object) -> object:
+        return timed(
+            "select_memory_estimate_ms",
+            "select_memory_estimate_calls",
+            original_memory_estimate,
+            plan,
+        )
+
+    def available_wrapper() -> object:
+        return timed(
+            "select_available_memory_ms",
+            "select_available_memory_calls",
+            original_available,
+        )
+
+    def profile_check_wrapper(plan: object) -> object:
+        return timed(
+            "select_profile_check_ms",
+            "select_profile_check_calls",
+            original_profile_check,
+            plan,
+        )
+
+    rank._plan_flat_forward = plan_wrapper  # type: ignore[method-assign]
+    rank._forward_item = forward_item_wrapper  # type: ignore[method-assign]
+    trainer_rank_module._pack_forward_items = pack_wrapper  # type: ignore[assignment]
+    rank._estimate_group_output_bytes = output_estimate_wrapper  # type: ignore[method-assign]
+    rank._memory_signature = signature_wrapper  # type: ignore[method-assign]
+    rank._memory_check = memory_check_wrapper  # type: ignore[method-assign]
+    rank._estimate_required_memory_bytes = memory_estimate_wrapper  # type: ignore[method-assign]
+    rank._available_memory_bytes = available_wrapper  # type: ignore[method-assign]
+    rank._all_ranks_have_memory_profile = profile_check_wrapper  # type: ignore[method-assign]
+    try:
+        yield stats
+    finally:
+        rank._plan_flat_forward = original_plan  # type: ignore[method-assign]
+        rank._forward_item = original_forward_item  # type: ignore[method-assign]
+        trainer_rank_module._pack_forward_items = original_pack  # type: ignore[assignment]
+        rank._estimate_group_output_bytes = original_output_estimate  # type: ignore[method-assign]
+        rank._memory_signature = original_signature  # type: ignore[method-assign]
+        rank._memory_check = original_memory_check  # type: ignore[method-assign]
+        rank._estimate_required_memory_bytes = original_memory_estimate  # type: ignore[method-assign]
+        rank._available_memory_bytes = original_available  # type: ignore[method-assign]
+        rank._all_ranks_have_memory_profile = original_profile_check  # type: ignore[method-assign]
 
 
 def _timed_cuda(
@@ -2240,13 +2395,13 @@ def _record_profile_stats(
     name: str,
     stats: Sequence[dict[str, int | bool | float]],
 ) -> None:
-    fields = (
-        "select_ms",
-        "execute_ms",
-        "unflatten_ms",
-        "loss_ms",
-        "backward_ms",
-        "optim_ms",
+    fields = sorted(
+        {
+            key
+            for stat in stats
+            for key, value in stat.items()
+            if key.endswith("_ms") and isinstance(value, int | float)
+        }
     )
     for field in fields:
         total = sum(float(stat.get(field, 0.0)) for stat in stats)
@@ -2254,6 +2409,21 @@ def _record_profile_stats(
         metadata[f"{name}_{field}_max"] = round(
             max((float(stat.get(field, 0.0)) for stat in stats), default=0.0),
             3,
+        )
+    call_fields = sorted(
+        {
+            key
+            for stat in stats
+            for key, value in stat.items()
+            if key.endswith("_calls") and isinstance(value, int | float)
+        }
+    )
+    for field in call_fields:
+        metadata[f"{name}_{field}_sum"] = int(
+            sum(int(stat.get(field, 0)) for stat in stats)
+        )
+        metadata[f"{name}_{field}_max"] = int(
+            max((int(stat.get(field, 0)) for stat in stats), default=0)
         )
 
 
