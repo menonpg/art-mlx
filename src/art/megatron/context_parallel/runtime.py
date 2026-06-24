@@ -4,7 +4,6 @@ from bisect import bisect_left, bisect_right
 import hashlib
 import json
 from typing import Any, cast
-import warnings
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -28,17 +27,12 @@ from .types import (
     PackedBatchAttentionSpec,
     PackedRowAttentionSpec,
     ParallelTopology,
-    PlannerProvenance,
     PreparedMegatronBatch,
     RankRuntimePlan,
     StagePlan,
     TokenRange,
 )
 
-_PLANNER_RUNTIME_BACKEND = "art_context_parallel"
-_PLANNER_BEST_EFFORT_WARNING_KEYS: set[
-    tuple[str, str, int, str, str, tuple[int, ...]]
-] = set()
 _CHUNK_MASK_STATS_TORCH_THRESHOLD = 1024
 _CP4_SEARCH_PROBE_CANDIDATE_LIMIT = 2
 _CP4_SEARCH_PROBE_IMPROVEMENT_MS = 1.0
@@ -126,157 +120,6 @@ def _rank_plan_cache_key(
     cp_rank: int,
 ) -> tuple[str, str, int | None, int]:
     return (planning_key, device.type, device.index, int(cp_rank))
-
-
-def _config_for_runtime_cp(
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-) -> ContextParallelConfig:
-    cp_size = max(int(topology.cp), 1)
-    updates: dict[str, Any] = {}
-    applied_override = False
-    for override in config.planner_cp_overrides:
-        if int(override.cp_size) != cp_size:
-            continue
-        override_updates = override.model_dump(mode="python", exclude_none=True)
-        override_updates.pop("cp_size", None)
-        updates.update(override_updates)
-        applied_override = True
-    if not applied_override:
-        return config
-    updates.setdefault("planner_tuned_cp_sizes", (cp_size,))
-    return config.model_copy(update=updates)
-
-
-def _normalized_planner_metadata_value(value: str | None) -> str:
-    if value is None:
-        return ""
-    normalized = "".join(
-        character.lower() if character.isalnum() else " "
-        for character in str(value).strip()
-    )
-    return " ".join(part for part in normalized.split() if part)
-
-
-def _planner_metadata_matches(
-    expected: str | None,
-    actual: str | None,
-    *,
-    fuzzy: bool,
-) -> bool:
-    normalized_expected = _normalized_planner_metadata_value(expected)
-    normalized_actual = _normalized_planner_metadata_value(actual)
-    if not normalized_expected or not normalized_actual:
-        return False
-    if normalized_expected == normalized_actual:
-        return True
-    return bool(
-        fuzzy
-        and (
-            normalized_expected in normalized_actual
-            or normalized_actual in normalized_expected
-        )
-    )
-
-
-def _planner_runtime_hardware() -> str | None:
-    if not torch.cuda.is_available():
-        return None
-    try:
-        return str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    except Exception:
-        return str(torch.cuda.get_device_name(0))
-
-
-def _planner_best_effort_warning_message(provenance: PlannerProvenance) -> str:
-    mismatch_reasons: list[str] = []
-    if not provenance.backend_match:
-        mismatch_reasons.append(
-            f"backend runtime={provenance.runtime_backend!r} tuned={provenance.tuned_backend!r}"
-        )
-    if not provenance.hardware_match:
-        mismatch_reasons.append(
-            f"hardware runtime={provenance.runtime_hardware!r} tuned={provenance.tuned_hardware!r}"
-        )
-    if not provenance.cp_size_match:
-        mismatch_reasons.append(
-            f"cp_size runtime={int(provenance.runtime_cp_size)} tuned={list(provenance.tuned_cp_sizes)}"
-        )
-    mismatch_text = (
-        "; ".join(mismatch_reasons) if mismatch_reasons else "metadata missing"
-    )
-    return (
-        "ART context parallel planner coefficients are running in best-effort mode; "
-        f"{mismatch_text}. The runtime will continue with the configured coefficients."
-    )
-
-
-def _planner_provenance(
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    warn: bool = True,
-) -> PlannerProvenance:
-    runtime_hardware = _planner_runtime_hardware()
-    tuned_cp_sizes = tuple(
-        sorted(
-            {
-                int(cp_size)
-                for cp_size in config.planner_tuned_cp_sizes
-                if int(cp_size) > 0
-            }
-        )
-    )
-    provenance = PlannerProvenance(
-        runtime_backend=_PLANNER_RUNTIME_BACKEND,
-        runtime_hardware=runtime_hardware,
-        runtime_cp_size=max(int(topology.cp), 1),
-        tuned_backend=config.planner_tuned_backend,
-        tuned_hardware=config.planner_tuned_hardware,
-        tuned_cp_sizes=tuned_cp_sizes,
-        backend_match=_planner_metadata_matches(
-            config.planner_tuned_backend,
-            _PLANNER_RUNTIME_BACKEND,
-            fuzzy=False,
-        ),
-        hardware_match=_planner_metadata_matches(
-            config.planner_tuned_hardware,
-            runtime_hardware,
-            fuzzy=True,
-        ),
-        cp_size_match=bool(tuned_cp_sizes)
-        and max(int(topology.cp), 1) in tuned_cp_sizes,
-        using_best_effort=False,
-    )
-    if (
-        provenance.backend_match
-        and provenance.hardware_match
-        and provenance.cp_size_match
-    ):
-        return provenance
-
-    warning_message = _planner_best_effort_warning_message(provenance)
-    warning_key = (
-        _normalized_planner_metadata_value(provenance.runtime_backend),
-        _normalized_planner_metadata_value(provenance.runtime_hardware),
-        int(provenance.runtime_cp_size),
-        _normalized_planner_metadata_value(provenance.tuned_backend),
-        _normalized_planner_metadata_value(provenance.tuned_hardware),
-        provenance.tuned_cp_sizes,
-    )
-    warning_emitted = False
-    if warn and warning_key not in _PLANNER_BEST_EFFORT_WARNING_KEYS:
-        _PLANNER_BEST_EFFORT_WARNING_KEYS.add(warning_key)
-        warnings.warn(warning_message, RuntimeWarning, stacklevel=3)
-        warning_emitted = True
-    return provenance.model_copy(
-        update={
-            "using_best_effort": True,
-            "warning_message": warning_message,
-            "warning_emitted": warning_emitted,
-        }
-    )
 
 
 def _normalized_chunk_size(
@@ -1804,11 +1647,10 @@ def build_context_parallel_token_layout_index(
             ownership_ranges_by_rank=(((0, valid_tokens, 0),) if valid_tokens else (),),
             token_counts_by_rank=(valid_tokens,),
         )
-    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
     _row_spec, chunk_ranges, owners, _wave_assignment = _runtime_plan_assignment(
         spec,
         topology=topology,
-        config=runtime_config,
+        config=config,
     )
     del original_seq_len
     return _build_runtime_token_layout_index(
@@ -1909,12 +1751,11 @@ def prepare_megatron_context_parallel_state(
         )
     group_ids_cpu = _planning_metadata_cpu(micro["group_ids"])
     parent_ids_cpu = _planning_metadata_cpu(micro["parent_ids"])
-    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
     planning_key = _planning_bundle_cache_key(
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
         topology=topology,
-        config=runtime_config,
+        config=config,
         original_seq_len=int(micro["tokens"].shape[1]),
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
@@ -1924,11 +1765,11 @@ def prepare_megatron_context_parallel_state(
             group_ids=group_ids_cpu,
             parent_ids=parent_ids_cpu,
         )
-        runtime_key = make_runtime_key(spec, topology=topology, config=runtime_config)
+        runtime_key = make_runtime_key(spec, topology=topology, config=config)
         runtime_plan = get_or_build_runtime_plan(
             spec,
             topology=topology,
-            config=runtime_config,
+            config=config,
             runtime_key=runtime_key,
             original_seq_len=int(micro["tokens"].shape[1]),
         )
@@ -1975,22 +1816,16 @@ def prepare_megatron_context_parallel_state(
                 attention_token_layout_index=rank_plan.token_layout_index,
             )
             _cache_put(_GDN_RANK_PLAN_CACHE, rank_gdn_key, gdn_execution_plan)
-    planner_provenance = _planner_provenance(
-        topology=topology,
-        config=runtime_config,
-        warn=int(cp_rank) == 0,
-    )
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1
     state = ArtContextParallelState(
         runtime_key=bundle.runtime_key,
         rank_plan=rank_plan,
         cp_group=cp_group,
-        config=runtime_config,
+        config=config,
         group_ids=group_ids_cpu[0].contiguous(),
         parent_ids=parent_ids_cpu[0].contiguous(),
         gdn_execution_spec=bundle.gdn_execution_spec,
         gdn_execution_plan=gdn_execution_plan,
-        planner_provenance=planner_provenance,
         trace_token_uids=None,
     )
     return state, rank_plan, bundle.spec, pad_multiple

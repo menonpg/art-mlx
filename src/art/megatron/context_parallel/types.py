@@ -60,36 +60,6 @@ class SharedPrefixBuilderConfig(BaseModel):
     require_contiguous_group_runs: bool = True
 
 
-class PlannerCpOverride(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    cp_size: int
-    block_size: int | None = None
-    planner_chunk_size: int | None = None
-    planner_chunk_budget_base: int | None = None
-    planner_chunk_budget_per_cp_rank: int | None = None
-    planner_assignment_strategy: str | None = None
-    planner_max_search_steps: int | None = None
-    planner_candidate_chunk_limit: int | None = None
-    planner_max_remote_waves: int | None = None
-    planner_stage_overhead_ms: float | None = None
-    planner_comm_stage_overhead_ms: float | None = None
-    planner_interval_overhead_ms: float | None = None
-    planner_merge_q_token_ms: float | None = None
-    planner_fetch_token_ms: float | None = None
-    planner_reduce_token_ms: float | None = None
-    planner_local_pair_ms: float | None = None
-    planner_remote_pair_ms: float | None = None
-    planner_local_backward_pair_ms: float | None = None
-    planner_remote_backward_pair_ms: float | None = None
-    planner_remote_stage_token_floor: int | None = None
-    planner_remote_stage_pair_floor: int | None = None
-    planner_remote_stage_underfill_ms: float | None = None
-    planner_tuned_backend: str | None = None
-    planner_tuned_hardware: str | None = None
-    planner_tuned_cp_sizes: tuple[int, ...] | None = None
-
-
 class ContextParallelConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -115,10 +85,6 @@ class ContextParallelConfig(BaseModel):
     planner_remote_stage_token_floor: int = 4096
     planner_remote_stage_pair_floor: int = 4_000_000
     planner_remote_stage_underfill_ms: float = 0.287151
-    planner_tuned_backend: str | None = "art_context_parallel"
-    planner_tuned_hardware: str | None = "NVIDIA H200"
-    planner_tuned_cp_sizes: tuple[int, ...] = (2, 4)
-    planner_cp_overrides: tuple[PlannerCpOverride, ...] = ()
 
 
 class ParallelTopology(BaseModel):
@@ -239,23 +205,6 @@ class StageExecutionSpec(BaseModel):
     mask_metadata: "ExactMaskMetadata | None" = None
 
 
-class PlannerProvenance(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    runtime_backend: str
-    runtime_hardware: str | None = None
-    runtime_cp_size: int
-    tuned_backend: str | None = None
-    tuned_hardware: str | None = None
-    tuned_cp_sizes: tuple[int, ...] = ()
-    backend_match: bool
-    hardware_match: bool
-    cp_size_match: bool
-    using_best_effort: bool
-    warning_message: str | None = None
-    warning_emitted: bool = False
-
-
 class ArtContextParallelState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -276,7 +225,6 @@ class ArtContextParallelState(BaseModel):
     )
     gdn_attention_token_uids: torch.Tensor | None = None
     gdn_active_module: Any | None = None
-    planner_provenance: PlannerProvenance
     trace_token_uids: torch.Tensor | None = None
     execution_cache: ContextParallelExecutionCache = Field(
         default_factory=ContextParallelExecutionCache

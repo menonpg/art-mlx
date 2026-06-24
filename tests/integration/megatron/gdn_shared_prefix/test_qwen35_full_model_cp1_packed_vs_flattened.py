@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-import socket
+from pathlib import Path
+import tempfile
 from typing import Any
 
 import pytest
@@ -31,6 +32,7 @@ from ..model_support.oracle_worker import (
     _apply_test_flex_inner_fp32_patch,
 )
 from .cases import default_phase0_cases
+from .distributed_init import file_init_method
 from .metrics import (
     GDN_CORRECTNESS_DTYPE,
     MEAN_ABS_PCT_THRESHOLD,
@@ -431,28 +433,23 @@ def _single_rank_model_parallel() -> Iterator[None]:
     if is_initialized():
         pytest.skip("torch.distributed is already initialized in this process.")
     torch.cuda.set_device(0)
-    init_process_group(
-        backend="nccl",
-        init_method=f"tcp://127.0.0.1:{_find_free_port()}",
-        rank=0,
-        world_size=1,
-    )
-    try:
-        ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
+    with tempfile.TemporaryDirectory(prefix="art_dist_") as tmp:
+        init_process_group(
+            backend="nccl",
+            init_method=file_init_method(Path(tmp), "qwen35_full_model_cp1"),
+            rank=0,
+            world_size=1,
         )
-        yield
-    finally:
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            ps.destroy_model_parallel()
-        if is_initialized():
-            destroy_process_group()
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+        try:
+            ps.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                context_parallel_size=1,
+                expert_model_parallel_size=1,
+            )
+            yield
+        finally:
+            if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+                ps.destroy_model_parallel()
+            if is_initialized():
+                destroy_process_group()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-import socket
 from typing import Any
 
 import pytest
@@ -30,6 +29,7 @@ from .cases import (  # noqa: E402
     default_phase0_cases,
 )
 from .distributed_grad import all_reduce_parameter_grads_coalesced  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import (  # noqa: E402
     GDN_CORRECTNESS_DTYPE,
     REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
@@ -51,10 +51,10 @@ def test_gdn_cp_packed_matches_cp1_oracle_all_edge_cases(
     cp_size: int, tmp_path: Path
 ) -> None:
     _skip_without_gpus(cp_size)
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"cp1_oracle_cp{cp_size}")
     mp.spawn(
         _cp1_oracle_worker,
-        args=(cp_size, port, str(tmp_path), False),
+        args=(cp_size, init_method, str(tmp_path), False),
         nprocs=cp_size,
         join=True,
     )
@@ -67,10 +67,10 @@ def test_gdn_cp_packed_sibling_order_matches_cp1_oracle(
     cp_size: int, tmp_path: Path
 ) -> None:
     _skip_without_gpus(cp_size)
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"cp1_oracle_sibling_cp{cp_size}")
     mp.spawn(
         _cp1_oracle_worker,
-        args=(cp_size, port, str(tmp_path), True),
+        args=(cp_size, init_method, str(tmp_path), True),
         nprocs=cp_size,
         join=True,
     )
@@ -81,10 +81,10 @@ def test_gdn_cp_packed_sibling_order_matches_cp1_oracle(
 @pytest.mark.parametrize("cp_size", (2, 4))
 def test_gdn_cp_tree_chain_matches_cp1_oracle(cp_size: int, tmp_path: Path) -> None:
     _skip_without_gpus(cp_size)
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"tree_chain_cp{cp_size}")
     mp.spawn(
         _tree_chain_oracle_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -95,10 +95,10 @@ def test_gdn_cp_tree_chain_matches_cp1_oracle(cp_size: int, tmp_path: Path) -> N
 def test_gdn_cp_tree_fuzz_matches_cp1_oracle(tmp_path: Path) -> None:
     cp_size = 4
     _skip_without_gpus(cp_size)
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, "tree_fuzz_cp4")
     mp.spawn(
         _tree_fuzz_oracle_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -109,14 +109,14 @@ def test_gdn_cp_tree_fuzz_matches_cp1_oracle(tmp_path: Path) -> None:
 def _cp1_oracle_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
     sibling_only: bool,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -158,13 +158,13 @@ def _cp1_oracle_worker(
 def _tree_chain_oracle_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -197,13 +197,13 @@ def _tree_chain_oracle_worker(
 def _tree_fuzz_oracle_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -754,9 +754,3 @@ def _swap_siblings(tensor: torch.Tensor) -> torch.Tensor:
 def _skip_without_gpus(cp_size: int) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
         pytest.skip(f"Need {cp_size} CUDA devices for CP{cp_size} packed GDN.")
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
