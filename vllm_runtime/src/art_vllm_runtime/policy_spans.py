@@ -476,18 +476,31 @@ def _patch_load_inplace_storage() -> None:
 
 
 def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
-    state = getattr(runner, "execute_model_state", None)
-    if state is None:
+    input_batch = getattr(runner, "input_batch", None)
+    if input_batch is None:
+        state = getattr(runner, "execute_model_state", None)
+        input_batch = getattr(state, "input_batch", None)
+    if input_batch is None:
         return {}
-    input_batch = state.input_batch
     lora_state = getattr(runner, "lora_state", None)
     context: dict[str, dict[str, Any]] = {}
     for req_id in input_batch.req_ids:
-        lora_request = None
-        if lora_state is not None:
-            lora_request = lora_state.lora_requests.get(req_id)
+        lora_request = _lora_request_for_input_batch_req(input_batch, req_id)
+        if lora_request is None and lora_state is not None:
+            lora_request = getattr(lora_state, "lora_requests", {}).get(req_id)
         context[req_id] = _policy_metadata_for_lora_request(lora_request)
     return context
+
+
+def _lora_request_for_input_batch_req(input_batch: Any, req_id: str) -> Any | None:
+    req_index = getattr(input_batch, "req_id_to_index", {}).get(req_id)
+    request_lora_mapping = getattr(input_batch, "request_lora_mapping", None)
+    if req_index is None or request_lora_mapping is None:
+        return None
+    lora_id = int(request_lora_mapping[req_index])
+    if lora_id <= 0:
+        return None
+    return getattr(input_batch, "lora_id_to_lora_request", {}).get(lora_id)
 
 
 def _policy_metadata_for_lora_request(lora_request: Any | None) -> dict[str, Any]:
