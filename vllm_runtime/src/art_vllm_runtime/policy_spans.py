@@ -52,6 +52,7 @@ def _patch_model_runner_output_type() -> None:
         art_policy_token_spans: dict[str, list[dict[str, Any]]] | None = None
 
     ModelRunnerOutput.__module__ = outputs_mod.__name__
+    ModelRunnerOutput.__qualname__ = "ModelRunnerOutput"
     outputs_mod.ModelRunnerOutput = ModelRunnerOutput
     for module_name in (
         "vllm.v1.worker.gpu.model_runner",

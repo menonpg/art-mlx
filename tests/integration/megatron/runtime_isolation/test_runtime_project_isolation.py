@@ -92,7 +92,7 @@ def test_runtime_policy_spans_read_final_request_output(artifact_dir: Path) -> N
             "python",
             "-c",
             (
-                "import json; "
+                "import json, pickle; "
                 "from types import SimpleNamespace; "
                 "from art_vllm_runtime.policy_spans import ("
                 "ART_POLICY_TOKEN_SPANS_FIELD, "
@@ -141,7 +141,7 @@ def test_runtime_policy_spans_accumulate_engine_core_outputs(
             "python",
             "-c",
             (
-                "import json; "
+                "import json, pickle; "
                 "from types import SimpleNamespace; "
                 "from art_vllm_runtime.policy_spans import ("
                 "ART_POLICY_TOKEN_SPANS_FIELD, "
@@ -194,7 +194,7 @@ def test_runtime_policy_spans_declares_model_runner_output_field(
             "python",
             "-c",
             (
-                "import json; "
+                "import json, pickle; "
                 "from dataclasses import fields; "
                 "from art_vllm_runtime.policy_spans import ("
                 "ART_POLICY_TOKEN_SPANS_FIELD, patch_policy_token_spans"
@@ -208,10 +208,12 @@ def test_runtime_policy_spans_declares_model_runner_output_field(
                 "req_ids=['r'], req_id_to_index={'r': 0}, "
                 "sampled_token_ids=[[1, 2]], art_policy_token_spans=spans"
                 "); "
+                "roundtrip = pickle.loads(pickle.dumps(output)); "
                 "print(json.dumps({"
                 "'has_field': ART_POLICY_TOKEN_SPANS_FIELD in "
                 "[field.name for field in fields(ModelRunnerOutput)], "
-                "'spans': getattr(output, ART_POLICY_TOKEN_SPANS_FIELD)"
+                "'spans': getattr(output, ART_POLICY_TOKEN_SPANS_FIELD), "
+                "'roundtrip_spans': getattr(roundtrip, ART_POLICY_TOKEN_SPANS_FIELD)"
                 "}, sort_keys=True))"
             ),
         ],
@@ -225,6 +227,17 @@ def test_runtime_policy_spans_declares_model_runner_output_field(
     assert json.loads(result.stdout.strip()) == {
         "has_field": True,
         "spans": {
+            "r": [
+                {
+                    "start_token": 0,
+                    "end_token": 2,
+                    "policy_version": 7,
+                    "lora_slot": "m:active",
+                    "update_seq": 3,
+                }
+            ]
+        },
+        "roundtrip_spans": {
             "r": [
                 {
                     "start_token": 0,
