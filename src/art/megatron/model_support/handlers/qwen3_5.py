@@ -313,44 +313,14 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-        from megatron.core.transformer.attention import SelfAttention
-        from megatron.core.transformer.transformer_layer import TransformerLayer
-
-        from art.megatron.lora import _is_language_transformer_layer_name
-        from art.megatron.weights.adapter_export import (
-            add_gated_delta_net_adapter_weights,
-            add_standard_self_attention_adapter_weights,
-            layer_base_prefix,
-        )
+        from art.megatron.weights import adapter_export
 
         _ensure_bridge_qwen35_adapter_name_map()
-        adapter_weights_by_base: dict[str, list[Any]] = {}
-        for chunk in model_chunks:
-            for module_name, module in chunk.named_modules():
-                if not isinstance(module, TransformerLayer):
-                    continue
-                if not _is_language_transformer_layer_name(module_name):
-                    continue
-                layer_prefix = layer_base_prefix(module, module_name=module_name)
-                if isinstance(module.self_attention, SelfAttention):
-                    add_standard_self_attention_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        self_attention=module.self_attention,
-                    )
-                elif isinstance(module.self_attention, GatedDeltaNet):
-                    add_gated_delta_net_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        self_attention=module.self_attention,
-                    )
-                self._add_mlp_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    module=module,
-                )
-        return adapter_weights_by_base
+        return adapter_export.build_transformer_layer_adapter_weights(
+            model_chunks,
+            grouped_moe=self.is_moe,
+            language_layers_only=True,
+        )
 
     def _wrap_mlp_lora(
         self,
@@ -372,22 +342,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
             target_modules=target_modules,
             rank=rank,
             alpha=alpha,
-        )
-
-    def _add_mlp_adapter_weights(
-        self,
-        adapter_weights_by_base: dict[str, list[Any]],
-        *,
-        layer_prefix: str,
-        module: Any,
-    ) -> None:
-        from art.megatron.weights.adapter_export import add_dense_mlp_adapter_weights
-
-        _require_dense_mlp(module)
-        add_dense_mlp_adapter_weights(
-            adapter_weights_by_base,
-            layer_prefix=layer_prefix,
-            mlp=module.mlp,
         )
 
     def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
@@ -504,31 +458,6 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
                 target_modules=target_modules,
                 rank=rank,
                 alpha=alpha,
-            )
-
-    def _add_mlp_adapter_weights(
-        self,
-        adapter_weights_by_base: dict[str, list[Any]],
-        *,
-        layer_prefix: str,
-        module: Any,
-    ) -> None:
-        from art.megatron.weights.adapter_export import (
-            add_grouped_moe_adapter_weights,
-            add_shared_experts_adapter_weights,
-        )
-
-        add_grouped_moe_adapter_weights(
-            adapter_weights_by_base,
-            layer_prefix=layer_prefix,
-            experts=_require_moe_experts(module),
-        )
-        shared_experts = getattr(module.mlp, "shared_experts", None)
-        if shared_experts is not None:
-            add_shared_experts_adapter_weights(
-                adapter_weights_by_base,
-                layer_prefix=layer_prefix,
-                shared_experts=shared_experts,
             )
 
     def compile_workaround_config(

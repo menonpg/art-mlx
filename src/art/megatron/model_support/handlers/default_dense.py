@@ -168,32 +168,9 @@ class DefaultDenseHandler:
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]:
-        from megatron.core.transformer.transformer_layer import TransformerLayer
+        from art.megatron.weights import adapter_export
 
-        from art.megatron.weights.adapter_export import (
-            add_dense_mlp_adapter_weights,
-            add_standard_self_attention_adapter_weights,
-            layer_base_prefix,
-        )
-
-        adapter_weights_by_base: dict[str, list[Any]] = {}
-        for chunk in model_chunks:
-            for module_name, module in chunk.named_modules():
-                if not isinstance(module, TransformerLayer):
-                    continue
-                layer_prefix = layer_base_prefix(module, module_name=module_name)
-                _require_dense_mlp(module)
-                add_standard_self_attention_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    self_attention=module.self_attention,
-                )
-                add_dense_mlp_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    mlp=module.mlp,
-                )
-        return adapter_weights_by_base
+        return adapter_export.build_transformer_layer_adapter_weights(model_chunks)
 
     def compile_workaround_config(
         self,
@@ -276,39 +253,12 @@ class DefaultMoeHandler(DefaultDenseHandler):
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]:
-        from megatron.core.transformer.transformer_layer import TransformerLayer
+        from art.megatron.weights import adapter_export
 
-        from art.megatron.weights.adapter_export import (
-            add_grouped_moe_adapter_weights,
-            add_shared_experts_adapter_weights,
-            add_standard_self_attention_adapter_weights,
-            layer_base_prefix,
+        return adapter_export.build_transformer_layer_adapter_weights(
+            model_chunks,
+            grouped_moe=True,
         )
-
-        adapter_weights_by_base: dict[str, list[Any]] = {}
-        for chunk in model_chunks:
-            for module_name, module in chunk.named_modules():
-                if not isinstance(module, TransformerLayer):
-                    continue
-                layer_prefix = layer_base_prefix(module, module_name=module_name)
-                add_standard_self_attention_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    self_attention=module.self_attention,
-                )
-                add_grouped_moe_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    experts=_require_moe_experts(module),
-                )
-                shared_experts = getattr(module.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    add_shared_experts_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        shared_experts=shared_experts,
-                    )
-        return adapter_weights_by_base
 
 
 def _require_dense_mlp(module: Any) -> None:
