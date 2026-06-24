@@ -11,6 +11,7 @@ from art.megatron.trainer_rank import (
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
+    _anchor_disconnected_target_logprobs,
     _MemoryCheck,
     _validate_top_k,
 )
@@ -257,3 +258,17 @@ def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
     logits_bytes = 3 * 10 * 4
     hidden_bytes = 3 * 4 * 4
     assert plan.output_bytes == target_bytes + topk_bytes + logits_bytes + hidden_bytes
+
+
+def test_disconnected_target_logprobs_keep_zero_graph_anchor() -> None:
+    hidden = torch.randn(2, 3, requires_grad=True)
+    disconnected = torch.zeros(4)
+
+    (anchored,) = _anchor_disconnected_target_logprobs([disconnected], hidden)
+
+    assert anchored is not None
+    assert anchored.requires_grad
+    torch.testing.assert_close(anchored, disconnected)
+    anchored.sum().backward()
+    assert hidden.grad is not None
+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))

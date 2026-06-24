@@ -1651,6 +1651,11 @@ class TrainerRank:
                 label_rows=label_rows,
             )
 
+        target_logprobs = _anchor_disconnected_target_logprobs(
+            target_logprobs,
+            hidden_by_row,
+        )
+        top_k = _anchor_disconnected_topk(top_k, hidden_by_row)
         return _HeadOutputs(target_logprobs, top_k, logits)
 
     def _project_full_logits(
@@ -2520,6 +2525,51 @@ def _scatter_row_target_logprobs(
             0,
             match.row_offsets,
         )
+
+
+def _anchor_disconnected_target_logprobs(
+    target_logprobs: list[torch.Tensor | None],
+    hidden_by_row: torch.Tensor,
+) -> list[torch.Tensor | None]:
+    if not hidden_by_row.requires_grad:
+        return target_logprobs
+    anchor: torch.Tensor | None = None
+    anchored: list[torch.Tensor | None] = []
+    for item_logprobs in target_logprobs:
+        if item_logprobs is None or item_logprobs.requires_grad:
+            anchored.append(item_logprobs)
+            continue
+        if anchor is None:
+            anchor = _zero_graph_anchor(hidden_by_row)
+        anchored.append(item_logprobs + anchor)
+    return anchored
+
+
+def _anchor_disconnected_topk(
+    top_k: list[TopK | None],
+    hidden_by_row: torch.Tensor,
+) -> list[TopK | None]:
+    if not hidden_by_row.requires_grad:
+        return top_k
+    anchor: torch.Tensor | None = None
+    anchored: list[TopK | None] = []
+    for item_top_k in top_k:
+        if item_top_k is None or item_top_k.logprobs.requires_grad:
+            anchored.append(item_top_k)
+            continue
+        if anchor is None:
+            anchor = _zero_graph_anchor(hidden_by_row)
+        anchored.append(
+            TopK(
+                logprobs=item_top_k.logprobs + anchor,
+                tokens=item_top_k.tokens,
+            )
+        )
+    return anchored
+
+
+def _zero_graph_anchor(hidden_by_row: torch.Tensor) -> torch.Tensor:
+    return hidden_by_row.reshape(-1)[:1].float().sum() * 0.0
 
 
 def _topk_from_full_logits(
