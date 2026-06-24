@@ -213,7 +213,10 @@ def _interval_block_has_any(
         if q_state.max_abs < min_abs:
             continue
         in_subtree = (q_state.enter_values >= enter) & (q_state.enter_values < exit)
-        if bool(in_subtree.any()) and int(q_state.abs_values[in_subtree].max()) >= min_abs:
+        if (
+            bool(in_subtree.any())
+            and int(q_state.abs_values[in_subtree].max()) >= min_abs
+        ):
             return True
     return False
 

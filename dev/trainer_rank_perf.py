@@ -2112,6 +2112,7 @@ def _profiled_adaptive_micro_batch_training_step_body(
                 context="target_trainer_adaptive_profile_train_step",
             ),
         )
+
         def unflatten_outputs() -> list[object]:
             flat_iter = iter(flat_outputs)
             return [_unflatten(item, flat_iter) for item in candidate.inputs]
@@ -2192,7 +2193,9 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
         "select_profile_check_calls": 0,
     }
 
-    def timed(key: str, calls_key: str, fn: Callable[..., object], *args: object) -> object:
+    def timed(
+        key: str, calls_key: str, fn: Callable[..., object], *args: object
+    ) -> object:
         start = time.perf_counter()
         try:
             return fn(*args)

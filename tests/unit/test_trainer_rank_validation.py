@@ -98,7 +98,9 @@ def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:
     assert not hasattr(trainer, "micro_batches")
 
 
-def test_forward_micro_batches_uses_deterministic_dp_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forward_micro_batches_uses_deterministic_dp_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (1, 2))
     monkeypatch.setattr(
@@ -109,7 +111,9 @@ def test_forward_micro_batches_uses_deterministic_dp_windows(monkeypatch: pytest
         ],
     )
 
-    batches = list(trainer.forward_micro_batches([_target_request(i) for i in range(5)]))
+    batches = list(
+        trainer.forward_micro_batches([_target_request(i) for i in range(5)])
+    )
 
     assert [batch.indices for batch in batches] == [(1,), (3,), ()]
     assert [len(batch.outputs) for batch in batches] == [1, 1, 0]
@@ -136,17 +140,23 @@ def test_forward_micro_batches_outputs_match_top_level_nested_inputs(
     assert len(batch.outputs[0]) == 2
 
 
-def test_forward_micro_batches_ramps_after_first_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forward_micro_batches_ramps_after_first_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
 
     def run(plan, **_kwargs):
         trainer._memory_profiles[plan.signature] = 0.0
-        return [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)]
+        return [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ]
 
     monkeypatch.setattr(trainer, "_run_flat_plan_with_memory_tracking", run)
 
-    batches = list(trainer.forward_micro_batches([_target_request(i) for i in range(8)]))
+    batches = list(
+        trainer.forward_micro_batches([_target_request(i) for i in range(8)])
+    )
 
     assert batches[0].stats.global_count == 1
     assert batches[0].stats.cold_start
@@ -186,7 +196,9 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
         ],
     )
 
-    batch = next(iter(trainer.forward_micro_batches([_target_request(i) for i in range(8)])))
+    batch = next(
+        iter(trainer.forward_micro_batches([_target_request(i) for i in range(8)]))
+    )
 
     assert batch.stats.global_count == 3
     assert batch.stats.rejected_candidates >= 1

@@ -1106,8 +1106,7 @@ class TrainerRank:
                     first.check,
                     context="forward_micro_batches",
                     message=(
-                        "smallest DP microbatch is predicted to exceed "
-                        "available memory"
+                        "smallest DP microbatch is predicted to exceed available memory"
                     ),
                 )
             if self._all_ranks_have_memory_profile_estimate(
@@ -1133,8 +1132,7 @@ class TrainerRank:
                     first.check,
                     context="forward_micro_batches",
                     message=(
-                        "smallest DP microbatch is predicted to exceed "
-                        "available memory"
+                        "smallest DP microbatch is predicted to exceed available memory"
                     ),
                 )
 
@@ -1298,7 +1296,9 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return 0, 1
 
-    def _plan_flat_forward(self, requests: Sequence[AnyForwardInput]) -> _FlatForwardPlan:
+    def _plan_flat_forward(
+        self, requests: Sequence[AnyForwardInput]
+    ) -> _FlatForwardPlan:
         active_indices = [
             index
             for index, request in enumerate(requests)
@@ -1316,7 +1316,9 @@ class TrainerRank:
         output_bytes = 0
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         for slot_ref, group_indices in groups.items():
-            items = tuple(self._forward_item(requests[index]) for index in group_indices)
+            items = tuple(
+                self._forward_item(requests[index]) for index in group_indices
+            )
             packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
             output_bytes += self._estimate_group_output_bytes(items)
             plans.append(
@@ -1422,9 +1424,7 @@ class TrainerRank:
             with self._use_slot(group.slot_ref):
                 prepared = self._prepare_packed_forward(group.packed)
                 item_outputs = self._forward_packed(group.items, prepared)
-            for index, output in zip(
-                group.request_indices, item_outputs, strict=True
-            ):
+            for index, output in zip(group.request_indices, item_outputs, strict=True):
                 outputs[index] = output
         return outputs
 
@@ -1444,8 +1444,10 @@ class TrainerRank:
             if request.target_tokens is not None:
                 total += int(request.target_tokens.numel()) * _dtype_size(torch.float32)
             if request.top_k is not None:
-                total += seq_len * int(request.top_k) * (
-                    _dtype_size(torch.float32) + _dtype_size(torch.long)
+                total += (
+                    seq_len
+                    * int(request.top_k)
+                    * (_dtype_size(torch.float32) + _dtype_size(torch.long))
                 )
             if request.logits:
                 if model is None:
@@ -1470,8 +1472,10 @@ class TrainerRank:
             if labels is not None:
                 total += int(labels.numel()) * _dtype_size(torch.float32)
             if item.request.top_k is not None:
-                total += seq_len * int(item.request.top_k) * (
-                    _dtype_size(torch.float32) + _dtype_size(torch.long)
+                total += (
+                    seq_len
+                    * int(item.request.top_k)
+                    * (_dtype_size(torch.float32) + _dtype_size(torch.long))
                 )
             if item.request.logits:
                 if model is None:
@@ -1695,7 +1699,9 @@ class TrainerRank:
             return bool(value.item())
         return local
 
-    def _update_memory_profile(self, plan: _FlatForwardPlan, peak_delta_bytes: int) -> None:
+    def _update_memory_profile(
+        self, plan: _FlatForwardPlan, peak_delta_bytes: int
+    ) -> None:
         if plan.packed_tokens <= 0:
             return
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)

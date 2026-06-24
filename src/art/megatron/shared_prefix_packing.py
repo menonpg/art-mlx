@@ -241,11 +241,7 @@ def estimate_shared_prefix_packed_tokens(
         active = tuple(index for index in indices if lengths[index] > start)
         if not active:
             return 0
-        if (
-            max_depth == 0
-            or len(active) == 1
-            or (has_parent and depth >= max_depth)
-        ):
+        if max_depth == 0 or len(active) == 1 or (has_parent and depth >= max_depth):
             return sum(lengths[index] - start for index in active)
 
         end = shared_end(active, start)
