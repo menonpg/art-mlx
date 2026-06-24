@@ -1828,9 +1828,9 @@ def _target_hidden_loss(
     hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
     outputs = rank._project_head(items, prepared, hidden)
     losses = [
-        -target_logprobs.sum()
-        for target_logprobs in outputs.target_logprobs
-        if target_logprobs is not None
+        -output.target_logprobs.sum()
+        for output in outputs
+        if output.target_logprobs is not None
     ]
     if not losses:
         raise RuntimeError("target logprobs were not produced")
@@ -2543,7 +2543,7 @@ def _target_correctness_metrics(
         max_abs_diff = torch.tensor(0.0, device=rank.device)
         for native, candidate in zip(
             native_logprobs,
-            head_outputs.target_logprobs,
+            (output.target_logprobs for output in head_outputs),
             strict=True,
         ):
             if candidate is None:

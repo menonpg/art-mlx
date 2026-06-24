@@ -410,13 +410,6 @@ class _PreparedPackedForward:
 
 
 @dataclass(frozen=True)
-class _HeadOutputs:
-    target_logprobs: list[torch.Tensor | None]
-    top_k: list[TopK | None]
-    logits: list[torch.Tensor | None]
-
-
-@dataclass(frozen=True)
 class _RowMatch:
     source_offsets: torch.Tensor
     row_offsets: torch.Tensor
@@ -1465,25 +1458,7 @@ class TrainerRank:
         hidden_by_row = self._gather_sequence_parallel_hidden(
             self._decoder_hidden(prepared)
         )
-        head_outputs = self._project_head(items, prepared, hidden_by_row)
-        outputs: list[AnyForwardOutput] = []
-        for index, (item, positions) in enumerate(
-            zip(items, prepared.positions_by_item, strict=True)
-        ):
-            hidden_states = (
-                _select_positions(hidden_by_row, positions)
-                if item.request.hidden_states
-                else None
-            )
-            outputs.append(
-                ForwardOutput(
-                    target_logprobs=head_outputs.target_logprobs[index],
-                    top_k=head_outputs.top_k[index],
-                    logits=head_outputs.logits[index],
-                    hidden_states=hidden_states,
-                )
-            )
-        return outputs
+        return self._project_head(items, prepared, hidden_by_row)
 
     def _decoder_hidden(
         self,
@@ -1537,7 +1512,7 @@ class TrainerRank:
         items: Sequence[_ForwardItem],
         prepared: _PreparedPackedForward,
         hidden_by_row: torch.Tensor,
-    ) -> "_HeadOutputs":
+    ) -> list[AnyForwardOutput]:
         model = _language_model(self.runtime.model[0])
         output_weight = (
             model.shared_embedding_or_output_weight()
@@ -1633,7 +1608,21 @@ class TrainerRank:
             hidden_by_row,
         )
         top_k = _anchor_disconnected_topk(top_k, hidden_by_row)
-        return _HeadOutputs(target_logprobs, top_k, logits)
+        return [
+            ForwardOutput(
+                target_logprobs=target_logprobs[index],
+                top_k=top_k[index],
+                logits=logits[index],
+                hidden_states=(
+                    _select_positions(hidden_by_row, positions)
+                    if item.request.hidden_states
+                    else None
+                ),
+            )
+            for index, (item, positions) in enumerate(
+                zip(items, prepared.positions_by_item, strict=True)
+            )
+        ]
 
     def _project_full_logits(
         self,

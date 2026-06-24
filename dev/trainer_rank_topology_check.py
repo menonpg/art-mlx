@@ -655,23 +655,7 @@ def _outputs_from_hidden(
         torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None
     ]
 ]:
-    head_outputs = rank._project_head(items, prepared, hidden)
-    outputs = []
-    for index, (item, positions) in enumerate(
-        zip(items, prepared.positions_by_item, strict=True)
-    ):
-        hidden_states = (
-            _select_positions(hidden, positions) if item.request.hidden_states else None
-        )
-        outputs.append(
-            ForwardOutput(
-                target_logprobs=head_outputs.target_logprobs[index],
-                top_k=head_outputs.top_k[index],
-                logits=head_outputs.logits[index],
-                hidden_states=hidden_states,
-            )
-        )
-    return outputs
+    return rank._project_head(items, prepared, hidden)
 
 
 def _packed_oracle_from_hidden(
