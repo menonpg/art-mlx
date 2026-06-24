@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, MutableMapping, Sequence
+from collections.abc import (
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import zip_longest
@@ -1299,28 +1306,18 @@ class TrainerRank:
     def _plan_flat_forward(
         self, requests: Sequence[AnyForwardInput]
     ) -> _FlatForwardPlan:
-        active_indices = [
-            index
-            for index, request in enumerate(requests)
-            if request.target_tokens is not None
-            or request.logits
-            or request.top_k is not None
-            or request.hidden_states
-        ]
-
-        groups: dict[LoRASlotRef | None, list[int]] = {}
-        for index in active_indices:
-            groups.setdefault(self._resolve_slot_ref(requests[index]), []).append(index)
-
         plans: list[_ForwardGroupPlan] = []
         output_bytes = 0
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
-        for slot_ref, group_indices in groups.items():
+        groups = self._group_active_request_indices(requests)
+        for slot_ref, group_indices in groups:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
             packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
-            output_bytes += self._estimate_group_output_bytes(items)
+            output_bytes += self._estimate_group_request_output_bytes(
+                [item.request for item in items]
+            )
             plans.append(
                 _ForwardGroupPlan(
                     slot_ref=slot_ref,
@@ -1342,23 +1339,11 @@ class TrainerRank:
     def _estimate_flat_forward(
         self, requests: Sequence[AnyForwardInput]
     ) -> _FlatForwardEstimate | None:
-        active_indices = [
-            index
-            for index, request in enumerate(requests)
-            if request.target_tokens is not None
-            or request.logits
-            or request.top_k is not None
-            or request.hidden_states
-        ]
-
-        groups: dict[LoRASlotRef | None, list[int]] = {}
-        for index in active_indices:
-            groups.setdefault(self._resolve_slot_ref(requests[index]), []).append(index)
-
+        groups = self._group_active_request_indices(requests)
         packed_tokens = 0
         output_bytes = 0
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
-        for group_indices in groups.values():
+        for _, group_indices in groups:
             group_packed_tokens = estimate_shared_prefix_packed_tokens(
                 (requests[index].input_tokens for index in group_indices),
                 max_depth=self.shared_prefix_max_depth,
@@ -1380,6 +1365,16 @@ class TrainerRank:
                 slot_group_count=len(groups),
             ),
         )
+
+    def _group_active_request_indices(
+        self,
+        requests: Sequence[AnyForwardInput],
+    ) -> tuple[tuple["LoRASlotRef | None", tuple[int, ...]], ...]:
+        groups: dict[LoRASlotRef | None, list[int]] = {}
+        for index, request in enumerate(requests):
+            if _request_has_outputs(request):
+                groups.setdefault(self._resolve_slot_ref(request), []).append(index)
+        return tuple((slot_ref, tuple(indices)) for slot_ref, indices in groups.items())
 
     def _run_flat_plan_with_memory_tracking(
         self,
@@ -1458,34 +1453,6 @@ class TrainerRank:
                 total += seq_len * hidden_size * dtype_size
         return total
 
-    def _estimate_group_output_bytes(self, items: Sequence[_ForwardItem]) -> int:
-        model: GPTModel | None
-        try:
-            model = _language_model(self.runtime.model[0])
-        except RuntimeError:
-            model = None
-        dtype_size = _dtype_size(next(self.runtime.model[0].parameters()).dtype)
-        total = 0
-        for item in items:
-            seq_len = int(item.input_ids.numel())
-            labels = item.labels
-            if labels is not None:
-                total += int(labels.numel()) * _dtype_size(torch.float32)
-            if item.request.top_k is not None:
-                total += (
-                    seq_len
-                    * int(item.request.top_k)
-                    * (_dtype_size(torch.float32) + _dtype_size(torch.long))
-                )
-            if item.request.logits:
-                if model is None:
-                    raise RuntimeError("logits output memory requires a GPT model")
-                total += seq_len * _padded_vocab_size(model) * dtype_size
-            if item.request.hidden_states:
-                hidden_size = _hidden_size(model, self.runtime.provider)
-                total += seq_len * hidden_size * dtype_size
-        return total
-
     def _memory_signature(
         self,
         requests: Sequence[AnyForwardInput],
@@ -1504,18 +1471,7 @@ class TrainerRank:
     ) -> _MemorySignature:
         mix = Counter[str]()
         for request in requests:
-            parts = []
-            if request.target_tokens is not None:
-                target = request.target_tokens
-                tail_shape = tuple(target.shape[request.input_tokens.ndim :])
-                parts.append(f"target:{tail_shape or 'single'}")
-            if request.top_k is not None:
-                parts.append(f"topk:{int(request.top_k)}")
-            if request.logits:
-                parts.append("logits")
-            if request.hidden_states:
-                parts.append("hidden")
-            mix["+".join(parts) if parts else "inactive"] += 1
+            mix[_request_mix_key(request)] += 1
         return _MemorySignature(
             topology=self._topology_key(),
             shared_prefix_max_depth=self.shared_prefix_max_depth,
@@ -2503,6 +2459,30 @@ def _validate_top_k(top_k: int | None, model: "GPTModel") -> None:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
 
 
+def _request_has_outputs(request: AnyForwardInput) -> bool:
+    return (
+        request.target_tokens is not None
+        or request.logits
+        or request.top_k is not None
+        or request.hidden_states
+    )
+
+
+def _request_mix_key(request: AnyForwardInput) -> str:
+    parts = []
+    if request.target_tokens is not None:
+        target = request.target_tokens
+        tail_shape = tuple(target.shape[request.input_tokens.ndim :])
+        parts.append(f"target:{tail_shape or 'single'}")
+    if request.top_k is not None:
+        parts.append(f"topk:{int(request.top_k)}")
+    if request.logits:
+        parts.append("logits")
+    if request.hidden_states:
+        parts.append("hidden")
+    return "+".join(parts) if parts else "inactive"
+
+
 def _is_native_target_only(items: Sequence[_ForwardItem]) -> bool:
     return all(
         item.labels is not None
@@ -3263,14 +3243,14 @@ def _batch_seq_logits(logits: torch.Tensor, *, seq_len: int) -> torch.Tensor:
 def _materialize(inputs: ForwardInputs) -> ForwardInputs:
     if isinstance(inputs, ForwardInput):
         return inputs
-    return [_materialize(item) for item in inputs]
+    return [_materialize(item) for item in _nested_forward_children(inputs)]
 
 
 def _flatten(inputs: ForwardInputs) -> Iterator[AnyForwardInput]:
     if isinstance(inputs, ForwardInput):
         yield inputs
         return
-    for item in inputs:
+    for item in _nested_forward_children(inputs):
         yield from _flatten(item)
 
 
@@ -3279,7 +3259,27 @@ def _unflatten(
 ) -> ForwardOutputs:
     if isinstance(template, ForwardInput):
         return next(outputs)
-    return [_unflatten(item, outputs) for item in template]
+    return [_unflatten(item, outputs) for item in _nested_forward_children(template)]
+
+
+def _nested_forward_children(inputs: ForwardInputs) -> Iterator[ForwardInputs]:
+    if isinstance(inputs, Mapping):
+        raise TypeError(
+            "dict was passed directly to TrainerRank; gather or materialize the "
+            "values into a list/tuple so nested forward output ordering is explicit"
+        )
+    if isinstance(inputs, str | bytes):
+        raise TypeError(
+            "TrainerRank forward inputs must be ForwardInput objects or nested "
+            "iterables of ForwardInput objects, not strings"
+        )
+    try:
+        return iter(cast(Iterable[ForwardInputs], inputs))
+    except TypeError as exc:
+        raise TypeError(
+            "TrainerRank forward inputs must be ForwardInput objects or nested "
+            "iterables of ForwardInput objects"
+        ) from exc
 
 
 __all__ = [
