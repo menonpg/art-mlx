@@ -7,6 +7,7 @@ with Pydantic after the OpenAI response crosses back into the training process.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 import re
 import sys
 from typing import Any
@@ -25,6 +26,7 @@ _WORKER_LORA_UPDATE_SEQ = 0
 
 
 def patch_policy_token_spans() -> None:
+    _patch_model_runner_output_type()
     _patch_engine_core_output_type()
     _patch_worker_policy_span_capture()
     _patch_scheduler_policy_span_transport()
@@ -32,6 +34,34 @@ def patch_policy_token_spans() -> None:
     _patch_openai_response_policy_spans()
     _patch_lora_alias_resolution()
     _patch_load_inplace_storage()
+
+
+def _patch_model_runner_output_type() -> None:
+    import vllm.v1.outputs as outputs_mod
+
+    if getattr(outputs_mod, "_art_policy_token_spans_model_runner_patched", False):
+        return
+
+    BaseModelRunnerOutput = outputs_mod.ModelRunnerOutput
+
+    @dataclass
+    class ModelRunnerOutput(BaseModelRunnerOutput):  # type: ignore[misc, valid-type]
+        # This object crosses the worker->scheduler process boundary. Dynamic
+        # attrs are not part of that transport contract, so ART span metadata
+        # must be a declared field.
+        art_policy_token_spans: dict[str, list[dict[str, Any]]] | None = None
+
+    ModelRunnerOutput.__module__ = outputs_mod.__name__
+    outputs_mod.ModelRunnerOutput = ModelRunnerOutput
+    for module_name in (
+        "vllm.v1.worker.gpu.model_runner",
+        "vllm.v1.worker.gpu.async_utils",
+        "vllm.v1.core.sched.scheduler",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, "ModelRunnerOutput", ModelRunnerOutput)
+    setattr(outputs_mod, "_art_policy_token_spans_model_runner_patched", True)
 
 
 def register_lora_alias(

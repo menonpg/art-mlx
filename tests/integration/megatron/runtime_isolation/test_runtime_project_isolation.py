@@ -182,6 +182,62 @@ def test_runtime_policy_spans_accumulate_engine_core_outputs(
     }
 
 
+def test_runtime_policy_spans_declares_model_runner_output_field(
+    artifact_dir: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(ROOT / "vllm_runtime"),
+            "python",
+            "-c",
+            (
+                "import json; "
+                "from dataclasses import fields; "
+                "from art_vllm_runtime.policy_spans import ("
+                "ART_POLICY_TOKEN_SPANS_FIELD, patch_policy_token_spans"
+                "); "
+                "patch_policy_token_spans(); "
+                "from vllm.v1.outputs import ModelRunnerOutput; "
+                "spans = {'r': [{'start_token': 0, 'end_token': 2, "
+                "'policy_version': 7, 'lora_slot': 'm:active', "
+                "'update_seq': 3}]}; "
+                "output = ModelRunnerOutput("
+                "req_ids=['r'], req_id_to_index={'r': 0}, "
+                "sampled_token_ids=[[1, 2]], art_policy_token_spans=spans"
+                "); "
+                "print(json.dumps({"
+                "'has_field': ART_POLICY_TOKEN_SPANS_FIELD in "
+                "[field.name for field in fields(ModelRunnerOutput)], "
+                "'spans': getattr(output, ART_POLICY_TOKEN_SPANS_FIELD)"
+                "}, sort_keys=True))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (artifact_dir / "model_runner_policy_spans_stdout.txt").write_text(result.stdout)
+    (artifact_dir / "model_runner_policy_spans_stderr.txt").write_text(result.stderr)
+    assert json.loads(result.stdout.strip()) == {
+        "has_field": True,
+        "spans": {
+            "r": [
+                {
+                    "start_token": 0,
+                    "end_token": 2,
+                    "policy_version": 7,
+                    "lora_slot": "m:active",
+                    "update_seq": 3,
+                }
+            ]
+        },
+    }
+
+
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
