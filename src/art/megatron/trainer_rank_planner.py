@@ -50,6 +50,7 @@ def select_next_micro_batch(
         raise RuntimeError("cannot select an empty microbatch window")
 
     cache: dict[int, _CandidateMicroBatch[InputT, PlanT]] = {}
+    estimate_cache: dict[int, tuple[EstimateT, _MemoryCheck] | None] = {}
     rejected = 0
 
     def clamp_width(width: int) -> int:
@@ -86,40 +87,58 @@ def select_next_micro_batch(
         return item
 
     def estimate_check(width: int) -> tuple[EstimateT, _MemoryCheck] | None:
+        width = clamp_width(width)
+        if width in estimate_cache:
+            return estimate_cache[width]
         indices, local_inputs = local_slice(width)
         estimate = estimate_for_local_inputs(indices, local_inputs)
         if estimate is None:
+            estimate_cache[width] = None
             return None
-        return estimate, memory_check_estimate(estimate)
+        estimate_cache[width] = estimate, memory_check_estimate(estimate)
+        return estimate_cache[width]
 
-    first_estimated_check = estimate_check(min_width)
-    if first_estimated_check is not None:
-        first_estimate, first_check = first_estimated_check
-        if not first_check.fits:
-            first = candidate(min_width, first_estimated_check)
-            raise_smallest_batch_error(first.plan, first.check)
-        if has_memory_profile_estimate(first_estimate):
-            best: _CandidateMicroBatch[InputT, PlanT] | None = None
-            best_estimated_check: tuple[EstimateT, _MemoryCheck] | None = (
-                first_estimated_check
-            )
-            best_width = min_width
-        else:
-            first = candidate(min_width, first_estimated_check)
-            if first.cold_start:
-                return first
-            best = first
-            best_estimated_check = None
-            best_width = first.stats_global_count
+    def probe(
+        width: int,
+    ) -> tuple[
+        bool,
+        tuple[EstimateT, _MemoryCheck] | None,
+        _CandidateMicroBatch[InputT, PlanT] | None,
+    ]:
+        estimated = estimate_check(width)
+        if estimated is not None:
+            return estimated[1].fits, estimated, None
+        item = candidate(width)
+        return item.check.fits, None, item
+
+    first_estimated = estimate_check(min_width)
+    if first_estimated is not None and not first_estimated[1].fits:
+        first = candidate(min_width, first_estimated)
+        raise_smallest_batch_error(first.plan, first.check)
+
+    if first_estimated is not None and has_memory_profile_estimate(first_estimated[0]):
+        best_width = min_width
+        best_estimated: tuple[EstimateT, _MemoryCheck] | None = first_estimated
+        best_item: _CandidateMicroBatch[InputT, PlanT] | None = None
     else:
-        first = candidate(min_width)
+        first = candidate(min_width, first_estimated)
         if not first.check.fits:
             raise_smallest_batch_error(first.plan, first.check)
         if first.cold_start:
             return first
-        best = first
-        best_estimated_check = None
         best_width = first.stats_global_count
+        best_estimated = None
+        best_item = first
+
+    def remember_fit(
+        width: int,
+        estimated: tuple[EstimateT, _MemoryCheck] | None,
+        item: _CandidateMicroBatch[InputT, PlanT] | None,
+    ) -> None:
+        nonlocal best_width, best_estimated, best_item
+        best_width = clamp_width(width)
+        best_estimated = estimated
+        best_item = item
 
     high_fail: int | None = None
     width = min(
@@ -127,24 +146,9 @@ def select_next_micro_batch(
         max(min_width, (previous_global_micro_batch_size or min_width) * 2),
     )
     while width <= remaining:
-        estimated = estimate_check(width)
-        if estimated is not None and not estimated[1].fits:
-            rejected += 1
-            high_fail = width
-            break
-        if estimated is not None:
-            best_width = width
-            best_estimated_check = estimated
-            best = None
-            if width == remaining:
-                break
-            width = min(remaining, max(width + 1, width * 2))
-            continue
-        item = candidate(width)
-        if item.check.fits:
-            best = item
-            best_width = width
-            best_estimated_check = None
+        fits, estimated, item = probe(width)
+        if fits:
+            remember_fit(width, estimated, item)
             if width == remaining:
                 break
             width = min(remaining, max(width + 1, width * 2))
@@ -154,13 +158,7 @@ def select_next_micro_batch(
         break
 
     def finalize_best() -> _CandidateMicroBatch[InputT, PlanT]:
-        selected = (
-            candidate(best_width, best_estimated_check)
-            if best is None
-            or best_width != best.stats_global_count
-            or best_estimated_check is not None
-            else best
-        )
+        selected = best_item or candidate(best_width, best_estimated)
         return _CandidateMicroBatch(
             inputs=selected.inputs,
             indices=selected.indices,
@@ -178,22 +176,9 @@ def select_next_micro_batch(
     high = high_fail - 1
     while low <= high:
         mid = (low + high) // 2
-        estimated = estimate_check(mid)
-        if estimated is not None and not estimated[1].fits:
-            rejected += 1
-            high = mid - 1
-            continue
-        if estimated is not None:
-            best_width = mid
-            best_estimated_check = estimated
-            best = None
-            low = mid + 1
-            continue
-        item = candidate(mid)
-        if item.check.fits:
-            best = item
-            best_width = mid
-            best_estimated_check = None
+        fits, estimated, item = probe(mid)
+        if fits:
+            remember_fit(mid, estimated, item)
             low = mid + 1
         else:
             rejected += 1

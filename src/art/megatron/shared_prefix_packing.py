@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 
@@ -14,6 +13,15 @@ class SharedPrefixPack:
     parent_ids: torch.Tensor
     position_ids: torch.Tensor
     positions_by_sequence: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
+class _PrefixSegment:
+    sequence_indices: tuple[int, ...]
+    start: int
+    end: int
+    group_id: int
+    parent_id: int
 
 
 def pack_shared_prefixes(
@@ -62,102 +70,28 @@ def pack_shared_prefixes(
         return _empty_pack()
 
     device = tensors[0].device
-    lengths = torch.tensor([len(tensor) for tensor in tensors], device=device)
-    if int(lengths.max().item()) == 0:
+    rows = tuple(tensor.detach().cpu().tolist() for tensor in tensors)
+    segments = _prefix_segments(rows, max_depth=max_depth)
+    if not segments:
         return _empty_pack(len(tensors), device=device)
 
-    padded = torch.nn.utils.rnn.pad_sequence(list(tensors), batch_first=True)
     token_chunks: list[torch.Tensor] = []
     group_chunks: list[torch.Tensor] = []
     parent_chunks: list[torch.Tensor] = []
     position_chunks: list[torch.Tensor] = []
     positions_by_sequence: list[list[torch.Tensor]] = [[] for _ in tensors]
     cursor = 0
-    next_group_id = 1
 
-    def emit(
-        indices: torch.Tensor,
-        start: int,
-        end: int,
-        parent_group_id: int | None,
-    ) -> int:
-        nonlocal cursor, next_group_id
-        segment = tensors[int(indices[0].item())][start:end]
-        group_id = next_group_id
-        next_group_id += 1
-        parent_id = group_id if parent_group_id is None else parent_group_id
+    for planned in segments:
+        segment = tensors[planned.sequence_indices[0]][planned.start : planned.end]
         packed_positions = torch.arange(cursor, cursor + len(segment), device=device)
-
         token_chunks.append(segment)
-        group_chunks.append(torch.full_like(segment, group_id))
-        parent_chunks.append(torch.full_like(segment, parent_id))
-        position_chunks.append(torch.arange(start, end, device=device))
-        for sequence_index in indices.tolist():
+        group_chunks.append(torch.full_like(segment, planned.group_id))
+        parent_chunks.append(torch.full_like(segment, planned.parent_id))
+        position_chunks.append(torch.arange(planned.start, planned.end, device=device))
+        for sequence_index in planned.sequence_indices:
             positions_by_sequence[sequence_index].append(packed_positions)
         cursor += len(segment)
-        return group_id
-
-    def shared_end(indices: torch.Tensor, start: int) -> int:
-        end = int(lengths.index_select(0, indices).min().item())
-        if start >= end:
-            return start
-        shared = (
-            padded.index_select(0, indices)[:, start:end]
-            == padded[indices[0], start:end]
-        ).all(dim=0)
-        return (
-            end
-            if bool(shared.all().item())
-            else start + int(shared.logical_not().nonzero()[0])
-        )
-
-    def branch_groups(indices: torch.Tensor, start: int) -> list[torch.Tensor]:
-        groups: dict[int, list[int]] = {}
-        order: list[int] = []
-        symbols = padded.index_select(0, indices)[:, start].tolist()
-        for symbol, index in zip(symbols, indices.tolist(), strict=True):
-            if symbol not in groups:
-                groups[symbol] = []
-                order.append(symbol)
-            groups[symbol].append(index)
-        return [
-            torch.tensor(groups[symbol], dtype=torch.long, device=device)
-            for symbol in order
-        ]
-
-    def walk(
-        indices: torch.Tensor,
-        start: int,
-        parent_group_id: int | None,
-        depth: int,
-    ) -> None:
-        active = indices[lengths.index_select(0, indices) > start]
-        if int(active.numel()) == 0:
-            return
-        if (
-            max_depth == 0
-            or int(active.numel()) == 1
-            or (parent_group_id is not None and depth >= max_depth)
-        ):
-            for sequence_index in active:
-                emit(
-                    sequence_index[None],
-                    start,
-                    int(lengths[sequence_index].item()),
-                    parent_group_id,
-                )
-            return
-
-        end = shared_end(active, start)
-        if end > start:
-            group_id = emit(active, start, end, parent_group_id)
-            walk(active, end, group_id, depth + 1)
-            return
-
-        for group in branch_groups(active, start):
-            walk(group, start, parent_group_id, depth)
-
-    walk(torch.arange(len(tensors), device=device), 0, None, 0)
 
     return SharedPrefixPack(
         tokens=torch.cat(token_chunks).unsqueeze(0),
@@ -187,78 +121,97 @@ def estimate_shared_prefix_packed_tokens(
     if max_depth < 0:
         raise ValueError("max_depth must be >= 0")
 
-    arrays: list[np.ndarray] = []
+    rows: list[list[int]] = []
     for sequence in sequences:
         tensor = _sequence_tensor(sequence)
         if tensor.device.type != "cpu":
             return None
-        arrays.append(tensor.numpy())
+        rows.append(tensor.tolist())
 
-    if not arrays:
-        return 0
+    return sum(
+        segment.end - segment.start
+        for segment in _prefix_segments(tuple(rows), max_depth=max_depth)
+    )
 
-    lengths = tuple(int(array.shape[0]) for array in arrays)
-    if max(lengths, default=0) == 0:
-        return 0
+
+def _prefix_segments(
+    rows: tuple[list[int], ...],
+    *,
+    max_depth: int,
+) -> tuple[_PrefixSegment, ...]:
+    if max_depth < 0:
+        raise ValueError("max_depth must be >= 0")
+    lengths = tuple(len(row) for row in rows)
+    segments: list[_PrefixSegment] = []
+    next_group_id = 1
+
+    def emit(
+        indices: tuple[int, ...],
+        start: int,
+        end: int,
+        parent_group_id: int | None,
+    ) -> int:
+        nonlocal next_group_id
+        group_id = next_group_id
+        next_group_id += 1
+        segments.append(
+            _PrefixSegment(
+                sequence_indices=indices,
+                start=start,
+                end=end,
+                group_id=group_id,
+                parent_id=group_id if parent_group_id is None else parent_group_id,
+            )
+        )
+        return group_id
 
     def shared_end(indices: tuple[int, ...], start: int) -> int:
         end = min(lengths[index] for index in indices)
-        if start >= end or len(indices) == 1:
-            return end
-        first = arrays[indices[0]]
-        low = start
-        high = end
-        while low < high:
-            mid = (low + high + 1) // 2
-            prefix = first[start:mid]
-            if all(
-                np.array_equal(arrays[index][start:mid], prefix)
-                for index in indices[1:]
-            ):
-                low = mid
-            else:
-                high = mid - 1
-        return low
+        while start < end:
+            token = rows[indices[0]][start]
+            if any(rows[index][start] != token for index in indices[1:]):
+                break
+            start += 1
+        return start
 
     def branch_groups(indices: tuple[int, ...], start: int) -> list[tuple[int, ...]]:
         groups: dict[int, list[int]] = {}
         order: list[int] = []
         for index in indices:
-            symbol = int(arrays[index][start])
-            if symbol not in groups:
-                groups[symbol] = []
-                order.append(symbol)
-            groups[symbol].append(index)
-        return [tuple(groups[symbol]) for symbol in order]
+            token = rows[index][start]
+            if token not in groups:
+                groups[token] = []
+                order.append(token)
+            groups[token].append(index)
+        return [tuple(groups[token]) for token in order]
 
     def walk(
         indices: tuple[int, ...],
         start: int,
-        *,
-        has_parent: bool,
+        parent_group_id: int | None,
         depth: int,
-    ) -> int:
+    ) -> None:
         active = tuple(index for index in indices if lengths[index] > start)
         if not active:
-            return 0
-        if max_depth == 0 or len(active) == 1 or (has_parent and depth >= max_depth):
-            return sum(lengths[index] - start for index in active)
+            return
+        if (
+            max_depth == 0
+            or len(active) == 1
+            or (parent_group_id is not None and depth >= max_depth)
+        ):
+            for index in active:
+                emit((index,), start, lengths[index], parent_group_id)
+            return
 
         end = shared_end(active, start)
         if end > start:
-            return (end - start) + walk(
-                active,
-                end,
-                has_parent=True,
-                depth=depth + 1,
-            )
+            walk(active, end, emit(active, start, end, parent_group_id), depth + 1)
+            return
+        for group in branch_groups(active, start):
+            walk(group, start, parent_group_id, depth)
 
-        return sum(
-            walk(group, start, has_parent=has_parent, depth=depth)
-            for group in branch_groups(active, start)
-        )
-
-    return walk(tuple(range(len(arrays))), 0, has_parent=False, depth=0)
+    walk(tuple(range(len(rows))), 0, None, 0)
+    return tuple(segments)
 
 
 def visualize_shared_prefix_pack(pack: SharedPrefixPack) -> str:

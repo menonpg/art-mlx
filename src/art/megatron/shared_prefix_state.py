@@ -75,14 +75,13 @@ def create_shared_prefix_state(
             attention_value_head_dim=attention_value_head_dim,
         ),
     )
-    cp_rank, cp_size, cp_group = _gdn_cp_rank_size_group()
-    gdn_execution_spec = _build_gdn_execution_spec_once(
-        group_ids_cpu,
-        parent_ids_cpu,
-        build=build_gdn_execution_spec,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        cp_group=cp_group,
+    cp_rank, cp_size = _gdn_cp_rank_size()
+    gdn_execution_spec = (
+        parse_gdn_shared_prefix_segments(
+            group_ids_cpu, parent_ids_cpu, min_completions_per_family=0
+        )
+        if build_gdn_execution_spec
+        else None
     )
     return SharedPrefixAttentionState(
         block_mask=block_mask,
@@ -94,7 +93,6 @@ def create_shared_prefix_state(
             device=device,
             cp_rank=cp_rank,
             cp_size=cp_size,
-            cp_group=cp_group,
             attention_token_layout_index=attention_token_layout_index,
         ),
     )
@@ -123,13 +121,21 @@ def _build_sparse_shared_prefix_block_mask(
     token_indices = torch.arange(seq_len, dtype=torch.int64)
     for row_spec in batch_spec.rows:
         row_index = int(row_spec.row_index)
-        slices = _row_local_slices(
-            _full_row_slices_with_padding(
-                row_slices=row_spec.slices,
-                valid_tokens=int(row_spec.valid_tokens),
-                seq_len=seq_len,
-            )
+        slices = tuple(
+            slice_.model_copy(update={"row_index": 0}) for slice_ in row_spec.slices
         )
+        if int(row_spec.valid_tokens) < seq_len:
+            padding_range = TokenRange(start=int(row_spec.valid_tokens), end=seq_len)
+            slices = (
+                *slices,
+                AttnSlice(
+                    q_range=padding_range,
+                    k_range=padding_range,
+                    mask_kind=AttnMaskKind.CAUSAL,
+                    row_index=0,
+                    family_index=None,
+                ),
+            )
         if not slices:
             row_masks.append(
                 _empty_block_mask(seq_len=seq_len, block_size=block_size, device=device)
@@ -160,10 +166,6 @@ def _build_sparse_shared_prefix_block_mask(
         seq_len=seq_len,
         block_size=block_size,
     )
-
-
-def _row_local_slices(slices: tuple[AttnSlice, ...]) -> tuple[AttnSlice, ...]:
-    return tuple(slice_.model_copy(update={"row_index": 0}) for slice_ in slices)
 
 
 def _stack_optional_block_tensors(
@@ -213,29 +215,6 @@ def _stack_row_block_masks(
         full_q_indices=_stack_optional_block_tensors(masks, "full_q_indices"),
         BLOCK_SIZE=block_size,
         mask_mod=mask_mod,
-    )
-
-
-def _full_row_slices_with_padding(
-    *,
-    row_slices: tuple[AttnSlice, ...],
-    valid_tokens: int,
-    seq_len: int,
-) -> tuple[AttnSlice, ...]:
-    if valid_tokens >= seq_len:
-        return row_slices
-    padding_range = TokenRange(start=int(valid_tokens), end=int(seq_len))
-    if padding_range.is_empty():
-        return row_slices
-    return (
-        *row_slices,
-        AttnSlice(
-            q_range=padding_range,
-            k_range=padding_range,
-            mask_kind=AttnMaskKind.CAUSAL,
-            row_index=0,
-            family_index=None,
-        ),
     )
 
 
@@ -294,36 +273,17 @@ def _shared_prefix_block_size(
     )
 
 
-def _build_gdn_execution_spec_once(
-    group_ids: Tensor,
-    parent_ids: Tensor,
-    *,
-    build: bool,
-    cp_rank: int,
-    cp_size: int,
-    cp_group: Any | None,
-) -> GdnPackedExecutionSpec | None:
-    del cp_rank, cp_size, cp_group
-    if not build:
-        return None
-    return parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
-
-
 def _build_gdn_execution_plan_once(
     spec: GdnPackedExecutionSpec | None,
     *,
     device: torch.device,
     cp_rank: int,
     cp_size: int,
-    cp_group: Any | None,
     attention_token_layout_index: TokenLayoutIndex | None,
 ) -> GdnRankExecutionPlan | None:
     if spec is None:
         return None
     planner_device = torch.device("cpu") if device.type == "cuda" else device
-    del cp_group
     gc_was_enabled = gc.isenabled()
     if gc_was_enabled:
         gc.disable()
@@ -341,7 +301,7 @@ def _build_gdn_execution_plan_once(
     return move_gdn_rank_execution_plan_to_device(plan, device)
 
 
-def _gdn_cp_rank_size_group() -> tuple[int, int, Any | None]:
+def _gdn_cp_rank_size() -> tuple[int, int]:
     try:
         from megatron.core import parallel_state as ps
 
@@ -349,8 +309,7 @@ def _gdn_cp_rank_size_group() -> tuple[int, int, Any | None]:
             return (
                 int(ps.get_context_parallel_rank()),
                 int(ps.get_context_parallel_world_size()),
-                ps.get_context_parallel_group(),
             )
     except Exception:
         pass
-    return 0, 1, None
+    return 0, 1
