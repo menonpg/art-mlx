@@ -271,6 +271,37 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     assert candidate.rejected_candidates <= 8
 
 
+def test_adaptive_planner_reuses_large_stable_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime(), shared_prefix_max_depth=1)  # type: ignore[arg-type]
+    rank._last_global_micro_batch_size = 512
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        rank,
+        "_estimate_required_memory_bytes_from_values",
+        lambda **kwargs: kwargs["packed_tokens"],
+    )
+    monkeypatch.setattr(
+        rank,
+        "_memory_check_required",
+        lambda required: _MemoryCheck(
+            estimated_required_bytes=required,
+            available_bytes=700,
+            fits=required <= 700,
+        ),
+    )
+
+    candidate = rank._select_next_micro_batch(
+        [_target_request(_tokens(index)) for index in range(900)],
+        0,
+    )
+
+    assert candidate.stats_global_count == 512
+    assert candidate.rejected_candidates == 0
+
+
 def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -781,6 +781,17 @@ class TrainerRank:
         def clamp_width(width: int) -> int:
             return max(min_width, min(width, remaining))
 
+        granularity = self._adaptive_window_granularity(
+            remaining=remaining,
+            dp_size=dp_size,
+        )
+
+        def snap_width(width: int) -> int:
+            width = clamp_width(width)
+            if width in (min_width, remaining) or granularity <= 1:
+                return width
+            return max(min_width, (width // granularity) * granularity)
+
         def local_slice(width: int) -> tuple[tuple[int, ...], list[ForwardInputsT]]:
             stop = start + clamp_width(width)
             indices = tuple(range(start + dp_rank, stop, dp_size))
@@ -859,8 +870,32 @@ class TrainerRank:
             check: _MemoryCheck | None,
         ) -> None:
             nonlocal best_width, best_check
-            best_width = clamp_width(width)
+            best_width = snap_width(width)
             best_check = check
+
+        def search_below(failed_width: int) -> None:
+            nonlocal rejected
+            low = best_width + 1
+            high = failed_width - 1
+            while low <= high:
+                mid = (low + high) // 2
+                fits, check = probe(mid)
+                if fits:
+                    remember_fit(mid, check)
+                    low = mid + 1
+                else:
+                    rejected += 1
+                    high = mid - 1
+
+        stable_width = self._last_global_micro_batch_size
+        if stable_width is not None and stable_width >= max(64, granularity * 2):
+            stable_width = snap_width(stable_width)
+            fits, check = probe(stable_width)
+            if fits:
+                return candidate(stable_width, check)
+            rejected += 1
+            search_below(stable_width)
+            return candidate(best_width, best_check)
 
         high_fail: int | None = None
         width = min(
@@ -880,19 +915,16 @@ class TrainerRank:
             break
 
         if high_fail is not None:
-            low = best_width + 1
-            high = high_fail - 1
-            while low <= high:
-                mid = (low + high) // 2
-                fits, check = probe(mid)
-                if fits:
-                    remember_fit(mid, check)
-                    low = mid + 1
-                else:
-                    rejected += 1
-                    high = mid - 1
+            search_below(high_fail)
 
         return candidate(best_width, best_check)
+
+    @staticmethod
+    def _adaptive_window_granularity(*, remaining: int, dp_size: int) -> int:
+        if remaining < 64:
+            return max(1, dp_size)
+        base = 8 if remaining < 256 else 32
+        return max(1, ((base + dp_size - 1) // dp_size) * dp_size)
 
     def _cached_adaptive_plan(
         self,
