@@ -143,12 +143,20 @@ def _patch_art_runtime_routes() -> None:
                 lora_slot=lora_slot,
                 policy_version=policy_version,
             )
+            waiting_cache_salt = None
+            if policy_version is not None:
+                waiting_cache_salt = await engine(raw_request).call_utility_async(
+                    "art_update_waiting_lora_cache_salt",
+                    lora_slot,
+                    policy_version,
+                )
             return JSONResponse(
                 content={
                     "status": "updated",
                     "model_name": public_model_name,
                     "lora_slot": lora_slot,
                     "policy_version": policy_version,
+                    "waiting_cache_salt": waiting_cache_salt,
                 }
             )
 

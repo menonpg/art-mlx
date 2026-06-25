@@ -566,6 +566,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
             actor_wall_s, actor_idle_s = self._consume_batch_rollout_timings(batch)
 
+            training_policy_step = current_step
             expected_step = current_step + 1
             should_eval_step = self._should_eval_step(expected_step)
             should_checkpoint = self.save_checkpoint and should_eval_step
@@ -626,7 +627,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     batch, step=current_step, step_seconds=step_seconds
                 )
 
-                steps_off_policy = self._average_steps_off_policy(current_step, batch)
+                steps_off_policy = self._average_steps_off_policy(
+                    training_policy_step, batch
+                )
                 metrics = {
                     "discarded_stale_groups": float(self.state.discarded_stale_groups),
                     "steps_off_policy": steps_off_policy,

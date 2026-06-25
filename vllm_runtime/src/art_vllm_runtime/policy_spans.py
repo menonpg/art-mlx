@@ -24,6 +24,8 @@ _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
 _COMPLETION_POLICY_SPANS_BY_REQUEST: dict[str, dict[int, list[dict[str, Any]]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
 _WORKER_LORA_UPDATE_SEQ = 0
+_POLICY_CACHE_SALT_PREFIX = "art_policy_cache_salt="
+_POLICY_CACHE_SALT_MARKER = f"|{_POLICY_CACHE_SALT_PREFIX}"
 
 _MODEL_RUNNER_OUTPUT_MODULES = (
     "vllm.v1.outputs",
@@ -49,6 +51,7 @@ def patch_policy_token_spans() -> None:
     _patch_openai_response_policy_spans()
     _patch_lora_alias_resolution()
     _patch_load_inplace_storage()
+    _patch_engine_waiting_cache_salt_utility()
 
 
 def _patch_model_runner_output_type() -> None:
@@ -113,6 +116,67 @@ def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
     if not slot:
         return None
     return models.lora_requests.get(slot)
+
+
+def _alias_policy_version(models: Any, model_name: str | None) -> int | None:
+    if not model_name:
+        return None
+    version = getattr(models, "_art_lora_alias_policy_versions", {}).get(model_name)
+    if version is None:
+        return None
+    return int(version)
+
+
+def _strip_policy_cache_salt(cache_salt: str | None) -> str | None:
+    if not cache_salt:
+        return None
+    if cache_salt.startswith(_POLICY_CACHE_SALT_PREFIX):
+        return None
+    base, marker, _policy = cache_salt.partition(_POLICY_CACHE_SALT_MARKER)
+    if marker:
+        return base or None
+    return cache_salt
+
+
+def _policy_cache_salt(
+    *,
+    lora_slot: str,
+    policy_version: int,
+    user_cache_salt: str | None,
+) -> str:
+    policy_salt = f"{lora_slot}:{policy_version}"
+    if user_cache_salt:
+        return f"{user_cache_salt}{_POLICY_CACHE_SALT_MARKER}{policy_salt}"
+    return f"{_POLICY_CACHE_SALT_PREFIX}{policy_salt}"
+
+
+def _set_policy_cache_salt(
+    request: Any,
+    *,
+    lora_slot: str,
+    policy_version: int,
+) -> None:
+    user_cache_salt = _strip_policy_cache_salt(getattr(request, "cache_salt", None))
+    request.cache_salt = _policy_cache_salt(
+        lora_slot=lora_slot,
+        policy_version=policy_version,
+        user_cache_salt=user_cache_salt,
+    )
+
+
+def _apply_lora_alias_policy_cache_salt(
+    models: Any,
+    request: Any,
+    lora_request: Any,
+) -> None:
+    policy_version = _alias_policy_version(models, getattr(request, "model", None))
+    if policy_version is None:
+        return
+    _set_policy_cache_salt(
+        request,
+        lora_slot=str(lora_request.lora_name),
+        policy_version=policy_version,
+    )
 
 
 def _set_pydantic_extra(model: Any, key: str, value: Any) -> None:
@@ -432,6 +496,7 @@ def _patch_lora_alias_resolution() -> None:
     ) -> Any:
         lora_request = _resolve_lora_alias(self.models, getattr(request, "model", None))
         if lora_request is not None:
+            _apply_lora_alias_policy_cache_salt(self.models, request, lora_request)
             return lora_request
         return original_maybe(
             self,
@@ -473,6 +538,59 @@ def _patch_load_inplace_storage() -> None:
 
     load_lora_adapter.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     OpenAIServingModels.load_lora_adapter = load_lora_adapter  # type: ignore[method-assign]
+
+
+def _patch_engine_waiting_cache_salt_utility() -> None:
+    from vllm.v1.engine.core import EngineCore
+
+    if hasattr(EngineCore, "art_update_waiting_lora_cache_salt"):
+        return
+
+    def art_update_waiting_lora_cache_salt(
+        self: Any,
+        lora_slot: str,
+        policy_version: int,
+    ) -> dict[str, int]:
+        return _update_waiting_lora_cache_salt(
+            self.scheduler,
+            lora_slot=str(lora_slot),
+            policy_version=int(policy_version),
+        )
+
+    EngineCore.art_update_waiting_lora_cache_salt = art_update_waiting_lora_cache_salt  # type: ignore[attr-defined]
+
+
+def _update_waiting_lora_cache_salt(
+    scheduler: Any,
+    *,
+    lora_slot: str,
+    policy_version: int,
+) -> dict[str, int]:
+    updated = 0
+    skipped_started = 0
+    for queue_name in ("waiting", "skipped_waiting"):
+        queue = getattr(scheduler, queue_name, None)
+        if queue is None:
+            continue
+        for request in list(queue):
+            lora_request = getattr(request, "lora_request", None)
+            if lora_request is None or str(lora_request.lora_name) != lora_slot:
+                continue
+            if int(getattr(request, "num_computed_tokens", 0) or 0) != 0:
+                skipped_started += 1
+                continue
+            _set_policy_cache_salt(
+                request,
+                lora_slot=lora_slot,
+                policy_version=policy_version,
+            )
+            request.block_hashes.clear()
+            request.update_block_hashes()
+            updated += 1
+    return {
+        "updated_waiting_requests": updated,
+        "skipped_started_waiting_requests": skipped_started,
+    }
 
 
 def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
