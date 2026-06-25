@@ -217,9 +217,9 @@ def _best_improving_move(
             candidate = list(current_owners)
             candidate[chunk_index] = dst_rank
             candidate_owners = tuple(candidate)
-            if not _assignment_uses_all_ranks(
-                candidate_owners,
-                cp_size=cp_size,
+            if (
+                len(candidate_owners) >= cp_size
+                and len(set(candidate_owners)) != cp_size
             ):
                 continue
             candidate_eval = evaluate_candidate(
@@ -240,12 +240,10 @@ def _build_chunk_ranges(
     valid_tokens: int,
     chunk_size: int,
 ) -> tuple[TokenRange, ...]:
-    ranges: list[TokenRange] = []
-    for start in range(0, valid_tokens, chunk_size):
-        ranges.append(
-            TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
-        )
-    return tuple(ranges)
+    return tuple(
+        TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
+        for start in range(0, valid_tokens, chunk_size)
+    )
 
 
 def _indexed_intersections(
@@ -555,47 +553,6 @@ def _contiguous_chunk_assignment(
         for chunk_index in range(start, end):
             owners[chunk_index] = rank
     return tuple(owners)
-
-
-def _bucket_chunk_assignment(
-    *,
-    q_weights: list[float],
-    cp_size: int,
-) -> tuple[int, ...]:
-    chunk_count = len(q_weights)
-    if chunk_count == 0:
-        return tuple()
-    if cp_size <= 1:
-        return tuple(0 for _ in range(chunk_count))
-    rank_loads = [0.0 for _ in range(cp_size)]
-    rank_chunk_counts = [0 for _ in range(cp_size)]
-    owners = [-1 for _ in range(chunk_count)]
-    for chunk_index in sorted(
-        range(chunk_count),
-        key=lambda index: (-q_weights[index], index),
-    ):
-        rank = min(
-            range(cp_size),
-            key=lambda candidate: (
-                rank_loads[candidate],
-                rank_chunk_counts[candidate],
-                candidate,
-            ),
-        )
-        owners[chunk_index] = rank
-        rank_loads[rank] += q_weights[chunk_index]
-        rank_chunk_counts[rank] += 1
-    return tuple(int(owner) for owner in owners)
-
-
-def _assignment_uses_all_ranks(
-    owners: tuple[int, ...],
-    *,
-    cp_size: int,
-) -> bool:
-    if len(owners) < cp_size:
-        return True
-    return len({int(owner) for owner in owners}) == cp_size
 
 
 def _candidate_chunk_indices(
@@ -1083,7 +1040,6 @@ def _search_chunk_assignment(
     cp_size: int,
     config: ContextParallelConfig,
 ) -> tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]]:
-    cp_size = int(cp_size)
     config = _search_config_for_chunk_count(
         config=config,
         chunk_count=len(chunk_ranges),
@@ -1092,9 +1048,7 @@ def _search_chunk_assignment(
         1,
         min(int(config.planner_max_remote_waves), len(chunk_ranges)) + 1,
     )
-    best_owners: tuple[int, ...] = tuple()
-    best_waves: tuple[int, ...] = tuple()
-    best_eval: dict[str, Any] | None = None
+    best: tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]] | None = None
     eval_cache: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
     pair_counts = torch.as_tensor(pair_matrix, dtype=torch.int64)
     pair_positive = pair_counts > 0
@@ -1128,80 +1082,35 @@ def _search_chunk_assignment(
         eval_cache[cache_key] = cached
         return cached
 
-    def _best_wave_assignment_for_owners(
-        owners: tuple[int, ...],
-    ) -> tuple[tuple[int, ...], dict[str, Any]]:
-        best_wave_assignment = tuple()
-        best_eval_local: dict[str, Any] | None = None
-        for wave_count in wave_count_candidates:
-            wave_assignment = _wave_assignment(
-                chunk_count=len(chunk_ranges),
-                wave_count=wave_count,
-            )
-            candidate_eval = _evaluate_candidate(
-                owners=owners,
-                wave_assignment=wave_assignment,
-            )
-            if best_eval_local is None or float(candidate_eval["score"]) + 1e-9 < float(
-                best_eval_local["score"]
-            ):
-                best_wave_assignment = wave_assignment
-                best_eval_local = candidate_eval
-        if best_eval_local is None:
-            raise RuntimeError("Failed to evaluate any wave assignment candidate.")
-        return best_wave_assignment, best_eval_local
-
-    strategy = str(config.planner_assignment_strategy).strip().lower()
-    fixed_owners_by_strategy = {
-        "contiguous": _contiguous_chunk_assignment(
-            q_weights=q_weights, cp_size=cp_size
-        ),
-        "bucket": _bucket_chunk_assignment(q_weights=q_weights, cp_size=cp_size),
-    }
-    if strategy in fixed_owners_by_strategy:
-        owners = fixed_owners_by_strategy[strategy]
-        best_waves, best_eval = _best_wave_assignment_for_owners(owners)
-        return owners, best_waves, best_eval
-    if strategy != "search":
-        raise ValueError(
-            "Unsupported planner_assignment_strategy="
-            f"{config.planner_assignment_strategy!r}."
-        )
-
     contiguous_owners = _contiguous_chunk_assignment(
         q_weights=q_weights,
         cp_size=cp_size,
     )
+    if not contiguous_owners:
+        wave_assignment = _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
+        return (
+            contiguous_owners,
+            wave_assignment,
+            _evaluate_candidate(
+                owners=contiguous_owners,
+                wave_assignment=wave_assignment,
+            ),
+        )
+
     for wave_count in wave_count_candidates:
         wave_assignment = _wave_assignment(
             chunk_count=len(chunk_ranges),
             wave_count=wave_count,
         )
-        initial_candidates = [
-            initial_owners
-            for initial_owners in (contiguous_owners,)
-            if initial_owners
-            if _assignment_uses_all_ranks(initial_owners, cp_size=cp_size)
-        ]
-        if not initial_candidates:
-            continue
-        current_owners = min(
-            initial_candidates,
-            key=lambda owners: float(
-                _evaluate_candidate(owners=owners, wave_assignment=wave_assignment)[
-                    "score"
-                ]
-            ),
-        )
+        current_owners = contiguous_owners
         current_eval = _evaluate_candidate(
             owners=current_owners,
             wave_assignment=wave_assignment,
         )
 
-        if cp_size >= 8:
-            search_steps_remaining = 0
-        else:
-            search_steps_remaining = int(config.planner_max_search_steps)
+        search_steps_remaining = (
+            0 if cp_size >= 8 else int(config.planner_max_search_steps)
+        )
         if cp_size == 4 and search_steps_remaining > 0:
             probe_move = _best_improving_move(
                 current_owners=current_owners,
@@ -1239,21 +1148,13 @@ def _search_chunk_assignment(
                 break
             current_owners, current_eval = best_move
 
-        if best_eval is None or float(current_eval["score"]) + 1e-9 < float(
-            best_eval["score"]
+        if best is None or float(current_eval["score"]) + 1e-9 < float(
+            best[2]["score"]
         ):
-            best_owners = current_owners
-            best_waves = wave_assignment
-            best_eval = current_eval
-
-    if best_eval is None:
-        best_owners = _contiguous_chunk_assignment(q_weights=q_weights, cp_size=cp_size)
-        best_waves = _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
-        best_eval = _evaluate_candidate(
-            owners=best_owners,
-            wave_assignment=best_waves,
-        )
-    return best_owners, best_waves, best_eval
+            best = (current_owners, wave_assignment, current_eval)
+    if best is None:
+        raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
+    return best
 
 
 def _flatten_ranges_by_peer(
