@@ -2308,7 +2308,7 @@ def _try_triton_local_topk_stats(
     try:
         from art.megatron.trainer_rank_topk import local_topk_stats
 
-        stats = local_topk_stats(
+        return local_topk_stats(
             local_logits,
             k=min(k, int(local_logits.shape[1])),
         )
@@ -2316,7 +2316,6 @@ def _try_triton_local_topk_stats(
         if _triton_topk_strict():
             raise
         return None
-    return stats.local_max, stats.local_sum, stats.values, stats.tokens
 
 
 def _try_triton_local_logsumexp_stats(
@@ -2331,12 +2330,11 @@ def _try_triton_local_logsumexp_stats(
     try:
         from art.megatron.trainer_rank_topk import local_logsumexp_stats
 
-        stats = local_logsumexp_stats(local_logits)
+        return local_logsumexp_stats(local_logits)
     except Exception:
         if _triton_topk_strict():
             raise
         return None
-    return stats.local_max, stats.local_sum
 
 
 def _triton_topk_disabled() -> bool:
