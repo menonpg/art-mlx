@@ -13,7 +13,6 @@ import os
 from typing import TYPE_CHECKING, Generic, Literal, ParamSpec, TypeVar, cast, overload
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import torch.distributed as dist
 
 from art.megatron.shared_prefix_packing import (
@@ -661,6 +660,11 @@ class TrainerRank:
     def _reduce_dynamic_grads(self, params: Sequence[torch.nn.Parameter]) -> None:
         from megatron.core import parallel_state as ps
 
+        from art.megatron.training.finalize_grads import (
+            coalesced_all_reduce,
+            tensor_parallel_grad_sync,
+        )
+
         buckets: dict[
             tuple[int, str, torch.dtype, torch.device],
             tuple[object, dist.ReduceOp.RedOpType, list[torch.Tensor]],
@@ -681,40 +685,13 @@ class TrainerRank:
             if group is not None and group.size() > 1:
                 add(group, dist.ReduceOp.SUM, grad)
 
-            op = getattr(param, "grad_sync_op", "none")
-            if op == "none":
-                continue
-            domain = getattr(param, "grad_sync_domain", "tp_default")
-            if domain == "expert_tp":
-                tp_group = ps.get_expert_tensor_parallel_group(check_initialized=False)
-            else:
-                tp_group = ps.get_tensor_model_parallel_group(check_initialized=False)
-            if tp_group is None or tp_group.size() <= 1:
-                continue
-            reduce_op = dist.ReduceOp.AVG if op == "avg" else dist.ReduceOp.SUM
-            add(tp_group, reduce_op, grad)
+            sync = tensor_parallel_grad_sync(param, name="dynamic LoRA")
+            if sync is not None:
+                group, reduce_op = sync
+                add(group, reduce_op, grad)
 
         for group, op, grads in buckets.values():
-            self._coalesced_all_reduce(grads, group=group, op=op)
-
-    @staticmethod
-    def _coalesced_all_reduce(
-        grads: Sequence[torch.Tensor],
-        *,
-        group: object,
-        op: dist.ReduceOp.RedOpType,
-    ) -> None:
-        coalesced = _flatten_dense_tensors(grads)
-        reduced = (
-            coalesced.float()
-            if torch.is_floating_point(coalesced) and coalesced.dtype != torch.float32
-            else coalesced
-        )
-        dist.all_reduce(reduced, op=op, group=group)
-        if reduced is not coalesced:
-            reduced = reduced.to(dtype=coalesced.dtype)
-        for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):
-            grad.copy_(synced)
+            coalesced_all_reduce(grads, group=group, op=op)
 
     def _select_next_micro_batch(
         self,
