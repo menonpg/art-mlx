@@ -175,12 +175,7 @@ class _PushedSlot:
     def __enter__(self) -> "_PushedSlot":
         return self
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: object,
-    ) -> bool:
+    def __exit__(self, *args: object) -> bool:
         if not self.trainer._slot_stack or self.trainer._slot_stack[-1] != self.ref:
             raise RuntimeError(
                 "Pushed LoRA/checkpoint stack changed before context exit"
@@ -321,12 +316,6 @@ class TrainerRank:
             raise RuntimeError("TrainerRank requires a runtime with an optimizer")
         return optimizer
 
-    def _handler(self) -> "ModelSupportHandler":
-        return cast("ModelSupportHandler", self.runtime.model_support_handler)
-
-    def _provider(self) -> "GPTModelProvider":
-        return cast("GPTModelProvider", self.runtime.provider)
-
     def set_checkpoint(self, name: str | None) -> None:
         self._set_default_slot(self._slot_ref("checkpoint", name))
 
@@ -442,22 +431,15 @@ class TrainerRank:
         dist.all_gather_object(gathered, local)
         ranks = [rank for rank in gathered if rank is not None]
         reference = ranks[0]
-        mismatched = [
-            rank
+        if all(
+            rank["loaded_sites"] == reference["loaded_sites"]
+            and rank["signature"] == reference["signature"]
             for rank in ranks
-            if rank["loaded_sites"] != reference["loaded_sites"]
-            or rank["signature"] != reference["signature"]
-        ]
-        if not mismatched:
+        ):
             return params
 
         summary = [
-            {
-                "rank": rank["rank"],
-                "loaded_sites": rank["loaded_sites"],
-                "param_count": rank["param_count"],
-                "numel": rank["numel"],
-            }
+            {key: rank[key] for key in ("rank", "loaded_sites", "param_count", "numel")}
             for rank in ranks
         ]
         raise RuntimeError(
@@ -531,32 +513,6 @@ class TrainerRank:
         ],
     ) -> Sequence[
         Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
-    ]: ...
-
-    @overload
-    def dp_rank_forward(
-        self,
-        inputs: Iterable[
-            Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
-        ],
-    ) -> Sequence[
-        Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
-    ]: ...
-
-    @overload
-    def dp_rank_forward(
-        self,
-        inputs: Iterable[
-            Iterable[
-                Iterable[
-                    Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
-                ]
-            ]
-        ],
-    ) -> Sequence[
-        Sequence[
-            Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
-        ]
     ]: ...
 
     def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
@@ -670,11 +626,9 @@ class TrainerRank:
             for param in slot_params:
                 if param.grad is None:
                     param.grad = torch.zeros_like(param)
+                elif scale_grads != 1.0:
+                    param.grad.mul_(scale_grads)
             self._reduce_dynamic_grads(slot_params)
-            if scale_grads != 1.0:
-                for param in slot_params:
-                    if param.grad is not None:
-                        param.grad.mul_(scale_grads)
             all_params.extend(slot_params)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -721,18 +675,9 @@ class TrainerRank:
             tuple[object, dist.ReduceOp.RedOpType, list[torch.Tensor]],
         ] = {}
 
-        def add_to_bucket(
-            *,
-            group: object,
-            op: dist.ReduceOp.RedOpType,
-            grad: torch.Tensor,
-        ) -> None:
+        def add(group: object, op: dist.ReduceOp.RedOpType, grad: torch.Tensor) -> None:
             key = (id(group), str(op), grad.dtype, grad.device)
-            bucket = buckets.get(key)
-            if bucket is None:
-                buckets[key] = (group, op, [grad])
-            else:
-                bucket[2].append(grad)
+            buckets.setdefault(key, (group, op, []))[2].append(grad)
 
         for param in params:
             grad = param.grad
@@ -743,7 +688,7 @@ class TrainerRank:
             else:
                 group = ps.get_expert_data_parallel_group()
             if group is not None and group.size() > 1:
-                add_to_bucket(group=group, op=dist.ReduceOp.SUM, grad=grad)
+                add(group, dist.ReduceOp.SUM, grad)
 
             op = getattr(param, "grad_sync_op", "none")
             if op == "none":
@@ -756,7 +701,7 @@ class TrainerRank:
             if tp_group is None or tp_group.size() <= 1:
                 continue
             reduce_op = dist.ReduceOp.AVG if op == "avg" else dist.ReduceOp.SUM
-            add_to_bucket(group=tp_group, op=reduce_op, grad=grad)
+            add(tp_group, reduce_op, grad)
 
         for group, op, grads in buckets.values():
             self._coalesced_all_reduce(grads, group=group, op=op)
@@ -768,8 +713,6 @@ class TrainerRank:
         group: object,
         op: dist.ReduceOp.RedOpType,
     ) -> None:
-        if not grads:
-            return
         coalesced = _flatten_dense_tensors(grads)
         reduced = (
             coalesced.float()
@@ -815,13 +758,12 @@ class TrainerRank:
             return indices, [items[index] for index in indices]
 
         estimates: dict[int, tuple[_MemoryCheck, bool] | None] = {}
-        rejected = 0
-        best_width = min_width
-        best_check: _MemoryCheck | None = None
 
-        def build_candidate(
+        def candidate(
             width: int,
             estimated_check: _MemoryCheck | None = None,
+            *,
+            rejected: int,
         ) -> _CandidateMicroBatch[ForwardInputsT]:
             width = clamp_width(width)
             indices, local_inputs = local_slice(width)
@@ -858,70 +800,64 @@ class TrainerRank:
                 message="smallest DP microbatch is predicted to exceed available memory",
             )
 
-        def probe(width: int) -> tuple[bool, _MemoryCheck | None]:
+        def probe(width: int) -> tuple[bool, _MemoryCheck | None, bool]:
             estimated = estimate(width)
             if estimated is not None:
-                return estimated[1] and estimated[0].fits, estimated[0]
-            item = build_candidate(width)
-            return item.check.fits, item.check
+                check, trusted = estimated
+                return trusted and check.fits, check, trusted
+            item = candidate(width, rejected=0)
+            return item.check.fits, item.check, not item.cold_start
 
-        def remember_fit(width: int, check: _MemoryCheck | None) -> None:
-            nonlocal best_width, best_check
-            best_width = snap_width(width)
-            best_check = check
+        rejected = 0
+        best_width = min_width
+        best_check: _MemoryCheck | None = None
+
+        def fit(width: int) -> bool:
+            nonlocal best_width, best_check, rejected
+            ok, check, _ = probe(width)
+            if ok:
+                best_width = snap_width(width)
+                best_check = check
+            else:
+                rejected += 1
+            return ok
 
         def search_below(failed_width: int) -> None:
-            nonlocal rejected
             low = best_width + 1
             high = failed_width - 1
             while low <= high:
                 mid = (low + high) // 2
-                fits, check = probe(mid)
-                if fits:
-                    remember_fit(mid, check)
+                if fit(mid):
                     low = mid + 1
                 else:
-                    rejected += 1
                     high = mid - 1
 
-        first_estimate = estimate(min_width)
-        if first_estimate is not None and not first_estimate[0].fits:
-            first = build_candidate(min_width, first_estimate[0])
-            raise_smallest(first.plan, first.check)
-        if first_estimate is None or not first_estimate[1]:
-            first = build_candidate(
-                min_width,
-                None if first_estimate is None else first_estimate[0],
-            )
+        first_fits, first_check, first_trusted = probe(min_width)
+        if not first_fits:
+            first = candidate(min_width, first_check, rejected=rejected)
             if not first.check.fits:
                 raise_smallest(first.plan, first.check)
             if first.cold_start:
                 return first
+            best_check = first.check
         else:
-            best_check = first_estimate[0]
+            best_check = first_check
 
         stable_width = self._last_global_micro_batch_size
         if stable_width is not None and stable_width >= max(64, granularity * 2):
             stable_capacity = stable_width
             stable_width = clamp_width(stable_capacity)
-            fits, check = probe(stable_width)
-            if fits:
+            if fit(stable_width):
                 grow_multiplier = 4 if stable_capacity < 256 else 2
                 grow_capacity = min(remaining, stable_capacity * grow_multiplier)
                 if remaining > grow_capacity:
                     grow_width = clamp_width(grow_capacity)
-                    if grow_width > stable_width:
-                        grow_fits, grow_check = probe(grow_width)
-                        if grow_fits:
-                            return build_candidate(grow_width, grow_check)
-                        rejected += 1
+                    if grow_width > stable_width and not fit(grow_width):
                         search_below(grow_width)
-                        return build_candidate(best_width, best_check)
-                return build_candidate(stable_width, check)
-            rejected += 1
+                return candidate(best_width, best_check, rejected=rejected)
             search_below(stable_width)
             self._last_global_micro_batch_size = best_width
-            return build_candidate(best_width, best_check)
+            return candidate(best_width, best_check, rejected=rejected)
 
         high_fail: int | None = None
         width = min(
@@ -929,21 +865,20 @@ class TrainerRank:
             max(min_width, (self._last_global_micro_batch_size or min_width) * 2),
         )
         while width <= remaining:
-            fits, check = probe(width)
-            if fits:
-                remember_fit(width, check)
+            if fit(width):
                 if width == remaining:
                     break
                 width = min(remaining, max(width + 1, width * 2))
                 continue
-            rejected += 1
             high_fail = width
             break
 
         if high_fail is not None:
             search_below(high_fail)
 
-        return build_candidate(best_width, best_check)
+        if not first_trusted and best_width == min_width and best_check is None:
+            return candidate(min_width, first_check, rejected=rejected)
+        return candidate(best_width, best_check, rejected=rejected)
 
     @staticmethod
     def _adaptive_window_granularity(*, remaining: int, dp_size: int) -> int:
@@ -1213,11 +1148,11 @@ class TrainerRank:
     def _topology_key(self) -> tuple[int, int, int, int]:
         try:
             topology = self._topology()
-            return (
-                int(topology.dp),
-                int(topology.tp),
-                int(topology.cp),
-                int(topology.pp),
+            return cast(
+                tuple[int, int, int, int],
+                tuple(
+                    int(getattr(topology, name)) for name in ("dp", "tp", "cp", "pp")
+                ),
             )
         except (AssertionError, AttributeError, ImportError, RuntimeError, ValueError):
             return (1, 1, 1, 1)
@@ -1281,7 +1216,13 @@ class TrainerRank:
         if packed_tokens <= 0:
             return output_bytes
         profiled = self._memory_profiles.get(signature)
-        static_compute = self._static_compute_memory_bytes_for_tokens(packed_tokens)
+        activation_factor = max(4, min(16, self._num_layers // 4 + 4))
+        static_compute = (
+            packed_tokens
+            * self._hidden_size
+            * self._param_dtype_size
+            * activation_factor
+        )
         if profiled is None or not _memory_profile_covers(
             profiled,
             packed_tokens=packed_tokens,
@@ -1290,17 +1231,6 @@ class TrainerRank:
         else:
             compute = max(static_compute, int(profiled.bytes_per_token * packed_tokens))
         return int((output_bytes + compute) * self.memory_safety_factor)
-
-    def _static_compute_memory_bytes_for_tokens(self, packed_tokens: int) -> int:
-        if packed_tokens <= 0:
-            return 0
-        activation_factor = max(4, min(16, self._num_layers // 4 + 4))
-        return int(
-            packed_tokens
-            * self._hidden_size
-            * self._param_dtype_size
-            * activation_factor
-        )
 
     def _available_memory_bytes(self) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
@@ -1379,7 +1309,7 @@ class TrainerRank:
     ) -> torch.Tensor:
         from art.megatron.train import _placeholder_attention_mask
 
-        handler = self._handler()
+        handler = self.runtime.model_support_handler
         model = _language_model(self.runtime.model[0])
         attention_mask = _placeholder_attention_mask(self.device)
         forward_kwargs = handler.get_forward_kwargs(
@@ -1474,10 +1404,9 @@ class TrainerRank:
             else torch.empty(0, dtype=torch.long, device=device)
         )
         if int(row_tensor.numel()):
-            local_row_matches = _row_matches_by_item(
-                prepared.positions_by_item,
-                row_tensor,
-                device=device,
+            local_row_matches = tuple(
+                _row_match(positions.to(device=device), row_tensor)
+                for positions in prepared.positions_by_item
             )
             self._project_vocab_parallel(
                 items,
@@ -1626,32 +1555,21 @@ class TrainerRank:
                     selected_log_z = log_z.index_select(0, chunk_offsets)
                     if local_topk is not None:
                         local_values, local_tokens = local_topk
-                        top_k[index] = _merge_topk(
-                            top_k[index],
-                            offsets,
-                            _vocab_parallel_topk_from_local(
-                                local_values.index_select(0, chunk_offsets),
-                                local_tokens.index_select(0, chunk_offsets),
-                                k=k,
-                                log_z=selected_log_z,
-                                vocab_start=_vocab_range(local_logits)[0],
-                            ),
-                            length=item_lengths[index],
+                        selected_values = local_values.index_select(0, chunk_offsets)
+                        selected_tokens = local_tokens.index_select(0, chunk_offsets)
+                    else:
+                        selected_logits = local_logits.index_select(0, chunk_offsets)
+                        selected_values, selected_tokens = torch.topk(
+                            selected_logits.float(),
+                            k=min(k, int(selected_logits.shape[1])),
+                            dim=-1,
                         )
-                        continue
-                    selected_logits = local_logits.index_select(0, chunk_offsets)
-                    local_k = min(k, int(selected_logits.shape[1]))
-                    local_values, local_tokens = torch.topk(
-                        selected_logits.float(),
-                        k=local_k,
-                        dim=-1,
-                    )
                     top_k[index] = _merge_topk(
                         top_k[index],
                         offsets,
                         _vocab_parallel_topk_from_local(
-                            local_values,
-                            local_tokens,
+                            selected_values,
+                            selected_tokens,
                             k=k,
                             log_z=selected_log_z,
                             vocab_start=_vocab_range(local_logits)[0],
@@ -1708,8 +1626,8 @@ class TrainerRank:
             return self._prepare_context_parallel_forward(batch, topology=topology)
         from art.megatron.shared_prefix_state import create_shared_prefix_state
 
-        handler = self._handler()
-        provider = self._provider()
+        handler = self.runtime.model_support_handler
+        provider = self.runtime.provider
         return _PreparedPackedForward(
             tokens=batch.tokens.to(self.device),
             position_ids=batch.position_ids.to(self.device),
@@ -1766,11 +1684,13 @@ class TrainerRank:
             "image_grid_thw": [None],
             "moe_routing_replay": None,
         }
-        handler = self._handler()
+        handler = self.runtime.model_support_handler
         prepared = prepare_cp_micro(
             micro=sparse_micro,
             topology=topology,
-            config=_context_parallel_config_for_provider(self._provider(), self.device),
+            config=_context_parallel_config_for_provider(
+                self.runtime.provider, self.device
+            ),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
             build_gdn_execution_spec=handler.build_gdn_execution_spec,
@@ -1879,11 +1799,7 @@ def _as_target_tokens(
     )
 
 
-def _validate_top_k(top_k: int | None, model: "GPTModel") -> None:
-    if top_k is None:
-        return
-    if top_k < 1:
-        raise ValueError("top_k must be >= 1")
+def _validate_top_k(top_k: int, model: "GPTModel") -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
@@ -2188,10 +2104,6 @@ def _vocab_parallel_topk_from_local(
 
     tp_size = int(ps.get_tensor_model_parallel_world_size())
     if tp_size <= 1:
-        if k > int(local_values.shape[1]):
-            raise ValueError(
-                f"top_k={k} exceeds vocabulary size {int(local_values.shape[1])}"
-            )
         return TopK(logprobs=local_values, tokens=local_tokens)
 
     from torch.distributed.nn.functional import all_gather
@@ -2202,8 +2114,6 @@ def _vocab_parallel_topk_from_local(
     dist.all_gather(gathered_tokens, local_tokens, group=group)
     values = torch.cat(gathered_values, dim=1)
     tokens = torch.cat(gathered_tokens, dim=1)
-    if k > int(values.shape[1]):
-        raise ValueError(f"top_k={k} exceeds vocabulary size {int(values.shape[1])}")
     top_values, top_offsets = torch.topk(values, k=k, dim=-1)
     return TopK(logprobs=top_values, tokens=tokens.gather(1, top_offsets))
 
@@ -2323,17 +2233,6 @@ def _matching_offsets(
         source_offsets,
     )
     return source_offsets[keep], order.index_select(0, found[keep])
-
-
-def _row_matches_by_item(
-    positions_by_item: Sequence[torch.Tensor],
-    rows: torch.Tensor,
-    *,
-    device: torch.device,
-) -> tuple[_RowMatch, ...]:
-    return tuple(
-        _row_match(positions.to(device=device), rows) for positions in positions_by_item
-    )
 
 
 def _row_match(positions: torch.Tensor, rows: torch.Tensor) -> _RowMatch:
