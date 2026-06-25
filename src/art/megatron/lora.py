@@ -1418,7 +1418,13 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
+        base_out, bias_out = cast(
+            Callable[
+                [torch.Tensor, list[int] | torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor | None],
+            ],
+            self.linear_fc1,
+        )(x, tokens_per_expert)
         adapter_out = (
             _expert_grouped_lora_forward(
                 self.lora, x, tokens_per_expert, self.linear_fc1.out_features
@@ -1456,7 +1462,13 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = self.linear_fc2(x, tokens_per_expert)
+        base_out, bias_out = cast(
+            Callable[
+                [torch.Tensor, list[int] | torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor | None],
+            ],
+            self.linear_fc2,
+        )(x, tokens_per_expert)
         adapter_out = _expert_grouped_lora_forward(
             self.lora, x, tokens_per_expert, self.linear_fc2.out_features
         )
