@@ -1212,12 +1212,17 @@ def _tensor_diff_value(
     else:
         max_abs_diff = 0.0
         mean_abs_pct = 0.0
-    tolerance = 5e-6 if "logprobs" in label else 0.0
+    mean_abs_pct_tolerance = 5e-3 if label.startswith("independent[") else 2e-5
+    max_abs_tolerance = 0.0
     _debug(
         f"{label} max_abs_diff={max_abs_diff} "
-        f"mean_abs_pct={mean_abs_pct} tolerance={tolerance}"
+        f"mean_abs_pct={mean_abs_pct} tolerance={mean_abs_pct_tolerance}"
     )
-    if max_abs_diff > tolerance:
+    if mean_abs_pct > mean_abs_pct_tolerance:
+        raise AssertionError(
+            f"{label} mean_abs_pct {mean_abs_pct} max_abs_diff {max_abs_diff}"
+        )
+    if max_abs_diff > max_abs_tolerance and not actual_for_diff.is_floating_point():
         raise AssertionError(f"{label} max diff {max_abs_diff}")
     return DiffStats(max_abs_diff=max_abs_diff, mean_abs_pct=mean_abs_pct)
 

@@ -249,55 +249,88 @@ def _build_tree_rank_execution_plan(
     ]
     cross_rank_token_count = 0
 
-    tree_segments_by_depth: list[list[GdnSegmentSpec]] = [
-        [] for _ in range(depth_count)
-    ]
-    for segment in spec.tree_segments:
-        tree_segments_by_depth[spec.tree_depths[segment.family_index]].append(segment)
+    children_by_node: list[list[int]] = [[] for _ in spec.tree_segments]
+    root_indices: list[int] = []
+    for node_index, parent_index in enumerate(spec.tree_parent_indices):
+        if parent_index < 0:
+            root_indices.append(node_index)
+        else:
+            children_by_node[parent_index].append(node_index)
 
-    for depth, depth_segments in enumerate(tree_segments_by_depth):
-        local_groups: list[tuple[GdnSegmentSpec, ...]] = []
-        for segment in depth_segments:
-            parent_index = spec.tree_parent_indices[segment.family_index]
-            if (
-                parent_index < 0
-                and cp_size > 1
-                and _can_chain_tree_segment(
-                    segment,
-                    cp_size=cp_size,
-                    planner_config=planner_config,
-                )
-            ):
-                chained_nodes[segment.family_index] = True
-                chain_segments_by_depth[depth].append(segment)
-                cross_rank_token_count += _append_chain_segment(
-                    gdn_ranges_by_rank,
-                    rank_loads,
-                    segment,
-                    spec,
-                    attention_layout_index=attention_layout_index,
-                )
-                continue
-            local_groups.append((segment,))
+    def subtree_indices(root_index: int) -> tuple[int, ...]:
+        ordered: list[int] = []
+        stack = [root_index]
+        while stack:
+            node_index = stack.pop()
+            ordered.append(node_index)
+            stack.extend(reversed(children_by_node[node_index]))
+        return tuple(ordered)
 
-        for local_group in local_groups:
-            owner = _best_segment_owner(
-                local_group,
+    def assign_local_group(node_indices: tuple[int, ...]) -> None:
+        nonlocal cross_rank_token_count
+        segments = tuple(spec.tree_segments[index] for index in node_indices)
+        owner = _best_segment_owner(
+            segments,
+            rank_loads,
+            segment_attention_counts=segment_attention_counts,
+            planner_config=planner_config,
+        )
+        for segment in segments:
+            owner_by_node[segment.family_index] = owner
+            segments_by_rank_depth[owner][
+                spec.tree_depths[segment.family_index]
+            ].append(segment)
+            cross_rank_token_count += _append_local_segment(
+                gdn_ranges_by_rank,
                 rank_loads,
+                owner,
+                segment,
+                spec,
                 segment_attention_counts=segment_attention_counts,
+            )
+
+    subtree_token_counts = [segment.length for segment in spec.tree_segments]
+    for node_index in reversed(range(len(spec.tree_segments))):
+        for child_index in children_by_node[node_index]:
+            subtree_token_counts[node_index] += subtree_token_counts[child_index]
+    target_rank_load = spec.real_token_count / max(1, cp_size)
+    max_local_group_tokens = max(1, int(target_rank_load))
+
+    def assign_tree(root_index: int) -> None:
+        nonlocal cross_rank_token_count
+        root = spec.tree_segments[root_index]
+        if (
+            spec.tree_parent_indices[root_index] < 0
+            and cp_size > 1
+            and _can_chain_tree_segment(
+                root,
+                cp_size=cp_size,
                 planner_config=planner_config,
             )
-            for segment in local_group:
-                owner_by_node[segment.family_index] = owner
-                segments_by_rank_depth[owner][depth].append(segment)
-                cross_rank_token_count += _append_local_segment(
-                    gdn_ranges_by_rank,
-                    rank_loads,
-                    owner,
-                    segment,
-                    spec,
-                    segment_attention_counts=segment_attention_counts,
-                )
+        ):
+            chained_nodes[root.family_index] = True
+            chain_segments_by_depth[spec.tree_depths[root.family_index]].append(root)
+            cross_rank_token_count += _append_chain_segment(
+                gdn_ranges_by_rank,
+                rank_loads,
+                root,
+                spec,
+                attention_layout_index=attention_layout_index,
+            )
+            for child_index in children_by_node[root_index]:
+                assign_tree(child_index)
+            return
+
+        if subtree_token_counts[root_index] <= max_local_group_tokens:
+            assign_local_group(subtree_indices(root_index))
+            return
+
+        assign_local_group((root_index,))
+        for child_index in children_by_node[root_index]:
+            assign_tree(child_index)
+
+    for root_index in root_indices:
+        assign_tree(root_index)
 
     gdn_ranges_by_rank_by_position = tuple(
         tuple(ranges) for ranges in gdn_ranges_by_rank
