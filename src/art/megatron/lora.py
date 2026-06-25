@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
 import functools
+import importlib
 import json
 import math
 import os
@@ -72,31 +73,13 @@ _CURRENT_LORA_SLOT: contextvars.ContextVar[_LoRASlotContext | None] = (
 )
 
 
-def set_lora_slot_context(
-    ref: LoRASlotRef | None,
-) -> contextvars.Token[_LoRASlotContext | None]:
-    """Select a dynamic LoRA slot for the current execution context.
-
-    ``None`` preserves the legacy single-adapter path. ``LoRASlotRef(..., None)``
-    explicitly selects the base model and makes every LoRA site an identity.
-    """
-
-    return _CURRENT_LORA_SLOT.set(None if ref is None else _LoRASlotContext(ref))
-
-
-def reset_lora_slot_context(
-    token: contextvars.Token[_LoRASlotContext | None],
-) -> None:
-    _CURRENT_LORA_SLOT.reset(token)
-
-
 @contextmanager
 def use_lora_slot(ref: LoRASlotRef | None) -> Iterator[None]:
-    token = set_lora_slot_context(ref)
+    token = _CURRENT_LORA_SLOT.set(None if ref is None else _LoRASlotContext(ref))
     try:
         yield
     finally:
-        reset_lora_slot_context(token)
+        _CURRENT_LORA_SLOT.reset(token)
 
 
 def _with_captured_lora_slot(function: _F) -> _F:
@@ -125,84 +108,60 @@ def _patch_function_once(module: Any, name: str, wrapper: Callable[[_F], _F]) ->
 def install_lora_checkpoint_context_hooks() -> None:
     """Preserve the selected dynamic LoRA slot across activation recompute."""
 
-    def wrap_torch_checkpoint(original: _F) -> _F:
+    def wrap_checkpoint(original: _F, function_index: int) -> _F:
         @functools.wraps(original)
-        def checkpoint(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-            return original(_with_captured_lora_slot(function), *args, **kwargs)
+        def checkpoint(*args: Any, **kwargs: Any) -> Any:
+            if len(args) > function_index:
+                args = (
+                    *args[:function_index],
+                    _with_captured_lora_slot(args[function_index]),
+                    *args[function_index + 1 :],
+                )
+            elif "function" in kwargs:
+                kwargs = {
+                    **kwargs,
+                    "function": _with_captured_lora_slot(kwargs["function"]),
+                }
+            elif "forward_func" in kwargs:
+                kwargs = {
+                    **kwargs,
+                    "forward_func": _with_captured_lora_slot(kwargs["forward_func"]),
+                }
+            else:
+                raise TypeError("checkpoint wrapper could not find callable argument")
+            return original(*args, **kwargs)
 
         return cast(_F, checkpoint)
 
-    def wrap_megatron_checkpoint(original: _F) -> _F:
-        @functools.wraps(original)
-        def checkpoint(
-            function: Callable[..., Any],
-            distribute_saved_activations: bool,
-            *args: Any,
-        ) -> Any:
-            return original(
-                _with_captured_lora_slot(function),
-                distribute_saved_activations,
-                *args,
-            )
-
-        return cast(_F, checkpoint)
-
-    def wrap_checkpoint_without_output(original: _F) -> _F:
-        @functools.wraps(original)
-        def checkpoint(self: Any, function: Callable[..., Any], *args: Any) -> Any:
-            return original(self, _with_captured_lora_slot(function), *args)
-
-        return cast(_F, checkpoint)
-
-    def wrap_te_checkpoint(original: _F) -> _F:
-        @functools.wraps(original)
-        def checkpoint(
-            forward_func: Callable[..., Any],
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            return original(_with_captured_lora_slot(forward_func), *args, **kwargs)
-
-        return cast(_F, checkpoint)
-
-    try:
-        import torch.utils.checkpoint as torch_checkpoint
-
-        _patch_function_once(torch_checkpoint, "checkpoint", wrap_torch_checkpoint)
-    except Exception:
-        pass
-
-    try:
-        import megatron.core.tensor_parallel as tensor_parallel
-        import megatron.core.tensor_parallel.random as megatron_random
-
-        _patch_function_once(tensor_parallel, "checkpoint", wrap_megatron_checkpoint)
-        _patch_function_once(megatron_random, "checkpoint", wrap_megatron_checkpoint)
-        checkpoint_without_output = getattr(
-            megatron_random, "CheckpointWithoutOutput", None
-        )
-        if checkpoint_without_output is not None:
+    def patch(target: str, name: str, function_index: int) -> None:
+        try:
+            module_name, _, attr_path = target.partition(":")
+            target_obj = importlib.import_module(module_name)
+            for attr in attr_path.split(".") if attr_path else ():
+                target_obj = getattr(target_obj, attr, None)
+                if target_obj is None:
+                    return
             _patch_function_once(
-                checkpoint_without_output,
-                "checkpoint",
-                wrap_checkpoint_without_output,
+                target_obj,
+                name,
+                lambda original: wrap_checkpoint(original, function_index),
             )
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    try:
-        import megatron.core.transformer.transformer_block as transformer_block
-
-        _patch_function_once(transformer_block, "te_checkpoint", wrap_te_checkpoint)
-    except Exception:
-        pass
-
-    try:
-        import transformer_engine.pytorch.distributed as te_distributed
-
-        _patch_function_once(te_distributed, "checkpoint", wrap_te_checkpoint)
-    except Exception:
-        pass
+    for target, name, function_index in (
+        ("torch.utils.checkpoint", "checkpoint", 0),
+        ("megatron.core.tensor_parallel", "checkpoint", 0),
+        ("megatron.core.tensor_parallel.random", "checkpoint", 0),
+        (
+            "megatron.core.tensor_parallel.random:CheckpointWithoutOutput",
+            "checkpoint",
+            1,
+        ),
+        ("megatron.core.transformer.transformer_block", "te_checkpoint", 0),
+        ("transformer_engine.pytorch.distributed", "checkpoint", 0),
+    ):
+        patch(target, name, function_index)
 
 
 install_lora_checkpoint_context_hooks()
@@ -400,13 +359,8 @@ def _set_lora_parallel_metadata(
     setattr(param, "lora_tp_shard_dim", parallel_spec.shard_dim)
     setattr(param, "grad_sync_domain", parallel_spec.grad_sync_domain)
     setattr(param, "grad_sync_op", parallel_spec.grad_sync_op)
-    # Megatron DDP routing flag:
-    # - allreduce=True: sync with regular DP/CP replicas.
-    # - allreduce=False: sync with expert-DP replicas.
-    # TP / expert-TP replica handling is controlled by grad_sync_* metadata.
     setattr(param, "allreduce", allreduce)
 
-    # Megatron's native TP finalize path consumes this attr.
     setattr(
         param,
         "average_gradients_across_tp_domain",
@@ -417,16 +371,12 @@ def _set_lora_parallel_metadata(
         ),
     )
 
-    # Megatron optimizer and checkpoint logic rely on tensor model-parallel metadata
-    # to distinguish true shards from TP-duplicate params.
     if parallel_spec.sharded:
         shard_dim = parallel_spec.shard_dim
         if shard_dim is None:
             raise ValueError("LoRAParallelSpec.shard_dim must be set when sharded=True")
         setattr(param, "tensor_model_parallel", True)
         setattr(param, "partition_dim", _normalize_axis(shard_dim, param.ndim))
-        # stride > 1 means the dim is split into blocks and each tp rank holds a shard of the block
-        # this might happen for fused e.g. gate_(up|proj), but loras are individual per module
         setattr(param, "partition_stride", 1)
     else:
         setattr(param, "tensor_model_parallel", False)
@@ -611,9 +561,6 @@ class LoRA(torch.nn.Module):
             ]
         return [f"{self.adapter_model_prefix}.{suffix}.weight"]
 
-    def has_lora_slot(self, ref: LoRASlotRef) -> bool:
-        return ref in self._slot_keys
-
     def load_lora_slot(
         self,
         ref: LoRASlotRef,
@@ -624,35 +571,11 @@ class LoRA(torch.nn.Module):
     ) -> bool:
         if ref.name is None:
             raise ValueError("base-model slot refs do not own LoRA tensors")
-        keys = {
-            suffix: self._expected_weight_keys(suffix)
-            for suffix in ("lora_A", "lora_B")
-        }
-        present = {
-            suffix: [key in adapter_model for key in suffix_keys]
-            for suffix, suffix_keys in keys.items()
-        }
-        if not any(any(values) for values in present.values()):
+        weights = self._adapter_weights(adapter_model, require=False)
+        if weights is None:
             return False
-        missing_keys = [
-            key
-            for suffix, suffix_keys in keys.items()
-            for key, is_present in zip(suffix_keys, present[suffix], strict=True)
-            if not is_present
-        ]
-        if missing_keys:
-            raise KeyError(
-                f"Incomplete LoRA slot {ref.kind}:{ref.name} for "
-                f"{self.adapter_model_prefix}: {sorted(missing_keys)}"
-            )
-        a_t = self._localized_weight(
-            self._adapter_weight(adapter_model, suffix="lora_A"),
-            into=self.A_T,
-        )
-        b_t = self._localized_weight(
-            self._adapter_weight(adapter_model, suffix="lora_B"),
-            into=self.B_T,
-        )
+        a_t = self._localized_weight(weights[0], into=self.A_T)
+        b_t = self._localized_weight(weights[1], into=self.B_T)
         slot_key = self._slot_keys.get(ref)
         if slot_key is None:
             slot_key = f"slot_{len(self._slot_keys)}"
@@ -692,25 +615,34 @@ class LoRA(torch.nn.Module):
         )
 
     def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
-        missing_keys = [
+        weights = self._adapter_weights(adapter_model, require=True)
+        assert weights is not None
+        self._load_weight(weights[0], into=self.A_T)
+        self._load_weight(weights[1], into=self.B_T)
+
+    def _adapter_weights(
+        self,
+        adapter_model: dict[str, torch.Tensor],
+        *,
+        require: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        all_keys = [
             key
             for suffix in ("lora_A", "lora_B")
             for key in self._expected_weight_keys(suffix)
-            if key not in adapter_model
         ]
-        if missing_keys:
+        missing = [key for key in all_keys if key not in adapter_model]
+        if len(missing) == len(all_keys) and not require:
+            return None
+        if missing:
+            state = "Missing" if require else "Incomplete"
             raise KeyError(
-                f"Missing LoRA adapter keys for {self.adapter_model_prefix}: {sorted(missing_keys)}"
+                f"{state} LoRA adapter keys for {self.adapter_model_prefix}: "
+                f"{sorted(missing)}"
             )
-        self.load_weights(
-            adapter_model,
-            suffix="lora_A",
-            into=self.A_T,
-        )
-        self.load_weights(
-            adapter_model,
-            suffix="lora_B",
-            into=self.B_T,
+        return (
+            self._adapter_weight(adapter_model, suffix="lora_A"),
+            self._adapter_weight(adapter_model, suffix="lora_B"),
         )
 
     def _adapter_weight(
@@ -723,16 +655,6 @@ class LoRA(torch.nn.Module):
         if self.num_local_experts > 1:
             return torch.stack([adapter_model[key].T for key in keys])
         return adapter_model[keys[0]].T
-
-    def load_weights(
-        self,
-        adapter_model: dict[str, torch.Tensor],
-        *,
-        suffix: str,
-        into: torch.nn.Parameter,
-    ) -> None:
-        weight = self._adapter_weight(adapter_model, suffix=suffix)
-        self.load_weight(weight, into=into)
 
     def _localized_weight(
         self, weight: torch.Tensor, *, into: torch.nn.Parameter
@@ -777,7 +699,7 @@ class LoRA(torch.nn.Module):
                 )
         return weight.contiguous()
 
-    def load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
+    def _load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
         weight = self._localized_weight(weight, into=into)
         if tuple(weight.shape) != tuple(into.shape):
             raise ValueError(
@@ -991,51 +913,50 @@ class LoRAPublishPlanner:
         template: _LoraPublishTemplate,
         adapter_model: dict[str, torch.Tensor],
     ) -> list[LoraShardMeta]:
-        if template.num_local_experts > 1:
-            return self._expert_metadata_for_template(template, adapter_model)
-        return self._dense_metadata_for_template(template, adapter_model)
-
-    def _dense_metadata_for_template(
-        self,
-        template: _LoraPublishTemplate,
-        adapter_model: dict[str, torch.Tensor],
-    ) -> list[LoraShardMeta]:
-        tp_ranks = self._dense_tp_ranks()
         shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
+        if template.num_local_experts <= 1:
+            tp_ranks = (
+                _process_group_ranks(ps.get_tensor_model_parallel_group())
+                if _distributed_initialized()
+                else (0,)
+            )
+            owners = [
+                (
+                    f"{template.adapter_model_prefix}.{template.suffix}",
+                    tp_ranks[shard_rank],
+                    shard_rank,
+                )
+                for shard_rank in shard_ranks
+            ]
+        else:
+            ep_world_size = self._expert_model_world_size()
+            owners = [
+                (
+                    f"{template.adapter_model_prefix.format(expert=expert)}.{template.suffix}",
+                    self._expert_owner_rank(ep_rank, shard_rank),
+                    shard_rank,
+                )
+                for ep_rank in range(ep_world_size)
+                for local_expert in range(template.num_local_experts)
+                for expert in [ep_rank * template.num_local_experts + local_expert]
+                for shard_rank in shard_ranks
+            ]
         return [
             self._make_metadata(
                 template,
-                key=f"{template.adapter_model_prefix}.{template.suffix}",
-                owner_rank=tp_ranks[shard_rank],
+                key=key,
+                owner_rank=owner_rank,
                 shard_rank=shard_rank,
                 adapter_model=adapter_model,
             )
-            for shard_rank in shard_ranks
+            for key, owner_rank, shard_rank in owners
         ]
 
-    def _expert_metadata_for_template(
-        self,
-        template: _LoraPublishTemplate,
-        adapter_model: dict[str, torch.Tensor],
-    ) -> list[LoraShardMeta]:
-        ep_world_size = self._expert_model_world_size()
-        shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
-        metadata: list[LoraShardMeta] = []
-        for ep_rank in range(ep_world_size):
-            for local_expert in range(template.num_local_experts):
-                expert = ep_rank * template.num_local_experts + local_expert
-                key = f"{template.adapter_model_prefix.format(expert=expert)}.{template.suffix}"
-                for shard_rank in shard_ranks:
-                    metadata.append(
-                        self._make_metadata(
-                            template,
-                            key=key,
-                            owner_rank=self._expert_owner_rank(ep_rank, shard_rank),
-                            shard_rank=shard_rank,
-                            adapter_model=adapter_model,
-                        )
-                    )
-        return metadata
+    @staticmethod
+    def _expert_model_world_size() -> int:
+        if not _distributed_initialized():
+            return 1
+        return ps.get_expert_model_parallel_world_size()
 
     @staticmethod
     def _make_metadata(
@@ -1046,6 +967,18 @@ class LoRAPublishPlanner:
         shard_rank: int,
         adapter_model: dict[str, torch.Tensor],
     ) -> LoraShardMeta:
+        manifest: dict[str, Any] = {
+            "sharded": template.sharded,
+            "shard_world_size": template.shard_world_size if template.sharded else 1,
+            "shard_rank": shard_rank if template.sharded else 0,
+        }
+        if template.sharded:
+            manifest["export_shard_dim"] = template.export_shard_dim
+            manifest["export_shard_strategy"] = (
+                template.export_shard_strategy or "uniform"
+            )
+            if template.component_sizes:
+                manifest["component_sizes"] = list(template.component_sizes)
         return LoraShardMeta(
             key=key,
             owner_rank=owner_rank,
@@ -1055,21 +988,9 @@ class LoRAPublishPlanner:
                 if key in adapter_model
                 else template.dtype_name
             ),
-            manifest=_publish_manifest(template, shard_rank=shard_rank),
+            manifest=manifest,
             block=_block_for_key(key),
         )
-
-    @staticmethod
-    def _dense_tp_ranks() -> tuple[int, ...]:
-        if not _distributed_initialized():
-            return (0,)
-        return _process_group_ranks(ps.get_tensor_model_parallel_group())
-
-    @staticmethod
-    def _expert_model_world_size() -> int:
-        if not _distributed_initialized():
-            return 1
-        return ps.get_expert_model_parallel_world_size()
 
     @staticmethod
     def _expert_owner_rank(ep_rank: int, shard_rank: int) -> int:
@@ -1115,24 +1036,6 @@ def _exported_param_shape(module: LoRA, param: torch.nn.Parameter) -> tuple[int,
     if module.num_local_experts > 1:
         return tuple(int(dim) for dim in param[0].T.shape)
     return tuple(int(dim) for dim in param.T.shape)
-
-
-def _publish_manifest(
-    template: _LoraPublishTemplate,
-    *,
-    shard_rank: int,
-) -> dict[str, Any]:
-    manifest: dict[str, Any] = {
-        "sharded": template.sharded,
-        "shard_world_size": template.shard_world_size if template.sharded else 1,
-        "shard_rank": shard_rank if template.sharded else 0,
-    }
-    if template.sharded:
-        manifest["export_shard_dim"] = template.export_shard_dim
-        manifest["export_shard_strategy"] = template.export_shard_strategy or "uniform"
-        if template.component_sizes:
-            manifest["component_sizes"] = list(template.component_sizes)
-    return manifest
 
 
 @torch.compiler.disable
@@ -1271,24 +1174,19 @@ def _parallel_lora_pair(
     num_local_experts: int = 1,
 ) -> tuple[LoRA, LoRA]:
     make_lora = _expert_parallel_lora if num_local_experts > 1 else _parallel_lora
-    return (
-        make_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.{suffixes[0]}",
-            linear=linear,
-            out_features=out_features,
-            rank=rank,
-            alpha=alpha,
-            layout=layout,
-            num_local_experts=num_local_experts,
-        ),
-        make_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.{suffixes[1]}",
-            linear=linear,
-            out_features=out_features,
-            rank=rank,
-            alpha=alpha,
-            layout=layout,
-            num_local_experts=num_local_experts,
+    return cast(
+        tuple[LoRA, LoRA],
+        tuple(
+            make_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.{suffix}",
+                linear=linear,
+                out_features=out_features,
+                rank=rank,
+                alpha=alpha,
+                layout=layout,
+                num_local_experts=num_local_experts,
+            )
+            for suffix in suffixes
         ),
     )
 
