@@ -60,8 +60,12 @@ def main(
     memory_sample_interval_s: float = 0.05,
     compare_target_correctness: bool = False,
     run_adapter_sanity: bool = False,
+    progress_jsonl: str = "",
     output_jsonl: str = "",
 ) -> None:
+    if progress_jsonl:
+        os.environ["ART_TRAINER_RANK_PROGRESS_JSONL"] = progress_jsonl
+
     os.environ.setdefault("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
     os.environ.setdefault("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "1")
     os.environ.setdefault("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", "1")
@@ -2077,6 +2081,7 @@ def _profiled_adaptive_micro_batch_training_step_body(
     rank._validate_replicated_top_level_count(len(items))
     start = 0
     stats: list[dict[str, int | bool | float]] = []
+    step_start = time.perf_counter()
     while start < len(items):
         with _profile_adaptive_selection(rank) as select_profile:
             candidate, select_ms = _timed_cuda(
@@ -2127,30 +2132,38 @@ def _profiled_adaptive_micro_batch_training_step_body(
             _, backward_ms = _timed_cuda(rank, loss.backward)
         else:
             backward_ms = 0.0
-        stats.append(
-            {
-                "global_count": int(candidate.stats_global_count),
-                "local_count": int(len(candidate.inputs)),
-                "packed_tokens": int(candidate.plan.packed_tokens),
-                "logical_tokens": int(candidate.plan.logical_tokens),
-                "estimated_required_bytes": int(
-                    candidate.check.estimated_required_bytes
-                ),
-                "available_bytes": int(candidate.check.available_bytes),
-                "rejected_candidates": int(candidate.rejected_candidates),
-                "cold_start": bool(candidate.cold_start),
-                "select_ms": select_ms,
-                "execute_ms": execute_ms,
-                "unflatten_ms": unflatten_ms,
-                "loss_ms": loss_ms,
-                "backward_ms": backward_ms,
-                "optim_ms": 0.0,
-                **select_profile,
-            }
-        )
+        row = {
+            "global_count": int(candidate.stats_global_count),
+            "local_count": int(len(candidate.inputs)),
+            "packed_tokens": int(candidate.plan.packed_tokens),
+            "logical_tokens": int(candidate.plan.logical_tokens),
+            "estimated_required_bytes": int(candidate.check.estimated_required_bytes),
+            "available_bytes": int(candidate.check.available_bytes),
+            "rejected_candidates": int(candidate.rejected_candidates),
+            "cold_start": bool(candidate.cold_start),
+            "select_ms": select_ms,
+            "execute_ms": execute_ms,
+            "unflatten_ms": unflatten_ms,
+            "loss_ms": loss_ms,
+            "backward_ms": backward_ms,
+            "optim_ms": 0.0,
+            **select_profile,
+        }
+        stats.append(row)
         rank._remember_adaptive_window(
             candidate.stats_global_count,
             is_tail=start + candidate.stats_global_count >= len(items),
+        )
+        _emit_adaptive_progress(
+            "target_trainer_adaptive_profile_train_step_window",
+            {
+                **row,
+                "window_index": len(stats) - 1,
+                "global_start": int(start),
+                "global_stop": int(start + candidate.stats_global_count),
+                "remembered_window": int(rank._last_global_micro_batch_size or 0),
+                "elapsed_ms": (time.perf_counter() - step_start) * 1000.0,
+            },
         )
         start += candidate.stats_global_count
     metrics, optim_ms = _timed_cuda(
@@ -2160,6 +2173,21 @@ def _profiled_adaptive_micro_batch_training_step_body(
         stats[-1]["optim_ms"] = optim_ms
     stats_sink[:] = stats
     return metrics
+
+
+def _emit_adaptive_progress(event: str, row: dict[str, object]) -> None:
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+    path = os.environ.get("ART_TRAINER_RANK_PROGRESS_JSONL")
+    if not path:
+        return
+    payload = {"event": event, **row}
+    line = json.dumps(payload, sort_keys=True)
+    print(line, flush=True)
+    progress_path = Path(path)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    with progress_path.open("a") as handle:
+        handle.write(line + "\n")
 
 
 @contextmanager
