@@ -171,17 +171,23 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
     trainer._last_global_micro_batch_size = 4
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile_values", lambda **_kwargs: True
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
     )
 
-    def memory_check(plan):
+    def required_memory(**kwargs):
+        return kwargs["packed_tokens"]
+
+    def memory_check(required):
         return _MemoryCheck(
-            estimated_required_bytes=plan.packed_tokens,
+            estimated_required_bytes=required,
             available_bytes=6,
-            fits=plan.packed_tokens <= 6,
+            fits=required <= 6,
         )
 
-    monkeypatch.setattr(trainer, "_memory_check", memory_check)
+    monkeypatch.setattr(
+        trainer, "_estimate_required_memory_bytes_from_values", required_memory
+    )
+    monkeypatch.setattr(trainer, "_memory_check_required", memory_check)
     monkeypatch.setattr(
         trainer,
         "_run_flat_plan_with_memory_tracking",
@@ -204,7 +210,7 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
     trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(
-        trainer, "_all_ranks_have_memory_profile_values", lambda **_kwargs: True
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
     )
     monkeypatch.setattr(
         trainer,
@@ -243,7 +249,7 @@ def test_forward_micro_batches_reuses_cached_candidate_plans(
     assert first_plan_calls > 0
     assert first_plan_calls == 1
     assert plan_calls == first_plan_calls
-    assert memory_checks > first_memory_checks
+    assert memory_checks == first_memory_checks == 0
 
 
 def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
@@ -253,9 +259,14 @@ def test_forward_micro_batches_raises_when_smallest_batch_will_not_fit(
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(
         trainer,
-        "_memory_check",
-        lambda plan: _MemoryCheck(
-            estimated_required_bytes=4,
+        "_estimate_required_memory_bytes_from_values",
+        lambda **_kwargs: 4,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_memory_check_required",
+        lambda required: _MemoryCheck(
+            estimated_required_bytes=required,
             available_bytes=3,
             fits=False,
         ),

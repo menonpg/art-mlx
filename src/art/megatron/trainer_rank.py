@@ -9,7 +9,6 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from itertools import zip_longest
 import os
 from typing import TYPE_CHECKING, Generic, Literal, ParamSpec, TypeVar, cast, overload
 
@@ -20,11 +19,6 @@ import torch.distributed as dist
 from art.megatron.shared_prefix_packing import (
     estimate_shared_prefix_packed_tokens,
     pack_shared_prefixes,
-)
-from art.megatron.trainer_rank_planner import (
-    _CandidateMicroBatch,
-    _MemoryCheck,
-    select_next_micro_batch,
 )
 
 if TYPE_CHECKING:
@@ -67,7 +61,6 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 _COMPILED_FUNCTIONS: dict[Callable[..., object], Callable[..., object]] = {}
-_ADAPTIVE_PLAN_CACHE_MAX_ENTRIES = 256
 
 
 class _Unset:
@@ -356,6 +349,24 @@ class MicroBatchStats:
     cold_start: bool
 
 
+@dataclass(frozen=True)
+class _MemoryCheck:
+    estimated_required_bytes: int
+    available_bytes: int
+    fits: bool
+
+
+@dataclass(frozen=True)
+class _CandidateMicroBatch(Generic[ForwardInputsT]):
+    inputs: Sequence[ForwardInputsT]
+    indices: tuple[int, ...]
+    plan: "_FlatForwardPlan"
+    check: _MemoryCheck
+    stats_global_count: int
+    rejected_candidates: int
+    cold_start: bool
+
+
 class TrainerRankMemoryError(RuntimeError):
     pass
 
@@ -440,19 +451,7 @@ class _FlatForwardPlan:
     signature: _MemorySignature
 
 
-@dataclass(frozen=True)
-class _FlatForwardEstimate:
-    packed_tokens: int
-    output_bytes: int
-    signature: _MemorySignature
-
-
-@dataclass(frozen=True)
-class _AdaptivePlanCacheKey:
-    local_indices: tuple[int, ...]
-    default_slot_ref: "LoRASlotRef | None"
-    slot_stack: tuple["LoRASlotRef", ...]
-    shared_prefix_max_depth: int
+type _AdaptivePlanCacheKey = tuple[tuple[int, ...], object, tuple[object, ...], int]
 
 
 class TrainerRank:
@@ -489,7 +488,7 @@ class TrainerRank:
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
         self._adaptive_estimate_cache: dict[
-            _AdaptivePlanCacheKey, _FlatForwardEstimate | None
+            _AdaptivePlanCacheKey, tuple[_MemoryCheck, bool] | None
         ] = {}
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
@@ -642,15 +641,6 @@ class TrainerRank:
         if not mismatched:
             return params
 
-        first_mismatch = None
-        for left, right in zip_longest(
-            cast(list[object], reference["signature"]),
-            cast(list[object], mismatched[0]["signature"]),
-            fillvalue=None,
-        ):
-            if left != right:
-                first_mismatch = {"expected": left, "actual": right}
-                break
         summary = [
             {
                 "rank": rank["rank"],
@@ -665,7 +655,7 @@ class TrainerRank:
             "distributed ranks. This usually means a sharded/exported LoRA state "
             "dict was passed directly to TrainerRank; gather or materialize the "
             "full adapter state before loading a dynamic slot. "
-            f"Rank summary: {summary}. First mismatch: {first_mismatch}."
+            f"Rank summary: {summary}."
         )
 
     def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
@@ -980,44 +970,131 @@ class TrainerRank:
         self,
         items: Sequence[ForwardInputsT],
         start: int,
-    ) -> _CandidateMicroBatch[ForwardInputsT, _FlatForwardPlan]:
+    ) -> _CandidateMicroBatch[ForwardInputsT]:
         dp_rank, dp_size = self._dp_rank_and_size()
-        return select_next_micro_batch(
-            items,
-            start,
-            dp_rank=dp_rank,
-            dp_size=dp_size,
-            previous_global_micro_batch_size=self._last_global_micro_batch_size,
-            plan_for_local_inputs=lambda indices, local_inputs: (
-                self._cached_adaptive_plan(items, indices, local_inputs)
-            ),
-            estimate_for_local_inputs=lambda indices, local_inputs: (
-                self._cached_adaptive_estimate(items, indices, local_inputs)
-            ),
-            memory_check=cast(
-                Callable[[_FlatForwardPlan], _MemoryCheck], self._memory_check
-            ),
-            memory_check_estimate=cast(
-                Callable[[_FlatForwardEstimate], _MemoryCheck],
-                self._memory_check,
-            ),
-            has_memory_profile=lambda plan: self._all_ranks_have_memory_profile_values(
-                packed_tokens=plan.packed_tokens,
-                signature=plan.signature,
-            ),
-            has_memory_profile_estimate=(
-                lambda estimate: self._all_ranks_have_memory_profile_values(
-                    packed_tokens=estimate.packed_tokens,
-                    signature=estimate.signature,
-                )
-            ),
-            raise_smallest_batch_error=lambda plan, check: self._raise_memory_error(
+        remaining = len(items) - start
+        min_width = min(dp_size, remaining)
+        if min_width <= 0:
+            raise RuntimeError("cannot select an empty microbatch window")
+
+        estimate_cache: dict[int, tuple[_MemoryCheck, bool] | None] = {}
+        rejected = 0
+
+        def clamp_width(width: int) -> int:
+            return max(min_width, min(width, remaining))
+
+        def local_slice(width: int) -> tuple[tuple[int, ...], list[ForwardInputsT]]:
+            stop = start + clamp_width(width)
+            indices = tuple(range(start + dp_rank, stop, dp_size))
+            return indices, [items[index] for index in indices]
+
+        def raise_smallest(plan: _FlatForwardPlan, check: _MemoryCheck) -> None:
+            self._raise_memory_error(
                 plan,
                 check,
                 context="forward_micro_batches",
                 message="smallest DP microbatch is predicted to exceed available memory",
-            ),
+            )
+
+        def candidate(
+            width: int,
+            estimated_check: _MemoryCheck | None = None,
+        ) -> _CandidateMicroBatch[ForwardInputsT]:
+            width = clamp_width(width)
+            indices, local_inputs = local_slice(width)
+            plan = self._cached_adaptive_plan(items, indices, local_inputs)
+            return _CandidateMicroBatch(
+                inputs=local_inputs,
+                indices=indices,
+                plan=plan,
+                check=estimated_check or self._memory_check(plan),
+                stats_global_count=width,
+                rejected_candidates=rejected,
+                cold_start=not self._all_ranks_have_memory_profile(
+                    packed_tokens=plan.packed_tokens,
+                    signature=plan.signature,
+                ),
+            )
+
+        def estimate_check(width: int) -> tuple[_MemoryCheck, bool] | None:
+            width = clamp_width(width)
+            if width not in estimate_cache:
+                indices, local_inputs = local_slice(width)
+                estimate_cache[width] = self._cached_adaptive_estimate(
+                    items,
+                    indices,
+                    local_inputs,
+                )
+            return estimate_cache[width]
+
+        first_estimated = estimate_check(min_width)
+        if first_estimated is not None and not first_estimated[0].fits:
+            first = candidate(min_width, first_estimated[0])
+            raise_smallest(first.plan, first.check)
+
+        if first_estimated is not None and first_estimated[1]:
+            best_width = min_width
+            best_check: _MemoryCheck | None = first_estimated[0]
+        else:
+            first = candidate(
+                min_width,
+                first_estimated[0] if first_estimated is not None else None,
+            )
+            if not first.check.fits:
+                raise_smallest(first.plan, first.check)
+            if first.cold_start:
+                return first
+            best_width = first.stats_global_count
+            best_check = None
+
+        def probe(
+            width: int,
+        ) -> tuple[bool, _MemoryCheck | None]:
+            estimated = estimate_check(width)
+            if estimated is not None:
+                return estimated[0].fits, estimated[0]
+            item = candidate(width)
+            return item.check.fits, None
+
+        def remember_fit(
+            width: int,
+            check: _MemoryCheck | None,
+        ) -> None:
+            nonlocal best_width, best_check
+            best_width = clamp_width(width)
+            best_check = check
+
+        high_fail: int | None = None
+        width = min(
+            remaining,
+            max(min_width, (self._last_global_micro_batch_size or min_width) * 2),
         )
+        while width <= remaining:
+            fits, check = probe(width)
+            if fits:
+                remember_fit(width, check)
+                if width == remaining:
+                    break
+                width = min(remaining, max(width + 1, width * 2))
+                continue
+            rejected += 1
+            high_fail = width
+            break
+
+        if high_fail is not None:
+            low = best_width + 1
+            high = high_fail - 1
+            while low <= high:
+                mid = (low + high) // 2
+                fits, check = probe(mid)
+                if fits:
+                    remember_fit(mid, check)
+                    low = mid + 1
+                else:
+                    rejected += 1
+                    high = mid - 1
+
+        return candidate(best_width, best_check)
 
     def _cached_adaptive_plan(
         self,
@@ -1030,8 +1107,6 @@ class TrainerRank:
         if cached is not None:
             return cached
         plan = self._plan_flat_forward(list(_flatten(local_inputs)))
-        if len(self._adaptive_plan_cache) >= _ADAPTIVE_PLAN_CACHE_MAX_ENTRIES:
-            self._adaptive_plan_cache.pop(next(iter(self._adaptive_plan_cache)))
         self._adaptive_plan_cache[key] = plan
         return plan
 
@@ -1040,13 +1115,26 @@ class TrainerRank:
         items: Sequence[ForwardInputsT],
         indices: tuple[int, ...],
         local_inputs: Sequence[ForwardInputsT],
-    ) -> _FlatForwardEstimate | None:
+    ) -> tuple[_MemoryCheck, bool] | None:
         key = self._adaptive_cache_key(items, indices)
         if key in self._adaptive_estimate_cache:
             return self._adaptive_estimate_cache[key]
         estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
-        if len(self._adaptive_estimate_cache) >= _ADAPTIVE_PLAN_CACHE_MAX_ENTRIES:
-            self._adaptive_estimate_cache.pop(next(iter(self._adaptive_estimate_cache)))
+        if estimate is not None:
+            packed_tokens, output_bytes, signature = estimate
+            estimate = (
+                self._memory_check_required(
+                    self._estimate_required_memory_bytes_from_values(
+                        packed_tokens=packed_tokens,
+                        output_bytes=output_bytes,
+                        signature=signature,
+                    )
+                ),
+                self._all_ranks_have_memory_profile(
+                    packed_tokens=packed_tokens,
+                    signature=signature,
+                ),
+            )
         self._adaptive_estimate_cache[key] = estimate
         return estimate
 
@@ -1060,11 +1148,11 @@ class TrainerRank:
             self._adaptive_plan_cache.clear()
             self._adaptive_estimate_cache.clear()
             self._adaptive_plan_cache_top_level_ids = top_level_ids
-        return _AdaptivePlanCacheKey(
-            local_indices=indices,
-            default_slot_ref=self._default_slot_ref,
-            slot_stack=tuple(self._slot_stack),
-            shared_prefix_max_depth=self.shared_prefix_max_depth,
+        return (
+            indices,
+            self._default_slot_ref,
+            tuple(self._slot_stack),
+            self.shared_prefix_max_depth,
         )
 
     def _validate_replicated_top_level_count(self, count: int) -> None:
@@ -1128,7 +1216,7 @@ class TrainerRank:
 
     def _estimate_flat_forward(
         self, requests: Sequence[AnyForwardInput]
-    ) -> _FlatForwardEstimate | None:
+    ) -> tuple[int, int, _MemorySignature] | None:
         groups = self._group_active_request_indices(requests)
         packed_tokens = 0
         output_bytes = 0
@@ -1144,10 +1232,10 @@ class TrainerRank:
                 [requests[index] for index in group_indices]
             )
 
-        return _FlatForwardEstimate(
-            packed_tokens=packed_tokens,
-            output_bytes=output_bytes,
-            signature=self._memory_signature_from_requests(
+        return (
+            packed_tokens,
+            output_bytes,
+            self._memory_signature_from_requests(
                 requests,
                 slot_group_count=len(groups),
             ),
@@ -1275,14 +1363,16 @@ class TrainerRank:
             return (1, 1, 1, 1)
 
     def _memory_check(
-        self, forward: _FlatForwardPlan | _FlatForwardEstimate
+        self,
+        forward: _FlatForwardPlan,
     ) -> _MemoryCheck:
-        required = self._estimate_required_memory_bytes_from_values(
-            packed_tokens=forward.packed_tokens,
-            output_bytes=forward.output_bytes,
-            signature=forward.signature,
+        return self._memory_check_required(
+            self._estimate_required_memory_bytes_from_values(
+                packed_tokens=forward.packed_tokens,
+                output_bytes=forward.output_bytes,
+                signature=forward.signature,
+            )
         )
-        return self._memory_check_required(required)
 
     def _memory_check_required(self, required: int) -> _MemoryCheck:
         available = self._available_memory_bytes()
@@ -1365,7 +1455,7 @@ class TrainerRank:
         reserve = int(total * self.memory_reserve_fraction)
         return max(0, int(free) + reusable_reserved - reserve)
 
-    def _all_ranks_have_memory_profile_values(
+    def _all_ranks_have_memory_profile(
         self,
         *,
         packed_tokens: int,
@@ -2476,13 +2566,10 @@ def _triton_topk_strict() -> bool:
 
 
 def _triton_fused_topk_max() -> int:
-    # H200 measurements: fused top-k wins through k=10; above that the
-    # logsumexp-only Triton path plus torch.topk scales better.
     return int(os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10"))
 
 
 def _triton_min_rows() -> int:
-    # Below this, Triton launch overhead usually costs more than the memory saved.
     return int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
 
 
