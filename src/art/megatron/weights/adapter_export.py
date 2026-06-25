@@ -10,7 +10,6 @@ import torch
 from art.megatron.lora import (
     GatedDeltaNetInProjLoRA,
     LoRA,
-    MLPExpertsLinearFC1FusedLoRA,
     MLPExpertsLinearFC1LoRA,
     MLPExpertsLinearFC2LoRA,
     SelfAttentionLinearProjLoRA,
@@ -37,12 +36,6 @@ def _adapter_tensors(
     return a_t.transpose(-1, -2).contiguous(), b_t.transpose(-1, -2).contiguous()
 
 
-def _adapter_param_prefix(base_prefix: str, adapter_key: str | None) -> str:
-    if adapter_key is None:
-        return f"{base_prefix}.adapter"
-    return f"{base_prefix}.adapter.{adapter_key}"
-
-
 def _adapter_weight(
     *,
     base_prefix: str,
@@ -52,7 +45,8 @@ def _adapter_weight(
     linear_in: torch.Tensor,
     linear_out: torch.Tensor,
 ) -> AdapterWeight:
-    param_prefix = _adapter_param_prefix(base_prefix, adapter_key)
+    adapter_suffix = "" if adapter_key is None else f".{adapter_key}"
+    param_prefix = f"{base_prefix}.adapter{adapter_suffix}"
     return AdapterWeight(
         global_base_prefix=base_prefix,
         adapter_key=adapter_key,
@@ -326,29 +320,28 @@ def add_grouped_moe_adapter_weights(
 ) -> None:
     linear_fc1 = getattr(experts, "linear_fc1", None)
     base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
-    if isinstance(linear_fc1, MLPExpertsLinearFC1FusedLoRA):
-        _set_expert_adapter_weights(
-            adapter_weights_by_base,
-            base_prefix,
-            linear_fc1.lora,
-            lambda local_expert_idx: _simple_adapter_weight(
+    if isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
+        if linear_fc1.fused_gate_up:
+            lora = linear_fc1.lora
+            build_weight = lambda local_expert_idx: _simple_adapter_weight(
                 base_prefix,
                 linear_fc1.lora,
                 expert_idx=local_expert_idx,
-            ),
-        )
-    elif isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
-        _set_expert_adapter_weights(
-            adapter_weights_by_base,
-            base_prefix,
-            linear_fc1.gate_lora,
-            lambda local_expert_idx: _fused_pair_adapter_weight(
+            )
+        else:
+            lora = linear_fc1.gate_lora
+            build_weight = lambda local_expert_idx: _fused_pair_adapter_weight(
                 base_prefix,
                 linear_fc1.gate_lora,
                 linear_fc1.up_lora,
                 first_expert_idx=local_expert_idx,
                 second_expert_idx=local_expert_idx,
-            ),
+            )
+        _set_expert_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            lora,
+            build_weight,
         )
 
     linear_fc2 = getattr(experts, "linear_fc2", None)

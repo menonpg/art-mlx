@@ -137,7 +137,7 @@ class DefaultDenseHandler:
 
         from art.megatron.lora import (
             _adapter_model_prefix,
-            wrap_dense_mlp,
+            wrap_split_mlp_lora,
             wrap_standard_self_attention,
         )
 
@@ -146,18 +146,19 @@ class DefaultDenseHandler:
             for module in chunk.modules():
                 if not isinstance(module, TransformerLayer):
                     continue
+                adapter_model_prefix = _adapter_model_prefix(module)
                 wrap_standard_self_attention(
                     module.self_attention,
-                    adapter_model_prefix=_adapter_model_prefix(module),
+                    adapter_model_prefix=adapter_model_prefix,
                     provider=provider,
                     target_modules=target_set,
                     rank=rank,
                     alpha=alpha,
                 )
                 _require_dense_mlp(module)
-                wrap_dense_mlp(
+                wrap_split_mlp_lora(
                     module.mlp,
-                    adapter_model_prefix=_adapter_model_prefix(module),
+                    adapter_model_prefix=f"{adapter_model_prefix}.mlp",
                     provider=provider,
                     target_modules=target_set,
                     rank=rank,
@@ -213,7 +214,7 @@ class DefaultMoeHandler(DefaultDenseHandler):
         from art.megatron.lora import (
             _adapter_model_prefix,
             wrap_grouped_moe_experts,
-            wrap_shared_experts_mlp,
+            wrap_split_mlp_lora,
             wrap_standard_self_attention,
         )
 
@@ -240,9 +241,9 @@ class DefaultMoeHandler(DefaultDenseHandler):
                 )
                 shared_experts = getattr(module.mlp, "shared_experts", None)
                 if shared_experts is not None:
-                    wrap_shared_experts_mlp(
+                    wrap_split_mlp_lora(
                         shared_experts,
-                        adapter_model_prefix=adapter_model_prefix,
+                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
                         provider=provider,
                         target_modules=target_set,
                         rank=rank,

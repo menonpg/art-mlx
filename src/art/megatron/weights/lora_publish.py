@@ -252,7 +252,12 @@ def _global_packed_expert_metadata(
             continue
         group_prefix, slot = slot_match
         shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
-        for ep_rank in range(planner._expert_model_world_size()):
+        ep_world_size = 1
+        if _distributed_ready():
+            from megatron.core import parallel_state as ps
+
+            ep_world_size = ps.get_expert_model_parallel_world_size()
+        for ep_rank in range(ep_world_size):
             expert_start = ep_rank * template.num_local_experts
             expert_key = (
                 f"{template.adapter_model_prefix.format(expert=expert_start)}."

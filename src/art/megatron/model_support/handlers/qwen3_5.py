@@ -336,12 +336,12 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import wrap_dense_mlp
+        from art.megatron.lora import wrap_split_mlp_lora
 
         _require_dense_mlp(module)
-        wrap_dense_mlp(
+        wrap_split_mlp_lora(
             module.mlp,
-            adapter_model_prefix=adapter_model_prefix,
+            adapter_model_prefix=f"{adapter_model_prefix}.mlp",
             provider=provider,
             target_modules=target_modules,
             rank=rank,
@@ -441,23 +441,21 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import (
-            wrap_grouped_moe_experts_3d,
-            wrap_shared_experts_mlp,
-        )
+        from art.megatron.lora import wrap_grouped_moe_experts, wrap_split_mlp_lora
 
-        wrap_grouped_moe_experts_3d(
+        wrap_grouped_moe_experts(
             _require_moe_experts(module),
             adapter_model_prefix=adapter_model_prefix,
             target_modules=target_modules,
             rank=rank,
             alpha=alpha,
+            fused_gate_up=True,
         )
         shared_experts = getattr(module.mlp, "shared_experts", None)
         if shared_experts is not None:
-            wrap_shared_experts_mlp(
+            wrap_split_mlp_lora(
                 shared_experts,
-                adapter_model_prefix=adapter_model_prefix,
+                adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
                 provider=provider,
                 target_modules=target_modules,
                 rank=rank,
