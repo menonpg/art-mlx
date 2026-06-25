@@ -204,6 +204,45 @@ def test_forward_micro_batches_shrinks_to_largest_fitting_window(
     assert batch.stats.rejected_candidates >= 1
 
 
+def test_forward_micro_batches_tail_does_not_reset_stable_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    trainer._last_global_micro_batch_size = 64
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_estimate_required_memory_bytes_from_values",
+        lambda **kwargs: kwargs["packed_tokens"],
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_memory_check_required",
+        lambda required: _MemoryCheck(
+            estimated_required_bytes=required,
+            available_bytes=128,
+            fits=required <= 128,
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+
+    batches = list(
+        trainer.forward_micro_batches([_target_request(i) for i in range(130)])
+    )
+
+    assert [batch.stats.global_count for batch in batches] == [64, 64, 2]
+    assert trainer._last_global_micro_batch_size == 64
+
+
 def test_forward_micro_batches_reuses_cached_candidate_plans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

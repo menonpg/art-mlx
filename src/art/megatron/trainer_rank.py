@@ -482,7 +482,10 @@ class TrainerRank:
             )
             outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
             stop = start + candidate.stats_global_count
-            self._last_global_micro_batch_size = candidate.stats_global_count
+            self._remember_adaptive_window(
+                candidate.stats_global_count,
+                is_tail=stop >= len(items),
+            )
             yield MicroBatch(
                 inputs=candidate.inputs,
                 outputs=outputs,
@@ -925,6 +928,10 @@ class TrainerRank:
             return max(1, dp_size)
         base = 8 if remaining < 256 else 32
         return max(1, ((base + dp_size - 1) // dp_size) * dp_size)
+
+    def _remember_adaptive_window(self, width: int, *, is_tail: bool) -> None:
+        if not is_tail:
+            self._last_global_micro_batch_size = width
 
     def _cached_adaptive_plan(
         self,

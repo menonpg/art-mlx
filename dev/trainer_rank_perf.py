@@ -2148,7 +2148,10 @@ def _profiled_adaptive_micro_batch_training_step_body(
                 **select_profile,
             }
         )
-        rank._last_global_micro_batch_size = candidate.stats_global_count
+        rank._remember_adaptive_window(
+            candidate.stats_global_count,
+            is_tail=start + candidate.stats_global_count >= len(items),
+        )
         start += candidate.stats_global_count
     metrics, optim_ms = _timed_cuda(
         rank, lambda: rank.optim_step(params=params, scale_grads=1.0)
