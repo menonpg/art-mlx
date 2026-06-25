@@ -189,9 +189,9 @@ class _LocalStatsFunction(torch.autograd.Function):
             grad_values.contiguous(),
             grad_logits,
             logits.stride(0),
-            vocab_size,  # ty: ignore[invalid-argument-type]
-            k,  # ty: ignore[invalid-argument-type]
-            block_v,  # ty: ignore[invalid-argument-type]
+            vocab_size=vocab_size,  # ty: ignore[invalid-argument-type]
+            k=k,  # ty: ignore[invalid-argument-type]
+            block_v=block_v,  # ty: ignore[invalid-argument-type]
             num_warps=8,  # ty: ignore[unknown-argument]
         )
         return grad_logits, None
@@ -242,11 +242,11 @@ def _local_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTopKStat
         partial_sum,
         partial_values,
         partial_tokens,
-        logits.stride(0),  # ty: ignore[invalid-argument-type]
-        vocab_size,  # ty: ignore[invalid-argument-type]
-        n_blocks,
-        k,  # ty: ignore[invalid-argument-type]
-        block_v,  # ty: ignore[invalid-argument-type]
+        stride_row=logits.stride(0),  # ty: ignore[invalid-argument-type]
+        vocab_size=vocab_size,  # ty: ignore[invalid-argument-type]
+        n_blocks=n_blocks,  # ty: ignore[invalid-argument-type]
+        k=k,  # ty: ignore[invalid-argument-type]
+        block_v=block_v,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
     )
     _stats_stage2_kernel[(rows,)](
@@ -258,10 +258,10 @@ def _local_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTopKStat
         local_sum,
         values,
         tokens,
-        n_blocks,
-        k,  # ty: ignore[invalid-argument-type]
-        block_b,
-        block_candidates,
+        n_blocks=n_blocks,  # ty: ignore[invalid-argument-type]
+        k=k,  # ty: ignore[invalid-argument-type]
+        block_b=block_b,  # ty: ignore[invalid-argument-type]
+        block_candidates=block_candidates,  # ty: ignore[invalid-argument-type]
         num_warps=8,  # ty: ignore[unknown-argument]
     )
     return local_max, local_sum, values, tokens
