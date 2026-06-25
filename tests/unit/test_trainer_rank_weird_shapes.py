@@ -271,7 +271,7 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     assert candidate.rejected_candidates <= 8
 
 
-def test_adaptive_planner_balances_large_stable_window(
+def test_adaptive_planner_reuses_large_stable_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime(), shared_prefix_max_depth=1)  # type: ignore[arg-type]
@@ -298,7 +298,7 @@ def test_adaptive_planner_balances_large_stable_window(
         0,
     )
 
-    assert candidate.stats_global_count == 480
+    assert candidate.stats_global_count == 512
     assert candidate.rejected_candidates == 0
 
 

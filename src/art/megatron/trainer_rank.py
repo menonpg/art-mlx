@@ -61,6 +61,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 _COMPILED_FUNCTIONS: dict[Callable[..., object], Callable[..., object]] = {}
+_MEMORY_PROFILE_TRUST_GROWTH = 8
 
 
 class _Unset:
@@ -152,6 +153,12 @@ class _MemoryCheck:
     estimated_required_bytes: int
     available_bytes: int
     fits: bool
+
+
+@dataclass(frozen=True)
+class _MemoryProfile:
+    bytes_per_token: float
+    packed_tokens: int
 
 
 @dataclass(frozen=True)
@@ -282,7 +289,7 @@ class TrainerRank:
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
-        self._memory_profiles: dict[_MemorySignature, float] = {}
+        self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._adaptive_plan_cache: dict[_AdaptivePlanCacheKey, _FlatForwardPlan] = {}
         self._adaptive_plan_cache_top_level_ids: tuple[int, ...] = ()
         self._adaptive_estimate_cache: dict[
@@ -796,6 +803,8 @@ class TrainerRank:
             width = clamp_width(width)
             if width in (min_width, remaining) or granularity <= 1:
                 return width
+            if width < granularity:
+                return width
             return max(min_width, (width // granularity) * granularity)
 
         def local_slice(width: int) -> tuple[tuple[int, ...], list[ForwardInputsT]]:
@@ -867,7 +876,7 @@ class TrainerRank:
         ) -> tuple[bool, _MemoryCheck | None]:
             estimated = estimate_check(width)
             if estimated is not None:
-                return estimated[0].fits, estimated[0]
+                return estimated[1] and estimated[0].fits, estimated[0]
             item = candidate(width)
             return item.check.fits, None
 
@@ -895,14 +904,21 @@ class TrainerRank:
 
         stable_width = self._last_global_micro_batch_size
         if stable_width is not None and stable_width >= max(64, granularity * 2):
-            stable_width = self._balanced_adaptive_window(
-                capacity=stable_width,
-                remaining=remaining,
-                min_width=min_width,
-                granularity=granularity,
-            )
+            stable_capacity = stable_width
+            stable_width = clamp_width(stable_capacity)
             fits, check = probe(stable_width)
             if fits:
+                grow_multiplier = 4 if stable_capacity < 256 else 2
+                grow_capacity = min(remaining, stable_capacity * grow_multiplier)
+                if remaining > grow_capacity:
+                    grow_width = clamp_width(grow_capacity)
+                    if grow_width > stable_width:
+                        grow_fits, grow_check = probe(grow_width)
+                        if grow_fits:
+                            return candidate(grow_width, grow_check)
+                        rejected += 1
+                        search_below(grow_width)
+                        return candidate(best_width, best_check)
                 return candidate(stable_width, check)
             rejected += 1
             search_below(stable_width)
@@ -937,22 +953,6 @@ class TrainerRank:
             return max(1, dp_size)
         base = 8 if remaining < 256 else 32
         return max(1, ((base + dp_size - 1) // dp_size) * dp_size)
-
-    @staticmethod
-    def _balanced_adaptive_window(
-        *,
-        capacity: int,
-        remaining: int,
-        min_width: int,
-        granularity: int,
-    ) -> int:
-        windows = max(1, (remaining + capacity - 1) // capacity)
-        if windows == 1:
-            return max(min_width, remaining)
-        raw = (remaining + windows - 1) // windows
-        if granularity > 1:
-            raw = ((raw + granularity - 1) // granularity) * granularity
-        return max(min_width, min(capacity, raw, remaining))
 
     def _remember_adaptive_window(self, width: int, *, is_tail: bool) -> None:
         if is_tail:
@@ -1291,10 +1291,13 @@ class TrainerRank:
             return output_bytes
         profiled = self._memory_profiles.get(signature)
         static_compute = self._static_compute_memory_bytes_for_tokens(packed_tokens)
-        if profiled is None:
+        if profiled is None or not _memory_profile_covers(
+            profiled,
+            packed_tokens=packed_tokens,
+        ):
             compute = static_compute
         else:
-            compute = max(static_compute, int(profiled * packed_tokens))
+            compute = max(static_compute, int(profiled.bytes_per_token * packed_tokens))
         return int((output_bytes + compute) * self.memory_safety_factor)
 
     def _static_compute_memory_bytes_for_tokens(self, packed_tokens: int) -> int:
@@ -1330,7 +1333,11 @@ class TrainerRank:
         packed_tokens: int,
         signature: _MemorySignature,
     ) -> bool:
-        local = packed_tokens <= 0 or signature in self._memory_profiles
+        profile = self._memory_profiles.get(signature)
+        local = packed_tokens <= 0 or (
+            profile is not None
+            and _memory_profile_covers(profile, packed_tokens=packed_tokens)
+        )
         if dist.is_available() and dist.is_initialized():
             value = torch.tensor(
                 int(local),
@@ -1349,8 +1356,16 @@ class TrainerRank:
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
-        if previous is None or bytes_per_token > previous:
-            self._memory_profiles[plan.signature] = bytes_per_token
+        self._memory_profiles[plan.signature] = _MemoryProfile(
+            bytes_per_token=max(
+                bytes_per_token,
+                0.0 if previous is None else previous.bytes_per_token,
+            ),
+            packed_tokens=max(
+                plan.packed_tokens,
+                0 if previous is None else previous.packed_tokens,
+            ),
+        )
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
         if request.top_k is not None:
@@ -2005,6 +2020,10 @@ def _request_mix_key(request: AnyForwardInput) -> str:
     if request.hidden_states:
         parts.append("hidden")
     return "+".join(parts) if parts else "inactive"
+
+
+def _memory_profile_covers(profile: _MemoryProfile, *, packed_tokens: int) -> bool:
+    return profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH >= packed_tokens
 
 
 def _pack_forward_items(

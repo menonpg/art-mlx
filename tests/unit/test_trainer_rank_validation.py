@@ -14,6 +14,7 @@ from art.megatron.trainer_rank import (
     Unset,
     _anchor_disconnected_outputs,
     _MemoryCheck,
+    _MemoryProfile,
     _validate_top_k,
 )
 
@@ -148,7 +149,10 @@ def test_forward_micro_batches_ramps_after_first_success(
     monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
 
     def run(plan, **_kwargs):
-        trainer._memory_profiles[plan.signature] = 0.0
+        trainer._memory_profiles[plan.signature] = _MemoryProfile(
+            bytes_per_token=0.0,
+            packed_tokens=plan.packed_tokens,
+        )
         return [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
@@ -163,6 +167,24 @@ def test_forward_micro_batches_ramps_after_first_success(
     assert batches[0].stats.cold_start
     assert batches[1].stats.global_count > 1
     assert not batches[1].stats.cold_start
+
+
+def test_forward_micro_batches_does_not_overtrust_tiny_memory_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    inputs = [_target_request(i) for i in range(64)]
+    tiny_plan = trainer._plan_flat_forward([inputs[0]])
+    trainer._memory_profiles[tiny_plan.signature] = _MemoryProfile(
+        bytes_per_token=0.0,
+        packed_tokens=tiny_plan.packed_tokens,
+    )
+
+    candidate = trainer._select_next_micro_batch(inputs, 0)
+
+    assert candidate.stats_global_count == 8
+    assert candidate.plan.packed_tokens == 16
 
 
 def test_forward_micro_batches_shrinks_to_largest_fitting_window(
@@ -240,8 +262,40 @@ def test_forward_micro_batches_tail_does_not_reset_stable_window(
         trainer.forward_micro_batches([_target_request(i) for i in range(130)])
     )
 
-    assert [batch.stats.global_count for batch in batches] == [48, 48, 34]
+    assert [batch.stats.global_count for batch in batches] == [64, 64, 2]
     assert trainer._last_global_micro_batch_size == 64
+
+
+def test_forward_micro_batches_grows_small_stable_window_when_work_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())  # type: ignore[arg-type]
+    trainer._last_global_micro_batch_size = 64
+    monkeypatch.setattr(trainer, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        trainer, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_estimate_required_memory_bytes_from_values",
+        lambda **kwargs: kwargs["packed_tokens"],
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_memory_check_required",
+        lambda required: _MemoryCheck(
+            estimated_required_bytes=required,
+            available_bytes=512,
+            fits=required <= 512,
+        ),
+    )
+
+    candidate = trainer._select_next_micro_batch(
+        [_target_request(i) for i in range(512)],
+        0,
+    )
+
+    assert candidate.stats_global_count == 256
 
 
 def test_forward_micro_batches_reuses_cached_candidate_plans(

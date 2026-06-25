@@ -301,6 +301,7 @@ def _empty_safe_norm_forward(
     return original_forward(input_, *args, **kwargs)
 
 
+@torch.compiler.disable
 def _shared_prefix_forward(
     self: Any,
     hidden_states: Tensor,
