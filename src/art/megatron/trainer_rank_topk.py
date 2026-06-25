@@ -169,7 +169,7 @@ class _LocalStatsFunction(torch.autograd.Function):
         rows = int(logits.shape[0])
         vocab_size = int(logits.shape[1])
         block_v = 4096
-        n_blocks = triton.cdiv(vocab_size, block_v)
+        n_blocks = int(triton.cdiv(vocab_size, block_v))
 
         if grad_local_sum is None:
             grad_local_sum = torch.zeros_like(local_max)
@@ -217,9 +217,9 @@ def _local_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTopKStat
     rows = int(logits.shape[0])
     vocab_size = int(logits.shape[1])
     block_v = 4096
-    n_blocks = triton.cdiv(vocab_size, block_v)
-    block_b = triton.next_power_of_2(n_blocks)
-    block_candidates = triton.next_power_of_2(n_blocks * k) if k else 1
+    n_blocks = int(triton.cdiv(vocab_size, block_v))
+    block_b = int(triton.next_power_of_2(n_blocks))
+    block_candidates = int(triton.next_power_of_2(n_blocks * k)) if k else 1
 
     partial_shape = (rows, n_blocks)
     partial_max = torch.empty(partial_shape, device=logits.device, dtype=torch.float32)
