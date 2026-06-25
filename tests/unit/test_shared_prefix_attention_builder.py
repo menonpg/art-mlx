@@ -12,11 +12,7 @@ from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
     build_shared_prefix_attention_spec,
 )
-from art.megatron.context_parallel.runtime import (
-    build_context_parallel_token_layout_index,
-    get_or_build_runtime_plan,
-    make_runtime_key,
-)
+from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
     AttnSlice,
@@ -64,16 +60,21 @@ def test_shared_prefix_attention_spec_matches_tree_reference() -> None:
 
 def test_shared_prefix_can_build_context_parallel_layout() -> None:
     group_ids, parent_ids = _branching_prefix_inputs()
-
-    layout = build_context_parallel_token_layout_index(
+    spec = build_shared_prefix_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
+    )
+
+    plan = get_or_build_runtime_plan(
+        spec,
         topology=ParallelTopology(cp=2),
         config=ContextParallelConfig(planner_chunk_size=2, planner_max_search_steps=1),
         original_seq_len=int(group_ids.numel()),
     )
 
-    assert sum(layout.token_counts_by_rank) == int(group_ids.numel())
+    assert sum(plan[rank].local_valid_lengths[0] for rank in range(2)) == int(
+        group_ids.numel()
+    )
 
 
 def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
@@ -314,13 +315,12 @@ def _assert_context_parallel_stage_masks_match_dense(
         spec,
         topology=topology,
         config=config,
-        runtime_key=make_runtime_key(spec, topology=topology, config=config),
         original_seq_len=int(pack.tokens.numel()),
     )
 
     checked_stages = 0
     checked_remote_stages = 0
-    for rank_plan in plan.rank_plans:
+    for rank_plan in plan:
         for stage in rank_plan.stage_plans:
             if stage.mask_metadata is None:
                 continue

@@ -21,7 +21,6 @@ from art.megatron.context_parallel.executor import _build_stage_execution_spec
 from art.megatron.context_parallel.runtime import (
     _RUNTIME_PLAN_CACHE,
     get_or_build_runtime_plan,
-    make_runtime_key,
 )
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
@@ -342,7 +341,6 @@ def _build_cp_plan(
         spec,
         topology=topology,
         config=config,
-        runtime_key=make_runtime_key(spec, topology=topology, config=config),
         original_seq_len=int(pack.tokens.numel()),
     )
 
@@ -357,7 +355,7 @@ def _build_stage_masks(
         group_ids=pack.group_ids[0],
         parent_ids=pack.parent_ids[0],
     )
-    for rank_plan in plan.rank_plans:
+    for rank_plan in plan:
         for stage in rank_plan.stage_plans:
             if stage.mask_metadata is None:
                 continue
@@ -531,7 +529,7 @@ def _build_stage_flex_cases(
         group_ids=pack.group_ids[0],
         parent_ids=pack.parent_ids[0],
     )
-    for rank_plan in plan.rank_plans:
+    for rank_plan in plan:
         for stage in rank_plan.stage_plans:
             if stage.mask_metadata is None:
                 continue
@@ -717,13 +715,13 @@ def _plan_stats(plan: object) -> dict[str, int]:
     stage_count = 0
     remote_stage_count = 0
     mask_stage_count = 0
-    for rank_plan in plan.rank_plans:
+    for rank_plan in plan:
         for stage in rank_plan.stage_plans:
             stage_count += 1
             remote_stage_count += int(not stage.is_local_stage)
             mask_stage_count += int(stage.mask_metadata is not None)
     return {
-        "rank_count": len(plan.rank_plans),
+        "rank_count": len(plan),
         "stage_count": stage_count,
         "remote_stage_count": remote_stage_count,
         "mask_stage_count": mask_stage_count,

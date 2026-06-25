@@ -25,9 +25,6 @@ class TokenRange:
     def size(self) -> int:
         return self.end - self.start
 
-    def is_empty(self) -> bool:
-        return self.end <= self.start
-
 
 @dataclass(frozen=True)
 class AttnSlice:
@@ -92,13 +89,6 @@ class ParallelTopology:
 
 
 @dataclass(frozen=True)
-class ContextParallelRuntimeKey:
-    topology: ParallelTopology
-    config: ContextParallelConfig
-    row_signatures: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class KvFetchPlan:
     send_splits: tuple[int, ...]
     recv_splits: tuple[int, ...]
@@ -139,19 +129,9 @@ class RankRuntimePlan:
     token_layout_index: TokenLayoutIndex
     local_valid_lengths: tuple[int, ...]
     local_row_ranges: tuple[TokenRange | None, ...]
-    local_token_count: int
     stage_plans: tuple[StagePlan, ...]
-    remote_kv_fetch_plan: KvFetchPlan
     remote_dkv_reduce_plan: DkvReducePlan
     backward_stage_indices: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class ContextParallelRuntimePlan:
-    topology: ParallelTopology
-    config: ContextParallelConfig
-    token_layout_index: TokenLayoutIndex
-    rank_plans: tuple[RankRuntimePlan, ...]
 
 
 class DispatchedPackedTensors(ContextParallelLossInputs):
@@ -193,7 +173,6 @@ class StageExecutionSpec:
 
 @dataclass
 class ArtContextParallelState:
-    runtime_key: ContextParallelRuntimeKey
     rank_plan: RankRuntimePlan
     cp_group: Any
     config: ContextParallelConfig

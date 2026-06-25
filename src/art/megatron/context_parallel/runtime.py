@@ -18,8 +18,6 @@ from .types import (
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
-    ContextParallelRuntimeKey,
-    ContextParallelRuntimePlan,
     DispatchedPackedTensors,
     DkvReducePlan,
     ExactMaskMetadata,
@@ -45,13 +43,12 @@ StageSliceKey = tuple[int, int, int, int, int, str, int]
 @dataclass(frozen=True)
 class _PlanningBundle:
     spec: PackedBatchAttentionSpec
-    runtime_key: ContextParallelRuntimeKey
-    runtime_plan: ContextParallelRuntimePlan
+    rank_plans: tuple[RankRuntimePlan, ...]
     gdn_execution_spec: Any | None = None
 
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
-_RUNTIME_PLAN_CACHE: dict[tuple[str, int], ContextParallelRuntimePlan] = {}
+_RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
 _GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int], Any] = {}
 
 
@@ -1476,16 +1473,8 @@ def _build_rank_runtime_plan(
             _remap_subrange(range_, host_local_ranges)
             for range_ in local_global_k_ranges
         ),
-        kv_fetch_plan=KvFetchPlan(
-            send_splits=tuple(0 for _ in range(cp_size)),
-            recv_splits=tuple(0 for _ in range(cp_size)),
-            send_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
-        ),
-        dkv_reduce_plan=DkvReducePlan(
-            send_splits=tuple(0 for _ in range(cp_size)),
-            recv_splits=tuple(0 for _ in range(cp_size)),
-            recv_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
-        ),
+        kv_fetch_plan=None,
+        dkv_reduce_plan=None,
         remote_buffer_range=None,
         block_size=block_size,
     )
@@ -1583,70 +1572,13 @@ def _build_rank_runtime_plan(
         token_layout_index=token_layout_index,
         local_valid_lengths=(local_token_count,),
         local_row_ranges=local_row_ranges,
-        local_token_count=local_token_count,
         stage_plans=tuple(stage_plans),
         backward_stage_indices=tuple(backward_stage_indices + [0]),
-        remote_kv_fetch_plan=KvFetchPlan(
-            send_splits=aggregate_send_splits,
-            recv_splits=tuple(aggregate_recv_splits),
-            send_ranges_by_peer=aggregate_send_ranges,
-        ),
         remote_dkv_reduce_plan=DkvReducePlan(
             send_splits=tuple(aggregate_recv_splits),
             recv_splits=aggregate_send_splits,
             recv_ranges_by_peer=aggregate_send_ranges,
         ),
-    )
-
-
-def make_runtime_key(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-) -> ContextParallelRuntimeKey:
-    if len(spec.rows) != 1:
-        raise RuntimeError(
-            "ART context parallel runtime keys expect exactly one packed sequence, "
-            f"got {len(spec.rows)} rows."
-        )
-    row_signatures = tuple(_row_signature(row) for row in spec.rows)
-    return ContextParallelRuntimeKey(
-        topology=topology,
-        config=config,
-        row_signatures=row_signatures,
-    )
-
-
-def build_context_parallel_token_layout_index(
-    *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    original_seq_len: int,
-) -> TokenLayoutIndex:
-    """Return the token ownership chosen by the real CP attention planner."""
-
-    spec = build_shared_prefix_attention_spec(
-        group_ids=group_ids, parent_ids=parent_ids
-    )
-    if int(topology.cp) <= 1:
-        valid_tokens = int(spec.rows[0].valid_tokens) if spec.rows else 0
-        return TokenLayoutIndex(
-            ownership_ranges_by_rank=(((0, valid_tokens, 0),) if valid_tokens else (),),
-            token_counts_by_rank=(valid_tokens,),
-        )
-    _row_spec, chunk_ranges, owners, _wave_assignment = _runtime_plan_assignment(
-        spec,
-        topology=topology,
-        config=config,
-    )
-    del original_seq_len
-    return _build_runtime_token_layout_index(
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        cp_size=max(int(topology.cp), 1),
     )
 
 
@@ -1755,12 +1687,10 @@ def prepare_megatron_context_parallel_state(
             group_ids=group_ids_cpu,
             parent_ids=parent_ids_cpu,
         )
-        runtime_key = make_runtime_key(spec, topology=topology, config=config)
         runtime_plan = get_or_build_runtime_plan(
             spec,
             topology=topology,
             config=config,
-            runtime_key=runtime_key,
             original_seq_len=int(micro["tokens"].shape[1]),
         )
         gdn_execution_spec = None
@@ -1774,12 +1704,11 @@ def prepare_megatron_context_parallel_state(
             )
         bundle = _PlanningBundle(
             spec=spec,
-            runtime_key=runtime_key,
-            runtime_plan=runtime_plan,
+            rank_plans=runtime_plan,
             gdn_execution_spec=gdn_execution_spec,
         )
         _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
-    rank_plan = bundle.runtime_plan.rank_plans[int(cp_rank)]
+    rank_plan = bundle.rank_plans[int(cp_rank)]
     gdn_execution_plan = None
     if build_gdn_execution_spec:
         if bundle.gdn_execution_spec is None:
@@ -1809,7 +1738,6 @@ def prepare_megatron_context_parallel_state(
             _cache_put(_GDN_RANK_PLAN_CACHE, rank_gdn_key, gdn_execution_plan)
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1
     state = ArtContextParallelState(
-        runtime_key=bundle.runtime_key,
         rank_plan=rank_plan,
         cp_group=cp_group,
         config=config,
@@ -1911,12 +1839,13 @@ def get_or_build_runtime_plan(
     *,
     topology: ParallelTopology,
     config: ContextParallelConfig,
-    runtime_key: ContextParallelRuntimeKey,
     original_seq_len: int,
-) -> ContextParallelRuntimePlan:
-    key = (
-        _json_cache_key(_runtime_key_payload(runtime_key)),
-        int(original_seq_len),
+) -> tuple[RankRuntimePlan, ...]:
+    key = _runtime_plan_cache_key(
+        spec,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
     )
     cached = _RUNTIME_PLAN_CACHE.get(key)
     if cached is not None:
@@ -1982,7 +1911,7 @@ def _build_runtime_plan(
     topology: ParallelTopology,
     config: ContextParallelConfig,
     original_seq_len: int,
-) -> ContextParallelRuntimePlan:
+) -> tuple[RankRuntimePlan, ...]:
     row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
         spec,
         topology=topology,
@@ -1994,7 +1923,7 @@ def _build_runtime_plan(
         owners=owners,
         cp_size=cp_size,
     )
-    rank_plans = [
+    return tuple(
         _build_rank_runtime_plan(
             row_spec=row_spec,
             chunk_ranges=chunk_ranges,
@@ -2007,12 +1936,6 @@ def _build_runtime_plan(
             block_size=int(config.block_size),
         )
         for rank in range(cp_size)
-    ]
-    return ContextParallelRuntimePlan(
-        topology=topology,
-        config=config,
-        token_layout_index=token_layout_index,
-        rank_plans=tuple(rank_plans),
     )
 
 
@@ -2045,16 +1968,25 @@ def _row_signature(row_spec: PackedRowAttentionSpec) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
+def _runtime_plan_cache_key(
+    spec: PackedBatchAttentionSpec,
+    *,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+) -> str:
+    return _json_cache_key(
+        {
+            "topology": _dataclass_payload(topology),
+            "config": _dataclass_payload(config),
+            "row_signatures": tuple(_row_signature(row) for row in spec.rows),
+            "original_seq_len": int(original_seq_len),
+        }
+    )
+
+
 def _dataclass_payload(value: Any) -> dict[str, Any]:
     return dict(value.__dict__)
-
-
-def _runtime_key_payload(runtime_key: ContextParallelRuntimeKey) -> dict[str, Any]:
-    return {
-        "topology": _dataclass_payload(runtime_key.topology),
-        "config": _dataclass_payload(runtime_key.config),
-        "row_signatures": runtime_key.row_signatures,
-    }
 
 
 def _attn_slice_payload(slice_: AttnSlice) -> dict[str, Any]:
