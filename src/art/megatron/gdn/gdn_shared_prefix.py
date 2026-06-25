@@ -338,34 +338,24 @@ def _build_tree_rank_execution_plan(
     )
     local_token_ranges = gdn_ranges_by_rank_by_source[cp_rank]
     tree_segment_buckets_by_depth = tuple(
-        (
-            _build_tree_segment_bucket_plans(
-                tuple(segments_by_rank_depth[cp_rank][depth]),
-                spec.tree_parent_indices,
-                tuple(tree_has_children),
-                device=device,
-                planner_config=planner_config,
-            )
-            if cp_size == 1
-            else _build_tree_position_bucket_plans(
-                tuple(segments_by_rank_depth[cp_rank][depth]),
-                spec.tree_parent_indices,
-                tuple(tree_has_children),
-                local_token_ranges,
-                sequence_length=spec.sequence_length,
-                device=device,
-                planner_config=planner_config,
-            )
+        _build_tree_bucket_plans(
+            tuple(segments_by_rank_depth[cp_rank][depth]),
+            spec.tree_parent_indices,
+            tuple(tree_has_children),
+            local_token_ranges=None if cp_size == 1 else local_token_ranges,
+            sequence_length=spec.sequence_length,
+            device=device,
+            planner_config=planner_config,
         )
         for depth in range(depth_count)
     )
     tree_chain_buckets_by_depth = (
         tuple(
-            _build_tree_position_bucket_plans(
+            _build_tree_bucket_plans(
                 tuple(chain_segments_by_depth[depth]),
                 spec.tree_parent_indices,
                 tuple(tree_has_children),
-                local_token_ranges,
+                local_token_ranges=local_token_ranges,
                 sequence_length=spec.sequence_length,
                 device=device,
                 planner_config=planner_config,
@@ -1060,38 +1050,12 @@ def _least_loaded_rank(rank_loads: list[int]) -> int:
     return min(range(len(rank_loads)), key=lambda rank: (rank_loads[rank], rank))
 
 
-def _build_tree_segment_bucket_plans(
+def _build_tree_bucket_plans(
     segments: tuple[GdnSegmentSpec, ...],
     tree_parent_indices: tuple[int, ...],
     tree_has_children: tuple[bool, ...],
     *,
-    device: torch.device | str,
-    planner_config: GdnPlannerConfig,
-) -> tuple[GdnSegmentBucketPlan, ...]:
-    segment_buckets = _batch_tree_segments_by_padded_work(
-        segments,
-        tree_has_children,
-        max_padding_ratio=planner_config.max_padding_ratio,
-        max_segments_per_batch=planner_config.max_segments_per_batch,
-    )
-    return tuple(
-        _bucket_with_tree_parent_indices(
-            _build_segment_bucket_plan(bucket, device=device),
-            bucket,
-            tree_parent_indices,
-            tree_has_children,
-            device=device,
-        )
-        for bucket in segment_buckets
-    )
-
-
-def _build_tree_position_bucket_plans(
-    segments: tuple[GdnSegmentSpec, ...],
-    tree_parent_indices: tuple[int, ...],
-    tree_has_children: tuple[bool, ...],
-    local_token_ranges: tuple[tuple[int, int, int], ...],
-    *,
+    local_token_ranges: tuple[tuple[int, int, int], ...] | None,
     sequence_length: int,
     device: torch.device | str,
     planner_config: GdnPlannerConfig,
@@ -1114,12 +1078,16 @@ def _build_tree_position_bucket_plans(
     )
     return tuple(
         _bucket_with_tree_parent_indices(
-            _build_position_bucket_plan(
-                bucket,
-                local_token_ranges,
-                sequence_length=sequence_length,
-                device=device,
-                token_ranges_by_rank=token_ranges_by_rank,
+            (
+                _build_segment_bucket_plan(bucket, device=device)
+                if local_token_ranges is None
+                else _build_position_bucket_plan(
+                    bucket,
+                    local_token_ranges,
+                    sequence_length=sequence_length,
+                    device=device,
+                    token_ranges_by_rank=token_ranges_by_rank,
+                )
             ),
             bucket,
             tree_parent_indices,
