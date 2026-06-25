@@ -510,15 +510,7 @@ def run_gdn_layer(
         )
     if input_layout != "attention" or output_layout != "attention":
         raise ValueError("GDN layout controls require a CP execution plan")
-    return _run_planned_prefixes_and_completions(gdn, hidden_states, execution_plan)
-
-
-def _run_planned_prefixes_and_completions(
-    gdn: Any,
-    hidden_states: Tensor,
-    plan: GdnRankExecutionPlan,
-) -> tuple[Tensor, Tensor | None]:
-    return _run_tree_prefixes(gdn, hidden_states, plan)
+    return _run_tree_prefixes(gdn, hidden_states, execution_plan)
 
 
 def _run_tree_prefixes(
@@ -680,7 +672,7 @@ class _TreeStateChunkCache:
         self._device = device
         self._conv_chunks: list[Tensor] = []
         self._rec_chunks: list[Tensor] = []
-        self._source_by_family: dict[int, tuple[int, int]] = {}
+        self._source_by_family: list[tuple[int, int] | None] = []
 
     def append(self, bucket: GdnSegmentBucketPlan, conv: Tensor, rec: Tensor) -> None:
         self.append_families(_bucket_family_indices_cpu(bucket), conv, rec)
@@ -703,6 +695,11 @@ class _TreeStateChunkCache:
         chunk_index = len(self._conv_chunks)
         self._conv_chunks.append(conv)
         self._rec_chunks.append(rec)
+        max_family = max(int(index) for index in family_indices)
+        if max_family >= len(self._source_by_family):
+            self._source_by_family.extend(
+                None for _ in range(max_family + 1 - len(self._source_by_family))
+            )
         for source_row, family_index in enumerate(family_indices):
             self._source_by_family[int(family_index)] = (chunk_index, source_row)
 
@@ -809,7 +806,11 @@ class _TreeStateChunkCache:
                     continue
                 missing_parents.append(parent_index)
                 continue
-            source = self._source_by_family.get(parent_index)
+            source = (
+                self._source_by_family[parent_index]
+                if parent_index < len(self._source_by_family)
+                else None
+            )
             if source is None:
                 missing_parents.append(parent_index)
                 continue
@@ -891,13 +892,7 @@ def _long_tensor(values: Iterable[int], *, device: torch.device) -> Tensor:
 
 
 def _bucket_has_parent_state(bucket: GdnSegmentBucketPlan) -> bool:
-    parent_indices_cpu = bucket.parent_indices_cpu
-    if parent_indices_cpu is None:
-        parent_indices = bucket.parent_indices
-        if parent_indices is None:
-            raise RuntimeError("tree GDN bucket is missing parent indices")
-        parent_indices_cpu = parent_indices.detach().cpu()
-    return any(int(parent_index) >= 0 for parent_index in parent_indices_cpu.tolist())
+    return any(parent_index >= 0 for parent_index in _bucket_parent_indices_cpu(bucket))
 
 
 def _bucket_has_uniform_lengths(bucket: GdnSegmentBucketPlan) -> bool:
