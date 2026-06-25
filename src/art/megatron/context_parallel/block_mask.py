@@ -70,11 +70,8 @@ def _dense_blocks_to_ordered(
     indices_np = np.zeros(blocks.shape, dtype=np.int32)
     if int(row_indices.size) > 0:
         starts = np.concatenate(([0], np.cumsum(counts_np[:-1], dtype=np.int64)))
-        active_rows = np.flatnonzero(counts_np)
-        for row_index in active_rows:
-            start = int(starts[row_index])
-            end = start + int(counts_np[row_index])
-            indices_np[row_index, : end - start] = column_indices[start:end]
+        offsets = np.arange(int(row_indices.size), dtype=np.int64) - starts[row_indices]
+        indices_np[row_indices, offsets] = column_indices
     counts = torch.from_numpy(counts_np)
     indices = torch.from_numpy(indices_np)
     return (

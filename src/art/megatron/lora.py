@@ -1567,29 +1567,6 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         return base_out + adapter_out, bias_out
 
 
-class SharedExpertsLinearFC2LoRA(torch.nn.Module):
-    def __init__(
-        self,
-        adapter_model_prefix: str,
-        linear_fc2: TERowParallelLinear,
-        rank: int,
-        alpha: float,
-        provider: GPTModelProvider,
-    ) -> None:
-        super().__init__()
-        self.row_parallel_lora = SelfAttentionLinearProjLoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.down_proj",
-            linear_proj=linear_fc2,
-            rank=rank,
-            alpha=alpha,
-            provider=provider,
-            reduce_output=not _linear_disables_tensor_parallel_comm(linear_fc2),
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return self.row_parallel_lora(x)
-
-
 def _unwrap_attr(
     value: Any,
     attr_name: str,
@@ -1835,12 +1812,13 @@ def _wrap_split_mlp_lora(
             "linear_fc2",
             TERowParallelLinear,
         )
-        mlp.linear_fc2 = SharedExpertsLinearFC2LoRA(
-            adapter_model_prefix=adapter_model_prefix,
-            linear_fc2=linear_fc2,
+        mlp.linear_fc2 = SelfAttentionLinearProjLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.down_proj",
+            linear_proj=linear_fc2,
             rank=rank,
             alpha=alpha,
             provider=provider,
+            reduce_output=not _linear_disables_tensor_parallel_comm(linear_fc2),
         )
 
 
