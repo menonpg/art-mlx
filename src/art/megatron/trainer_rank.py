@@ -65,8 +65,7 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 
 
 class _Unset:
-    def __repr__(self) -> str:
-        return "Unset"
+    pass
 
 
 Unset = _Unset()
@@ -81,29 +80,21 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     hidden_states: HiddenStatesT
 
 
+@dataclass(slots=True)
 class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
-    def __init__(
-        self,
-        *,
-        input_tokens: torch.Tensor,
-        target_tokens: torch.Tensor | None = None,
-        top_k: int | None = None,
-        logits: bool = False,
-        hidden_states: bool = False,
-        checkpoint: AdapterSelection = Unset,
-        lora: AdapterSelection = Unset,
-    ) -> None:
-        if top_k is not None and top_k < 1:
+    input_tokens: torch.Tensor
+    target_tokens: torch.Tensor | None = None
+    top_k: int | None = None
+    logits: bool = False
+    hidden_states: bool = False
+    checkpoint: AdapterSelection = Unset
+    lora: AdapterSelection = Unset
+
+    def __post_init__(self) -> None:
+        if self.top_k is not None and self.top_k < 1:
             raise ValueError("top_k must be >= 1")
-        if checkpoint is not Unset and lora is not Unset:
+        if self.checkpoint is not Unset and self.lora is not Unset:
             raise ValueError("ForwardInput cannot set both checkpoint and lora")
-        self.input_tokens = input_tokens
-        self.target_tokens = target_tokens
-        self.top_k = top_k
-        self.logits = logits
-        self.hidden_states = hidden_states
-        self.checkpoint = checkpoint
-        self.lora = lora
 
 
 type AnyForwardInput = ForwardInput[
@@ -283,6 +274,20 @@ class TrainerRank:
         self.memory_safety_factor = memory_safety_factor
         self.memory_reserve_fraction = memory_reserve_fraction
         self.device = next(runtime.model[0].parameters()).device
+        self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
+        try:
+            metadata_model = _language_model(runtime.model[0])
+        except RuntimeError:
+            metadata_model = None
+        self._hidden_size = _hidden_size(metadata_model, runtime.provider)
+        self._padded_vocab_size = (
+            None if metadata_model is None else _padded_vocab_size(metadata_model)
+        )
+        self._num_layers = int(
+            getattr(getattr(metadata_model, "config", None), "num_layers", 0)
+            or getattr(runtime.provider, "num_layers", 1)
+            or 1
+        )
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._dynamic_optimizers: dict[str, torch.optim.Optimizer] = {}
@@ -788,9 +793,6 @@ class TrainerRank:
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
 
-        estimate_cache: dict[int, tuple[_MemoryCheck, bool] | None] = {}
-        rejected = 0
-
         def clamp_width(width: int) -> int:
             return max(min_width, min(width, remaining))
 
@@ -812,15 +814,12 @@ class TrainerRank:
             indices = tuple(range(start + dp_rank, stop, dp_size))
             return indices, [items[index] for index in indices]
 
-        def raise_smallest(plan: _FlatForwardPlan, check: _MemoryCheck) -> None:
-            self._raise_memory_error(
-                plan,
-                check,
-                context="forward_micro_batches",
-                message="smallest DP microbatch is predicted to exceed available memory",
-            )
+        estimates: dict[int, tuple[_MemoryCheck, bool] | None] = {}
+        rejected = 0
+        best_width = min_width
+        best_check: _MemoryCheck | None = None
 
-        def candidate(
+        def build_candidate(
             width: int,
             estimated_check: _MemoryCheck | None = None,
         ) -> _CandidateMicroBatch[ForwardInputsT]:
@@ -840,50 +839,33 @@ class TrainerRank:
                 ),
             )
 
-        def estimate_check(width: int) -> tuple[_MemoryCheck, bool] | None:
+        def estimate(width: int) -> tuple[_MemoryCheck, bool] | None:
             width = clamp_width(width)
-            if width not in estimate_cache:
+            if width not in estimates:
                 indices, local_inputs = local_slice(width)
-                estimate_cache[width] = self._cached_adaptive_estimate(
+                estimates[width] = self._cached_adaptive_estimate(
                     items,
                     indices,
                     local_inputs,
                 )
-            return estimate_cache[width]
+            return estimates[width]
 
-        first_estimated = estimate_check(min_width)
-        if first_estimated is not None and not first_estimated[0].fits:
-            first = candidate(min_width, first_estimated[0])
-            raise_smallest(first.plan, first.check)
-
-        if first_estimated is not None and first_estimated[1]:
-            best_width = min_width
-            best_check: _MemoryCheck | None = first_estimated[0]
-        else:
-            first = candidate(
-                min_width,
-                first_estimated[0] if first_estimated is not None else None,
+        def raise_smallest(plan: _FlatForwardPlan, check: _MemoryCheck) -> None:
+            self._raise_memory_error(
+                plan,
+                check,
+                context="forward_micro_batches",
+                message="smallest DP microbatch is predicted to exceed available memory",
             )
-            if not first.check.fits:
-                raise_smallest(first.plan, first.check)
-            if first.cold_start:
-                return first
-            best_width = first.stats_global_count
-            best_check = None
 
-        def probe(
-            width: int,
-        ) -> tuple[bool, _MemoryCheck | None]:
-            estimated = estimate_check(width)
+        def probe(width: int) -> tuple[bool, _MemoryCheck | None]:
+            estimated = estimate(width)
             if estimated is not None:
                 return estimated[1] and estimated[0].fits, estimated[0]
-            item = candidate(width)
-            return item.check.fits, None
+            item = build_candidate(width)
+            return item.check.fits, item.check
 
-        def remember_fit(
-            width: int,
-            check: _MemoryCheck | None,
-        ) -> None:
+        def remember_fit(width: int, check: _MemoryCheck | None) -> None:
             nonlocal best_width, best_check
             best_width = snap_width(width)
             best_check = check
@@ -902,6 +884,22 @@ class TrainerRank:
                     rejected += 1
                     high = mid - 1
 
+        first_estimate = estimate(min_width)
+        if first_estimate is not None and not first_estimate[0].fits:
+            first = build_candidate(min_width, first_estimate[0])
+            raise_smallest(first.plan, first.check)
+        if first_estimate is None or not first_estimate[1]:
+            first = build_candidate(
+                min_width,
+                None if first_estimate is None else first_estimate[0],
+            )
+            if not first.check.fits:
+                raise_smallest(first.plan, first.check)
+            if first.cold_start:
+                return first
+        else:
+            best_check = first_estimate[0]
+
         stable_width = self._last_global_micro_batch_size
         if stable_width is not None and stable_width >= max(64, granularity * 2):
             stable_capacity = stable_width
@@ -915,15 +913,15 @@ class TrainerRank:
                     if grow_width > stable_width:
                         grow_fits, grow_check = probe(grow_width)
                         if grow_fits:
-                            return candidate(grow_width, grow_check)
+                            return build_candidate(grow_width, grow_check)
                         rejected += 1
                         search_below(grow_width)
-                        return candidate(best_width, best_check)
-                return candidate(stable_width, check)
+                        return build_candidate(best_width, best_check)
+                return build_candidate(stable_width, check)
             rejected += 1
             search_below(stable_width)
             self._last_global_micro_batch_size = best_width
-            return candidate(best_width, best_check)
+            return build_candidate(best_width, best_check)
 
         high_fail: int | None = None
         width = min(
@@ -945,7 +943,7 @@ class TrainerRank:
         if high_fail is not None:
             search_below(high_fail)
 
-        return candidate(best_width, best_check)
+        return build_candidate(best_width, best_check)
 
     @staticmethod
     def _adaptive_window_granularity(*, remaining: int, dp_size: int) -> int:
@@ -1178,12 +1176,6 @@ class TrainerRank:
         self,
         requests: Sequence[AnyForwardInput],
     ) -> int:
-        model: GPTModel | None
-        try:
-            model = _language_model(self.runtime.model[0])
-        except RuntimeError:
-            model = None
-        dtype_size = _dtype_size(next(self.runtime.model[0].parameters()).dtype)
         total = 0
         for request in requests:
             seq_len = int(request.input_tokens.numel())
@@ -1196,12 +1188,11 @@ class TrainerRank:
                     * (_dtype_size(torch.float32) + _dtype_size(torch.long))
                 )
             if request.logits:
-                if model is None:
+                if self._padded_vocab_size is None:
                     raise RuntimeError("logits output memory requires a GPT model")
-                total += seq_len * _padded_vocab_size(model) * dtype_size
+                total += seq_len * self._padded_vocab_size * self._param_dtype_size
             if request.hidden_states:
-                hidden_size = _hidden_size(model, self.runtime.provider)
-                total += seq_len * hidden_size * dtype_size
+                total += seq_len * self._hidden_size * self._param_dtype_size
         return total
 
     def _memory_signature_from_requests(
@@ -1303,19 +1294,13 @@ class TrainerRank:
     def _static_compute_memory_bytes_for_tokens(self, packed_tokens: int) -> int:
         if packed_tokens <= 0:
             return 0
-        try:
-            model = _language_model(self.runtime.model[0])
-        except RuntimeError:
-            return 0
-        dtype_size = _dtype_size(next(self.runtime.model[0].parameters()).dtype)
-        hidden_size = _hidden_size(model, self.runtime.provider)
-        layers = int(
-            getattr(getattr(model, "config", None), "num_layers", 0)
-            or getattr(self.runtime.provider, "num_layers", 1)
-            or 1
+        activation_factor = max(4, min(16, self._num_layers // 4 + 4))
+        return int(
+            packed_tokens
+            * self._hidden_size
+            * self._param_dtype_size
+            * activation_factor
         )
-        activation_factor = max(4, min(16, layers // 4 + 4))
-        return int(packed_tokens * hidden_size * dtype_size * activation_factor)
 
     def _available_memory_bytes(self) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):

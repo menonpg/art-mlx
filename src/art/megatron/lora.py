@@ -1,7 +1,7 @@
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import contextvars
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import importlib
 import json
@@ -28,7 +28,6 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from pydantic import BaseModel, ConfigDict
 import torch
 
 from .kernels.cute_grouped_lora_quack import (
@@ -62,19 +61,14 @@ class LoRASlotRef:
     name: str | None
 
 
-@dataclass(frozen=True)
-class _LoRASlotContext:
-    ref: LoRASlotRef
-
-
-_CURRENT_LORA_SLOT: contextvars.ContextVar[_LoRASlotContext | None] = (
-    contextvars.ContextVar("art_megatron_current_lora_slot", default=None)
+_CURRENT_LORA_SLOT: contextvars.ContextVar[LoRASlotRef | None] = contextvars.ContextVar(
+    "art_megatron_current_lora_slot", default=None
 )
 
 
 @contextmanager
 def use_lora_slot(ref: LoRASlotRef | None) -> Iterator[None]:
-    token = _CURRENT_LORA_SLOT.set(None if ref is None else _LoRASlotContext(ref))
+    token = _CURRENT_LORA_SLOT.set(ref)
     try:
         yield
     finally:
@@ -166,11 +160,9 @@ def install_lora_checkpoint_context_hooks() -> None:
 install_lora_checkpoint_context_hooks()
 
 
-class LoRAParallelSpec(BaseModel):
-    # This spec only describes TP / expert-TP behavior.
-    # DP/CP vs expert-DP behavior is selected separately via `allreduce`.
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class LoRAParallelSpec:
+    # This only describes TP / expert-TP; DP/CP vs expert-DP is selected by `allreduce`.
     shard_domain: ShardDomain = "tp"
     sharded: bool = False
     shard_dim: int | None = None
@@ -803,12 +795,12 @@ class LoRA(torch.nn.Module):
     def active_lora_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
-        context = _CURRENT_LORA_SLOT.get()
-        if context is None:
+        ref = _CURRENT_LORA_SLOT.get()
+        if ref is None:
             return self.A_T, self.B_T, self.scale
-        if context.ref.name is None:
+        if ref.name is None:
             return None
-        slot = self._slot(context.ref)
+        slot = self._slot(ref)
         if slot is None:
             return None
         return slot.A_T, slot.B_T, slot.scale
@@ -1105,13 +1097,12 @@ def _parallel_lora(
         grad_sync_domain=grad_sync_domain,
         grad_sync_op=GRAD_SYNC_OP_NONE if row_layout else GRAD_SYNC_OP_SUM,
     )
-    b_parallel_spec = a_parallel_spec.model_copy(
-        update={
-            "sharded": not row_layout,
-            "shard_dim": None if row_layout else -1,
-            "grad_sync_domain": grad_sync_domain,
-            "grad_sync_op": GRAD_SYNC_OP_SUM if row_layout else GRAD_SYNC_OP_NONE,
-        }
+    b_parallel_spec = replace(
+        a_parallel_spec,
+        sharded=not row_layout,
+        shard_dim=None if row_layout else -1,
+        grad_sync_domain=grad_sync_domain,
+        grad_sync_op=GRAD_SYNC_OP_SUM if row_layout else GRAD_SYNC_OP_NONE,
     )
     return LoRA(
         adapter_model_prefix=adapter_model_prefix,
