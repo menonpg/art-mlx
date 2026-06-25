@@ -19,7 +19,7 @@ from art.megatron.gdn.layout import (
 
 
 class TestGdnCpLayoutPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     batch_size: int = Field(ge=1)
     sequence_length: int = Field(ge=1)
