@@ -576,6 +576,7 @@ def _run_tree_depth_buckets(
                 )
 
         for bucket in buckets:
+            recurrent_cp = plan.cp_size > 1 and _bucket_has_parent_state(bucket)
             recurrent_output, cp_dependency = _run_tree_bucket(
                 gdn,
                 qkv,
@@ -585,7 +586,12 @@ def _run_tree_depth_buckets(
                 state_cache,
                 bucket,
                 state_reference=state_reference,
+                group=group if recurrent_cp else None,
                 cp_dependency=cp_dependency,
+                recurrent_cp=recurrent_cp,
+                scale_parent_state_gradient=(
+                    1.0 / plan.cp_size if recurrent_cp else None
+                ),
             )
 
     return recurrent_output, cp_dependency
