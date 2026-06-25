@@ -1104,13 +1104,14 @@ class TrainerRank:
     def _memory_check_required(self, required: int) -> _MemoryCheck:
         available = self._available_memory_bytes()
         if dist.is_available() and dist.is_initialized():
+            group = self._forward_memory_group()
             values = torch.tensor(
                 [float(required), float(available)],
                 device=self.device if self.device.type == "cuda" else "cpu",
                 dtype=torch.float64,
             )
-            dist.all_reduce(values[0], op=dist.ReduceOp.MAX)
-            dist.all_reduce(values[1], op=dist.ReduceOp.MIN)
+            dist.all_reduce(values[0], op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(values[1], op=dist.ReduceOp.MIN, group=group)
             required = int(values[0].item())
             available = int(values[1].item())
         return _MemoryCheck(
@@ -1118,6 +1119,15 @@ class TrainerRank:
             available_bytes=available,
             fits=required <= available,
         )
+
+    @staticmethod
+    def _forward_memory_group() -> object | None:
+        try:
+            from megatron.core import parallel_state as ps
+
+            return ps.get_tensor_and_context_parallel_group(check_initialized=False)
+        except (AssertionError, ImportError, RuntimeError, ValueError):
+            return None
 
     def _raise_memory_error(
         self,
