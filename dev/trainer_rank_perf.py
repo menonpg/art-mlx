@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import typer
 
+from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 import art.megatron.trainer_rank as trainer_rank_module
 from art.megatron.trainer_rank import (
     AdamParams,
@@ -21,9 +22,15 @@ from art.megatron.trainer_rank import (
     TrainerRank,
     _batch_seq_logits,
     _language_model,
-    _pack_forward_items,
     _unflatten,
 )
+
+
+def _pack_forward_items(items: Sequence[Any], *, max_depth: int) -> SharedPrefixPack:
+    return pack_shared_prefixes(
+        (item.input_ids for item in items),
+        max_depth=max_depth,
+    )
 
 
 def main(
@@ -2252,7 +2259,7 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     original_estimate = rank._estimate_flat_forward
     original_cached_estimate = rank._cached_adaptive_estimate
     original_forward_item = rank._forward_item
-    original_pack = trainer_rank_module._pack_forward_items
+    original_pack = trainer_rank_module.pack_shared_prefixes
     original_output_estimate = rank._estimate_group_request_output_bytes
     original_signature = rank._memory_signature_from_requests
     original_memory_check = rank._memory_check
@@ -2362,7 +2369,7 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
     rank._estimate_flat_forward = estimate_wrapper  # type: ignore[method-assign]
     rank._cached_adaptive_estimate = cached_estimate_wrapper  # type: ignore[method-assign]
     rank._forward_item = forward_item_wrapper  # type: ignore[method-assign]
-    trainer_rank_module._pack_forward_items = pack_wrapper  # type: ignore[assignment]
+    trainer_rank_module.pack_shared_prefixes = pack_wrapper  # type: ignore[assignment]
     rank._estimate_group_request_output_bytes = output_estimate_wrapper  # type: ignore[method-assign]
     rank._memory_signature_from_requests = signature_wrapper  # type: ignore[method-assign]
     rank._memory_check = memory_check_wrapper  # type: ignore[method-assign]
@@ -2377,7 +2384,7 @@ def _profile_adaptive_selection(rank: TrainerRank) -> Any:
         rank._estimate_flat_forward = original_estimate  # type: ignore[method-assign]
         rank._cached_adaptive_estimate = original_cached_estimate  # type: ignore[method-assign]
         rank._forward_item = original_forward_item  # type: ignore[method-assign]
-        trainer_rank_module._pack_forward_items = original_pack  # type: ignore[assignment]
+        trainer_rank_module.pack_shared_prefixes = original_pack  # type: ignore[assignment]
         rank._estimate_group_request_output_bytes = original_output_estimate  # type: ignore[method-assign]
         rank._memory_signature_from_requests = original_signature  # type: ignore[method-assign]
         rank._memory_check = original_memory_check  # type: ignore[method-assign]

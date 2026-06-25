@@ -971,7 +971,10 @@ class TrainerRank:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
-            packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
+            packed = pack_shared_prefixes(
+                (item.input_ids for item in items),
+                max_depth=self.shared_prefix_max_depth,
+            )
             plans.append(
                 _ForwardGroupPlan(
                     slot_ref=slot_ref,
@@ -1196,9 +1199,9 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
-        if profiled is None or not _memory_profile_covers(
-            profiled,
-            packed_tokens=packed_tokens,
+        if (
+            profiled is None
+            or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
         ):
             compute = static_compute
         else:
@@ -1224,7 +1227,7 @@ class TrainerRank:
         profile = self._memory_profiles.get(signature)
         local = packed_tokens <= 0 or (
             profile is not None
-            and _memory_profile_covers(profile, packed_tokens=packed_tokens)
+            and profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH >= packed_tokens
         )
         if dist.is_available() and dist.is_initialized():
             value = torch.tensor(
@@ -1258,12 +1261,30 @@ class TrainerRank:
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
         if request.top_k is not None:
             _validate_top_k(request.top_k, _language_model(self.runtime.model[0]))
-        input_ids = _as_1d_long(request.input_tokens, name="input_tokens")
-        labels = (
-            _as_target_tokens(request.target_tokens, request.input_tokens, input_ids)
-            if request.target_tokens is not None
-            else None
-        )
+        input_ids = request.input_tokens.reshape(-1).to(dtype=torch.long)
+        if int(input_ids.numel()) == 0:
+            raise ValueError("input_tokens must not be empty")
+        labels = None
+        if request.target_tokens is not None:
+            labels = request.target_tokens.to(dtype=torch.long)
+            if int(labels.numel()) == 0:
+                raise ValueError("target_tokens must not be empty")
+            input_shape = tuple(request.input_tokens.shape)
+            if tuple(labels.shape) == input_shape:
+                labels = labels.reshape(-1)
+            elif (
+                labels.ndim > request.input_tokens.ndim
+                and tuple(labels.shape[: request.input_tokens.ndim]) == input_shape
+            ):
+                labels = labels.reshape(
+                    int(input_ids.numel()), *labels.shape[request.input_tokens.ndim :]
+                )
+            elif labels.ndim < 1 or int(labels.shape[0]) != int(input_ids.numel()):
+                raise ValueError(
+                    "target_tokens must match input_tokens or add trailing target "
+                    f"dimensions: input_tokens={input_shape} "
+                    f"target_tokens={tuple(labels.shape)}"
+                )
         return _ForwardItem(request=request, input_ids=input_ids, labels=labels)
 
     def _forward_packed(
@@ -1474,12 +1495,23 @@ class TrainerRank:
                     )
                     local_topk = (local_values.float(), local_tokens)
 
-            logit_chunk_offsets = _logit_chunk_offsets(
-                items,
-                row_matches,
-                start=start,
-                end=start + int(chunk_rows.numel()),
-                device=rows.device,
+            logit_chunks = [
+                chunk_offsets
+                for item, match in zip(items, row_matches, strict=True)
+                if item.request.logits
+                for _, chunk_offsets in (
+                    _match_chunk_offsets(
+                        match,
+                        start=start,
+                        end=start + int(chunk_rows.numel()),
+                    ),
+                )
+                if int(chunk_offsets.numel())
+            ]
+            logit_chunk_offsets = (
+                torch.cat(logit_chunks).unique(sorted=True)
+                if logit_chunks
+                else torch.empty(0, dtype=torch.long, device=rows.device)
             )
             chunk_logits: torch.Tensor | None = None
             if int(logit_chunk_offsets.numel()):
@@ -1537,18 +1569,30 @@ class TrainerRank:
                             k=min(k, int(selected_logits.shape[1])),
                             dim=-1,
                         )
-                    top_k[index] = _merge_topk(
-                        top_k[index],
-                        offsets,
-                        _vocab_parallel_topk_from_local(
-                            selected_values,
-                            selected_tokens,
-                            k=k,
-                            log_z=selected_log_z,
-                            vocab_start=_vocab_range(local_logits)[0],
-                        ),
-                        length=item_lengths[index],
+                    values = _vocab_parallel_topk_from_local(
+                        selected_values,
+                        selected_tokens,
+                        k=k,
+                        log_z=selected_log_z,
+                        vocab_start=_vocab_range(local_logits)[0],
                     )
+                    current = top_k[index]
+                    if current is None:
+                        current = TopK(
+                            logprobs=torch.empty(
+                                (item_lengths[index], int(values.logprobs.shape[1])),
+                                device=values.logprobs.device,
+                                dtype=values.logprobs.dtype,
+                            ),
+                            tokens=torch.empty(
+                                (item_lengths[index], int(values.tokens.shape[1])),
+                                device=values.tokens.device,
+                                dtype=values.tokens.dtype,
+                            ),
+                        )
+                        top_k[index] = current
+                    current.logprobs[offsets] = values.logprobs
+                    current.tokens[offsets] = values.tokens
 
     def _local_logits_from_hidden_rows(
         self,
@@ -1738,40 +1782,6 @@ class TrainerRank:
                     param.grad.mul_(scale)
 
 
-def _as_1d_long(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
-    tensor = tensor.reshape(-1)
-    if int(tensor.numel()) == 0:
-        raise ValueError(f"{name} must not be empty")
-    return tensor.to(dtype=torch.long)
-
-
-def _as_target_tokens(
-    tensor: torch.Tensor,
-    input_tokens: torch.Tensor,
-    input_ids: torch.Tensor,
-) -> torch.Tensor:
-    labels = tensor.to(dtype=torch.long)
-    if int(labels.numel()) == 0:
-        raise ValueError("target_tokens must not be empty")
-    if tuple(labels.shape) == tuple(input_tokens.shape):
-        return labels.reshape(-1)
-
-    input_shape = tuple(input_tokens.shape)
-    if (
-        labels.ndim > input_tokens.ndim
-        and tuple(labels.shape[: input_tokens.ndim]) == input_shape
-    ):
-        return labels.reshape(
-            int(input_ids.numel()), *labels.shape[input_tokens.ndim :]
-        )
-    if labels.ndim >= 1 and int(labels.shape[0]) == int(input_ids.numel()):
-        return labels
-    raise ValueError(
-        "target_tokens must match input_tokens or add trailing target dimensions: "
-        f"input_tokens={tuple(input_tokens.shape)} target_tokens={tuple(labels.shape)}"
-    )
-
-
 def _validate_top_k(top_k: int, model: "GPTModel") -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
@@ -1791,21 +1801,6 @@ def _request_mix_key(request: AnyForwardInput) -> str:
     if request.hidden_states:
         parts.append("hidden")
     return "+".join(parts) if parts else "inactive"
-
-
-def _memory_profile_covers(profile: _MemoryProfile, *, packed_tokens: int) -> bool:
-    return profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH >= packed_tokens
-
-
-def _pack_forward_items(
-    items: Sequence[_ForwardItem],
-    *,
-    max_depth: int,
-) -> SharedPrefixPack:
-    return pack_shared_prefixes(
-        (item.input_ids for item in items),
-        max_depth=max_depth,
-    )
 
 
 def _pad_packed_batch(
@@ -1935,26 +1930,6 @@ def _finish_target_logprobs(
     return (target_logits.float() - log_z).masked_fill(labels == -100, 0.0)
 
 
-def _logit_chunk_offsets(
-    items: Sequence[_ForwardItem],
-    row_matches: Sequence[_RowMatch],
-    *,
-    start: int,
-    end: int,
-    device: torch.device,
-) -> torch.Tensor:
-    parts = [
-        chunk_offsets
-        for item, match in zip(items, row_matches, strict=True)
-        if item.request.logits
-        for _, chunk_offsets in (_match_chunk_offsets(match, start=start, end=end),)
-        if int(chunk_offsets.numel())
-    ]
-    if not parts:
-        return torch.empty(0, dtype=torch.long, device=device)
-    return torch.cat(parts).unique(sorted=True)
-
-
 def _anchor_disconnected_outputs(
     target_logprobs: list[torch.Tensor | None],
     top_k: list[TopK | None],
@@ -1994,7 +1969,9 @@ def _try_triton_local_topk_stats(
     *,
     k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    if k <= 0 or k > _triton_fused_topk_max():
+    if k <= 0 or k > int(
+        os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
+    ):
         return None
     return cast(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
@@ -2022,35 +1999,21 @@ def _try_triton_stats(
 ) -> object | None:
     if not local_logits.is_cuda:
         return None
-    if _triton_topk_disabled() or int(local_logits.shape[0]) < _triton_min_rows():
+    if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
+        "0",
+        "false",
+    } or int(local_logits.shape[0]) < int(
+        os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64")
+    ):
         return None
     try:
         from art.megatron import trainer_rank_topk
 
         return getattr(trainer_rank_topk, name)(local_logits, **kwargs)
     except Exception:
-        if _triton_topk_strict():
+        if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
             raise
         return None
-
-
-def _triton_topk_disabled() -> bool:
-    return os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
-        "0",
-        "false",
-    }
-
-
-def _triton_topk_strict() -> bool:
-    return os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict"
-
-
-def _triton_fused_topk_max() -> int:
-    return int(os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10"))
-
-
-def _triton_min_rows() -> int:
-    return int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
 
 
 def _vocab_parallel_topk_from_local(
@@ -2081,31 +2044,6 @@ def _vocab_parallel_topk_from_local(
     tokens = torch.cat(gathered_tokens, dim=1)
     top_values, top_offsets = torch.topk(values, k=k, dim=-1)
     return TopK(logprobs=top_values, tokens=tokens.gather(1, top_offsets))
-
-
-def _merge_topk(
-    current: TopK | None,
-    offsets: torch.Tensor,
-    values: TopK,
-    *,
-    length: int,
-) -> TopK:
-    if current is None:
-        current = TopK(
-            logprobs=torch.empty(
-                (length, int(values.logprobs.shape[1])),
-                device=values.logprobs.device,
-                dtype=values.logprobs.dtype,
-            ),
-            tokens=torch.empty(
-                (length, int(values.tokens.shape[1])),
-                device=values.tokens.device,
-                dtype=values.tokens.dtype,
-            ),
-        )
-    current.logprobs[offsets] = values.logprobs
-    current.tokens[offsets] = values.tokens
-    return current
 
 
 def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:

@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import typer
 
-from art.megatron.shared_prefix_packing import SharedPrefixPack
+from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 from art.megatron.trainer_rank import (
     ForwardInput,
     ForwardOutput,
@@ -17,7 +17,6 @@ from art.megatron.trainer_rank import (
     TrainerRank,
     _batch_seq_logits,
     _language_model,
-    _pack_forward_items,
     _select_positions,
 )
 
@@ -617,7 +616,10 @@ def _packed_oracle(
 ) -> tuple[list[CheckOutput], tuple[torch.Tensor, ...]]:
     items = [rank._forward_item(request) for request in requests]
     prepared = rank._prepare_packed_forward(
-        _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
+        pack_shared_prefixes(
+            (item.input_ids for item in items),
+            max_depth=rank.shared_prefix_max_depth,
+        )
     )
     hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
     return (
@@ -650,7 +652,10 @@ def _shared_hidden_check(
 ]:
     items = [rank_a._forward_item(request) for request in requests]
     prepared = rank_a._prepare_packed_forward(
-        _pack_forward_items(items, max_depth=rank_a.shared_prefix_max_depth)
+        pack_shared_prefixes(
+            (item.input_ids for item in items),
+            max_depth=rank_a.shared_prefix_max_depth,
+        )
     )
     hidden = rank_a._gather_sequence_parallel_hidden(rank_a._decoder_hidden(prepared))
     outputs_a = _outputs_from_hidden(rank_a, items, prepared, hidden)
@@ -690,7 +695,10 @@ def _same_layout_check_outputs(
     ],
 ) -> list[CheckOutput]:
     items = [rank._forward_item(request) for request in requests]
-    batch = _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
+    batch = pack_shared_prefixes(
+        (item.input_ids for item in items),
+        max_depth=rank.shared_prefix_max_depth,
+    )
     outputs = []
     for index, positions in enumerate(batch.positions_by_sequence):
         mutated = _mutated_batch(batch, keep_positions=positions)
@@ -829,7 +837,10 @@ def _source_positions(
 ) -> tuple[torch.Tensor, ...]:
     items = [rank._forward_item(request) for request in requests]
     prepared = rank._prepare_packed_forward(
-        _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
+        pack_shared_prefixes(
+            (item.input_ids for item in items),
+            max_depth=rank.shared_prefix_max_depth,
+        )
     )
     return prepared.source_positions_by_item
 

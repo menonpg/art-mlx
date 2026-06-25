@@ -11,13 +11,12 @@ import torch
 import torch.distributed as dist
 import typer
 
-from art.megatron.shared_prefix_packing import SharedPrefixPack
+from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 from art.megatron.trainer_rank import (
     AnyForwardInput,
     TrainerRank,
     _batch_seq_logits,
     _language_model,
-    _pack_forward_items,
 )
 
 
@@ -213,7 +212,10 @@ def _run_capture(
 
     model = _language_model(rank.runtime.model[0])
     items = [rank._forward_item(request) for request in requests]
-    batch = _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
+    batch = pack_shared_prefixes(
+        (item.input_ids for item in items),
+        max_depth=rank.shared_prefix_max_depth,
+    )
     if mutate_except is not None:
         batch = _mutated_batch(
             batch, keep_positions=batch.positions_by_sequence[mutate_except]
