@@ -11,7 +11,6 @@ from .types import (
     PackedRowAttentionSpec,
     ParallelTopology,
     PreparedMegatronBatch,
-    SharedPrefixBuilderConfig,
     TokenRange,
 )
 
@@ -25,7 +24,6 @@ __all__ = [
     "PackedRowAttentionSpec",
     "ParallelTopology",
     "PreparedMegatronBatch",
-    "SharedPrefixBuilderConfig",
     "ContextParallelConfig",
     "TokenRange",
     "TokenLayoutIndex",

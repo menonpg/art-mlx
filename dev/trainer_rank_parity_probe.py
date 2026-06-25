@@ -11,13 +11,13 @@ import torch
 import torch.distributed as dist
 import typer
 
+from art.megatron.shared_prefix_packing import SharedPrefixPack
 from art.megatron.trainer_rank import (
     AnyForwardInput,
     TrainerRank,
     _batch_seq_logits,
     _language_model,
     _pack_forward_items,
-    _PackedForwardBatch,
 )
 
 
@@ -216,7 +216,7 @@ def _run_capture(
     batch = _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
     if mutate_except is not None:
         batch = _mutated_batch(
-            batch, keep_positions=batch.positions_by_item[mutate_except]
+            batch, keep_positions=batch.positions_by_sequence[mutate_except]
         )
     prepared = rank._prepare_packed_forward(batch)
     local_seq_len = int(prepared.tokens.shape[1])
@@ -270,10 +270,10 @@ def _run_capture(
 
 
 def _mutated_batch(
-    batch: _PackedForwardBatch,
+    batch: SharedPrefixPack,
     *,
     keep_positions: torch.Tensor,
-) -> _PackedForwardBatch:
+) -> SharedPrefixPack:
     tokens = batch.tokens.clone()
     mask = torch.ones(int(tokens.shape[1]), dtype=torch.bool, device=tokens.device)
     mask[keep_positions.to(device=tokens.device)] = False
@@ -282,12 +282,12 @@ def _mutated_batch(
         + 50_000
     )
     tokens[0, mask] = replacement[mask] % 100_000
-    return _PackedForwardBatch(
+    return SharedPrefixPack(
         tokens=tokens,
         group_ids=batch.group_ids,
         parent_ids=batch.parent_ids,
         position_ids=batch.position_ids,
-        positions_by_item=batch.positions_by_item,
+        positions_by_sequence=batch.positions_by_sequence,
     )
 
 

@@ -17,6 +17,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import torch.distributed as dist
 
 from art.megatron.shared_prefix_packing import (
+    SharedPrefixPack,
     estimate_shared_prefix_packed_tokens,
     pack_shared_prefixes,
 )
@@ -190,15 +191,6 @@ class _ForwardItem:
 
 
 @dataclass(frozen=True)
-class _PackedForwardBatch:
-    tokens: torch.Tensor
-    group_ids: torch.Tensor
-    parent_ids: torch.Tensor
-    position_ids: torch.Tensor
-    positions_by_item: tuple[torch.Tensor, ...]
-
-
-@dataclass(frozen=True)
 class _PreparedPackedForward:
     tokens: torch.Tensor
     position_ids: torch.Tensor
@@ -227,7 +219,7 @@ class _ForwardGroupPlan:
     slot_ref: "LoRASlotRef | None"
     request_indices: tuple[int, ...]
     items: tuple[_ForwardItem, ...]
-    packed: _PackedForwardBatch
+    packed: SharedPrefixPack
 
 
 @dataclass(frozen=True)
@@ -972,7 +964,7 @@ class TrainerRank:
         self, requests: Sequence[AnyForwardInput]
     ) -> _FlatForwardPlan:
         plans: list[_ForwardGroupPlan] = []
-        output_bytes = 0
+        output_bytes = self._estimate_group_request_output_bytes(requests)
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         groups = self._group_active_request_indices(requests)
         for slot_ref, group_indices in groups:
@@ -980,9 +972,6 @@ class TrainerRank:
                 self._forward_item(requests[index]) for index in group_indices
             )
             packed = _pack_forward_items(items, max_depth=self.shared_prefix_max_depth)
-            output_bytes += self._estimate_group_request_output_bytes(
-                [item.request for item in items]
-            )
             plans.append(
                 _ForwardGroupPlan(
                     slot_ref=slot_ref,
@@ -1009,7 +998,6 @@ class TrainerRank:
     ) -> tuple[int, int, _MemorySignature] | None:
         groups = self._group_active_request_indices(requests)
         packed_tokens = 0
-        output_bytes = 0
         for _, group_indices in groups:
             group_packed_tokens = estimate_shared_prefix_packed_tokens(
                 (requests[index].input_tokens for index in group_indices),
@@ -1018,13 +1006,10 @@ class TrainerRank:
             if group_packed_tokens is None:
                 return None
             packed_tokens += group_packed_tokens
-            output_bytes += self._estimate_group_request_output_bytes(
-                [requests[index] for index in group_indices]
-            )
 
         return (
             packed_tokens,
-            output_bytes,
+            self._estimate_group_request_output_bytes(requests),
             self._memory_signature_from_requests(
                 requests,
                 slot_group_count=len(groups),
@@ -1606,7 +1591,7 @@ class TrainerRank:
 
     def _prepare_packed_forward(
         self,
-        batch: _PackedForwardBatch,
+        batch: SharedPrefixPack,
     ) -> _PreparedPackedForward:
         topology = self._topology()
         batch = _pad_packed_batch(batch, multiple=int(topology.tp))
@@ -1628,20 +1613,20 @@ class TrainerRank:
                 attention_value_head_dim=provider.kv_channels,
             ),
             packed_seq_params=None,
-            positions_by_item=batch.positions_by_item,
+            positions_by_item=batch.positions_by_sequence,
             source_positions_by_item=tuple(
                 torch.arange(
                     int(positions.numel()),
                     dtype=torch.long,
                     device=positions.device,
                 )
-                for positions in batch.positions_by_item
+                for positions in batch.positions_by_sequence
             ),
         )
 
     def _prepare_context_parallel_forward(
         self,
-        batch: _PackedForwardBatch,
+        batch: SharedPrefixPack,
         *,
         topology: "ParallelTopology",
     ) -> _PreparedPackedForward:
@@ -1697,7 +1682,7 @@ class TrainerRank:
         )
         local_position_pairs = tuple(
             _local_position_pairs(local_positions, positions)
-            for positions in batch.positions_by_item
+            for positions in batch.positions_by_sequence
         )
         return _PreparedPackedForward(
             tokens=prepared.tensors.tokens,
@@ -1816,24 +1801,18 @@ def _pack_forward_items(
     items: Sequence[_ForwardItem],
     *,
     max_depth: int,
-) -> _PackedForwardBatch:
-    input_tensors = tuple(item.input_ids for item in items)
-    pack = pack_shared_prefixes(input_tensors, max_depth=max_depth)
-
-    return _PackedForwardBatch(
-        tokens=pack.tokens,
-        group_ids=pack.group_ids,
-        parent_ids=pack.parent_ids,
-        position_ids=pack.position_ids,
-        positions_by_item=pack.positions_by_sequence,
+) -> SharedPrefixPack:
+    return pack_shared_prefixes(
+        (item.input_ids for item in items),
+        max_depth=max_depth,
     )
 
 
 def _pad_packed_batch(
-    batch: _PackedForwardBatch,
+    batch: SharedPrefixPack,
     *,
     multiple: int,
-) -> _PackedForwardBatch:
+) -> SharedPrefixPack:
     if multiple <= 1:
         return batch
     seq_len = int(batch.tokens.shape[1])
@@ -1851,7 +1830,7 @@ def _pad_packed_batch(
         dtype=batch.group_ids.dtype,
         device=device,
     ).unsqueeze(0)
-    return _PackedForwardBatch(
+    return SharedPrefixPack(
         tokens=torch.cat(
             (
                 batch.tokens,
@@ -1868,7 +1847,7 @@ def _pad_packed_batch(
             ),
             dim=1,
         ),
-        positions_by_item=batch.positions_by_item,
+        positions_by_sequence=batch.positions_by_sequence,
     )
 
 

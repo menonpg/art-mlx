@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import typer
 
+from art.megatron.shared_prefix_packing import SharedPrefixPack
 from art.megatron.trainer_rank import (
     ForwardInput,
     ForwardOutput,
@@ -17,7 +18,6 @@ from art.megatron.trainer_rank import (
     _batch_seq_logits,
     _language_model,
     _pack_forward_items,
-    _PackedForwardBatch,
     _select_positions,
 )
 
@@ -692,7 +692,7 @@ def _same_layout_check_outputs(
     items = [rank._forward_item(request) for request in requests]
     batch = _pack_forward_items(items, max_depth=rank.shared_prefix_max_depth)
     outputs = []
-    for index, positions in enumerate(batch.positions_by_item):
+    for index, positions in enumerate(batch.positions_by_sequence):
         mutated = _mutated_batch(batch, keep_positions=positions)
         prepared = rank._prepare_packed_forward(mutated)
         hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
@@ -707,10 +707,10 @@ def _same_layout_check_outputs(
 
 
 def _mutated_batch(
-    batch: _PackedForwardBatch,
+    batch: SharedPrefixPack,
     *,
     keep_positions: torch.Tensor,
-) -> _PackedForwardBatch:
+) -> SharedPrefixPack:
     tokens = batch.tokens.clone()
     mutate = torch.ones(int(tokens.shape[1]), dtype=torch.bool, device=tokens.device)
     mutate[keep_positions.to(device=tokens.device)] = False
@@ -719,12 +719,12 @@ def _mutated_batch(
         + 50_000
     )
     tokens[0, mutate] = replacement[mutate] % 100_000
-    return _PackedForwardBatch(
+    return SharedPrefixPack(
         tokens=tokens,
         group_ids=batch.group_ids,
         parent_ids=batch.parent_ids,
         position_ids=batch.position_ids,
-        positions_by_item=batch.positions_by_item,
+        positions_by_sequence=batch.positions_by_sequence,
     )
 
 

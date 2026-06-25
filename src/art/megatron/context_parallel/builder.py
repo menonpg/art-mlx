@@ -9,7 +9,6 @@ from .types import (
     AttnSlice,
     PackedBatchAttentionSpec,
     PackedRowAttentionSpec,
-    SharedPrefixBuilderConfig,
     TokenRange,
 )
 
@@ -50,7 +49,7 @@ def build_shared_prefix_attention_spec(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
-    config: SharedPrefixBuilderConfig = SharedPrefixBuilderConfig(),
+    ignore_padding_group_id: int = -1,
 ) -> PackedBatchAttentionSpec:
     if group_ids.shape != parent_ids.shape:
         raise RuntimeError(
@@ -66,7 +65,7 @@ def build_shared_prefix_attention_spec(
     for row in parse_shared_prefix_tree(
         group_ids=group_ids,
         parent_ids=parent_ids,
-        ignore_padding_group_id=config.ignore_padding_group_id,
+        ignore_padding_group_id=ignore_padding_group_id,
     ):
         if row.valid_tokens == 0:
             rows.append(

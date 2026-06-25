@@ -48,11 +48,6 @@ class PackedBatchAttentionSpec:
 
 
 @dataclass(frozen=True)
-class SharedPrefixBuilderConfig:
-    ignore_padding_group_id: int = -1
-
-
-@dataclass(frozen=True)
 class ContextParallelConfig:
     block_size: int = 128
     attention_sparse_block_size: tuple[int, int] | None = None

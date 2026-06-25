@@ -1465,7 +1465,7 @@ def _packed_request_stats(
 
     trainable_mask = torch.zeros(int(batch.tokens.numel()), dtype=torch.bool)
     trainable_tokens = 0
-    for item, positions in zip(items, batch.positions_by_item, strict=True):
+    for item, positions in zip(items, batch.positions_by_sequence, strict=True):
         labels = getattr(item, "labels", None)
         if labels is None:
             continue
