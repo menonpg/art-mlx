@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import gc
 from typing import Any
 
@@ -121,9 +122,7 @@ def _build_sparse_shared_prefix_block_mask(
     token_indices = torch.arange(seq_len, dtype=torch.int64)
     for row_spec in batch_spec.rows:
         row_index = int(row_spec.row_index)
-        slices = tuple(
-            slice_.model_copy(update={"row_index": 0}) for slice_ in row_spec.slices
-        )
+        slices = tuple(replace(slice_, row_index=0) for slice_ in row_spec.slices)
         if int(row_spec.valid_tokens) < seq_len:
             padding_range = TokenRange(start=int(row_spec.valid_tokens), end=seq_len)
             slices = (

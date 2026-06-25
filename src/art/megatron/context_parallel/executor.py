@@ -697,7 +697,7 @@ def _build_stage_block_mask(
             k_len=int(execution_spec.k_len),
             block_size=resolved_block_size,
             slices=stage_plan.slices,
-            exact_mask=mask_metadata.model_dump(mode="python"),
+            exact_mask=mask_metadata,
         ),
         context=block_mask_context,
         device=device,

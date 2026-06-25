@@ -89,7 +89,7 @@ def _build_full_exchange_plan(
         )
         for transfer in local_plan.transfers:
             transfers.setdefault((transfer.source_rank, transfer.dest_rank), transfer)
-    return GdnCpExchangePlan.model_construct(
+    return GdnCpExchangePlan(
         cp_size=len(source_layout.token_counts_by_rank),
         source_token_counts_by_rank=source_layout.token_counts_by_rank,
         dest_token_counts_by_rank=tuple(

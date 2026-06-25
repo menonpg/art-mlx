@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from typing import Any, Literal, TypeVar
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
@@ -12,22 +12,20 @@ from art.megatron.shared_prefix_tree import parse_shared_prefix_tree
 GdnSegmentKind = Literal["prefix", "completion"]
 # FLA's public chunk_gated_delta_rule hard-codes 64-token WY chunks.
 FLA_CHUNK_SIZE = 64
-_PydanticModelT = TypeVar("_PydanticModelT", bound=BaseModel)
 
 
-class GdnSegmentSpec(BaseModel):
+@dataclass(frozen=True)
+class GdnSegmentSpec:
     """Contiguous logical GDN segment in one packed row."""
 
-    model_config = ConfigDict(frozen=True)
-
-    row_index: int = Field(ge=0)
-    family_index: int = Field(ge=0)
+    row_index: int
+    family_index: int
     group_id: int
     parent_id: int
-    start: int = Field(ge=0)
-    end: int = Field(ge=1)
+    start: int
+    end: int
     kind: GdnSegmentKind
-    child_index: int | None = Field(default=None, ge=0)
+    child_index: int | None = None
 
     @property
     def length(self) -> int:
@@ -38,13 +36,12 @@ class GdnSegmentSpec(BaseModel):
         return tuple(range(base + self.start, base + self.end))
 
 
-class GdnPackedExecutionSpec(BaseModel):
+@dataclass(frozen=True)
+class GdnPackedExecutionSpec:
     """Parsed shared-prefix GDN execution metadata for a packed batch."""
 
-    model_config = ConfigDict(frozen=True)
-
-    batch_size: int = Field(ge=1)
-    sequence_length: int = Field(ge=1)
+    batch_size: int
+    sequence_length: int
     valid_lengths: tuple[int, ...]
     tree_segments: tuple[GdnSegmentSpec, ...]
     tree_parent_indices: tuple[int, ...]
@@ -70,53 +67,25 @@ class GdnPackedExecutionSpec(BaseModel):
         return self.tree_segments
 
 
-_GDN_SEGMENT_SPEC_FIELDS = frozenset(
-    {
-        "row_index",
-        "family_index",
-        "group_id",
-        "parent_id",
-        "start",
-        "end",
-        "kind",
-        "child_index",
-    }
-)
-
-
-def _trusted_pydantic_construct(
-    model_type: type[_PydanticModelT],
-    fields_set: frozenset[str],
-    **values: Any,
-) -> _PydanticModelT:
-    model = model_type.__new__(model_type)
-    object.__setattr__(model, "__dict__", values)
-    object.__setattr__(model, "__pydantic_fields_set__", fields_set)
-    object.__setattr__(model, "__pydantic_extra__", None)
-    object.__setattr__(model, "__pydantic_private__", None)
-    return model
-
-
-class GdnSegmentBucketPlan(BaseModel):
+@dataclass(frozen=True)
+class GdnSegmentBucketPlan:
     """Device-local index tensors for a variable-length GDN segment batch."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    length: int = Field(ge=1)
+    length: int
     lengths: torch.Tensor
     lengths_cpu: torch.Tensor
-    lengths_by_rank_cpu: torch.Tensor | None = None
     real_mask: torch.Tensor
     cu_seqlens: torch.Tensor
     cu_seqlens_cpu: torch.Tensor
     row_indices: torch.Tensor
     position_indices: torch.Tensor
     family_indices: torch.Tensor
+    real_token_count_static: int
+    lengths_by_rank_cpu: torch.Tensor | None = None
     family_indices_cpu: torch.Tensor | None = None
     parent_indices: torch.Tensor | None = None
     parent_indices_cpu: torch.Tensor | None = None
     needs_final_state: bool = True
-    real_token_count_static: int = Field(ge=0)
     output_mask: torch.Tensor | None = None
 
     @property
@@ -128,10 +97,9 @@ class GdnSegmentBucketPlan(BaseModel):
         return self.real_token_count_static
 
 
-class GdnStateExchangePlan(BaseModel):
+@dataclass(frozen=True)
+class GdnStateExchangePlan:
     """Sparse CP exchange for tree parent states needed by remote children."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     source_family_indices: tuple[int, ...]
     dest_family_indices: tuple[int, ...]
@@ -139,45 +107,43 @@ class GdnStateExchangePlan(BaseModel):
     reverse_exchange: Any
 
 
-class GdnPlannerConfig(BaseModel):
+@dataclass(frozen=True)
+class GdnPlannerConfig:
     """Tunable cost coefficients for one packed-row GDN execution plan."""
 
-    model_config = ConfigDict(frozen=True)
-
-    max_padding_ratio: float = Field(default=2.0, gt=1.0)
-    max_segments_per_batch: int = Field(default=4096, ge=1)
-    cp_chain_min_tokens_per_rank: int = Field(default=32, ge=1)
-    cp_chain_min_total_tokens: int = Field(default=32768, ge=1)
-    cp_chain_min_prefix_only_tokens: int = Field(default=32768, ge=1)
-    cp_tree_chain_min_total_tokens: int = Field(default=8192, ge=1)
-    cp_tree_chain_min_prefix_only_tokens: int = Field(default=8192, ge=1)
-    rank_idle_token_cost: float = Field(default=1.0, ge=0.0)
-    max_zero_exchange_load_imbalance: float = Field(default=1.5, ge=1.0)
-    planner_local_token_ms: float = Field(default=0.00065, ge=0.0)
-    planner_layout_cross_rank_token_ms: float = Field(default=0.00008, ge=0.0)
-    planner_empty_rank_ms: float = Field(default=32.0, ge=0.0)
+    max_padding_ratio: float = 2.0
+    max_segments_per_batch: int = 4096
+    cp_chain_min_tokens_per_rank: int = 32
+    cp_chain_min_total_tokens: int = 32768
+    cp_chain_min_prefix_only_tokens: int = 32768
+    cp_tree_chain_min_total_tokens: int = 8192
+    cp_tree_chain_min_prefix_only_tokens: int = 8192
+    rank_idle_token_cost: float = 1.0
+    max_zero_exchange_load_imbalance: float = 1.5
+    planner_local_token_ms: float = 0.00065
+    planner_layout_cross_rank_token_ms: float = 0.00008
+    planner_empty_rank_ms: float = 32.0
 
 
-class GdnRankExecutionPlan(BaseModel):
+@dataclass(frozen=True)
+class GdnRankExecutionPlan:
     """Rank-local planned execution metadata for shared-prefix GDN."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    cp_rank: int = Field(ge=0)
-    cp_size: int = Field(ge=1)
-    batch_size: int = Field(ge=1)
-    sequence_length: int = Field(ge=0)
-    packed_batch_size: int | None = Field(default=None, ge=1)
-    packed_sequence_length: int | None = Field(default=None, ge=1)
+    cp_rank: int
+    cp_size: int
+    batch_size: int
+    sequence_length: int
     real_token_mask: torch.Tensor
-    family_count: int = Field(ge=0)
-    completion_count: int = Field(ge=0)
+    family_count: int
+    completion_count: int
+    packed_batch_size: int | None = None
+    packed_sequence_length: int | None = None
     attention_to_gdn: Any | None = None
     gdn_to_attention: Any | None = None
     attention_token_ranges: tuple[tuple[int, int, int], ...] = ()
     gdn_token_ranges: tuple[tuple[int, int, int], ...] = ()
-    attention_token_count: int = Field(default=0, ge=0)
-    gdn_token_count: int = Field(default=0, ge=0)
+    attention_token_count: int = 0
+    gdn_token_count: int = 0
     tree_segment_buckets_by_depth: tuple[tuple[GdnSegmentBucketPlan, ...], ...] = ()
     tree_chain_buckets_by_depth: tuple[tuple[GdnSegmentBucketPlan, ...], ...] = ()
     tree_state_exchanges_by_depth: tuple[GdnStateExchangePlan | None, ...] = ()
@@ -191,14 +157,13 @@ class GdnRankExecutionPlan(BaseModel):
         return _tokens_from_rank_ranges(self.gdn_token_ranges)
 
 
-class _AttentionLayoutIndex(BaseModel):
+@dataclass(frozen=True)
+class _AttentionLayoutIndex:
     """Counting index for CP attention token ownership."""
-
-    model_config = ConfigDict(frozen=True)
 
     token_ranges_by_rank: tuple[tuple[tuple[int, int], ...], ...]
     token_range_ends_by_rank: tuple[tuple[int, ...], ...]
-    range_count: int = Field(ge=0)
+    range_count: int
 
 
 def _layout_cp_size(layout: TokenLayoutIndex) -> int:
@@ -456,7 +421,7 @@ def _build_tree_rank_execution_plan(
             dtype=torch.bool,
         )
 
-    return GdnRankExecutionPlan.model_construct(
+    return GdnRankExecutionPlan(
         cp_rank=cp_rank,
         cp_size=cp_size,
         batch_size=1 if cp_size > 1 else spec.batch_size,
@@ -486,7 +451,7 @@ def move_gdn_rank_execution_plan_to_device(
 
     from art.megatron.gdn.layout import move_cp_exchange_plan_to_device
 
-    return GdnRankExecutionPlan.model_construct(
+    return GdnRankExecutionPlan(
         cp_rank=plan.cp_rank,
         cp_size=plan.cp_size,
         batch_size=plan.batch_size,
@@ -525,7 +490,7 @@ def _move_state_exchange_plan(
         return None
     from art.megatron.gdn.layout import move_cp_exchange_plan_to_device
 
-    return GdnStateExchangePlan.model_construct(
+    return GdnStateExchangePlan(
         source_family_indices=exchange.source_family_indices,
         dest_family_indices=exchange.dest_family_indices,
         exchange=move_cp_exchange_plan_to_device(exchange.exchange, device),
@@ -540,7 +505,7 @@ def _move_bucket_plans(
     device: torch.device | str,
 ) -> tuple[GdnSegmentBucketPlan, ...]:
     return tuple(
-        GdnSegmentBucketPlan.model_construct(
+        GdnSegmentBucketPlan(
             length=bucket.length,
             lengths=_move_planner_tensor(bucket.lengths, device),
             lengths_cpu=bucket.lengths_cpu,
@@ -611,9 +576,7 @@ def parse_gdn_shared_prefix_segments(
                 child_index = child_counts_by_parent.get(parent_node_index, 0)
                 child_counts_by_parent[parent_node_index] = child_index + 1
             tree_segments.append(
-                _trusted_pydantic_construct(
-                    GdnSegmentSpec,
-                    _GDN_SEGMENT_SPEC_FIELDS,
+                GdnSegmentSpec(
                     row_index=segment.row_index,
                     family_index=node_index,
                     group_id=segment.group_id,
@@ -855,7 +818,7 @@ def _build_tree_state_exchanges_by_depth(
                     device=device,
                 )
             )
-        exchange = GdnCpExchangePlan.model_construct(
+        exchange = GdnCpExchangePlan(
             cp_size=cp_size,
             source_token_counts_by_rank=tuple(
                 len(families) for families in source_families
@@ -867,7 +830,7 @@ def _build_tree_state_exchanges_by_depth(
             cross_rank_token_count_override=transfer_count,
         )
         state_exchanges.append(
-            GdnStateExchangePlan.model_construct(
+            GdnStateExchangePlan(
                 source_family_indices=source_families[cp_rank],
                 dest_family_indices=dest_families[cp_rank],
                 exchange=exchange,
@@ -888,7 +851,7 @@ def _build_attention_layout_index_from_token_layout(
         for rank_ranges in layout.ownership_ranges_by_rank
     )
     range_count = sum(len(ranges) for ranges in ranges_by_rank)
-    return _AttentionLayoutIndex.model_construct(
+    return _AttentionLayoutIndex(
         token_ranges_by_rank=ranges_by_rank,
         token_range_ends_by_rank=tuple(
             tuple(end for _, end in ranges) for ranges in ranges_by_rank
@@ -1229,14 +1192,13 @@ def _bucket_with_tree_parent_indices(
         [tree_parent_indices[segment.family_index] for segment in segments],
         dtype=torch.long,
     )
-    return plan.model_copy(
-        update={
-            "parent_indices": _move_planner_tensor(parent_indices, device),
-            "parent_indices_cpu": parent_indices,
-            "needs_final_state": any(
-                tree_has_children[segment.family_index] for segment in segments
-            ),
-        }
+    return replace(
+        plan,
+        parent_indices=_move_planner_tensor(parent_indices, device),
+        parent_indices_cpu=parent_indices,
+        needs_final_state=any(
+            tree_has_children[segment.family_index] for segment in segments
+        ),
     )
 
 
@@ -1461,7 +1423,7 @@ def _build_bucket_plan(
         [segment.family_index for segment in segments],
         dtype=torch.long,
     )
-    return GdnSegmentBucketPlan.model_construct(
+    return GdnSegmentBucketPlan(
         length=max_length,
         lengths=_move_planner_tensor(lengths_cpu, device),
         lengths_cpu=lengths_cpu,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -16,9 +17,8 @@ class AttnMaskKind(str, Enum):
     CAUSAL = "causal"
 
 
-class TokenRange(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class TokenRange:
     start: int
     end: int
 
@@ -29,9 +29,8 @@ class TokenRange(BaseModel):
         return self.end <= self.start
 
 
-class AttnSlice(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class AttnSlice:
     q_range: TokenRange
     k_range: TokenRange
     mask_kind: AttnMaskKind
@@ -39,30 +38,26 @@ class AttnSlice(BaseModel):
     family_index: int | None = None
 
 
-class PackedRowAttentionSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class PackedRowAttentionSpec:
     row_index: int
     valid_tokens: int
     slices: tuple[AttnSlice, ...]
 
 
-class PackedBatchAttentionSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class PackedBatchAttentionSpec:
     rows: tuple[PackedRowAttentionSpec, ...]
 
 
-class SharedPrefixBuilderConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class SharedPrefixBuilderConfig:
     ignore_padding_group_id: int = -1
     require_contiguous_group_runs: bool = True
 
 
-class ContextParallelConfig(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
+@dataclass(frozen=True)
+class ContextParallelConfig:
     block_size: int = 128
     attention_sparse_block_size: tuple[int, int] | None = None
     planner_chunk_size: int = 512
@@ -87,9 +82,8 @@ class ContextParallelConfig(BaseModel):
     planner_remote_stage_underfill_ms: float = 0.287151
 
 
-class ParallelTopology(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class ParallelTopology:
     tp: int = 1
     cp: int = 1
     dp: int = 1
@@ -97,54 +91,49 @@ class ParallelTopology(BaseModel):
     sp: bool = False
 
 
-class ContextParallelRuntimeKey(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class ContextParallelRuntimeKey:
     topology: ParallelTopology
     config: ContextParallelConfig
     row_signatures: tuple[str, ...]
 
 
-class KvFetchPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class KvFetchPlan:
     send_splits: tuple[int, ...]
     recv_splits: tuple[int, ...]
     send_ranges_by_peer: tuple[tuple[TokenRange, ...], ...]
 
 
-class DkvReducePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class DkvReducePlan:
     send_splits: tuple[int, ...]
     recv_splits: tuple[int, ...]
     recv_ranges_by_peer: tuple[tuple[TokenRange, ...], ...]
 
 
-class StagePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class StagePlan:
     stage_index: int
     source_rank: int
-    source_ranks: tuple[int, ...] = ()
     is_local_stage: bool
-    wave_index: int | None = None
     slices: tuple[AttnSlice, ...]
-    global_q_ranges: tuple[TokenRange, ...] = ()
-    global_k_ranges: tuple[TokenRange, ...] = ()
     owner_local_q_ranges: tuple[TokenRange, ...]
     owner_local_k_ranges: tuple[TokenRange, ...]
-    mask_metadata: "ExactMaskMetadata | None" = None
-    remote_buffer_range: TokenRange | None = None
     q_len: int
     k_len: int
+    source_ranks: tuple[int, ...] = ()
+    wave_index: int | None = None
+    global_q_ranges: tuple[TokenRange, ...] = ()
+    global_k_ranges: tuple[TokenRange, ...] = ()
+    mask_metadata: "ExactMaskMetadata | None" = None
+    remote_buffer_range: TokenRange | None = None
     kv_fetch_plan: KvFetchPlan | None = None
     dkv_reduce_plan: DkvReducePlan | None = None
 
 
-class RankRuntimePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class RankRuntimePlan:
     rank: int
     original_seq_len: int
     token_layout_index: TokenLayoutIndex
@@ -152,14 +141,13 @@ class RankRuntimePlan(BaseModel):
     local_row_ranges: tuple[TokenRange | None, ...]
     local_token_count: int
     stage_plans: tuple[StagePlan, ...]
-    backward_stage_indices: tuple[int, ...] = ()
     remote_kv_fetch_plan: KvFetchPlan
     remote_dkv_reduce_plan: DkvReducePlan
+    backward_stage_indices: tuple[int, ...] = ()
 
 
-class ContextParallelRuntimePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class ContextParallelRuntimePlan:
     topology: ParallelTopology
     config: ContextParallelConfig
     token_layout_index: TokenLayoutIndex
@@ -196,9 +184,8 @@ class ContextParallelExecutionCache(BaseModel):
     stage_execution_specs: dict[Any, "StageExecutionSpec"] = Field(default_factory=dict)
 
 
-class StageExecutionSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class StageExecutionSpec:
     q_len: int
     k_len: int
     compile_key: str
@@ -241,9 +228,8 @@ class PreparedMegatronBatch(BaseModel):
     pad_multiple: int = 1
 
 
-class FlexMaskSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class FlexMaskSpec:
     q_len: int
     k_len: int
     block_size: int | tuple[int, int]
@@ -251,9 +237,8 @@ class FlexMaskSpec(BaseModel):
     exact_mask: "ExactMaskMetadata"
 
 
-class ExactMaskMetadata(BaseModel):
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class ExactMaskMetadata:
     q_token_indices: torch.Tensor
     k_token_indices: torch.Tensor
     cache_key: str

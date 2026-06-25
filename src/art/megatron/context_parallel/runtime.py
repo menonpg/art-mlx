@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from dataclasses import replace
 import hashlib
 import json
 from typing import Any, cast
@@ -105,8 +106,8 @@ def _planning_bundle_cache_key(
         {
             "group_ids": _metadata_tensor_digest(group_ids),
             "parent_ids": _metadata_tensor_digest(parent_ids),
-            "topology": topology.model_dump(mode="json"),
-            "config": config.model_dump(mode="json"),
+            "topology": _dataclass_payload(topology),
+            "config": _dataclass_payload(config),
             "original_seq_len": int(original_seq_len),
             "build_gdn_execution_spec": bool(build_gdn_execution_spec),
         }
@@ -194,7 +195,7 @@ def _search_config_for_chunk_count(
         return config
     if all(int(getattr(config, key)) == int(value) for key, value in updates.items()):
         return config
-    return config.model_copy(update=updates)
+    return replace(config, **updates)
 
 
 def _best_improving_move(
@@ -1992,7 +1993,7 @@ def get_or_build_runtime_plan(
     original_seq_len: int,
 ) -> ContextParallelRuntimePlan:
     key = (
-        _json_cache_key(runtime_key.model_dump(mode="json")),
+        _json_cache_key(_runtime_key_payload(runtime_key)),
         int(original_seq_len),
     )
     cached = _RUNTIME_PLAN_CACHE.get(key)
@@ -2168,9 +2169,31 @@ def _build_runtime_token_layout_index(
 def _row_signature(row_spec: PackedRowAttentionSpec) -> str:
     payload = {
         "valid_tokens": row_spec.valid_tokens,
-        "slices": [slice_.model_dump(mode="json") for slice_ in row_spec.slices],
+        "slices": [_attn_slice_payload(slice_) for slice_ in row_spec.slices],
     }
     return json.dumps(payload, sort_keys=True)
+
+
+def _dataclass_payload(value: Any) -> dict[str, Any]:
+    return dict(value.__dict__)
+
+
+def _runtime_key_payload(runtime_key: ContextParallelRuntimeKey) -> dict[str, Any]:
+    return {
+        "topology": _dataclass_payload(runtime_key.topology),
+        "config": _dataclass_payload(runtime_key.config),
+        "row_signatures": runtime_key.row_signatures,
+    }
+
+
+def _attn_slice_payload(slice_: AttnSlice) -> dict[str, Any]:
+    return {
+        "q_range": _dataclass_payload(slice_.q_range),
+        "k_range": _dataclass_payload(slice_.k_range),
+        "mask_kind": slice_.mask_kind.value,
+        "row_index": slice_.row_index,
+        "family_index": slice_.family_index,
+    }
 
 
 def _range_key(range_: TokenRange) -> tuple[int, int]:
