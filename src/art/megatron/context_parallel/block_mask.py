@@ -553,16 +553,6 @@ def _build_sparse_block_mask(
             k_block_end,
             k_end,
         )
-        q_min, q_max = (
-            (q_abs[q_overlap_start], q_abs[q_overlap_end - 1])
-            if q_abs_sorted
-            else _block_min_max(q_abs, q_overlap_start, q_overlap_end)
-        )
-        k_min, k_max = (
-            (k_abs[k_overlap_start], k_abs[k_overlap_end - 1])
-            if k_abs_sorted
-            else _block_min_max(k_abs, k_overlap_start, k_overlap_end)
-        )
         q_is_full = (q_overlap_start == q_block_start) & (
             q_overlap_end == q_block_end_raw
         )
@@ -576,6 +566,16 @@ def _build_sparse_block_mask(
             )
             is_full = covers_block
         else:
+            q_min, q_max = (
+                (q_abs[q_overlap_start], q_abs[q_overlap_end - 1])
+                if q_abs_sorted
+                else _block_min_max(q_abs, q_overlap_start, q_overlap_end)
+            )
+            k_min, k_max = (
+                (k_abs[k_overlap_start], k_abs[k_overlap_end - 1])
+                if k_abs_sorted
+                else _block_min_max(k_abs, k_overlap_start, k_overlap_end)
+            )
             has_any = q_max[:, None] >= k_min[None, :]
             is_full = covers_block & (q_min[:, None] >= k_max[None, :])
 
