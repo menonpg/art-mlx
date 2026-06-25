@@ -2014,23 +2014,29 @@ def _adaptive_micro_batch_training_step_body(
 ) -> dict[str, float]:
     rank.zero_grad()
     stats: list[dict[str, int | bool]] = []
+    step_start = time.perf_counter()
     for micro_batch in rank.forward_micro_batches(requests):
         loss = _micro_batch_loss(rank, micro_batch.outputs, loss_kind=loss_kind)
         if loss.requires_grad:
             loss.backward()
-        stats.append(
+        row = {
+            "global_count": int(micro_batch.stats.global_count),
+            "local_count": int(micro_batch.stats.local_count),
+            "packed_tokens": int(micro_batch.stats.packed_tokens),
+            "logical_tokens": int(micro_batch.stats.logical_tokens),
+            "estimated_required_bytes": int(micro_batch.stats.estimated_required_bytes),
+            "available_bytes": int(micro_batch.stats.available_bytes),
+            "rejected_candidates": int(micro_batch.stats.rejected_candidates),
+            "cold_start": bool(micro_batch.stats.cold_start),
+        }
+        stats.append(row)
+        _emit_adaptive_progress(
+            "target_trainer_adaptive_train_step_window",
             {
-                "global_count": int(micro_batch.stats.global_count),
-                "local_count": int(micro_batch.stats.local_count),
-                "packed_tokens": int(micro_batch.stats.packed_tokens),
-                "logical_tokens": int(micro_batch.stats.logical_tokens),
-                "estimated_required_bytes": int(
-                    micro_batch.stats.estimated_required_bytes
-                ),
-                "available_bytes": int(micro_batch.stats.available_bytes),
-                "rejected_candidates": int(micro_batch.stats.rejected_candidates),
-                "cold_start": bool(micro_batch.stats.cold_start),
-            }
+                **row,
+                "window_index": len(stats) - 1,
+                "elapsed_ms": (time.perf_counter() - step_start) * 1000.0,
+            },
         )
     stats_sink[:] = stats
     return rank.optim_step(params=params, scale_grads=1.0)
