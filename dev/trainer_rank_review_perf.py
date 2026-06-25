@@ -52,6 +52,7 @@ def main(
     repeat: int = 10,
     shape_variants: int = 4,
     validate_torch: bool = True,
+    validate_torch_token_cap: int = 32768,
     run_flex: bool = True,
     flex_token_cap: int = 8192,
     flex_heads: int = 2,
@@ -88,6 +89,8 @@ def main(
         "logical_tokens": _logical_tokens(pack),
         "warmup": warmup,
         "repeat": repeat,
+        "validate_torch": validate_torch,
+        "validate_torch_token_cap": validate_torch_token_cap,
     }
 
     plan, plan_ms = _bench_cpu(
@@ -127,7 +130,12 @@ def main(
         repeat=repeat,
     )
     masks = tuple(mask for mask, _ in stage_masks)
-    if validate_torch:
+    torch_validation_skipped = _torch_validation_skip_reason(
+        validate_torch=validate_torch,
+        packed_tokens=int(pack.tokens.numel()),
+        token_cap=validate_torch_token_cap,
+    )
+    if torch_validation_skipped is None:
         for mask, slices in stage_masks:
             _assert_matches_torch_block_mask(mask, slices=slices)
     _write(
@@ -136,6 +144,7 @@ def main(
             **base,
             "case": "block_mask_build",
             "ms": mask_ms,
+            "torch_validation_skipped": torch_validation_skipped,
             **_mask_stats(masks),
         },
     )
@@ -190,7 +199,12 @@ def main(
             repeat=1,
         )
         variant_masks = tuple(mask for mask, _ in variant_stage_masks)
-        if validate_torch:
+        variant_torch_validation_skipped = _torch_validation_skip_reason(
+            validate_torch=validate_torch,
+            packed_tokens=int(variant_pack.tokens.numel()),
+            token_cap=validate_torch_token_cap,
+        )
+        if variant_torch_validation_skipped is None:
             for mask, slices in variant_stage_masks:
                 _assert_matches_torch_block_mask(mask, slices=slices)
         _write(
@@ -203,6 +217,7 @@ def main(
                 "variant_logical_tokens": _logical_tokens(variant_pack),
                 "cp_planning_ms": variant_plan_ms,
                 "block_mask_build_ms": variant_mask_ms,
+                "torch_validation_skipped": variant_torch_validation_skipped,
                 **_plan_stats(variant_plan),
                 **_mask_stats(variant_masks),
             },
@@ -811,6 +826,19 @@ def _block_entries(
 
 def _logical_tokens(pack: SharedPrefixPack) -> int:
     return sum(int(positions.numel()) for positions in pack.positions_by_sequence)
+
+
+def _torch_validation_skip_reason(
+    *,
+    validate_torch: bool,
+    packed_tokens: int,
+    token_cap: int,
+) -> str | None:
+    if not validate_torch:
+        return "disabled"
+    if token_cap > 0 and packed_tokens > token_cap:
+        return f"packed_tokens>{token_cap}"
+    return None
 
 
 def _csv_values(value: str) -> tuple[str, ...]:
