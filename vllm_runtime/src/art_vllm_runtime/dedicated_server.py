@@ -145,7 +145,8 @@ def _patch_art_runtime_routes() -> None:
             )
             waiting_cache_salt = None
             if policy_version is not None:
-                waiting_cache_salt = await engine(raw_request).call_utility_async(
+                engine_client = engine(raw_request)
+                waiting_cache_salt = await engine_client.engine_core.call_utility_async(
                     "art_update_waiting_lora_cache_salt",
                     lora_slot,
                     policy_version,
