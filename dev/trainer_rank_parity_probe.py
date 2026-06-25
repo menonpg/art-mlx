@@ -14,6 +14,7 @@ import typer
 from art.megatron.trainer_rank import (
     AnyForwardInput,
     TrainerRank,
+    _batch_seq_logits,
     _language_model,
     _pack_forward_items,
     _PackedForwardBatch,
@@ -413,11 +414,15 @@ def _logits(rank: TrainerRank, hidden_rows: torch.Tensor) -> torch.Tensor:
     )
     if int(hidden_rows.shape[0]) == 0:
         return hidden_rows.new_empty((0, int(model.vocab_size)))
-    return rank._logits_from_hidden_rows(
+    local_logits = rank._local_logits_from_hidden_rows(
         model,
         hidden_rows,
         output_weight=output_weight,
     )
+    return _batch_seq_logits(
+        rank._gather_tensor_parallel_logits(local_logits.unsqueeze(1)),
+        seq_len=int(hidden_rows.shape[0]),
+    ).squeeze(0)
 
 
 def _records_from_capture(

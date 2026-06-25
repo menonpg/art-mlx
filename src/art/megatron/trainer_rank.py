@@ -1437,17 +1437,14 @@ class TrainerRank:
         logits: list[torch.Tensor | None] = [None for _ in items]
         top_k: list[TopK | None] = [None for _ in items]
         label_rows: list[torch.Tensor | None] = [None for _ in items]
-        full_rows: list[torch.Tensor] = []
-        local_rows: list[torch.Tensor] = []
+        projected_rows: list[torch.Tensor] = []
 
         for index, (item, positions_cpu) in enumerate(
             zip(items, prepared.positions_by_item, strict=True)
         ):
             positions = positions_cpu.to(device=device)
-            if item.request.logits:
-                full_rows.append(positions)
-            elif item.request.top_k is not None:
-                local_rows.append(positions)
+            if item.request.logits or item.request.top_k is not None:
+                projected_rows.append(positions)
             if item.labels is not None:
                 source_positions = prepared.source_positions_by_item[index].to(device)
                 labels = item.labels.to(device=device).index_select(0, source_positions)
@@ -1463,7 +1460,7 @@ class TrainerRank:
                         valid = valid.reshape(int(labels.shape[0]), -1).any(dim=1)
                     valid_offsets = torch.nonzero(valid, as_tuple=False).reshape(-1)
                     if int(valid_offsets.numel()):
-                        local_rows.append(positions.index_select(0, valid_offsets))
+                        projected_rows.append(positions.index_select(0, valid_offsets))
             if item.request.logits:
                 logits[index] = torch.empty(
                     (int(positions.numel()), _padded_vocab_size(model)),
@@ -1471,44 +1468,21 @@ class TrainerRank:
                     dtype=hidden_by_row.dtype,
                 )
 
-        full_row_tensor = (
-            torch.cat(full_rows).unique(sorted=True)
-            if full_rows
+        row_tensor = (
+            torch.cat(projected_rows).unique(sorted=True)
+            if projected_rows
             else torch.empty(0, dtype=torch.long, device=device)
         )
-        local_row_tensor = (
-            torch.cat(local_rows).unique(sorted=True)
-            if local_rows
-            else torch.empty(0, dtype=torch.long, device=device)
-        )
-        if int(full_row_tensor.numel()) and int(local_row_tensor.numel()):
-            local_row_tensor = local_row_tensor[
-                ~torch.isin(local_row_tensor, full_row_tensor)
-            ]
-
-        if int(full_row_tensor.numel()):
-            self._project_full_logits(
-                items,
-                prepared,
-                hidden_by_row,
-                full_row_tensor,
-                output_weight=output_weight,
-                target_logprobs=target_logprobs,
-                top_k=top_k,
-                logits=logits,
-                label_rows=label_rows,
-            )
-
-        if int(local_row_tensor.numel()):
+        if int(row_tensor.numel()):
             local_row_matches = _row_matches_by_item(
                 prepared.positions_by_item,
-                local_row_tensor,
+                row_tensor,
                 device=device,
             )
             self._project_vocab_parallel(
                 items,
                 hidden_by_row,
-                local_row_tensor,
+                row_tensor,
                 row_matches=local_row_matches,
                 item_lengths=tuple(
                     int(positions.numel()) for positions in prepared.positions_by_item
@@ -1516,6 +1490,7 @@ class TrainerRank:
                 output_weight=output_weight,
                 target_logprobs=target_logprobs,
                 top_k=top_k,
+                logits=logits,
                 label_rows=label_rows,
             )
 
@@ -1540,70 +1515,6 @@ class TrainerRank:
             )
         ]
 
-    def _project_full_logits(
-        self,
-        items: Sequence[_ForwardItem],
-        prepared: _PreparedPackedForward,
-        hidden_by_row: torch.Tensor,
-        rows: torch.Tensor,
-        *,
-        output_weight: torch.Tensor | None,
-        target_logprobs: list[torch.Tensor | None],
-        top_k: list[TopK | None],
-        logits: list[torch.Tensor | None],
-        label_rows: list[torch.Tensor | None],
-    ) -> None:
-        model = _language_model(self.runtime.model[0])
-        for start in range(0, int(rows.numel()), self.head_chunk_tokens):
-            chunk_rows = rows[start : start + self.head_chunk_tokens]
-            chunk_logits = self._logits_from_hidden_rows(
-                model,
-                _select_positions(hidden_by_row, chunk_rows),
-                output_weight=output_weight,
-            )
-            log_z = None
-            if any(
-                item.labels is not None or item.request.top_k is not None
-                for item in items
-            ):
-                log_z = torch.logsumexp(chunk_logits.float(), dim=-1)
-
-            for index, item in enumerate(items):
-                positions = prepared.positions_by_item[index].to(device=rows.device)
-                offsets, chunk_offsets = _matching_offsets(positions, chunk_rows)
-                if int(offsets.numel()) == 0:
-                    continue
-                selected_logits = chunk_logits.index_select(0, chunk_offsets)
-                item_logits = logits[index]
-                if item_logits is not None:
-                    item_logits[offsets] = selected_logits
-                labels = label_rows[index]
-                item_logprobs = target_logprobs[index]
-                if item_logprobs is not None and labels is not None:
-                    if log_z is None:
-                        raise RuntimeError("target logprobs require logsumexp")
-                    item_logprobs[offsets] = _call_compiled(
-                        _target_logprobs_from_full_logits,
-                        selected_logits,
-                        labels.index_select(0, offsets),
-                        log_z.index_select(0, chunk_offsets),
-                    )
-                k = item.request.top_k
-                if k is not None:
-                    if log_z is None:
-                        raise RuntimeError("top_k requires logsumexp")
-                    values, tokens = torch.topk(selected_logits.float(), k=k, dim=-1)
-                    top_k[index] = _merge_topk(
-                        top_k[index],
-                        offsets,
-                        TopK(
-                            logprobs=values
-                            - log_z.index_select(0, chunk_offsets).unsqueeze(1),
-                            tokens=tokens,
-                        ),
-                        length=int(positions.numel()),
-                    )
-
     def _project_vocab_parallel(
         self,
         items: Sequence[_ForwardItem],
@@ -1615,52 +1526,13 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         target_logprobs: list[torch.Tensor | None],
         top_k: list[TopK | None],
+        logits: list[torch.Tensor | None],
         label_rows: list[torch.Tensor | None],
     ) -> None:
         model = _language_model(self.runtime.model[0])
-        fused_target_labels = (
-            _consistent_row_labels(
-                label_rows,
-                row_matches,
-                row_count=int(rows.numel()),
-                device=rows.device,
-            )
-            if all(item.request.top_k is None for item in items)
-            and all(labels is None or labels.ndim == 1 for labels in label_rows)
-            else None
-        )
-        if fused_target_labels is not None:
-            row_target_logprobs = torch.empty(
-                int(rows.numel()),
-                device=rows.device,
-                dtype=torch.float32,
-            )
-            for start in range(0, int(rows.numel()), self.head_chunk_tokens):
-                chunk_rows = rows[start : start + self.head_chunk_tokens]
-                local_logits = self._local_logits_from_hidden_rows(
-                    model,
-                    _select_positions(hidden_by_row, chunk_rows),
-                    output_weight=output_weight,
-                )
-                row_target_logprobs[
-                    start : start + int(chunk_rows.numel())
-                ] = -model.compute_language_model_loss(
-                    fused_target_labels[
-                        start : start + int(chunk_rows.numel())
-                    ].unsqueeze(0),
-                    local_logits.unsqueeze(1),
-                ).reshape(-1)
-            _scatter_row_target_logprobs(
-                row_target_logprobs,
-                row_matches,
-                label_rows,
-                target_logprobs,
-            )
-            return
-
-        max_top_k = max(
-            (int(item.request.top_k or 0) for item in items if not item.request.logits),
-            default=0,
+        max_top_k = max((int(item.request.top_k or 0) for item in items), default=0)
+        need_log_z = any(
+            item.labels is not None or item.request.top_k is not None for item in items
         )
         for start in range(0, int(rows.numel()), self.head_chunk_tokens):
             chunk_rows = rows[start : start + self.head_chunk_tokens]
@@ -1669,36 +1541,54 @@ class TrainerRank:
                 _select_positions(hidden_by_row, chunk_rows),
                 output_weight=output_weight,
             )
-            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
-            logsumexp_stats = (
-                _try_triton_local_logsumexp_stats(local_logits)
-                if topk_stats is None
-                else None
-            )
-            stats = topk_stats if topk_stats is not None else logsumexp_stats
-            if stats is not None:
-                local_max, local_sum = stats[:2]
-                local_max = local_max.detach()
-                global_max = _all_reduce_tensor_parallel_max(local_max)
-                global_sum = _all_reduce_tensor_parallel_sum(
-                    local_sum * torch.exp(local_max - global_max)
-                )
-                log_z = global_max + torch.log(global_sum)
-            else:
-                log_z = _vocab_parallel_log_z(local_logits)
-
+            log_z: torch.Tensor | None = None
             local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
-            if topk_stats is not None:
-                _, _, local_values, local_tokens = topk_stats
-                local_topk = (local_values, local_tokens)
-            elif logsumexp_stats is not None and max_top_k > 0:
-                local_k = min(max_top_k, int(local_logits.shape[1]))
-                local_values, local_tokens = torch.topk(local_logits, k=local_k, dim=-1)
-                local_topk = (local_values.float(), local_tokens)
+            if need_log_z:
+                topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+                logsumexp_stats = (
+                    _try_triton_local_logsumexp_stats(local_logits)
+                    if topk_stats is None
+                    else None
+                )
+                stats = topk_stats if topk_stats is not None else logsumexp_stats
+                if stats is not None:
+                    local_max, local_sum = stats[:2]
+                    local_max = local_max.detach()
+                    global_max = _all_reduce_tensor_parallel_max(local_max)
+                    global_sum = _all_reduce_tensor_parallel_sum(
+                        local_sum * torch.exp(local_max - global_max)
+                    )
+                    log_z = global_max + torch.log(global_sum)
+                else:
+                    log_z = _vocab_parallel_log_z(local_logits)
+
+                if topk_stats is not None:
+                    _, _, local_values, local_tokens = topk_stats
+                    local_topk = (local_values, local_tokens)
+                elif logsumexp_stats is not None and max_top_k > 0:
+                    local_k = min(max_top_k, int(local_logits.shape[1]))
+                    local_values, local_tokens = torch.topk(
+                        local_logits, k=local_k, dim=-1
+                    )
+                    local_topk = (local_values.float(), local_tokens)
+
+            logit_chunk_offsets = _logit_chunk_offsets(
+                items,
+                row_matches,
+                start=start,
+                end=start + int(chunk_rows.numel()),
+                device=rows.device,
+            )
+            chunk_logits: torch.Tensor | None = None
+            if int(logit_chunk_offsets.numel()):
+                chunk_logits = _batch_seq_logits(
+                    self._gather_tensor_parallel_logits(
+                        local_logits.index_select(0, logit_chunk_offsets).unsqueeze(1)
+                    ),
+                    seq_len=int(logit_chunk_offsets.numel()),
+                ).squeeze(0)
 
             for index, item in enumerate(items):
-                if item.request.logits:
-                    continue
                 offsets, chunk_offsets = _match_chunk_offsets(
                     row_matches[index],
                     start=start,
@@ -1706,10 +1596,23 @@ class TrainerRank:
                 )
                 if int(offsets.numel()) == 0:
                     continue
-                selected_log_z = log_z.index_select(0, chunk_offsets)
+                item_logits = logits[index]
+                if item_logits is not None:
+                    if chunk_logits is None:
+                        raise RuntimeError("logits output requires gathered logits")
+                    source_offsets, gathered_offsets = _matching_offsets(
+                        chunk_offsets,
+                        logit_chunk_offsets,
+                    )
+                    item_logits[offsets.index_select(0, source_offsets)] = (
+                        chunk_logits.index_select(0, gathered_offsets)
+                    )
                 labels = label_rows[index]
                 item_logprobs = target_logprobs[index]
                 if item_logprobs is not None and labels is not None:
+                    if log_z is None:
+                        raise RuntimeError("target logprobs require logsumexp")
+                    selected_log_z = log_z.index_select(0, chunk_offsets)
                     item_logprobs[offsets] = _vocab_parallel_target_logprobs(
                         local_logits,
                         labels.index_select(0, offsets),
@@ -1718,6 +1621,9 @@ class TrainerRank:
                     )
                 k = item.request.top_k
                 if k is not None:
+                    if log_z is None:
+                        raise RuntimeError("top_k requires logsumexp")
+                    selected_log_z = log_z.index_select(0, chunk_offsets)
                     if local_topk is not None:
                         local_values, local_tokens = local_topk
                         top_k[index] = _merge_topk(
@@ -1734,33 +1640,24 @@ class TrainerRank:
                         )
                         continue
                     selected_logits = local_logits.index_select(0, chunk_offsets)
+                    local_k = min(k, int(selected_logits.shape[1]))
+                    local_values, local_tokens = torch.topk(
+                        selected_logits.float(),
+                        k=local_k,
+                        dim=-1,
+                    )
                     top_k[index] = _merge_topk(
                         top_k[index],
                         offsets,
-                        _vocab_parallel_topk(
-                            selected_logits,
+                        _vocab_parallel_topk_from_local(
+                            local_values,
+                            local_tokens,
                             k=k,
                             log_z=selected_log_z,
+                            vocab_start=_vocab_range(local_logits)[0],
                         ),
                         length=item_lengths[index],
                     )
-
-    def _logits_from_hidden_rows(
-        self,
-        model: "GPTModel",
-        hidden: torch.Tensor,
-        *,
-        output_weight: torch.Tensor | None,
-    ) -> torch.Tensor:
-        local_logits = self._local_logits_from_hidden_rows(
-            model,
-            hidden,
-            output_weight=output_weight,
-        )
-        return _batch_seq_logits(
-            self._gather_tensor_parallel_logits(local_logits.unsqueeze(1)),
-            seq_len=int(hidden.shape[0]),
-        ).squeeze(0)
 
     def _local_logits_from_hidden_rows(
         self,
@@ -2106,16 +2003,6 @@ def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
-def _target_logprobs_from_full_logits(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    log_z: torch.Tensor,
-) -> torch.Tensor:
-    flat_labels = labels.clamp_min(0).reshape(int(labels.shape[0]), -1)
-    target_logits = logits.gather(1, flat_labels).float().reshape(labels.shape)
-    return _finish_target_logprobs(target_logits, labels, log_z)
-
-
 def _vocab_parallel_target_logprobs(
     local_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -2165,62 +2052,24 @@ def _finish_target_logprobs(
     return (target_logits.float() - log_z).masked_fill(labels == -100, 0.0)
 
 
-def _consistent_row_labels(
-    label_rows: Sequence[torch.Tensor | None],
+def _logit_chunk_offsets(
+    items: Sequence[_ForwardItem],
     row_matches: Sequence[_RowMatch],
     *,
-    row_count: int,
+    start: int,
+    end: int,
     device: torch.device,
-) -> torch.Tensor | None:
-    labels = torch.full(
-        (row_count,),
-        -100,
-        dtype=torch.long,
-        device=device,
-    )
-    has_label = torch.zeros_like(labels, dtype=torch.bool)
-    for item_labels, match in zip(label_rows, row_matches, strict=True):
-        if item_labels is None:
-            continue
-        if int(match.source_offsets.numel()) == 0:
-            continue
-        selected_labels = item_labels.index_select(0, match.source_offsets)
-        keep = selected_labels != -100
-        if not bool(keep.any().item()):
-            continue
-        kept_row_offsets = match.row_offsets[keep]
-        kept_labels = selected_labels[keep]
-        existing = labels.index_select(0, kept_row_offsets)
-        seen = has_label.index_select(0, kept_row_offsets)
-        if bool(((existing != kept_labels) & seen).any().item()):
-            return None
-        labels.index_copy_(0, kept_row_offsets, kept_labels)
-        has_label.index_fill_(0, kept_row_offsets, True)
-    return labels
-
-
-def _scatter_row_target_logprobs(
-    row_target_logprobs: torch.Tensor,
-    row_matches: Sequence[_RowMatch],
-    label_rows: Sequence[torch.Tensor | None],
-    target_logprobs: list[torch.Tensor | None],
-) -> None:
-    for match, labels, item_logprobs in zip(
-        row_matches,
-        label_rows,
-        target_logprobs,
-        strict=True,
-    ):
-        if labels is None or item_logprobs is None:
-            continue
-        if int(match.source_offsets.numel()) == 0:
-            continue
-        selected = row_target_logprobs.index_select(0, match.row_offsets)
-        selected_labels = labels.index_select(0, match.source_offsets)
-        item_logprobs[match.source_offsets] = selected.masked_fill(
-            selected_labels == -100,
-            0.0,
-        )
+) -> torch.Tensor:
+    parts = [
+        chunk_offsets
+        for item, match in zip(items, row_matches, strict=True)
+        if item.request.logits
+        for _, chunk_offsets in (_match_chunk_offsets(match, start=start, end=end),)
+        if int(chunk_offsets.numel())
+    ]
+    if not parts:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return torch.cat(parts).unique(sorted=True)
 
 
 def _anchor_disconnected_outputs(
@@ -2254,24 +2103,6 @@ def _anchor_disconnected_outputs(
             )
             for item_top_k in top_k
         ],
-    )
-
-
-def _vocab_parallel_topk(
-    local_logits: torch.Tensor,
-    *,
-    k: int,
-    log_z: torch.Tensor,
-) -> TopK:
-    start, _ = _vocab_range(local_logits)
-    local_k = min(k, int(local_logits.shape[1]))
-    local_values, local_tokens = torch.topk(local_logits.float(), k=local_k, dim=-1)
-    return _vocab_parallel_topk_from_local(
-        local_values,
-        local_tokens,
-        k=k,
-        log_z=log_z,
-        vocab_start=start,
     )
 
 

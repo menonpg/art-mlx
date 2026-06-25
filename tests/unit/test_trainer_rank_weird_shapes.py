@@ -19,8 +19,6 @@ from art.megatron.trainer_rank import (
     Unset,
     _flatten,
     _MemoryCheck,
-    _RowMatch,
-    _scatter_row_target_logprobs,
 )
 
 
@@ -482,33 +480,6 @@ def test_topk_output_memory_scales_with_requested_k() -> None:
     large = rank._plan_flat_forward([_target_request(tokens, top_k=7)])
 
     assert large.output_bytes - small.output_bytes == 4 * 6 * (4 + 8)
-
-
-def test_shared_row_target_scatter_preserves_per_item_label_masks() -> None:
-    item_a = torch.full((2,), -1.0)
-    item_b = torch.full((2,), -1.0)
-
-    _scatter_row_target_logprobs(
-        torch.tensor([-10.0, -20.0]),
-        (
-            _RowMatch(
-                source_offsets=torch.tensor([0, 1]),
-                row_offsets=torch.tensor([0, 1]),
-            ),
-            _RowMatch(
-                source_offsets=torch.tensor([0, 1]),
-                row_offsets=torch.tensor([0, 1]),
-            ),
-        ),
-        (
-            torch.tensor([111, -100]),
-            torch.tensor([-100, 222]),
-        ),
-        [item_a, item_b],
-    )
-
-    torch.testing.assert_close(item_a, torch.tensor([-10.0, 0.0]))
-    torch.testing.assert_close(item_b, torch.tensor([0.0, -20.0]))
 
 
 def test_flatten_rejects_dicts_to_avoid_silent_top_level_shape_changes() -> None:

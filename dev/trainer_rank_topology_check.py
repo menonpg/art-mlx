@@ -14,6 +14,7 @@ from art.megatron.trainer_rank import (
     ForwardOutput,
     TopK,
     TrainerRank,
+    _batch_seq_logits,
     _language_model,
     _pack_forward_items,
     _PackedForwardBatch,
@@ -412,7 +413,89 @@ def _debug_output_requests(
             ForwardInput(input_tokens=request.input_tokens, logits=True)
             for request in requests
         ]
-    raise ValueError("debug_output must be 'none', 'hidden', or 'logits'")
+    if debug_output == "target":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=_labels(request.input_tokens, 0),
+            )
+            for request in requests
+        ]
+    if debug_output == "topk":
+        return [
+            ForwardInput(input_tokens=request.input_tokens, top_k=3)
+            for request in requests
+        ]
+    if debug_output == "target_topk":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=_labels(request.input_tokens, 0),
+                top_k=3,
+            )
+            for request in requests
+        ]
+    if debug_output == "mixed_no_topk":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=request.target_tokens,
+                logits=request.logits,
+                hidden_states=request.hidden_states,
+            )
+            for request in requests
+        ]
+    if debug_output == "mixed_no_logits":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=request.target_tokens,
+                top_k=request.top_k,
+                hidden_states=request.hidden_states,
+            )
+            for request in requests
+        ]
+    if debug_output == "mixed_no_targets":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                top_k=request.top_k,
+                logits=request.logits,
+                hidden_states=request.hidden_states,
+            )
+            for request in requests
+        ]
+    if debug_output == "mixed_targets_only":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=request.target_tokens,
+            )
+            for request in requests
+        ]
+    if debug_output == "mixed_targets_hidden":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=request.target_tokens,
+                hidden_states=request.hidden_states,
+            )
+            for request in requests
+        ]
+    if debug_output == "mixed_targets_logits":
+        return [
+            ForwardInput(
+                input_tokens=request.input_tokens,
+                target_tokens=request.target_tokens,
+                logits=request.logits,
+            )
+            for request in requests
+        ]
+    raise ValueError(
+        "debug_output must be 'none', 'hidden', 'logits', 'target', 'topk', "
+        "'target_topk', 'mixed_no_topk', 'mixed_no_logits', 'mixed_no_targets', "
+        "'mixed_targets_only', 'mixed_targets_hidden', or 'mixed_targets_logits'"
+    )
 
 
 def _deep_rows() -> list[torch.Tensor]:
@@ -683,15 +766,18 @@ def _packed_oracle_from_hidden(
         )
         all_logits = None
         if needs_projection:
-            all_logits = (
-                rank._logits_from_hidden_rows(
+            if int(positions.numel()):
+                local_logits = rank._local_logits_from_hidden_rows(
                     model,
                     _select_positions(hidden, positions),
                     output_weight=output_weight,
                 )
-                if int(positions.numel())
-                else _empty_logits_like_positions(positions, model, hidden)
-            )
+                all_logits = _batch_seq_logits(
+                    rank._gather_tensor_parallel_logits(local_logits.unsqueeze(1)),
+                    seq_len=int(positions.numel()),
+                ).squeeze(0)
+            else:
+                all_logits = _empty_logits_like_positions(positions, model, hidden)
         logprobs = (
             None
             if all_logits is None
