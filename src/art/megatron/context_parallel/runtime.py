@@ -112,15 +112,6 @@ def _planning_bundle_cache_key(
     )
 
 
-def _rank_plan_cache_key(
-    *,
-    planning_key: str,
-    device: torch.device,
-    cp_rank: int,
-) -> tuple[str, str, int | None, int]:
-    return (planning_key, device.type, device.index, int(cp_rank))
-
-
 def _normalized_chunk_size(
     *,
     valid_tokens: int,
@@ -1796,10 +1787,11 @@ def prepare_megatron_context_parallel_state(
         gdn_plan_device = (
             target_device if target_device is not None else micro["tokens"].device
         )
-        rank_gdn_key = _rank_plan_cache_key(
-            planning_key=planning_key,
-            device=gdn_plan_device,
-            cp_rank=int(cp_rank),
+        rank_gdn_key = (
+            planning_key,
+            gdn_plan_device.type,
+            gdn_plan_device.index,
+            int(cp_rank),
         )
         gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
         if gdn_execution_plan is None:
@@ -1872,111 +1864,43 @@ def dispatch_megatron_context_parallel_training_tensors(
         if trace_token_uids
         else None
     )
-    local_tokens = _dispatch_tensor(
-        micro["tokens"],
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_labels = _dispatch_tensor(
-        labels,
-        rank_plan=rank_plan,
-        pad_value=-100,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_input_pos = _dispatch_tensor(
-        micro["input_pos"],
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_assistant_mask = _dispatch_tensor(
-        assistant_mask,
-        rank_plan=rank_plan,
-        pad_value=False,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    ).to(dtype=torch.bool)
-    local_group_ids = _dispatch_tensor(
-        shifted_group_ids,
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_old_logprobs = _dispatch_tensor(
-        old_logprobs,
-        rank_plan=rank_plan,
-        pad_value=float("nan"),
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_original_logprobs = (
-        None
-        if original_logprobs is None
-        else _dispatch_tensor(
-            original_logprobs,
+
+    def dispatch(
+        tensor: torch.Tensor,
+        pad_value: int | float | bool,
+        *,
+        move_to_target: bool = True,
+    ) -> torch.Tensor:
+        local = _dispatch_tensor(
+            tensor,
             rank_plan=rank_plan,
-            pad_value=0.0,
+            pad_value=pad_value,
             pad_multiple=pad_multiple,
             dispatch_meta_cache=dispatch_meta_cache,
         )
-    )
-    local_ref_logprobs = (
-        None
-        if ref_logprobs is None
-        else _dispatch_tensor(
-            ref_logprobs,
-            rank_plan=rank_plan,
-            pad_value=float("nan"),
-            pad_multiple=pad_multiple,
-            dispatch_meta_cache=dispatch_meta_cache,
-        )
-    )
-    local_advantages = _dispatch_tensor(
-        advantages,
-        rank_plan=rank_plan,
-        pad_value=0.0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_weights = _dispatch_tensor(
-        weights,
-        rank_plan=rank_plan,
-        pad_value=0.0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
+        return _to_target_device(local, target_device) if move_to_target else local
+
+    def maybe_dispatch(
+        tensor: torch.Tensor | None,
+        pad_value: int | float | bool,
+    ) -> torch.Tensor | None:
+        return None if tensor is None else dispatch(tensor, pad_value)
+
     local_token_uids = (
-        None
-        if token_uids is None
-        else _dispatch_tensor(
-            token_uids,
-            rank_plan=rank_plan,
-            pad_value=-1,
-            pad_multiple=pad_multiple,
-            dispatch_meta_cache=dispatch_meta_cache,
-        )
+        None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
     return DispatchedPackedTensors(
-        tokens=_to_target_device(local_tokens, target_device),
-        labels=_to_target_device(local_labels, target_device),
-        input_pos=_to_target_device(local_input_pos, target_device),
-        assistant_mask=_to_target_device(local_assistant_mask, target_device),
-        group_ids=_to_target_device(local_group_ids, target_device),
-        old_logprobs=_to_target_device(local_old_logprobs, target_device),
-        advantages=_to_target_device(local_advantages, target_device),
-        weights=_to_target_device(local_weights, target_device),
+        tokens=dispatch(micro["tokens"], 0),
+        labels=dispatch(labels, -100),
+        input_pos=dispatch(micro["input_pos"], 0),
+        assistant_mask=dispatch(assistant_mask, False).to(dtype=torch.bool),
+        group_ids=dispatch(shifted_group_ids, 0),
+        old_logprobs=dispatch(old_logprobs, float("nan")),
+        advantages=dispatch(advantages, 0.0),
+        weights=dispatch(weights, 0.0),
         valid_lengths=rank_plan.local_valid_lengths,
-        original_logprobs=None
-        if local_original_logprobs is None
-        else _to_target_device(local_original_logprobs, target_device),
-        ref_logprobs=None
-        if local_ref_logprobs is None
-        else _to_target_device(local_ref_logprobs, target_device),
+        original_logprobs=maybe_dispatch(original_logprobs, 0.0),
+        ref_logprobs=maybe_dispatch(ref_logprobs, float("nan")),
         loss_all_reduce_group=cp_group,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
     )
@@ -2005,25 +1929,6 @@ def get_or_build_runtime_plan(
     )
     _cache_put(_RUNTIME_PLAN_CACHE, key, plan)
     return plan
-
-
-def get_or_build_rank_runtime_plan(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    runtime_key: ContextParallelRuntimeKey,
-    original_seq_len: int,
-    target_rank: int,
-) -> RankRuntimePlan:
-    del runtime_key
-    return _build_rank_runtime_plan_for_spec(
-        spec,
-        topology=topology,
-        config=config,
-        original_seq_len=original_seq_len,
-        target_rank=target_rank,
-    )
 
 
 def _runtime_plan_assignment(
@@ -2069,38 +1974,6 @@ def _runtime_plan_assignment(
         config=config,
     )
     return row_spec, chunk_ranges, owners, wave_assignment
-
-
-def _build_rank_runtime_plan_for_spec(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    original_seq_len: int,
-    target_rank: int,
-) -> RankRuntimePlan:
-    row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
-        spec,
-        topology=topology,
-        config=config,
-    )
-    cp_size = max(int(topology.cp), 1)
-    token_layout_index = _build_runtime_token_layout_index(
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        cp_size=cp_size,
-    )
-    return _build_rank_runtime_plan(
-        row_spec=row_spec,
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        wave_assignment=wave_assignment,
-        token_layout_index=token_layout_index,
-        cp_size=cp_size,
-        original_seq_len=original_seq_len,
-        target_rank=int(target_rank),
-        block_size=int(config.block_size),
-    )
 
 
 def _build_runtime_plan(
