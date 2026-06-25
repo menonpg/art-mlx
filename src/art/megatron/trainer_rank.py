@@ -703,13 +703,15 @@ class TrainerRank:
         min_width = min(dp_size, remaining)
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
+        self._scope_adaptive_cache(items)
 
         def clamp_width(width: int) -> int:
             return max(min_width, min(width, remaining))
 
-        granularity = self._adaptive_window_granularity(
-            remaining=remaining,
-            dp_size=dp_size,
+        base_granularity = 1 if remaining < 64 else 8 if remaining < 256 else 32
+        granularity = max(
+            1,
+            ((base_granularity + dp_size - 1) // dp_size) * dp_size,
         )
 
         def snap_width(width: int) -> int:
@@ -725,8 +727,6 @@ class TrainerRank:
             indices = tuple(range(start + dp_rank, stop, dp_size))
             return indices, [items[index] for index in indices]
 
-        estimates: dict[int, tuple[_MemoryCheck, bool] | None] = {}
-
         def candidate(
             width: int,
             estimated_check: _MemoryCheck | None = None,
@@ -735,7 +735,7 @@ class TrainerRank:
         ) -> _CandidateMicroBatch[ForwardInputsT]:
             width = clamp_width(width)
             indices, local_inputs = local_slice(width)
-            plan = self._cached_adaptive_plan(items, indices, local_inputs)
+            plan = self._cached_adaptive_plan(indices, local_inputs)
             return _CandidateMicroBatch(
                 inputs=local_inputs,
                 indices=indices,
@@ -750,23 +750,8 @@ class TrainerRank:
             )
 
         def estimate(width: int) -> tuple[_MemoryCheck, bool] | None:
-            width = clamp_width(width)
-            if width not in estimates:
-                indices, local_inputs = local_slice(width)
-                estimates[width] = self._cached_adaptive_estimate(
-                    items,
-                    indices,
-                    local_inputs,
-                )
-            return estimates[width]
-
-        def raise_smallest(plan: _FlatForwardPlan, check: _MemoryCheck) -> None:
-            self._raise_memory_error(
-                plan,
-                check,
-                context="forward_micro_batches",
-                message="smallest DP microbatch is predicted to exceed available memory",
-            )
+            indices, local_inputs = local_slice(width)
+            return self._cached_adaptive_estimate(indices, local_inputs)
 
         def probe(width: int) -> tuple[bool, _MemoryCheck | None, bool]:
             estimated = estimate(width)
@@ -804,7 +789,12 @@ class TrainerRank:
         if not first_fits:
             first = candidate(min_width, first_check, rejected=rejected)
             if not first.check.fits:
-                raise_smallest(first.plan, first.check)
+                self._raise_memory_error(
+                    first.plan,
+                    first.check,
+                    context="forward_micro_batches",
+                    message="smallest DP microbatch is predicted to exceed available memory",
+                )
             if first.cold_start:
                 return first
             best_check = first.check
@@ -848,20 +838,12 @@ class TrainerRank:
             return candidate(min_width, first_check, rejected=rejected)
         return candidate(best_width, best_check, rejected=rejected)
 
-    @staticmethod
-    def _adaptive_window_granularity(*, remaining: int, dp_size: int) -> int:
-        if remaining < 64:
-            return max(1, dp_size)
-        base = 8 if remaining < 256 else 32
-        return max(1, ((base + dp_size - 1) // dp_size) * dp_size)
-
     def _cached_adaptive_plan(
         self,
-        items: Sequence[ForwardInputsT],
         indices: tuple[int, ...],
         local_inputs: Sequence[ForwardInputsT],
     ) -> _FlatForwardPlan:
-        key = self._adaptive_cache_key(items, indices)
+        key = self._adaptive_cache_key(indices)
         cached = self._adaptive_plan_cache.get(key)
         if cached is not None:
             return cached
@@ -871,11 +853,10 @@ class TrainerRank:
 
     def _cached_adaptive_estimate(
         self,
-        items: Sequence[ForwardInputsT],
         indices: tuple[int, ...],
         local_inputs: Sequence[ForwardInputsT],
     ) -> tuple[_MemoryCheck, bool] | None:
-        key = self._adaptive_cache_key(items, indices)
+        key = self._adaptive_cache_key(indices)
         if key in self._adaptive_estimate_cache:
             return self._adaptive_estimate_cache[key]
         estimate = self._estimate_flat_forward(list(_flatten(local_inputs)))
@@ -897,16 +878,21 @@ class TrainerRank:
         self._adaptive_estimate_cache[key] = estimate
         return estimate
 
-    def _adaptive_cache_key(
+    def _scope_adaptive_cache(
         self,
         items: Sequence[ForwardInputsT],
+    ) -> None:
+        top_level_ids = tuple(id(item) for item in items)
+        if top_level_ids == self._adaptive_plan_cache_top_level_ids:
+            return
+        self._adaptive_plan_cache.clear()
+        self._adaptive_estimate_cache.clear()
+        self._adaptive_plan_cache_top_level_ids = top_level_ids
+
+    def _adaptive_cache_key(
+        self,
         indices: tuple[int, ...],
     ) -> _AdaptivePlanCacheKey:
-        top_level_ids = tuple(id(item) for item in items)
-        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
-            self._adaptive_plan_cache.clear()
-            self._adaptive_estimate_cache.clear()
-            self._adaptive_plan_cache_top_level_ids = top_level_ids
         return (
             indices,
             self._default_slot_ref,
