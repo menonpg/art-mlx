@@ -51,7 +51,6 @@ def patch_policy_token_spans() -> None:
     _patch_openai_response_policy_spans()
     _patch_lora_alias_resolution()
     _patch_load_inplace_storage()
-    _patch_engine_request_cache_salt_audit()
     _patch_engine_waiting_cache_salt_utility()
 
 
@@ -483,7 +482,13 @@ def _patch_lora_alias_resolution() -> None:
                 self.models, getattr(request, "model", None)
             )
             if lora_request is not None:
+                from art_vllm_runtime.metrics import record_policy_cache_salt_audit
+
                 _apply_lora_alias_policy_cache_salt(self.models, request, lora_request)
+                record_policy_cache_salt_audit(
+                    lora_request=True,
+                    salted=bool(getattr(request, "cache_salt", None)),
+                )
                 return None
             return await original_check(self, request)
 
@@ -565,26 +570,6 @@ def _patch_engine_waiting_cache_salt_utility() -> None:
     EngineCore.art_update_waiting_lora_cache_salt = art_update_waiting_lora_cache_salt  # type: ignore[attr-defined]
 
 
-def _patch_engine_request_cache_salt_audit() -> None:
-    from vllm.v1.engine.core import EngineCore
-
-    original = EngineCore.preprocess_add_request
-    if getattr(original, "__art_policy_spans_patched__", False):
-        return
-
-    def preprocess_add_request(self: Any, request: Any) -> Any:
-        from art_vllm_runtime.metrics import record_policy_cache_salt_audit
-
-        record_policy_cache_salt_audit(
-            lora_request=getattr(request, "lora_request", None) is not None,
-            salted=bool(getattr(request, "cache_salt", None)),
-        )
-        return original(self, request)
-
-    preprocess_add_request.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-    EngineCore.preprocess_add_request = preprocess_add_request  # type: ignore[method-assign]
-
-
 def _update_waiting_lora_cache_salt(
     scheduler: Any,
     *,
@@ -612,12 +597,6 @@ def _update_waiting_lora_cache_salt(
             request.block_hashes.clear()
             request.update_block_hashes()
             updated += 1
-    from art_vllm_runtime.metrics import record_policy_cache_waiting_update
-
-    record_policy_cache_waiting_update(
-        updated=updated,
-        skipped_started=skipped_started,
-    )
     return {
         "updated_waiting_requests": updated,
         "skipped_started_waiting_requests": skipped_started,

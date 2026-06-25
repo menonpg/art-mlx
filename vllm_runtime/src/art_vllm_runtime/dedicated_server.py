@@ -151,6 +151,14 @@ def _patch_art_runtime_routes() -> None:
                     lora_slot,
                     policy_version,
                 )
+                from art_vllm_runtime.metrics import record_policy_cache_waiting_update
+
+                record_policy_cache_waiting_update(
+                    updated=int(waiting_cache_salt["updated_waiting_requests"]),
+                    skipped_started=int(
+                        waiting_cache_salt["skipped_started_waiting_requests"]
+                    ),
+                )
             return JSONResponse(
                 content={
                     "status": "updated",
