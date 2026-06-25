@@ -27,6 +27,10 @@ class _ArtRuntimeMetricsState:
             "external_prefix_cache_queries_total": 0.0,
             "external_prefix_cache_hits_total": 0.0,
             "num_preempted_reqs_total": 0.0,
+            "policy_cache_salted_lora_requests_total": 0.0,
+            "policy_cache_unsalted_lora_requests_total": 0.0,
+            "policy_cache_waiting_requests_updated_total": 0.0,
+            "policy_cache_started_waiting_requests_skipped_total": 0.0,
         }
 
     def record(
@@ -129,6 +133,30 @@ class _ArtRuntimeMetricsState:
                 "metrics": metrics,
             }
 
+    def record_policy_cache_salt_audit(
+        self, *, lora_request: bool, salted: bool
+    ) -> None:
+        if not lora_request:
+            return
+        key = (
+            "policy_cache_salted_lora_requests_total"
+            if salted
+            else "policy_cache_unsalted_lora_requests_total"
+        )
+        with self._lock:
+            self._counters[key] += 1.0
+
+    def record_policy_cache_waiting_update(
+        self, *, updated: int, skipped_started: int
+    ) -> None:
+        with self._lock:
+            self._counters["policy_cache_waiting_requests_updated_total"] += float(
+                updated
+            )
+            self._counters["policy_cache_started_waiting_requests_skipped_total"] += (
+                float(skipped_started)
+            )
+
 
 _STATE = _ArtRuntimeMetricsState()
 
@@ -158,3 +186,14 @@ class ArtRuntimeStatLogger(StatLoggerBase):
 
 def get_art_metrics_snapshot() -> dict[str, Any]:
     return _STATE.snapshot()
+
+
+def record_policy_cache_salt_audit(*, lora_request: bool, salted: bool) -> None:
+    _STATE.record_policy_cache_salt_audit(lora_request=lora_request, salted=salted)
+
+
+def record_policy_cache_waiting_update(*, updated: int, skipped_started: int) -> None:
+    _STATE.record_policy_cache_waiting_update(
+        updated=updated,
+        skipped_started=skipped_started,
+    )
