@@ -13,8 +13,6 @@ from torch.nn.attention.flex_attention import create_block_mask as torch_block_m
 import typer
 
 from art.megatron.context_parallel.block_mask import (
-    _remap_group_values,
-    _select_with_invalid_np,
     build_block_mask_from_context,
     prepare_block_mask_context,
 )
@@ -58,7 +56,7 @@ def main(
     flex_token_cap: int = 8192,
     flex_heads: int = 2,
     flex_head_dim: int = 128,
-    flex_mask_variants: str = "current,ancestor_slots,causal_abs_only",
+    flex_mask_variants: str = "current,causal_abs_only",
     output_jsonl: Path = Path(".local/trainer_rank_review/block_mask_flex.jsonl"),
 ) -> None:
     if warmup < 0 or repeat < 1:
@@ -500,9 +498,6 @@ class _StageFlexCase:
     block_mask: BlockMask
     q_abs: np.ndarray
     k_abs: np.ndarray
-    q_group_index: np.ndarray
-    k_group_index: np.ndarray
-    group_can_attend: np.ndarray
 
 
 def _build_stage_flex_cases(
@@ -551,16 +546,6 @@ def _build_stage_flex_cases(
                 .reshape(-1)
                 .numpy()
             )
-            q_group = _select_with_invalid_np(
-                context.group_ids_np,
-                q_abs,
-                invalid_value=-1,
-            )
-            k_group = _select_with_invalid_np(
-                context.group_ids_np,
-                k_abs,
-                invalid_value=-1,
-            )
             cases.append(
                 _StageFlexCase(
                     rank=int(rank_plan.rank),
@@ -572,15 +557,6 @@ def _build_stage_flex_cases(
                     block_mask=mask,
                     q_abs=q_abs,
                     k_abs=k_abs,
-                    q_group_index=_remap_group_values(
-                        q_group,
-                        sorted_group_ids=context.sorted_group_ids,
-                    ),
-                    k_group_index=_remap_group_values(
-                        k_group,
-                        sorted_group_ids=context.sorted_group_ids,
-                    ),
-                    group_can_attend=context.group_can_attend,
                 )
             )
     return tuple(cases)
@@ -631,41 +607,7 @@ def _stage_variant_block_mask(
             return q_abs[query_idx] >= k_abs[kv_idx]
 
         return _replace_block_mask_mod(case.block_mask, mask_mod)
-    if variant == "ancestor_slots":
-        q_group = torch.as_tensor(case.q_group_index, device=device, dtype=torch.int32)
-        k_group = torch.as_tensor(case.k_group_index, device=device, dtype=torch.int32)
-        ancestor_slots = torch.as_tensor(
-            _ancestor_slots(case.group_can_attend),
-            device=device,
-            dtype=torch.int32,
-        )
-        slot_columns = tuple(
-            ancestor_slots[:, index] for index in range(ancestor_slots.shape[1])
-        )
-
-        def mask_mod(batch_idx, head_idx, query_idx, kv_idx):
-            del batch_idx, head_idx
-            q_group_local = q_group[query_idx]
-            k_group_local = k_group[kv_idx]
-            allowed = torch.zeros_like(q_group_local, dtype=torch.bool)
-            for slot_values in slot_columns:
-                allowed = allowed | (k_group_local == slot_values[q_group_local])
-            return (q_abs[query_idx] >= k_abs[kv_idx]) & allowed
-
-        return _replace_block_mask_mod(case.block_mask, mask_mod)
     raise ValueError(f"unknown flex_mask_variant {variant!r}")
-
-
-def _ancestor_slots(group_can_attend: np.ndarray) -> np.ndarray:
-    max_ancestors = max(
-        1,
-        max(int(np.count_nonzero(row)) for row in group_can_attend),
-    )
-    slots = np.full((group_can_attend.shape[0], max_ancestors), -1, dtype=np.int32)
-    for group_index, row in enumerate(group_can_attend):
-        ancestors = np.flatnonzero(row).astype(np.int32, copy=False)
-        slots[group_index, : int(ancestors.size)] = ancestors
-    return slots
 
 
 def _stage_flex_stats(cases: Sequence[_StageFlexCase]) -> dict[str, object]:
