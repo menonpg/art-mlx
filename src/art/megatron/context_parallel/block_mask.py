@@ -18,11 +18,9 @@ _INVALID_EXIT = -1
 
 @dataclass(frozen=True, slots=True)
 class PreparedBlockMaskContext:
-    group_ids: torch.Tensor
-    parent_ids: torch.Tensor
+    source_len: int
     group_enter_np: np.ndarray
     group_exit_np: np.ndarray
-    max_depth: int
 
 
 def _build_interval_mask_mod(
@@ -533,15 +531,18 @@ def prepare_block_mask_context(
         length=int(flat_group_ids.numel()),
     )
     return PreparedBlockMaskContext(
-        group_ids=flat_group_ids,
-        parent_ids=flat_parent_ids,
+        source_len=int(flat_group_ids.numel()),
         group_enter_np=group_enter_np,
         group_exit_np=group_exit_np,
-        max_depth=int(row_tree.max_depth),
     )
 
 
-def _valid_prefix(indices: torch.Tensor, *, name: str) -> torch.Tensor:
+def _validate_exact_indices(
+    indices: torch.Tensor,
+    *,
+    name: str,
+    source_len: int,
+) -> int:
     if indices.ndim != 1:
         raise RuntimeError(f"{name} exact token indices must be rank 1.")
     if indices.dtype != torch.int64:
@@ -554,52 +555,33 @@ def _valid_prefix(indices: torch.Tensor, *, name: str) -> torch.Tensor:
             raise RuntimeError(
                 f"{name} exact token indices must use only contiguous tail padding."
             )
-        return indices_cpu[:first_invalid]
-    return indices_cpu
-
-
-def _validate_exact_indices(
-    indices: torch.Tensor,
-    *,
-    name: str,
-    source_len: int,
-) -> int:
-    valid = _valid_prefix(indices, name=name)
-    if int(valid.numel()) == 0:
+        indices_cpu = indices_cpu[:first_invalid]
+    if int(indices_cpu.numel()) == 0:
         return 0
-    if int(valid.unique().numel()) != int(valid.numel()):
+    if int(indices_cpu.unique().numel()) != int(indices_cpu.numel()):
         raise RuntimeError(f"{name} exact token indices must not contain duplicates.")
-    max_index = int(valid.max().item())
+    max_index = int(indices_cpu.max().item())
     if max_index >= int(source_len):
         raise RuntimeError(
             f"{name} exact token index {max_index} exceeds source metadata length {int(source_len)}."
         )
-    return int(valid.numel())
+    return int(indices_cpu.numel())
 
 
 def _validate_supported_mask_spec(
     spec: FlexMaskSpec,
     *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
+    source_len: int,
 ) -> None:
-    if group_ids.ndim != 1 or parent_ids.ndim != 1:
-        raise RuntimeError(
-            "Shared-prefix sparse block masks require rank-1 group_ids and parent_ids."
-        )
-    if int(group_ids.numel()) != int(parent_ids.numel()):
-        raise RuntimeError(
-            "Shared-prefix sparse block masks require equal group_ids and parent_ids lengths."
-        )
     q_valid_len = _validate_exact_indices(
         spec.exact_mask.q_token_indices,
         name="q",
-        source_len=int(group_ids.numel()),
+        source_len=source_len,
     )
     k_valid_len = _validate_exact_indices(
         spec.exact_mask.k_token_indices,
         name="k",
-        source_len=int(group_ids.numel()),
+        source_len=source_len,
     )
     for slice_ in spec.slices:
         if int(slice_.row_index) != 0:
@@ -663,8 +645,7 @@ def build_block_mask_from_context(
     if validate:
         _validate_supported_mask_spec(
             spec,
-            group_ids=context.group_ids,
-            parent_ids=context.parent_ids,
+            source_len=context.source_len,
         )
     block_size = normalize_sparse_block_size(spec.block_size)
     return _build_sparse_block_mask(
