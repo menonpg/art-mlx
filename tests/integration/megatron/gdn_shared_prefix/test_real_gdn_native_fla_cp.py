@@ -127,9 +127,7 @@ def _native_gdn_cp_packed_layer_worker(
         tensors = build_phase0_packed_tensors(case)
         group_ids = tensors["group_ids"].cuda()
         parent_ids = tensors["parent_ids"].cuda()
-        spec = parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
+        spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
         plan = build_gdn_rank_execution_plan(
             spec,
             device=group_ids.device,

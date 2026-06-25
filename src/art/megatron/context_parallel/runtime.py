@@ -1601,7 +1601,7 @@ def prepare_megatron_context_parallel_state(
             )
 
             gdn_execution_spec = parse_gdn_shared_prefix_segments(
-                group_ids_cpu, parent_ids_cpu, min_completions_per_family=0
+                group_ids_cpu, parent_ids_cpu
             )
         bundle = _PlanningBundle(
             spec=spec,

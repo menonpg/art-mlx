@@ -11,7 +11,10 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask
 
-from art.megatron.context_parallel.block_mask import build_block_mask
+from art.megatron.context_parallel.block_mask import (
+    build_block_mask_from_context,
+    prepare_block_mask_context,
+)
 from art.megatron.context_parallel.builder import build_shared_prefix_attention_spec
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.context_parallel.types import (
@@ -78,9 +81,7 @@ def create_shared_prefix_state(
     )
     cp_rank, cp_size = _gdn_cp_rank_size()
     gdn_execution_spec = (
-        parse_gdn_shared_prefix_segments(
-            group_ids_cpu, parent_ids_cpu, min_completions_per_family=0
-        )
+        parse_gdn_shared_prefix_segments(group_ids_cpu, parent_ids_cpu)
         if build_gdn_execution_spec
         else None
     )
@@ -141,7 +142,7 @@ def _build_sparse_shared_prefix_block_mask(
             )
             continue
         row_masks.append(
-            build_block_mask(
+            build_block_mask_from_context(
                 FlexMaskSpec(
                     q_len=seq_len,
                     k_len=seq_len,
@@ -153,8 +154,10 @@ def _build_sparse_shared_prefix_block_mask(
                         cache_key=f"identity:{seq_len}",
                     ),
                 ),
-                group_ids=group_ids_cpu[row_index],
-                parent_ids=parent_ids_cpu[row_index],
+                context=prepare_block_mask_context(
+                    group_ids=group_ids_cpu[row_index],
+                    parent_ids=parent_ids_cpu[row_index],
+                ),
                 device=device,
             )
         )

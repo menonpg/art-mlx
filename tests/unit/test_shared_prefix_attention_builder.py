@@ -7,7 +7,10 @@ from torch.nn.attention.flex_attention import create_block_mask as torch_block_m
 
 pytest.importorskip("megatron.core.packed_seq_params")
 
-from art.megatron.context_parallel.block_mask import build_block_mask
+from art.megatron.context_parallel.block_mask import (
+    build_block_mask_from_context,
+    prepare_block_mask_context,
+)
 from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
     build_shared_prefix_attention_spec,
@@ -24,6 +27,23 @@ from art.megatron.context_parallel.types import (
 )
 from art.megatron.shared_prefix_packing import SharedPrefixPack, pack_shared_prefixes
 from art.megatron.shared_prefix_state import create_shared_prefix_state
+
+
+def build_block_mask(
+    spec: FlexMaskSpec,
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    device: torch.device,
+) -> BlockMask | None:
+    return build_block_mask_from_context(
+        spec,
+        context=prepare_block_mask_context(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+        ),
+        device=device,
+    )
 
 
 def test_shared_prefix_attention_spec_supports_branching_completions() -> None:

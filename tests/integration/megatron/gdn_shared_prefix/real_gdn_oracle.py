@@ -347,9 +347,7 @@ def run_real_gdn_flattened_reference(
     parent_ids: Tensor,
     execution_spec: Any | None = None,
 ) -> Tensor:
-    spec = execution_spec or parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=1
-    )
+    spec = execution_spec or parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     for segment_index, segment in enumerate(spec.tree_segments):
         flat_hidden = torch.cat(
@@ -411,9 +409,7 @@ def run_real_gdn_local_fork_reference(
     cp_size: int,
     attention_token_layout_index: TokenLayoutIndex | None = None,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     gdn_token_indices_by_rank = _split_gdn_families_by_rank(spec, cp_size=cp_size)
     gdn_token_ranges_by_rank = _rank_ranges_from_tokens_by_rank(
         gdn_token_indices_by_rank
@@ -471,7 +467,7 @@ def _split_gdn_families_by_rank(
         family_tokens = tuple(
             token
             for segment in (family.prefix, *family.completions)
-            for token in segment.linear_indices(spec.sequence_length)
+            for token in _segment_linear_indices(segment, spec.sequence_length)
         )
         ranks[rank].extend(family_tokens)
         loads[rank] += len(family_tokens)
@@ -521,6 +517,11 @@ def _simulate_all_to_all_single(
             )
         outputs.append(torch.stack([piece for piece in pieces if piece is not None]))
     return tuple(outputs)
+
+
+def _segment_linear_indices(segment: Any, sequence_length: int) -> range:
+    base = int(segment.row_index) * int(sequence_length)
+    return range(base + int(segment.start), base + int(segment.end))
 
 
 def _transfer_positions(tensor: Tensor | None, *, count: int) -> tuple[int, ...]:
@@ -575,9 +576,7 @@ def run_real_gdn_suffix_only_chain_reference(
     mutation: GdnChainMutation | None = None,
     boundary_debug: list[GdnChainBoundaryDebug] | None = None,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     for family in _tree_families(spec):
         row = family.row_index
@@ -627,9 +626,7 @@ def run_real_gdn_chunk_native_reference(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     for family in _tree_families(spec):
         _scatter_family_output(
@@ -649,9 +646,7 @@ def run_real_gdn_mixed_cp_reference(
     cp_size: int,
     local_fork_max_tokens: int,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden_states)
     local_count = 0
     chain_count = 0
@@ -947,7 +942,7 @@ def _local_fork_group_tensors(
         family_tokens = tuple(
             token_index
             for segment in family_segments
-            for token_index in segment.linear_indices(spec.sequence_length)
+            for token_index in _segment_linear_indices(segment, spec.sequence_length)
         )
         token_is_local = tuple(
             token_index in local_position for token_index in family_tokens
@@ -970,7 +965,7 @@ def _local_fork_group_tensors(
             parent_group_id = (
                 group_id if parent_index < 0 else group_by_segment_index[parent_index]
             )
-            for token_index in segment.linear_indices(spec.sequence_length):
+            for token_index in _segment_linear_indices(segment, spec.sequence_length):
                 position = local_position[token_index]
                 group_ids[position] = group_id
                 parent_ids[position] = parent_group_id

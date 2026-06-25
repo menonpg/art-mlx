@@ -250,9 +250,7 @@ def _assert_case_matches_cp1(
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,
@@ -417,9 +415,7 @@ def _assert_sibling_order_matches_cp1(
     swapped_parent_ids[0, 5:9] = 0
     swapped_group_ids[0, 9:12] = 2
     swapped_parent_ids[0, 9:12] = 0
-    spec = parse_gdn_shared_prefix_segments(
-        swapped_group_ids, swapped_parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(swapped_group_ids, swapped_parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,

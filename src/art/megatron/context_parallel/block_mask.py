@@ -606,23 +606,6 @@ def _validate_supported_mask_spec(
             )
 
 
-def build_block_mask(
-    spec: FlexMaskSpec,
-    *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    device: torch.device,
-) -> BlockMask | None:
-    return build_block_mask_from_context(
-        spec,
-        context=prepare_block_mask_context(
-            group_ids=group_ids,
-            parent_ids=parent_ids,
-        ),
-        device=device,
-    )
-
-
 def build_block_mask_from_context(
     spec: FlexMaskSpec,
     *,

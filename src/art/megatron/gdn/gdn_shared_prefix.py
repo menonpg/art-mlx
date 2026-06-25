@@ -31,10 +31,6 @@ class GdnSegmentSpec:
     def length(self) -> int:
         return self.end - self.start
 
-    def linear_indices(self, sequence_length: int) -> tuple[int, ...]:
-        base = self.row_index * sequence_length
-        return tuple(range(base + self.start, base + self.end))
-
 
 @dataclass(frozen=True)
 class GdnPackedExecutionSpec:
@@ -52,16 +48,8 @@ class GdnPackedExecutionSpec:
         return len(self.tree_segments)
 
     @property
-    def completion_count(self) -> int:
-        return sum(1 for parent in self.tree_parent_indices if parent >= 0)
-
-    @property
     def real_token_count(self) -> int:
         return sum(self.valid_lengths)
-
-    @property
-    def max_segment_length(self) -> int:
-        return max((segment.length for segment in self.tree_segments), default=0)
 
 
 @dataclass(frozen=True)
@@ -131,8 +119,6 @@ class GdnRankExecutionPlan:
     batch_size: int
     sequence_length: int
     real_token_mask: torch.Tensor
-    family_count: int
-    completion_count: int
     packed_batch_size: int | None = None
     packed_sequence_length: int | None = None
     attention_to_gdn: Any | None = None
@@ -424,8 +410,6 @@ def _build_tree_rank_execution_plan(
         packed_batch_size=spec.batch_size,
         packed_sequence_length=spec.sequence_length,
         real_token_mask=real_token_mask,
-        family_count=spec.family_count,
-        completion_count=spec.completion_count,
         attention_to_gdn=attention_to_gdn,
         gdn_to_attention=_reverse_exchange_plan(attention_to_gdn),
         attention_token_ranges=source_layout.ownership_ranges_by_rank[cp_rank],
@@ -514,12 +498,9 @@ def _move_bucket_plans(
 def parse_gdn_shared_prefix_segments(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
-    *,
-    min_completions_per_family: int = 0,
 ) -> GdnPackedExecutionSpec:
     """Parse ART packed shared-prefix metadata into generic GDN tree nodes."""
 
-    del min_completions_per_family
     groups = _rank2_long_cpu("group_ids", group_ids)
     parents = _rank2_long_cpu("parent_ids", parent_ids)
     if tuple(groups.shape) != tuple(parents.shape):

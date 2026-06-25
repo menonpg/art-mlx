@@ -39,9 +39,7 @@ def build_test_gdn_cp_layout_plan(
     gdn_token_ranges_by_rank: Sequence[Sequence[tuple[int, int, int]]] | None = None,
     device: torch.device | str | None = None,
 ) -> TestGdnCpLayoutPlan:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     gdn_ranges = (
         _normalize_rank_ranges(gdn_token_ranges_by_rank, cp_size=cp_size)
         if gdn_token_ranges_by_rank is not None

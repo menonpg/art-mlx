@@ -109,9 +109,7 @@ def run_toy_packed(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=1
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden)
     conv_states: list[Tensor] = []
     rec_states: list[Tensor] = []
@@ -142,9 +140,7 @@ def run_toy_flattened_reference(
     group_ids: Tensor,
     parent_ids: Tensor,
 ) -> Tensor:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=1
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     output = torch.zeros_like(hidden)
     for segment_index, segment in enumerate(spec.tree_segments):
         path = _segment_path(spec, segment_index)

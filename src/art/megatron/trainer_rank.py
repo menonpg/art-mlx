@@ -22,7 +22,6 @@ from art.megatron.shared_prefix_packing import (
 )
 
 if TYPE_CHECKING:
-    from megatron.bridge.models.gpt_provider import GPTModelProvider
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.optimizer import MegatronOptimizer, OptimizerConfig
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -32,7 +31,6 @@ if TYPE_CHECKING:
         ParallelTopology,
     )
     from art.megatron.lora import LoRASlotRef
-    from art.megatron.model_support import ModelSupportHandler
     from art.megatron.shared_prefix_state import SharedPrefixAttentionState
     from art.megatron.train import TrainingRuntime
 
@@ -476,10 +474,11 @@ class TrainerRank:
             )
             outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
             stop = start + candidate.stats_global_count
-            self._remember_adaptive_window(
-                candidate.stats_global_count,
-                is_tail=stop >= len(items),
-            )
+            if stop < len(items):
+                self._last_global_micro_batch_size = max(
+                    self._last_global_micro_batch_size or 0,
+                    candidate.stats_global_count,
+                )
             yield MicroBatch(
                 inputs=candidate.inputs,
                 outputs=outputs,
@@ -886,17 +885,6 @@ class TrainerRank:
             return max(1, dp_size)
         base = 8 if remaining < 256 else 32
         return max(1, ((base + dp_size - 1) // dp_size) * dp_size)
-
-    def _remember_adaptive_window(self, width: int, *, is_tail: bool) -> None:
-        if is_tail:
-            return
-        if self._last_global_micro_batch_size is None:
-            self._last_global_micro_batch_size = width
-        else:
-            self._last_global_micro_batch_size = max(
-                self._last_global_micro_batch_size,
-                width,
-            )
 
     def _cached_adaptive_plan(
         self,
@@ -2027,42 +2015,40 @@ def _try_triton_local_topk_stats(
     *,
     k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    if k <= 0:
+    if k <= 0 or k > _triton_fused_topk_max():
         return None
-    if k > _triton_fused_topk_max():
-        return None
-    if not local_logits.is_cuda:
-        return None
-    if _triton_topk_disabled():
-        return None
-    if int(local_logits.shape[0]) < _triton_min_rows():
-        return None
-    try:
-        from art.megatron.trainer_rank_topk import local_topk_stats
-
-        return local_topk_stats(
+    return cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        _try_triton_stats(
+            "local_topk_stats",
             local_logits,
             k=min(k, int(local_logits.shape[1])),
-        )
-    except Exception:
-        if _triton_topk_strict():
-            raise
-        return None
+        ),
+    )
 
 
 def _try_triton_local_logsumexp_stats(
     local_logits: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    return cast(
+        tuple[torch.Tensor, torch.Tensor] | None,
+        _try_triton_stats("local_logsumexp_stats", local_logits),
+    )
+
+
+def _try_triton_stats(
+    name: str,
+    local_logits: torch.Tensor,
+    **kwargs: object,
+) -> object | None:
     if not local_logits.is_cuda:
         return None
-    if _triton_topk_disabled():
-        return None
-    if int(local_logits.shape[0]) < _triton_min_rows():
+    if _triton_topk_disabled() or int(local_logits.shape[0]) < _triton_min_rows():
         return None
     try:
-        from art.megatron.trainer_rank_topk import local_logsumexp_stats
+        from art.megatron import trainer_rank_topk
 
-        return local_logsumexp_stats(local_logits)
+        return getattr(trainer_rank_topk, name)(local_logits, **kwargs)
     except Exception:
         if _triton_topk_strict():
             raise

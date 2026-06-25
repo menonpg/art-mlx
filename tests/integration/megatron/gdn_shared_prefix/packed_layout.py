@@ -137,9 +137,7 @@ def summarize_case(
     conv_width: int,
     cp_sizes: tuple[int, ...] = (2, 4, 8),
 ) -> GdnCaseSummary:
-    spec = parse_gdn_shared_prefix_segments(
-        tensors["group_ids"], tensors["parent_ids"], min_completions_per_family=1
-    )
+    spec = parse_gdn_shared_prefix_segments(tensors["group_ids"], tensors["parent_ids"])
     suffix_lengths = [
         segment.length
         for index, segment in enumerate(spec.tree_segments)
@@ -150,8 +148,12 @@ def summarize_case(
         name=case.name,
         total_tokens=spec.real_token_count,
         family_count=spec.family_count,
-        completion_count=spec.completion_count,
-        max_segment_length=spec.max_segment_length,
+        completion_count=sum(
+            1 for parent_index in spec.tree_parent_indices if parent_index >= 0
+        ),
+        max_segment_length=max(
+            (segment.length for segment in spec.tree_segments), default=0
+        ),
         suffix_shorter_than_conv=any(length < conv_width for length in suffix_lengths),
         suffix_equal_to_conv=any(length == conv_width for length in suffix_lengths),
         suffix_longer_than_conv=any(length > conv_width for length in suffix_lengths),

@@ -464,9 +464,7 @@ def run_gdn_layer(
         )
 
     if execution_spec is None and execution_plan is None:
-        execution_spec = parse_gdn_shared_prefix_segments(
-            group_ids, parent_ids, min_completions_per_family=0
-        )
+        execution_spec = parse_gdn_shared_prefix_segments(group_ids, parent_ids)
     if (
         execution_spec is not None
         and requested_cp_size == 1

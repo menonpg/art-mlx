@@ -1532,9 +1532,8 @@ def _gather_planner_metadata(prepared: object) -> dict[str, object]:
             merged[f"planner_{key}_sum"] = int(sum(int(value) for value in values))
             merged[f"planner_{key}_max"] = int(max(int(value) for value in values))
     rank0 = ranks[0] if ranks else {}
-    for key in ("tree_depth_count", "tree_family_count", "tree_completion_count"):
-        if key in rank0:
-            merged[f"planner_{key}"] = rank0[key]
+    if "tree_depth_count" in rank0:
+        merged["planner_tree_depth_count"] = rank0["tree_depth_count"]
     return merged
 
 
@@ -1564,8 +1563,6 @@ def _local_planner_metadata(prepared: object) -> dict[str, object]:
         "attention_tokens": int(getattr(plan, "attention_token_count", 0)),
         "gdn_tokens": int(getattr(plan, "gdn_token_count", 0)),
         "tree_depth_count": len(getattr(plan, "tree_segment_buckets_by_depth", ())),
-        "tree_family_count": int(getattr(plan, "family_count", 0)),
-        "tree_completion_count": int(getattr(plan, "completion_count", 0)),
         "tree_local_bucket_count": len(local_buckets),
         "tree_chain_bucket_count": len(chain_buckets),
         "tree_local_segment_count": sum(
@@ -2156,22 +2153,24 @@ def _profiled_adaptive_micro_batch_training_step_body(
             **select_profile,
         }
         stats.append(row)
-        rank._remember_adaptive_window(
-            candidate.stats_global_count,
-            is_tail=start + candidate.stats_global_count >= len(items),
-        )
+        stop = start + candidate.stats_global_count
+        if stop < len(items):
+            rank._last_global_micro_batch_size = max(
+                rank._last_global_micro_batch_size or 0,
+                candidate.stats_global_count,
+            )
         _emit_adaptive_progress(
             "target_trainer_adaptive_profile_train_step_window",
             {
                 **row,
                 "window_index": len(stats) - 1,
                 "global_start": int(start),
-                "global_stop": int(start + candidate.stats_global_count),
+                "global_stop": int(stop),
                 "remembered_window": int(rank._last_global_micro_batch_size or 0),
                 "elapsed_ms": (time.perf_counter() - step_start) * 1000.0,
             },
         )
-        start += candidate.stats_global_count
+        start = stop
     metrics, optim_ms = _timed_cuda(
         rank, lambda: rank.optim_step(params=params, scale_grads=1.0)
     )

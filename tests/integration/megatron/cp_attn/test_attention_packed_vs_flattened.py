@@ -60,9 +60,7 @@ def test_shared_prefix_attention_matches_flattened_grad_accumulation() -> None:
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
     q, k, v = _attention_inputs(group_ids.shape, seed=20260425)
     q_ref = q.detach().clone().requires_grad_(True)
     k_ref = k.detach().clone().requires_grad_(True)
@@ -121,9 +119,7 @@ def test_physical_causal_attention_leaks_across_siblings() -> None:
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
     q, k, v = _attention_inputs(group_ids.shape, seed=20260427)
     attention_state = create_shared_prefix_state(group_ids, parent_ids)
     packed_out = FlexAttentionWrapper()(

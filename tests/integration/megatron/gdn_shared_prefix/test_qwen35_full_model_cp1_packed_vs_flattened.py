@@ -98,9 +98,7 @@ def test_qwen35_full_model_cp1_matches_flattened_grad_accumulation() -> None:
 
         flat_loss_sum: torch.Tensor | None = None
         logits_mean_abs_pct = 0.0
-        spec = parse_gdn_shared_prefix_segments(
-            group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
-        )
+        spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
         for segment_index, completion in enumerate(spec.tree_segments):
             if spec.tree_parent_indices[segment_index] < 0:
                 continue
@@ -218,9 +216,7 @@ def _assert_logits_vjp_equivalence(
 
     flat_loss_sum: torch.Tensor | None = None
     logits_mean_abs_pct = 0.0
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids.cpu(), parent_ids.cpu(), min_completions_per_family=1
-    )
+    spec = parse_gdn_shared_prefix_segments(group_ids.cpu(), parent_ids.cpu())
     for segment_index, completion in enumerate(spec.tree_segments):
         if spec.tree_parent_indices[segment_index] < 0:
             continue
