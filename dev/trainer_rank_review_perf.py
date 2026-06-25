@@ -58,6 +58,8 @@ def main(
     flex_heads: int = 2,
     flex_head_dim: int = 128,
     flex_mask_variants: str = "current,causal_abs_only",
+    max_block_mask_build_ms: float | None = None,
+    max_cp_planning_cold_ms: float | None = None,
     output_jsonl: Path = Path(".local/trainer_rank_review/block_mask_flex.jsonl"),
 ) -> None:
     if warmup < 0 or repeat < 1:
@@ -148,6 +150,8 @@ def main(
             **_mask_stats(masks),
         },
     )
+    _check_threshold("block_mask_build", mask_ms, max_block_mask_build_ms)
+    _check_threshold("cp_planning_cold", plan_ms, max_cp_planning_cold_ms)
 
     if run_flex:
         for record in _flex_records(
@@ -853,6 +857,13 @@ def _write(path: Path, payload: dict[str, object]) -> None:
     with path.open("a", encoding="utf-8") as output:
         output.write(line + "\n")
     print(line, flush=True)
+
+
+def _check_threshold(name: str, value_ms: float, limit_ms: float | None) -> None:
+    if limit_ms is not None and float(value_ms) > float(limit_ms):
+        raise RuntimeError(
+            f"{name} took {float(value_ms):.3f}ms, exceeding {float(limit_ms):.3f}ms"
+        )
 
 
 if __name__ == "__main__":
