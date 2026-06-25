@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -496,17 +496,11 @@ def move_cp_exchange_plan_to_device(
     if plan is None:
         return None
     target = torch.device(device)
-    return GdnCpExchangePlan(
-        cp_size=plan.cp_size,
-        source_token_counts_by_rank=_source_counts_by_rank(plan),
-        dest_token_counts_by_rank=_dest_counts_by_rank(plan),
+    return replace(
+        plan,
         transfers=tuple(
-            GdnCpPeerTransfer(
-                source_rank=transfer.source_rank,
-                dest_rank=transfer.dest_rank,
-                token_count=transfer.token_count,
-                source_positions_cpu=transfer.source_positions_cpu,
-                dest_positions_cpu=transfer.dest_positions_cpu,
+            replace(
+                transfer,
                 source_positions_tensor=_move_optional_index_tensor(
                     transfer.source_positions_tensor, target
                 ),
@@ -516,7 +510,6 @@ def move_cp_exchange_plan_to_device(
             )
             for transfer in plan.transfers
         ),
-        cross_rank_token_count_override=plan.cross_rank_token_count_override,
     )
 
 

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.loss import shift_tensor
@@ -43,9 +42,8 @@ StagePiece = tuple[TokenRange, TokenRange, AttnMaskKind, int | None]
 StageSliceKey = tuple[int, int, int, int, int, str, int]
 
 
-class _PlanningBundle(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class _PlanningBundle:
     spec: PackedBatchAttentionSpec
     runtime_key: ContextParallelRuntimeKey
     runtime_plan: ContextParallelRuntimePlan
@@ -1702,7 +1700,7 @@ def prepare_cp_micro(
         ref_logprobs=ref_logprobs,
     )
     if tensors.token_uids is not None:
-        state = state.model_copy(update={"trace_token_uids": tensors.token_uids})
+        state = replace(state, trace_token_uids=tensors.token_uids)
     if prepare_execution_state:
         from .executor import prepare_context_parallel_execution_state
 

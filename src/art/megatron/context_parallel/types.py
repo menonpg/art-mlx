@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 import torch
 
 from .layout_index import TokenLayoutIndex
@@ -172,16 +172,15 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     token_uids: torch.Tensor | None = None
 
 
-class ContextParallelExecutionCache(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass
+class ContextParallelExecutionCache:
     block_mask_context: Any | None = None
-    block_masks: dict[Any, Any] = Field(default_factory=dict)
-    range_indices: dict[Any, torch.Tensor] = Field(default_factory=dict)
-    range_meta: dict[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = Field(
+    block_masks: dict[Any, Any] = field(default_factory=dict)
+    range_indices: dict[Any, torch.Tensor] = field(default_factory=dict)
+    range_meta: dict[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = field(
         default_factory=dict
     )
-    stage_execution_specs: dict[Any, "StageExecutionSpec"] = Field(default_factory=dict)
+    stage_execution_specs: dict[Any, "StageExecutionSpec"] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -192,9 +191,8 @@ class StageExecutionSpec:
     mask_metadata: "ExactMaskMetadata | None" = None
 
 
-class ArtContextParallelState(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass
+class ArtContextParallelState:
     runtime_key: ContextParallelRuntimeKey
     rank_plan: RankRuntimePlan
     cp_group: Any
@@ -207,23 +205,22 @@ class ArtContextParallelState(BaseModel):
     gdn_input_layout: str | None = None
     gdn_output_layout: str | None = None
     gdn_attention_original_shape: tuple[int, int, int] | None = None
-    gdn_attention_original_shapes: dict[int, tuple[int, int, int]] = Field(
+    gdn_attention_original_shapes: dict[int, tuple[int, int, int]] = field(
         default_factory=dict
     )
     gdn_attention_token_uids: torch.Tensor | None = None
     gdn_active_module: Any | None = None
     trace_token_uids: torch.Tensor | None = None
-    execution_cache: ContextParallelExecutionCache = Field(
+    execution_cache: ContextParallelExecutionCache = field(
         default_factory=ContextParallelExecutionCache
     )
 
 
-class PreparedMegatronBatch(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass
+class PreparedMegatronBatch:
     tensors: DispatchedPackedTensors
-    packed_seq_params: PackedSeqParams | None = None
     attention_state: Any
+    packed_seq_params: PackedSeqParams | None = None
     rank_plan: RankRuntimePlan | None = None
     pad_multiple: int = 1
 

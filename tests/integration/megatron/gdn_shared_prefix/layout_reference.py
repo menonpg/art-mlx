@@ -133,7 +133,7 @@ def _split_gdn_token_ranges_by_rank(
                 _segment_token_start(segment, spec.sequence_length),
                 _segment_token_start(segment, spec.sequence_length) + segment.length,
             )
-            for segment in spec.segments()
+            for segment in spec.tree_segments
         ),
         cp_size=cp_size,
     )

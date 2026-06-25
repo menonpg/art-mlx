@@ -63,9 +63,6 @@ class GdnPackedExecutionSpec:
     def max_segment_length(self) -> int:
         return max((segment.length for segment in self.tree_segments), default=0)
 
-    def segments(self) -> tuple[GdnSegmentSpec, ...]:
-        return self.tree_segments
-
 
 @dataclass(frozen=True)
 class GdnSegmentBucketPlan:
@@ -163,7 +160,6 @@ class _AttentionLayoutIndex:
 
     token_ranges_by_rank: tuple[tuple[tuple[int, int], ...], ...]
     token_range_ends_by_rank: tuple[tuple[int, ...], ...]
-    range_count: int
 
 
 def _layout_cp_size(layout: TokenLayoutIndex) -> int:
@@ -265,8 +261,7 @@ def _build_tree_rank_execution_plan(
         planner_config=planner_config,
     )
     attention_layout_index = _build_attention_layout_index_from_token_layout(
-        source_layout,
-        max_ranges=max(1, 2 * spec.real_token_count // len(spec.tree_segments)),
+        source_layout
     )
     segment_attention_counts = _segment_attention_rank_counts(
         spec,
@@ -451,22 +446,11 @@ def move_gdn_rank_execution_plan_to_device(
 
     from art.megatron.gdn.layout import move_cp_exchange_plan_to_device
 
-    return GdnRankExecutionPlan(
-        cp_rank=plan.cp_rank,
-        cp_size=plan.cp_size,
-        batch_size=plan.batch_size,
-        sequence_length=plan.sequence_length,
-        packed_batch_size=plan.packed_batch_size,
-        packed_sequence_length=plan.packed_sequence_length,
+    return replace(
+        plan,
         real_token_mask=_move_planner_tensor(plan.real_token_mask, device),
-        family_count=plan.family_count,
-        completion_count=plan.completion_count,
         attention_to_gdn=move_cp_exchange_plan_to_device(plan.attention_to_gdn, device),
         gdn_to_attention=move_cp_exchange_plan_to_device(plan.gdn_to_attention, device),
-        attention_token_ranges=plan.attention_token_ranges,
-        gdn_token_ranges=plan.gdn_token_ranges,
-        attention_token_count=plan.attention_token_count,
-        gdn_token_count=plan.gdn_token_count,
         tree_segment_buckets_by_depth=tuple(
             _move_bucket_plans(buckets, device)
             for buckets in plan.tree_segment_buckets_by_depth
@@ -490,9 +474,8 @@ def _move_state_exchange_plan(
         return None
     from art.megatron.gdn.layout import move_cp_exchange_plan_to_device
 
-    return GdnStateExchangePlan(
-        source_family_indices=exchange.source_family_indices,
-        dest_family_indices=exchange.dest_family_indices,
+    return replace(
+        exchange,
         exchange=move_cp_exchange_plan_to_device(exchange.exchange, device),
         reverse_exchange=move_cp_exchange_plan_to_device(
             exchange.reverse_exchange, device
@@ -505,26 +488,19 @@ def _move_bucket_plans(
     device: torch.device | str,
 ) -> tuple[GdnSegmentBucketPlan, ...]:
     return tuple(
-        GdnSegmentBucketPlan(
-            length=bucket.length,
+        replace(
+            bucket,
             lengths=_move_planner_tensor(bucket.lengths, device),
-            lengths_cpu=bucket.lengths_cpu,
-            lengths_by_rank_cpu=bucket.lengths_by_rank_cpu,
             real_mask=_move_planner_tensor(bucket.real_mask, device),
             cu_seqlens=_move_planner_tensor(bucket.cu_seqlens, device),
-            cu_seqlens_cpu=bucket.cu_seqlens_cpu,
             row_indices=_move_planner_tensor(bucket.row_indices, device),
             position_indices=_move_planner_tensor(bucket.position_indices, device),
             family_indices=_move_planner_tensor(bucket.family_indices, device),
-            family_indices_cpu=bucket.family_indices_cpu,
             parent_indices=(
                 _move_planner_tensor(bucket.parent_indices, device)
                 if bucket.parent_indices is not None
                 else None
             ),
-            parent_indices_cpu=bucket.parent_indices_cpu,
-            needs_final_state=bucket.needs_final_state,
-            real_token_count_static=bucket.real_token_count,
             output_mask=(
                 _move_planner_tensor(bucket.output_mask, device)
                 if bucket.output_mask is not None
@@ -842,21 +818,16 @@ def _build_tree_state_exchanges_by_depth(
 
 def _build_attention_layout_index_from_token_layout(
     layout: TokenLayoutIndex,
-    *,
-    max_ranges: int,
 ) -> _AttentionLayoutIndex:
-    del max_ranges
     ranges_by_rank = tuple(
         tuple(sorted((int(start), int(end)) for start, end, _ in rank_ranges))
         for rank_ranges in layout.ownership_ranges_by_rank
     )
-    range_count = sum(len(ranges) for ranges in ranges_by_rank)
     return _AttentionLayoutIndex(
         token_ranges_by_rank=ranges_by_rank,
         token_range_ends_by_rank=tuple(
             tuple(end for _, end in ranges) for ranges in ranges_by_rank
         ),
-        range_count=range_count,
     )
 
 
@@ -867,7 +838,7 @@ def _segment_attention_rank_counts(
     attention_layout_index: _AttentionLayoutIndex,
 ) -> dict[tuple[int, int, int], tuple[int, ...]]:
     del cp_size
-    segments = tuple(spec.segments())
+    segments = spec.tree_segments
     if not segments:
         return {}
     starts = torch.tensor(
