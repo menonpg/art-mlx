@@ -892,12 +892,18 @@ class TrainerRank:
 
         stable_width = self._last_global_micro_batch_size
         if stable_width is not None and stable_width >= max(64, granularity * 2):
-            stable_width = snap_width(stable_width)
+            stable_width = self._balanced_adaptive_window(
+                capacity=stable_width,
+                remaining=remaining,
+                min_width=min_width,
+                granularity=granularity,
+            )
             fits, check = probe(stable_width)
             if fits:
                 return candidate(stable_width, check)
             rejected += 1
             search_below(stable_width)
+            self._last_global_micro_batch_size = best_width
             return candidate(best_width, best_check)
 
         high_fail: int | None = None
@@ -929,9 +935,32 @@ class TrainerRank:
         base = 8 if remaining < 256 else 32
         return max(1, ((base + dp_size - 1) // dp_size) * dp_size)
 
+    @staticmethod
+    def _balanced_adaptive_window(
+        *,
+        capacity: int,
+        remaining: int,
+        min_width: int,
+        granularity: int,
+    ) -> int:
+        windows = max(1, (remaining + capacity - 1) // capacity)
+        if windows == 1:
+            return max(min_width, remaining)
+        raw = (remaining + windows - 1) // windows
+        if granularity > 1:
+            raw = ((raw + granularity - 1) // granularity) * granularity
+        return max(min_width, min(capacity, raw, remaining))
+
     def _remember_adaptive_window(self, width: int, *, is_tail: bool) -> None:
-        if not is_tail:
+        if is_tail:
+            return
+        if self._last_global_micro_batch_size is None:
             self._last_global_micro_batch_size = width
+        else:
+            self._last_global_micro_batch_size = max(
+                self._last_global_micro_batch_size,
+                width,
+            )
 
     def _cached_adaptive_plan(
         self,

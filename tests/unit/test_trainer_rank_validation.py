@@ -239,7 +239,7 @@ def test_forward_micro_batches_tail_does_not_reset_stable_window(
         trainer.forward_micro_batches([_target_request(i) for i in range(130)])
     )
 
-    assert [batch.stats.global_count for batch in batches] == [64, 64, 2]
+    assert [batch.stats.global_count for batch in batches] == [48, 48, 34]
     assert trainer._last_global_micro_batch_size == 64
 
 
