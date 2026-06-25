@@ -148,33 +148,10 @@ class _AttentionLayoutIndex:
     token_range_ends_by_rank: tuple[tuple[int, ...], ...]
 
 
-def _layout_cp_size(layout: TokenLayoutIndex) -> int:
-    return len(layout.token_counts_by_rank)
-
-
-def _layout_token_count(layout: TokenLayoutIndex) -> int:
-    return sum(int(count) for count in layout.token_counts_by_rank)
-
-
 def _tokens_from_rank_ranges(
     ranges: tuple[tuple[int, int, int], ...],
 ) -> tuple[int, ...]:
     return tuple(token for start, end, _ in ranges for token in range(start, end))
-
-
-def _token_layout_from_rank_ranges(
-    ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...],
-) -> TokenLayoutIndex:
-    return TokenLayoutIndex(
-        ownership_ranges_by_rank=ranges_by_rank,
-        token_counts_by_rank=tuple(
-            _ranges_token_count(ranges) for ranges in ranges_by_rank
-        ),
-    )
-
-
-def _ranges_token_count(ranges: tuple[tuple[int, int, int], ...]) -> int:
-    return sum(int(end) - int(start) for start, end, _ in ranges)
 
 
 def build_gdn_rank_execution_plan(
@@ -554,24 +531,32 @@ def _attention_source_layout(
     planner_config: GdnPlannerConfig,
 ) -> TokenLayoutIndex:
     if attention_token_layout_index is not None:
-        if _layout_cp_size(attention_token_layout_index) != cp_size:
+        layout_cp_size = len(attention_token_layout_index.token_counts_by_rank)
+        layout_token_count = sum(
+            int(count) for count in attention_token_layout_index.token_counts_by_rank
+        )
+        if layout_cp_size != cp_size:
             raise ValueError(
                 "attention token layout index cp_size must match GDN cp_size, got "
-                f"{_layout_cp_size(attention_token_layout_index)} and {cp_size}"
+                f"{layout_cp_size} and {cp_size}"
             )
-        if _layout_token_count(attention_token_layout_index) != spec.real_token_count:
+        if layout_token_count != spec.real_token_count:
             raise ValueError(
                 "attention token layout index token count must match GDN real token "
-                f"count, got {_layout_token_count(attention_token_layout_index)} and "
-                f"{spec.real_token_count}"
+                f"count, got {layout_token_count} and {spec.real_token_count}"
             )
         return attention_token_layout_index
-    return _token_layout_from_rank_ranges(
-        _default_attention_layout_ranges(
-            spec,
-            cp_size=cp_size,
-            planner_config=planner_config,
-        )
+    ranges_by_rank = _default_attention_layout_ranges(
+        spec,
+        cp_size=cp_size,
+        planner_config=planner_config,
+    )
+    return TokenLayoutIndex(
+        ownership_ranges_by_rank=ranges_by_rank,
+        token_counts_by_rank=tuple(
+            sum(int(end) - int(start) for start, end, _ in ranges)
+            for ranges in ranges_by_rank
+        ),
     )
 
 
@@ -581,7 +566,7 @@ def _can_chain_tree_segment(
     cp_size: int,
     planner_config: GdnPlannerConfig,
 ) -> bool:
-    min_tokens = (
+    min_total_tokens = (
         min(
             planner_config.cp_tree_chain_min_prefix_only_tokens,
             planner_config.cp_chain_min_prefix_only_tokens,
@@ -592,31 +577,12 @@ def _can_chain_tree_segment(
             planner_config.cp_chain_min_total_tokens,
         )
     )
-    return _can_chain_segment_with_min_tokens(
-        segment,
-        cp_size=cp_size,
-        min_tokens=min_tokens,
-        planner_config=planner_config,
+    return (
+        segment.length >= min_total_tokens
+        and segment.length >= cp_size
+        and segment.length // FLA_CHUNK_SIZE >= cp_size
+        and segment.length / cp_size >= planner_config.cp_chain_min_tokens_per_rank
     )
-
-
-def _can_chain_segment_with_min_tokens(
-    segment: GdnSegmentSpec,
-    *,
-    cp_size: int,
-    min_tokens: int,
-    planner_config: GdnPlannerConfig,
-) -> bool:
-    if segment.length < min_tokens:
-        return False
-    if segment.length < cp_size:
-        return False
-    if segment.length // FLA_CHUNK_SIZE < cp_size:
-        return False
-    per_rank = segment.length / cp_size
-    if per_rank < planner_config.cp_chain_min_tokens_per_rank:
-        return False
-    return True
 
 
 def _best_segment_owner(
@@ -893,27 +859,17 @@ def _default_attention_layout_ranges(
     for segment in spec.tree_segments:
         token_start = _segment_token_start(segment, spec.sequence_length)
         if should_split_segment(segment):
-            _append_split_default_attention_segment(
-                ranks, loads, token_start, segment.length
-            )
+            for rank in range(cp_size):
+                start = (segment.length * rank) // cp_size
+                end = (segment.length * (rank + 1)) // cp_size
+                ranks[rank].append(
+                    (token_start + start, token_start + end, loads[rank])
+                )
+                loads[rank] += end - start
             continue
         owner = _least_loaded_rank(loads)
         append_segment(owner, token_start, segment.length)
     return tuple(tuple(ranges) for ranges in ranks)
-
-
-def _append_split_default_attention_segment(
-    ranks: list[list[tuple[int, int, int]]],
-    loads: list[int],
-    token_start: int,
-    token_count: int,
-) -> None:
-    cp_size = len(ranks)
-    for rank in range(cp_size):
-        start = (token_count * rank) // cp_size
-        end = (token_count * (rank + 1)) // cp_size
-        ranks[rank].append((token_start + start, token_start + end, loads[rank]))
-        loads[rank] += end - start
 
 
 def _append_chain_segment(
@@ -956,11 +912,11 @@ def _append_chain_segment(
         )
         rank_loads[rank] += shard_length
         if attention_layout_index is not None:
-            cross_rank_tokens += shard_length - _attention_overlap_count(
-                attention_layout_index,
-                rank,
+            cross_rank_tokens += shard_length - _range_overlap_count(
                 shard_start,
                 shard_start + shard_length,
+                attention_layout_index.token_ranges_by_rank[rank],
+                attention_layout_index.token_range_ends_by_rank[rank],
             )
         start = end
     return cross_rank_tokens
@@ -996,15 +952,14 @@ def _attention_contiguous_chain_shards(
     shards: list[range] = []
     cursor = token_start
     for rank in range(cp_size):
-        overlap = _attention_single_contiguous_overlap(
-            attention_layout_index,
-            rank,
+        overlaps = _range_overlaps(
             token_start,
             segment_end,
+            attention_layout_index.token_ranges_by_rank[rank],
         )
-        if overlap is None:
+        if len(overlaps) != 1:
             return None
-        start, end = overlap
+        start, end = overlaps[0]
         if start != cursor or end <= start:
             return None
         shards.append(range(start, end))
@@ -1014,18 +969,6 @@ def _attention_contiguous_chain_shards(
     if any(len(shard) % FLA_CHUNK_SIZE != 0 for shard in shards[:-1]):
         return None
     return tuple(shards)
-
-
-def _attention_single_contiguous_overlap(
-    index: _AttentionLayoutIndex,
-    rank: int,
-    start: int,
-    end: int,
-) -> tuple[int, int] | None:
-    overlaps = _range_overlaps(start, end, index.token_ranges_by_rank[rank])
-    if len(overlaps) != 1:
-        return None
-    return overlaps[0]
 
 
 def _append_local_segment(
@@ -1359,20 +1302,6 @@ def _build_bucket_plan(
 
 def _segment_token_start(segment: GdnSegmentSpec, sequence_length: int) -> int:
     return segment.row_index * sequence_length + segment.start
-
-
-def _attention_overlap_count(
-    index: _AttentionLayoutIndex,
-    rank: int,
-    start: int,
-    end: int,
-) -> int:
-    return _range_overlap_count(
-        start,
-        end,
-        index.token_ranges_by_rank[rank],
-        index.token_range_ends_by_rank[rank],
-    )
 
 
 def _range_overlap_count(

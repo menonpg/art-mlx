@@ -703,7 +703,11 @@ class TrainerRank:
         min_width = min(dp_size, remaining)
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
-        self._scope_adaptive_cache(items)
+        top_level_ids = tuple(id(item) for item in items)
+        if top_level_ids != self._adaptive_plan_cache_top_level_ids:
+            self._adaptive_plan_cache.clear()
+            self._adaptive_estimate_cache.clear()
+            self._adaptive_plan_cache_top_level_ids = top_level_ids
 
         def clamp_width(width: int) -> int:
             return max(min_width, min(width, remaining))
@@ -877,17 +881,6 @@ class TrainerRank:
             )
         self._adaptive_estimate_cache[key] = estimate
         return estimate
-
-    def _scope_adaptive_cache(
-        self,
-        items: Sequence[ForwardInputsT],
-    ) -> None:
-        top_level_ids = tuple(id(item) for item in items)
-        if top_level_ids == self._adaptive_plan_cache_top_level_ids:
-            return
-        self._adaptive_plan_cache.clear()
-        self._adaptive_estimate_cache.clear()
-        self._adaptive_plan_cache_top_level_ids = top_level_ids
 
     def _adaptive_cache_key(
         self,

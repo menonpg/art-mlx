@@ -180,10 +180,7 @@ class LoraShardMeta(NamedTuple):
 
     @property
     def numel(self) -> int:
-        total = 1
-        for dim in self.shape:
-            total *= dim
-        return total
+        return math.prod(self.shape)
 
 
 class _LoraPublishTemplate(NamedTuple):
@@ -229,14 +226,6 @@ def _get_shard_rank(domain: ShardDomain) -> int:
     if group is None:
         return 0
     return group.rank()
-
-
-def _get_shard_group(domain: ShardDomain) -> Any | None:
-    if not _distributed_initialized():
-        return None
-    if domain == "tp":
-        return ps.get_tensor_model_parallel_group()
-    return ps.get_expert_tensor_parallel_group(check_initialized=False)
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -519,7 +508,11 @@ class LoRA(torch.nn.Module):
         world_size = _get_shard_world_size(domain)
         if world_size <= 1:
             return
-        group = _get_shard_group(domain)
+        group = (
+            ps.get_tensor_model_parallel_group()
+            if domain == "tp"
+            else ps.get_expert_tensor_parallel_group(check_initialized=False)
+        )
         if group is None:
             raise RuntimeError(
                 f"{self.adapter_model_prefix}: missing process group for replicated parameter domain={domain}"
@@ -1067,14 +1060,6 @@ def _expert_grouped_lora_dual_forward(
     )
 
 
-def _linear_weight(linear: Any) -> torch.Tensor:
-    weight = getattr(linear, "weight0", None)
-    if weight is None:
-        weight = getattr(linear, "weight", None)
-    assert isinstance(weight, torch.Tensor)
-    return weight
-
-
 def _parallel_lora(
     *,
     adapter_model_prefix: str,
@@ -1088,7 +1073,10 @@ def _parallel_lora(
     allreduce: bool = True,
     num_local_experts: int = 1,
 ) -> LoRA:
-    weight = _linear_weight(linear)
+    weight = getattr(linear, "weight0", None)
+    if weight is None:
+        weight = getattr(linear, "weight", None)
+    assert isinstance(weight, torch.Tensor)
     row_layout = layout == "row"
     a_parallel_spec = LoRAParallelSpec(
         shard_domain=shard_domain,
@@ -1119,30 +1107,6 @@ def _parallel_lora(
     )
 
 
-def _expert_parallel_lora(
-    *,
-    adapter_model_prefix: str,
-    linear: Any,
-    out_features: int,
-    rank: int,
-    alpha: float,
-    layout: Literal["column", "row"],
-    num_local_experts: int,
-) -> LoRA:
-    return _parallel_lora(
-        adapter_model_prefix=adapter_model_prefix,
-        linear=linear,
-        out_features=out_features,
-        rank=rank,
-        alpha=alpha,
-        layout=layout,
-        shard_domain="expert_tp",
-        grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-        num_local_experts=num_local_experts,
-        allreduce=False,
-    )
-
-
 def _parallel_lora_pair(
     *,
     adapter_model_prefix: str,
@@ -1154,17 +1118,24 @@ def _parallel_lora_pair(
     suffixes: tuple[str, str],
     num_local_experts: int = 1,
 ) -> tuple[LoRA, LoRA]:
-    make_lora = _expert_parallel_lora if num_local_experts > 1 else _parallel_lora
+    expert_parallel = num_local_experts > 1
     return cast(
         tuple[LoRA, LoRA],
         tuple(
-            make_lora(
+            _parallel_lora(
                 adapter_model_prefix=f"{adapter_model_prefix}.{suffix}",
                 linear=linear,
                 out_features=out_features,
                 rank=rank,
                 alpha=alpha,
                 layout=layout,
+                shard_domain="expert_tp" if expert_parallel else "tp",
+                grad_sync_domain=(
+                    EXPERT_TP_GRAD_SYNC_DOMAIN
+                    if expert_parallel
+                    else TP_DEFAULT_GRAD_SYNC_DOMAIN
+                ),
+                allreduce=not expert_parallel,
                 num_local_experts=num_local_experts,
             )
             for suffix in suffixes
@@ -1410,13 +1381,16 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         self.linear_fc1 = linear_fc1
         self.fused_gate_up = bool(fused_gate_up)
         if self.fused_gate_up:
-            self.lora = _expert_parallel_lora(
+            self.lora = _parallel_lora(
                 adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
                 linear=linear_fc1,
                 out_features=linear_fc1.out_features,
                 rank=rank,
                 alpha=alpha,
                 layout="column",
+                shard_domain="expert_tp",
+                grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+                allreduce=False,
                 num_local_experts=num_local_experts,
             )
             gate_out_features = linear_fc1.out_features // 2
@@ -1466,13 +1440,16 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.linear_fc2 = linear_fc2
-        self.lora = _expert_parallel_lora(
+        self.lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.down_proj",
             linear=linear_fc2,
             out_features=linear_fc2.out_features,
             rank=rank,
             alpha=alpha,
             layout="row",
+            shard_domain="expert_tp",
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+            allreduce=False,
             num_local_experts=num_local_experts,
         )
 
