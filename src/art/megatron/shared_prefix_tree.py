@@ -7,23 +7,16 @@ import torch
 
 @dataclass(frozen=True, slots=True)
 class SharedPrefixSegment:
-    row_index: int
-    run_index: int
     group_id: int
     parent_id: int
     start: int
     end: int
     family_index: int
-    root_group_id: int
     ancestors: tuple[int, ...]
 
     @property
     def depth(self) -> int:
         return len(self.ancestors)
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,23 +25,12 @@ class SharedPrefixRowTree:
     valid_tokens: int
     segments: tuple[SharedPrefixSegment, ...]
 
-    @property
-    def max_depth(self) -> int:
-        return max((segment.depth for segment in self.segments), default=0)
-
-    def segment_by_group_id(self) -> dict[int, SharedPrefixSegment]:
-        segments: dict[int, SharedPrefixSegment] = {}
-        for segment in self.segments:
-            segments.setdefault(segment.group_id, segment)
-        return segments
-
 
 def parse_shared_prefix_tree(
     *,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     ignore_padding_group_id: int = -1,
-    require_contiguous_group_runs: bool = True,
 ) -> tuple[SharedPrefixRowTree, ...]:
     if group_ids.shape != parent_ids.shape:
         raise RuntimeError(
@@ -66,7 +48,6 @@ def parse_shared_prefix_tree(
             parent_ids=parent_ids[row_index],
             row_index=row_index,
             ignore_padding_group_id=ignore_padding_group_id,
-            require_contiguous_group_runs=require_contiguous_group_runs,
         )
         for row_index in range(int(group_ids.shape[0]))
     )
@@ -78,7 +59,6 @@ def parse_shared_prefix_row(
     parent_ids: torch.Tensor,
     row_index: int = 0,
     ignore_padding_group_id: int = -1,
-    require_contiguous_group_runs: bool = True,
 ) -> SharedPrefixRowTree:
     if group_ids.shape != parent_ids.shape:
         raise RuntimeError(
@@ -99,52 +79,31 @@ def parse_shared_prefix_row(
         return SharedPrefixRowTree(row_index=row_index, valid_tokens=0, segments=())
 
     runs = _scan_runs(group_ids[:valid_tokens], parent_ids[:valid_tokens])
-    group_run_count: dict[int, int] = {}
     first_segment_by_group: dict[int, SharedPrefixSegment] = {}
     family_by_group: dict[int, int] = {}
-    root_by_group: dict[int, int] = {}
     ancestors_by_group: dict[int, tuple[int, ...]] = {}
     segments: list[SharedPrefixSegment] = []
     next_family_index = 0
 
+    seen_groups: set[int] = set()
+    repeated_groups: dict[int, int] = {}
     for _start, _end, group_id, _parent_id in runs:
-        group_run_count[group_id] = group_run_count.get(group_id, 0) + 1
-    if require_contiguous_group_runs:
-        repeated_groups = {
-            group_id: count
-            for group_id, count in group_run_count.items()
-            if count > 1 and group_id != ignore_padding_group_id
-        }
-        if repeated_groups:
-            raise RuntimeError(
-                "Shared-prefix metadata requires contiguous group runs per row, "
-                f"found repeats in row {row_index}: {repeated_groups}"
-            )
+        if group_id in seen_groups and group_id != ignore_padding_group_id:
+            repeated_groups[group_id] = repeated_groups.get(group_id, 1) + 1
+        seen_groups.add(group_id)
+    if repeated_groups:
+        raise RuntimeError(
+            "Shared-prefix metadata requires contiguous group runs per row, "
+            f"found repeats in row {row_index}: {repeated_groups}"
+        )
 
-    for run_index, (start, end, group_id, parent_id) in enumerate(runs):
-        prior_segment = first_segment_by_group.get(group_id)
-        if prior_segment is not None:
-            segment = SharedPrefixSegment(
-                row_index=row_index,
-                run_index=run_index,
-                group_id=group_id,
-                parent_id=parent_id,
-                start=start,
-                end=end,
-                family_index=prior_segment.family_index,
-                root_group_id=prior_segment.root_group_id,
-                ancestors=prior_segment.ancestors,
-            )
-            segments.append(segment)
-            continue
-
+    for start, end, group_id, parent_id in runs:
         is_root = group_id == parent_id or (
             start == 0 and parent_id == ignore_padding_group_id
         )
         if is_root:
             family_index = next_family_index
             next_family_index += 1
-            root_group_id = group_id
             ancestors: tuple[int, ...] = ()
         else:
             parent_segment = first_segment_by_group.get(parent_id)
@@ -159,23 +118,18 @@ def parse_shared_prefix_row(
                     f"row={row_index}, group_id={group_id}, parent_id={parent_id}"
                 )
             family_index = family_by_group[parent_id]
-            root_group_id = root_by_group[parent_id]
             ancestors = (*ancestors_by_group[parent_id], parent_id)
 
         segment = SharedPrefixSegment(
-            row_index=row_index,
-            run_index=run_index,
             group_id=group_id,
             parent_id=parent_id,
             start=start,
             end=end,
             family_index=family_index,
-            root_group_id=root_group_id,
             ancestors=ancestors,
         )
         first_segment_by_group[group_id] = segment
         family_by_group[group_id] = family_index
-        root_by_group[group_id] = root_group_id
         ancestors_by_group[group_id] = ancestors
         segments.append(segment)
 
@@ -183,25 +137,6 @@ def parse_shared_prefix_row(
         row_index=row_index,
         valid_tokens=valid_tokens,
         segments=tuple(segments),
-    )
-
-
-def max_shared_prefix_tree_depth(
-    *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    ignore_padding_group_id: int = -1,
-) -> int:
-    return max(
-        (
-            row.max_depth
-            for row in parse_shared_prefix_tree(
-                group_ids=group_ids,
-                parent_ids=parent_ids,
-                ignore_padding_group_id=ignore_padding_group_id,
-            )
-        ),
-        default=0,
     )
 
 

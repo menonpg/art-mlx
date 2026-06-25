@@ -4,10 +4,7 @@ import pytest
 import torch
 
 from art.megatron.shared_prefix_packing import pack_shared_prefixes
-from art.megatron.shared_prefix_tree import (
-    max_shared_prefix_tree_depth,
-    parse_shared_prefix_row,
-)
+from art.megatron.shared_prefix_tree import parse_shared_prefix_row
 
 
 def test_parse_shared_prefix_row_tracks_ancestors_and_depth() -> None:
@@ -27,7 +24,7 @@ def test_parse_shared_prefix_row_tracks_ancestors_and_depth() -> None:
     )
 
     assert tree.valid_tokens == int(pack.tokens.numel())
-    assert tree.max_depth == 3
+    assert max(segment.depth for segment in tree.segments) == 3
     assert [(segment.group_id, segment.ancestors) for segment in tree.segments] == [
         (1, ()),
         (2, (1,)),
@@ -53,25 +50,6 @@ def test_parse_shared_prefix_row_rejects_non_contiguous_group() -> None:
             group_ids=torch.tensor([1, 2, 1]),
             parent_ids=torch.tensor([1, 1, 1]),
         )
-
-
-def test_max_shared_prefix_tree_depth_treats_flat_families_as_depth_one() -> None:
-    pack = pack_shared_prefixes(
-        (
-            torch.tensor([1, 2, 3, 4]),
-            torch.tensor([1, 2, 5]),
-            torch.tensor([9]),
-        ),
-        max_depth=1,
-    )
-
-    assert (
-        max_shared_prefix_tree_depth(
-            group_ids=pack.group_ids,
-            parent_ids=pack.parent_ids,
-        )
-        == 1
-    )
 
 
 def test_gdn_tree_parser_accepts_nested_tree() -> None:

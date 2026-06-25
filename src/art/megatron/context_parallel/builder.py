@@ -67,7 +67,6 @@ def build_shared_prefix_attention_spec(
         group_ids=group_ids,
         parent_ids=parent_ids,
         ignore_padding_group_id=config.ignore_padding_group_id,
-        require_contiguous_group_runs=config.require_contiguous_group_runs,
     ):
         if row.valid_tokens == 0:
             rows.append(
@@ -77,7 +76,7 @@ def build_shared_prefix_attention_spec(
             )
             continue
 
-        segment_by_group_id = row.segment_by_group_id()
+        segment_by_group_id = {segment.group_id: segment for segment in row.segments}
         row_slices: list[AttnSlice] = []
         for segment in row.segments:
             q_range = TokenRange(start=segment.start, end=segment.end)

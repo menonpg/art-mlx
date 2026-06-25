@@ -1461,7 +1461,7 @@ def _packed_request_stats(
     *,
     request_metadata: dict[str, int | str],
 ) -> dict[str, int | str]:
-    from art.megatron.shared_prefix_tree import max_shared_prefix_tree_depth
+    from art.megatron.shared_prefix_tree import parse_shared_prefix_tree
 
     trainable_mask = torch.zeros(int(batch.tokens.numel()), dtype=torch.bool)
     trainable_tokens = 0
@@ -1487,9 +1487,16 @@ def _packed_request_stats(
         "packed_group_count": int(group_ids.max().item())
         if int(group_ids.numel())
         else 0,
-        "nested_prefix_depth": max_shared_prefix_tree_depth(
-            group_ids=group_ids,
-            parent_ids=parent_ids,
+        "nested_prefix_depth": max(
+            (
+                segment.depth
+                for row in parse_shared_prefix_tree(
+                    group_ids=group_ids,
+                    parent_ids=parent_ids,
+                )
+                for segment in row.segments
+            ),
+            default=0,
         ),
     }
 

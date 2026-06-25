@@ -299,7 +299,7 @@ def _build_group_interval_arrays(
 ) -> tuple[np.ndarray, np.ndarray]:
     enter_by_group: dict[int, int] = {}
     exit_by_group: dict[int, int] = {}
-    segment_by_group = row_tree.segment_by_group_id()
+    segment_by_group = {segment.group_id: segment for segment in row_tree.segments}
     children_by_group: dict[int, list[int]] = {}
     roots: list[int] = []
     for segment in row_tree.segments:

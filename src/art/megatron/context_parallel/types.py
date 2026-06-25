@@ -50,7 +50,6 @@ class PackedBatchAttentionSpec:
 @dataclass(frozen=True)
 class SharedPrefixBuilderConfig:
     ignore_padding_group_id: int = -1
-    require_contiguous_group_runs: bool = True
 
 
 @dataclass(frozen=True)

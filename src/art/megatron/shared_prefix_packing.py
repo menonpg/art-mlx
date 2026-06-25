@@ -139,8 +139,6 @@ def _prefix_segments(
     *,
     max_depth: int,
 ) -> tuple[_PrefixSegment, ...]:
-    if max_depth < 0:
-        raise ValueError("max_depth must be >= 0")
     lengths = tuple(len(row) for row in rows)
     segments: list[_PrefixSegment] = []
     next_group_id = 1
@@ -218,23 +216,6 @@ def _prefix_segments(
 
     walk(tuple(range(len(rows))), 0, None, 0)
     return tuple(segments)
-
-
-def visualize_shared_prefix_pack(pack: SharedPrefixPack) -> str:
-    rows = ["pos token group parent source_pos"]
-    for position, (token, group, parent, source_pos) in enumerate(
-        zip(
-            pack.tokens.reshape(-1).detach().cpu().tolist(),
-            pack.group_ids.reshape(-1).detach().cpu().tolist(),
-            pack.parent_ids.reshape(-1).detach().cpu().tolist(),
-            pack.position_ids.reshape(-1).detach().cpu().tolist(),
-            strict=True,
-        )
-    ):
-        rows.append(f"{position:>3} {token:>5} {group:>5} {parent:>6} {source_pos:>10}")
-    for index, positions in enumerate(pack.positions_by_sequence):
-        rows.append(f"seq {index}: {positions.detach().cpu().tolist()}")
-    return "\n".join(rows)
 
 
 def _empty_pack(

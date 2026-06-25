@@ -6,7 +6,6 @@ import torch
 from art.megatron.shared_prefix_packing import (
     estimate_shared_prefix_packed_tokens,
     pack_shared_prefixes,
-    visualize_shared_prefix_pack,
 )
 from art.megatron.trainer_rank import _local_position_pairs
 
@@ -146,18 +145,6 @@ def test_packed_token_estimator_matches_randomized_packing() -> None:
 def test_packing_rejects_non_1d_sequences() -> None:
     with pytest.raises(ValueError, match="expects 1-D tensors"):
         pack_shared_prefixes((torch.tensor([[1, 2], [3, 4]]),), max_depth=1)
-
-
-def test_visualization_includes_reverse_index() -> None:
-    pack = pack_shared_prefixes(
-        (torch.tensor([1, 2, 3]), torch.tensor([1, 2, 4])),
-        max_depth=1,
-    )
-
-    visualization = visualize_shared_prefix_pack(pack)
-
-    assert visualization.splitlines()[0] == "pos token group parent source_pos"
-    assert "seq 1: [0, 1, 3]" in visualization
 
 
 def test_local_position_pairs_preserve_requested_order_without_dense_match() -> None:

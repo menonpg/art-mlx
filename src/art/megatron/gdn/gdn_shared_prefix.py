@@ -524,9 +524,7 @@ def parse_gdn_shared_prefix_segments(
             node_index = len(tree_segments)
             is_root = segment.depth == 0
             parent_node_index = (
-                -1
-                if is_root
-                else node_by_row_group[(segment.row_index, segment.parent_id)]
+                -1 if is_root else node_by_row_group[(row.row_index, segment.parent_id)]
             )
             child_index = None
             if not is_root:
@@ -534,7 +532,7 @@ def parse_gdn_shared_prefix_segments(
                 child_counts_by_parent[parent_node_index] = child_index + 1
             tree_segments.append(
                 GdnSegmentSpec(
-                    row_index=segment.row_index,
+                    row_index=row.row_index,
                     family_index=node_index,
                     group_id=segment.group_id,
                     parent_id=segment.parent_id,
@@ -546,7 +544,7 @@ def parse_gdn_shared_prefix_segments(
             )
             tree_parent_indices.append(parent_node_index)
             tree_depths.append(segment.depth)
-            node_by_row_group[(segment.row_index, segment.group_id)] = node_index
+            node_by_row_group[(row.row_index, segment.group_id)] = node_index
 
     return GdnPackedExecutionSpec(
         batch_size=batch_size,
