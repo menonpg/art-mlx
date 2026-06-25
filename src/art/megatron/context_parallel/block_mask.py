@@ -25,26 +25,6 @@ class PreparedBlockMaskContext:
     max_depth: int
 
 
-@dataclass(frozen=True, slots=True)
-class _QBlockState:
-    abs_values: np.ndarray
-    enter_values: np.ndarray
-    min_abs: int
-    max_abs: int
-    min_enter: int
-    max_enter: int
-    all_valid: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _KBlockState:
-    max_abs: int
-    max_enter: int
-    min_exit: int
-    intervals: tuple[tuple[int, int, int], ...]
-    all_valid: bool
-
-
 def _build_interval_mask_mod(
     *,
     q_abs: np.ndarray,
@@ -114,134 +94,6 @@ def _select_with_invalid_np(
     if bool(valid.any()):
         selected[valid] = values[indices[valid]]
     return selected
-
-
-def _build_q_block_state(
-    *,
-    q_abs: np.ndarray,
-    q_enter: np.ndarray,
-    q_block: int,
-    block_idx: int,
-) -> _QBlockState:
-    start = int(block_idx) * q_block
-    end = min((int(block_idx) + 1) * q_block, int(q_abs.size))
-    abs_block = q_abs[start:end]
-    enter_block = q_enter[start:end]
-    valid = (abs_block >= 0) & (enter_block >= 0)
-    all_valid = bool(valid.all()) and int(abs_block.size) == int(q_block)
-    if not bool(valid.any()):
-        return _QBlockState(
-            abs_values=np.empty(0, dtype=np.int64),
-            enter_values=np.empty(0, dtype=np.int64),
-            min_abs=_INVALID_ABS,
-            max_abs=_INVALID_ABS,
-            min_enter=_INVALID_ENTER,
-            max_enter=_INVALID_ENTER,
-            all_valid=False,
-        )
-    valid_abs = abs_block[valid]
-    valid_enter = enter_block[valid]
-    return _QBlockState(
-        abs_values=valid_abs,
-        enter_values=valid_enter,
-        min_abs=int(valid_abs.min()),
-        max_abs=int(valid_abs.max()),
-        min_enter=int(valid_enter.min()),
-        max_enter=int(valid_enter.max()),
-        all_valid=all_valid,
-    )
-
-
-def _build_k_block_state(
-    *,
-    k_abs: np.ndarray,
-    k_enter: np.ndarray,
-    k_exit: np.ndarray,
-    k_block: int,
-    block_idx: int,
-) -> _KBlockState:
-    start = int(block_idx) * k_block
-    end = min((int(block_idx) + 1) * k_block, int(k_abs.size))
-    abs_block = k_abs[start:end]
-    enter_block = k_enter[start:end]
-    exit_block = k_exit[start:end]
-    valid = (abs_block >= 0) & (enter_block >= 0) & (exit_block > enter_block)
-    all_valid = bool(valid.all()) and int(abs_block.size) == int(k_block)
-    if not bool(valid.any()):
-        return _KBlockState(
-            max_abs=_INVALID_ABS,
-            max_enter=_INVALID_ENTER,
-            min_exit=_INVALID_EXIT,
-            intervals=(),
-            all_valid=False,
-        )
-    valid_abs = abs_block[valid]
-    valid_enter = enter_block[valid]
-    valid_exit = exit_block[valid]
-    if bool(
-        (valid_enter == valid_enter[0]).all() and (valid_exit == valid_exit[0]).all()
-    ):
-        intervals = ((int(valid_enter[0]), int(valid_exit[0]), int(valid_abs.min())),)
-    else:
-        min_abs_by_interval: dict[tuple[int, int], int] = {}
-        for abs_value, enter_value, exit_value in zip(
-            valid_abs,
-            valid_enter,
-            valid_exit,
-            strict=True,
-        ):
-            interval = (int(enter_value), int(exit_value))
-            prior = min_abs_by_interval.get(interval)
-            min_abs_by_interval[interval] = (
-                int(abs_value) if prior is None else min(prior, int(abs_value))
-            )
-        intervals = tuple(
-            (enter, exit, min_abs)
-            for (enter, exit), min_abs in min_abs_by_interval.items()
-        )
-    return _KBlockState(
-        max_abs=int(valid_abs.max()),
-        max_enter=int(valid_enter.max()),
-        min_exit=int(valid_exit.min()),
-        intervals=intervals,
-        all_valid=all_valid,
-    )
-
-
-def _interval_block_has_any(
-    *,
-    q_state: _QBlockState,
-    k_state: _KBlockState,
-) -> bool:
-    if int(q_state.abs_values.size) == 0 or not k_state.intervals:
-        return False
-    for enter, exit, min_abs in k_state.intervals:
-        if q_state.max_abs < min_abs:
-            continue
-        in_subtree = (q_state.enter_values >= enter) & (q_state.enter_values < exit)
-        if (
-            bool(in_subtree.any())
-            and int(q_state.abs_values[in_subtree].max()) >= min_abs
-        ):
-            return True
-    return False
-
-
-def _interval_block_state(
-    *,
-    q_state: _QBlockState,
-    k_state: _KBlockState,
-) -> tuple[bool, bool]:
-    has_any = _interval_block_has_any(q_state=q_state, k_state=k_state)
-    if not has_any:
-        return False, False
-    if not q_state.all_valid or not k_state.all_valid:
-        return True, False
-    causal_full = q_state.min_abs >= k_state.max_abs
-    interval_full = (
-        k_state.max_enter <= q_state.min_enter and q_state.max_enter < k_state.min_exit
-    )
-    return True, bool(causal_full and interval_full)
 
 
 def _refine_interval_blocks(
@@ -360,34 +212,58 @@ def _refine_interval_blocks(
         partial_blocks[single_q, single_k] = has_any & ~is_full
         full_blocks[single_q, single_k] = is_full
 
-    q_state_cache: dict[int, _QBlockState] = {}
-    k_state_cache: dict[int, _KBlockState] = {}
+    intervals_by_k: dict[int, tuple[tuple[int, int, int], ...]] = {}
+
+    def k_intervals(k_idx: int) -> tuple[tuple[int, int, int], ...]:
+        cached = intervals_by_k.get(k_idx)
+        if cached is not None:
+            return cached
+        min_abs_by_interval: dict[tuple[int, int], int] = {}
+        for abs_value, enter_value, exit_value in zip(
+            k_abs_blocks[k_idx, k_valid[k_idx]],
+            k_enter_blocks[k_idx, k_valid[k_idx]],
+            k_exit_blocks[k_idx, k_valid[k_idx]],
+            strict=True,
+        ):
+            key = (int(enter_value), int(exit_value))
+            prior = min_abs_by_interval.get(key)
+            min_abs_by_interval[key] = (
+                int(abs_value) if prior is None else min(prior, int(abs_value))
+            )
+        cached = tuple(
+            (enter, exit, min_abs)
+            for (enter, exit), min_abs in min_abs_by_interval.items()
+        )
+        intervals_by_k[k_idx] = cached
+        return cached
+
     for q_idx, k_idx in zip(
         q_indices[~single_pair],
         k_indices[~single_pair],
         strict=True,
     ):
-        q_state = q_state_cache.get(int(q_idx))
-        if q_state is None:
-            q_state = _build_q_block_state(
-                q_abs=q_abs,
-                q_enter=q_enter,
-                q_block=q_block,
-                block_idx=int(q_idx),
-            )
-            q_state_cache[int(q_idx)] = q_state
-        k_state = k_state_cache.get(int(k_idx))
-        if k_state is None:
-            k_state = _build_k_block_state(
-                k_abs=k_abs,
-                k_enter=k_enter,
-                k_exit=k_exit,
-                k_block=k_block,
-                block_idx=int(k_idx),
-            )
-            k_state_cache[int(k_idx)] = k_state
-        has_any, is_full = _interval_block_state(q_state=q_state, k_state=k_state)
-        partial_blocks[q_idx, k_idx] = bool(has_any and not is_full)
+        q_valid_row = q_valid[q_idx]
+        intervals = k_intervals(int(k_idx))
+        has_any = False
+        if bool(q_valid_row.any()) and intervals:
+            q_abs_row = q_abs_blocks[q_idx]
+            q_enter_row = q_enter_blocks[q_idx]
+            for enter, exit, min_abs in intervals:
+                in_subtree = q_valid_row & (q_enter_row >= enter) & (q_enter_row < exit)
+                if bool(in_subtree.any()) and int(q_abs_row[in_subtree].max()) >= int(
+                    min_abs
+                ):
+                    has_any = True
+                    break
+        is_full = (
+            has_any
+            and bool(q_all_valid[q_idx])
+            and bool(k_all_valid[k_idx])
+            and int(q_min_abs[q_idx]) >= int(k_max_abs[k_idx])
+            and int(k_max_enter[k_idx]) <= int(q_min_enter[q_idx])
+            and int(q_max_enter[q_idx]) < int(k_min_exit[k_idx])
+        )
+        partial_blocks[q_idx, k_idx] = has_any and not is_full
         full_blocks[q_idx, k_idx] = bool(is_full)
 
 
