@@ -8,10 +8,11 @@ import torch
 from art.megatron.trainer_rank import (
     ForwardInput,
     ForwardOutput,
+    TopK,
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
-    _anchor_disconnected_target_logprobs,
+    _anchor_disconnected_outputs,
     _MemoryCheck,
     _validate_top_k,
 )
@@ -371,15 +372,23 @@ def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
     assert plan.output_bytes == target_bytes + topk_bytes + logits_bytes + hidden_bytes
 
 
-def test_disconnected_target_logprobs_keep_zero_graph_anchor() -> None:
+def test_disconnected_outputs_keep_zero_graph_anchor() -> None:
     hidden = torch.randn(2, 3, requires_grad=True)
     disconnected = torch.zeros(4)
+    top_k = TopK(logprobs=torch.zeros(4, 2), tokens=torch.ones(4, 2, dtype=torch.long))
 
-    (anchored,) = _anchor_disconnected_target_logprobs([disconnected], hidden)
+    (anchored,), (anchored_top_k,) = _anchor_disconnected_outputs(
+        [disconnected],
+        [top_k],
+        hidden,
+    )
 
     assert anchored is not None
     assert anchored.requires_grad
+    assert anchored_top_k is not None
+    assert anchored_top_k.logprobs.requires_grad
     torch.testing.assert_close(anchored, disconnected)
-    anchored.sum().backward()
+    torch.testing.assert_close(anchored_top_k.logprobs, top_k.logprobs)
+    (anchored.sum() + anchored_top_k.logprobs.sum()).backward()
     assert hidden.grad is not None
     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))

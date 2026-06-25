@@ -624,23 +624,26 @@ class TrainerRank:
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
         if checkpoints is not None:
-            unknown = set(checkpoints) - self._checkpoint_slot_params_by_name.keys()
-            if unknown:
+            if (
+                unknown := set(checkpoints)
+                - self._checkpoint_slot_params_by_name.keys()
+            ):
                 raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
             return tuple(dict.fromkeys(checkpoints))
-        names = []
-        for name, params in sorted(self._checkpoint_slot_params_by_name.items()):
-            local_has_grad = any(param.grad is not None for param in params)
-            has_grad = torch.tensor(
-                int(local_has_grad),
-                device=self.device,
-                dtype=torch.int32,
-            )
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(has_grad, op=dist.ReduceOp.MAX)
-            if bool(has_grad.item()):
-                names.append(name)
-        return tuple(names)
+        slots = tuple(sorted(self._checkpoint_slot_params_by_name.items()))
+        if not slots:
+            return ()
+        has_grad = torch.tensor(
+            [
+                int(any(param.grad is not None for param in params))
+                for _, params in slots
+            ],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(has_grad, op=dist.ReduceOp.MAX)
+        return tuple(name for (name, _), flag in zip(slots, has_grad.tolist()) if flag)
 
     def _dynamic_optim_step(
         self,
@@ -1455,7 +1458,10 @@ class TrainerRank:
                     dtype=torch.float32,
                 )
                 if item.request.top_k is None and not item.request.logits:
-                    valid_offsets = _valid_target_offsets(labels)
+                    valid = labels != -100
+                    if labels.ndim > 1:
+                        valid = valid.reshape(int(labels.shape[0]), -1).any(dim=1)
+                    valid_offsets = torch.nonzero(valid, as_tuple=False).reshape(-1)
                     if int(valid_offsets.numel()):
                         local_rows.append(positions.index_select(0, valid_offsets))
             if item.request.logits:
@@ -1513,11 +1519,11 @@ class TrainerRank:
                 label_rows=label_rows,
             )
 
-        target_logprobs = _anchor_disconnected_target_logprobs(
+        target_logprobs, top_k = _anchor_disconnected_outputs(
             target_logprobs,
+            top_k,
             hidden_by_row,
         )
-        top_k = _anchor_disconnected_topk(top_k, hidden_by_row)
         return [
             ForwardOutput(
                 target_logprobs=target_logprobs[index],
@@ -1576,7 +1582,8 @@ class TrainerRank:
                 if item_logprobs is not None and labels is not None:
                     if log_z is None:
                         raise RuntimeError("target logprobs require logsumexp")
-                    item_logprobs[offsets] = _target_logprobs_from_full_logits(
+                    item_logprobs[offsets] = _call_compiled(
+                        _target_logprobs_from_full_logits,
                         selected_logits,
                         labels.index_select(0, offsets),
                         log_z.index_select(0, chunk_offsets),
@@ -1585,13 +1592,14 @@ class TrainerRank:
                 if k is not None:
                     if log_z is None:
                         raise RuntimeError("top_k requires logsumexp")
+                    values, tokens = torch.topk(selected_logits.float(), k=k, dim=-1)
                     top_k[index] = _merge_topk(
                         top_k[index],
                         offsets,
-                        _topk_from_full_logits(
-                            selected_logits,
-                            k=k,
-                            log_z=log_z.index_select(0, chunk_offsets),
+                        TopK(
+                            logprobs=values
+                            - log_z.index_select(0, chunk_offsets).unsqueeze(1),
+                            tokens=tokens,
                         ),
                         length=int(positions.numel()),
                     )
@@ -1610,7 +1618,6 @@ class TrainerRank:
         label_rows: list[torch.Tensor | None],
     ) -> None:
         model = _language_model(self.runtime.model[0])
-        use_fused_target_ce = _can_use_fused_target_ce(items, label_rows)
         fused_target_labels = (
             _consistent_row_labels(
                 label_rows,
@@ -1618,7 +1625,8 @@ class TrainerRank:
                 row_count=int(rows.numel()),
                 device=rows.device,
             )
-            if use_fused_target_ce
+            if all(item.request.top_k is None for item in items)
+            and all(labels is None or labels.ndim == 1 for labels in label_rows)
             else None
         )
         if fused_target_labels is not None:
@@ -1667,16 +1675,9 @@ class TrainerRank:
                 if topk_stats is None
                 else None
             )
-            if topk_stats is not None:
-                local_max, local_sum, _, _ = topk_stats
-                local_max = local_max.detach()
-                global_max = _all_reduce_tensor_parallel_max(local_max)
-                global_sum = _all_reduce_tensor_parallel_sum(
-                    local_sum * torch.exp(local_max - global_max)
-                )
-                log_z = global_max + torch.log(global_sum)
-            elif logsumexp_stats is not None:
-                local_max, local_sum = logsumexp_stats
+            stats = topk_stats if topk_stats is not None else logsumexp_stats
+            if stats is not None:
+                local_max, local_sum = stats[:2]
                 local_max = local_max.detach()
                 global_max = _all_reduce_tensor_parallel_max(local_max)
                 global_sum = _all_reduce_tensor_parallel_sum(
@@ -1686,11 +1687,14 @@ class TrainerRank:
             else:
                 log_z = _vocab_parallel_log_z(local_logits)
 
-            logits_topk: tuple[torch.Tensor, torch.Tensor] | None = None
-            if logsumexp_stats is not None and max_top_k > 0:
+            local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
+            if topk_stats is not None:
+                _, _, local_values, local_tokens = topk_stats
+                local_topk = (local_values, local_tokens)
+            elif logsumexp_stats is not None and max_top_k > 0:
                 local_k = min(max_top_k, int(local_logits.shape[1]))
                 local_values, local_tokens = torch.topk(local_logits, k=local_k, dim=-1)
-                logits_topk = (local_values.float(), local_tokens)
+                local_topk = (local_values.float(), local_tokens)
 
             for index, item in enumerate(items):
                 if item.request.logits:
@@ -1714,23 +1718,8 @@ class TrainerRank:
                     )
                 k = item.request.top_k
                 if k is not None:
-                    if topk_stats is not None:
-                        _, _, local_values, local_tokens = topk_stats
-                        top_k[index] = _merge_topk(
-                            top_k[index],
-                            offsets,
-                            _vocab_parallel_topk_from_local(
-                                local_values.index_select(0, chunk_offsets),
-                                local_tokens.index_select(0, chunk_offsets),
-                                k=k,
-                                log_z=selected_log_z,
-                                vocab_start=_vocab_range(local_logits)[0],
-                            ),
-                            length=item_lengths[index],
-                        )
-                        continue
-                    if logits_topk is not None:
-                        local_values, local_tokens = logits_topk
+                    if local_topk is not None:
+                        local_values, local_tokens = local_topk
                         top_k[index] = _merge_topk(
                             top_k[index],
                             offsets,
@@ -2118,14 +2107,6 @@ def _target_logprobs_from_full_logits(
     labels: torch.Tensor,
     log_z: torch.Tensor,
 ) -> torch.Tensor:
-    return _call_compiled(_target_logprobs_from_full_logits_impl, logits, labels, log_z)
-
-
-def _target_logprobs_from_full_logits_impl(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    log_z: torch.Tensor,
-) -> torch.Tensor:
     flat_labels = labels.clamp_min(0).reshape(int(labels.shape[0]), -1)
     target_logits = logits.gather(1, flat_labels).float().reshape(labels.shape)
     return _finish_target_logprobs(target_logits, labels, log_z)
@@ -2136,58 +2117,18 @@ def _vocab_parallel_target_logprobs(
     labels: torch.Tensor,
     log_z: torch.Tensor,
     *,
-    row_offsets: torch.Tensor | None = None,
-) -> torch.Tensor:
-    target_logits = _vocab_parallel_target_logits(
-        local_logits,
-        labels,
-        row_offsets=row_offsets,
-    )
-    return _call_compiled(_finish_target_logprobs, target_logits, labels, log_z)
-
-
-def _vocab_parallel_target_logits(
-    local_logits: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    row_offsets: torch.Tensor | None = None,
+    row_offsets: torch.Tensor,
 ) -> torch.Tensor:
     start, _ = _vocab_range(local_logits)
-    if row_offsets is None:
-        local_target_logits = _call_compiled(
-            _owned_target_logits,
-            local_logits,
-            labels,
-            start,
-        )
-    else:
-        local_target_logits = _call_compiled(
-            _owned_target_logits_for_rows,
-            local_logits,
-            labels,
-            start,
-            row_offsets,
-        )
-    return _all_reduce_tensor_parallel_sum(local_target_logits)
-
-
-def _owned_target_logits(
-    local_logits: torch.Tensor,
-    labels: torch.Tensor,
-    vocab_start: int,
-) -> torch.Tensor:
-    flat_labels = labels.reshape(int(labels.shape[0]), -1)
-    local_labels = flat_labels - vocab_start
-    owns_label = (
-        (flat_labels != -100)
-        & (local_labels >= 0)
-        & (local_labels < int(local_logits.shape[1]))
+    target_logits = _call_compiled(
+        _owned_target_logits_for_rows,
+        local_logits,
+        labels,
+        start,
+        row_offsets,
     )
-    selected = local_logits.gather(
-        1,
-        local_labels.clamp(0, int(local_logits.shape[1]) - 1),
-    ).float()
-    return selected.masked_fill(~owns_label, 0.0).reshape(labels.shape)
+    target_logits = _all_reduce_tensor_parallel_sum(target_logits)
+    return _call_compiled(_finish_target_logprobs, target_logits, labels, log_z)
 
 
 def _owned_target_logits_for_rows(
@@ -2218,24 +2159,6 @@ def _finish_target_logprobs(
 ) -> torch.Tensor:
     log_z = log_z.reshape(int(log_z.shape[0]), *((1,) * (int(labels.ndim) - 1)))
     return (target_logits.float() - log_z).masked_fill(labels == -100, 0.0)
-
-
-def _valid_target_offsets(labels: torch.Tensor) -> torch.Tensor:
-    if int(labels.shape[0]) == 0:
-        return torch.empty(0, dtype=torch.long, device=labels.device)
-    valid = labels != -100
-    if labels.ndim > 1:
-        valid = valid.reshape(int(labels.shape[0]), -1).any(dim=1)
-    return torch.nonzero(valid, as_tuple=False).reshape(-1)
-
-
-def _can_use_fused_target_ce(
-    items: Sequence[_ForwardItem],
-    label_rows: Sequence[torch.Tensor | None],
-) -> bool:
-    return all(item.request.top_k is None for item in items) and all(
-        labels is None or labels.ndim == 1 for labels in label_rows
-    )
 
 
 def _consistent_row_labels(
@@ -2296,61 +2219,38 @@ def _scatter_row_target_logprobs(
         )
 
 
-def _anchor_disconnected_target_logprobs(
+def _anchor_disconnected_outputs(
     target_logprobs: list[torch.Tensor | None],
-    hidden_by_row: torch.Tensor,
-) -> list[torch.Tensor | None]:
-    if not hidden_by_row.requires_grad:
-        return target_logprobs
-    anchor: torch.Tensor | None = None
-    anchored: list[torch.Tensor | None] = []
-    for item_logprobs in target_logprobs:
-        if item_logprobs is None or item_logprobs.requires_grad:
-            anchored.append(item_logprobs)
-            continue
-        if anchor is None:
-            anchor = _zero_graph_anchor(hidden_by_row)
-        anchored.append(item_logprobs + anchor)
-    return anchored
-
-
-def _anchor_disconnected_topk(
     top_k: list[TopK | None],
     hidden_by_row: torch.Tensor,
-) -> list[TopK | None]:
+) -> tuple[list[torch.Tensor | None], list[TopK | None]]:
     if not hidden_by_row.requires_grad:
-        return top_k
+        return target_logprobs, top_k
     anchor: torch.Tensor | None = None
-    anchored: list[TopK | None] = []
-    for item_top_k in top_k:
-        if item_top_k is None or item_top_k.logprobs.requires_grad:
-            anchored.append(item_top_k)
-            continue
+
+    def anchor_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal anchor
+        if tensor.requires_grad:
+            return tensor
         if anchor is None:
-            anchor = _zero_graph_anchor(hidden_by_row)
-        anchored.append(
-            TopK(
-                logprobs=item_top_k.logprobs + anchor,
+            anchor = hidden_by_row.reshape(-1)[:1].float().sum() * 0.0
+        return tensor + anchor
+
+    return (
+        [
+            None if item_logprobs is None else anchor_tensor(item_logprobs)
+            for item_logprobs in target_logprobs
+        ],
+        [
+            None
+            if item_top_k is None
+            else TopK(
+                logprobs=anchor_tensor(item_top_k.logprobs),
                 tokens=item_top_k.tokens,
             )
-        )
-    return anchored
-
-
-def _zero_graph_anchor(hidden_by_row: torch.Tensor) -> torch.Tensor:
-    return hidden_by_row.reshape(-1)[:1].float().sum() * 0.0
-
-
-def _topk_from_full_logits(
-    logits: torch.Tensor,
-    *,
-    k: int,
-    log_z: torch.Tensor,
-) -> TopK:
-    if k > int(logits.shape[1]):
-        raise ValueError(f"top_k={k} exceeds vocabulary size {int(logits.shape[1])}")
-    values, tokens = torch.topk(logits.float(), k=k, dim=-1)
-    return TopK(logprobs=values - log_z.unsqueeze(1), tokens=tokens)
+            for item_top_k in top_k
+        ],
+    )
 
 
 def _vocab_parallel_topk(
