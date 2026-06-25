@@ -140,7 +140,6 @@ GEMMA4_MOE_SPEC = ModelSupportSpec(
     model_names=(
         "google/gemma-4-26B-A4B",
         "google/gemma-4-26B-A4B-it",
-        "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
     ),
     default_target_modules=_GEMMA4_MOE_TARGET_MODULES,
     native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
@@ -156,7 +155,6 @@ GEMMA4_DENSE_SPEC = ModelSupportSpec(
     model_names=(
         "google/gemma-4-31B",
         "google/gemma-4-31B-it",
-        "google/gemma-4-31B-it-qat-q4_0-unquantized",
     ),
     default_target_modules=_DENSE_TARGET_MODULES,
     native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
