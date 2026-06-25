@@ -167,9 +167,15 @@ def _prefix_segments(
 
     def shared_end(indices: tuple[int, ...], start: int) -> int:
         end = min(lengths[index] for index in indices)
+        low = high = rows[indices[0]]
+        for index in indices[1:]:
+            row = rows[index]
+            if row < low:
+                low = row
+            elif row > high:
+                high = row
         while start < end:
-            token = rows[indices[0]][start]
-            if any(rows[index][start] != token for index in indices[1:]):
+            if low[start] != high[start]:
                 break
             start += 1
         return start
