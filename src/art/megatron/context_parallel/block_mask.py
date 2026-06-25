@@ -178,26 +178,32 @@ def _build_k_block_state(
     valid_abs = abs_block[valid]
     valid_enter = enter_block[valid]
     valid_exit = exit_block[valid]
-    min_abs_by_interval: dict[tuple[int, int], int] = {}
-    for abs_value, enter_value, exit_value in zip(
-        valid_abs,
-        valid_enter,
-        valid_exit,
-        strict=True,
+    if bool(
+        (valid_enter == valid_enter[0]).all() and (valid_exit == valid_exit[0]).all()
     ):
-        interval = (int(enter_value), int(exit_value))
-        prior = min_abs_by_interval.get(interval)
-        min_abs_by_interval[interval] = (
-            int(abs_value) if prior is None else min(prior, int(abs_value))
+        intervals = ((int(valid_enter[0]), int(valid_exit[0]), int(valid_abs.min())),)
+    else:
+        min_abs_by_interval: dict[tuple[int, int], int] = {}
+        for abs_value, enter_value, exit_value in zip(
+            valid_abs,
+            valid_enter,
+            valid_exit,
+            strict=True,
+        ):
+            interval = (int(enter_value), int(exit_value))
+            prior = min_abs_by_interval.get(interval)
+            min_abs_by_interval[interval] = (
+                int(abs_value) if prior is None else min(prior, int(abs_value))
+            )
+        intervals = tuple(
+            (enter, exit, min_abs)
+            for (enter, exit), min_abs in min_abs_by_interval.items()
         )
     return _KBlockState(
         max_abs=int(valid_abs.max()),
         max_enter=int(valid_enter.max()),
         min_exit=int(valid_exit.min()),
-        intervals=tuple(
-            (enter, exit, min_abs)
-            for (enter, exit), min_abs in min_abs_by_interval.items()
-        ),
+        intervals=intervals,
         all_valid=all_valid,
     )
 
@@ -250,10 +256,117 @@ def _refine_interval_blocks(
     q_block: int,
     k_block: int,
 ) -> None:
-    candidate_blocks = partial_blocks | full_blocks
+    if not bool((partial_blocks | full_blocks).any()):
+        return
+
+    q_abs_blocks = _block_matrix(
+        q_abs,
+        block_size=q_block,
+        block_count=int(partial_blocks.shape[0]),
+        fill_value=_INVALID_ABS,
+    )
+    q_enter_blocks = _block_matrix(
+        q_enter,
+        block_size=q_block,
+        block_count=int(partial_blocks.shape[0]),
+        fill_value=_INVALID_ENTER,
+    )
+    k_abs_blocks = _block_matrix(
+        k_abs,
+        block_size=k_block,
+        block_count=int(partial_blocks.shape[1]),
+        fill_value=_INVALID_ABS,
+    )
+    k_enter_blocks = _block_matrix(
+        k_enter,
+        block_size=k_block,
+        block_count=int(partial_blocks.shape[1]),
+        fill_value=_INVALID_ENTER,
+    )
+    k_exit_blocks = _block_matrix(
+        k_exit,
+        block_size=k_block,
+        block_count=int(partial_blocks.shape[1]),
+        fill_value=_INVALID_EXIT,
+    )
+
+    q_valid = (q_abs_blocks >= 0) & (q_enter_blocks >= 0)
+    k_valid = (
+        (k_abs_blocks >= 0) & (k_enter_blocks >= 0) & (k_exit_blocks > k_enter_blocks)
+    )
+    q_all_valid = q_valid.all(axis=1)
+    k_all_valid = k_valid.all(axis=1)
+    q_min_abs = np.where(q_valid, q_abs_blocks, np.iinfo(np.int64).max).min(axis=1)
+    q_min_enter = np.where(
+        q_valid,
+        q_enter_blocks,
+        np.iinfo(np.int64).max,
+    ).min(axis=1)
+    q_max_enter = np.where(q_valid, q_enter_blocks, _INVALID_ENTER).max(axis=1)
+    k_max_abs = np.where(k_valid, k_abs_blocks, _INVALID_ABS).max(axis=1)
+    k_max_enter = np.where(k_valid, k_enter_blocks, _INVALID_ENTER).max(axis=1)
+    k_min_exit = np.where(k_valid, k_exit_blocks, np.iinfo(np.int64).max).min(axis=1)
+    safe_full = (
+        q_all_valid[:, None]
+        & k_all_valid[None, :]
+        & (q_min_abs[:, None] >= k_max_abs[None, :])
+        & (k_max_enter[None, :] <= q_min_enter[:, None])
+        & (q_max_enter[:, None] < k_min_exit[None, :])
+    )
+    candidate_blocks = partial_blocks | (full_blocks & ~safe_full)
+    q_indices, k_indices = np.nonzero(candidate_blocks)
+    if int(q_indices.size) == 0:
+        return
+
+    rows = np.arange(int(k_valid.shape[0]))
+    first_valid_offsets = k_valid.argmax(axis=1)
+    first_enter = k_enter_blocks[rows, first_valid_offsets]
+    first_exit = k_exit_blocks[rows, first_valid_offsets]
+    k_single_interval = k_valid.any(axis=1) & (
+        (~k_valid)
+        | (
+            (k_enter_blocks == first_enter[:, None])
+            & (k_exit_blocks == first_exit[:, None])
+        )
+    ).all(axis=1)
+
+    single_pair = k_single_interval[k_indices]
+    if bool(single_pair.any()):
+        single_q = q_indices[single_pair]
+        single_k = k_indices[single_pair]
+        q_abs_selected = q_abs_blocks[single_q]
+        q_enter_selected = q_enter_blocks[single_q]
+        in_subtree = (
+            q_valid[single_q]
+            & (q_enter_selected >= first_enter[single_k, None])
+            & (q_enter_selected < first_exit[single_k, None])
+        )
+        max_abs_in_subtree = np.where(
+            in_subtree,
+            q_abs_selected,
+            _INVALID_ABS,
+        ).max(axis=1)
+        k_min_abs = np.where(k_valid, k_abs_blocks, np.iinfo(np.int64).max).min(axis=1)
+        has_any = max_abs_in_subtree >= k_min_abs[single_k]
+
+        is_full = (
+            has_any
+            & q_all_valid[single_q]
+            & k_all_valid[single_k]
+            & (q_min_abs[single_q] >= k_max_abs[single_k])
+            & (first_enter[single_k] <= q_min_enter[single_q])
+            & (q_max_enter[single_q] < first_exit[single_k])
+        )
+        partial_blocks[single_q, single_k] = has_any & ~is_full
+        full_blocks[single_q, single_k] = is_full
+
     q_state_cache: dict[int, _QBlockState] = {}
     k_state_cache: dict[int, _KBlockState] = {}
-    for q_idx, k_idx in np.argwhere(candidate_blocks):
+    for q_idx, k_idx in zip(
+        q_indices[~single_pair],
+        k_indices[~single_pair],
+        strict=True,
+    ):
         q_state = q_state_cache.get(int(q_idx))
         if q_state is None:
             q_state = _build_q_block_state(
@@ -294,6 +407,18 @@ def _block_min_max(
         mins[index] = block.min()
         maxes[index] = block.max()
     return mins, maxes
+
+
+def _block_matrix(
+    values: np.ndarray,
+    *,
+    block_size: int,
+    block_count: int,
+    fill_value: int,
+) -> np.ndarray:
+    padded = np.full(block_count * block_size, fill_value, dtype=np.int64)
+    padded[: int(values.size)] = values
+    return padded.reshape(block_count, block_size)
 
 
 def _build_group_interval_arrays(
@@ -348,6 +473,7 @@ def _build_sparse_block_mask(
     k_blocks = (int(spec.k_len) + k_block - 1) // k_block
     partial_blocks = np.zeros((q_blocks, k_blocks), dtype=bool)
     full_blocks = np.zeros((q_blocks, k_blocks), dtype=bool)
+    touch_counts = np.zeros((q_blocks, k_blocks), dtype=np.int16)
     q_abs_tensor = spec.exact_mask.q_token_indices.detach().to(
         device="cpu",
         dtype=torch.int64,
@@ -455,21 +581,28 @@ def _build_sparse_block_mask(
 
         q_slice = slice(int(q_block_indices[0]), int(q_block_indices[-1]) + 1)
         k_slice = slice(int(k_block_indices[0]), int(k_block_indices[-1]) + 1)
+        touch_counts[q_slice, k_slice] += has_any.astype(np.int16)
         partial_blocks[q_slice, k_slice] |= has_any
         full_blocks[q_slice, k_slice] |= is_full
 
     partial_blocks &= ~full_blocks
-    _refine_interval_blocks(
-        partial_blocks=partial_blocks,
-        full_blocks=full_blocks,
-        q_abs=q_abs,
-        k_abs=k_abs,
-        q_enter=q_enter,
-        k_enter=k_enter,
-        k_exit=k_exit,
-        q_block=q_block,
-        k_block=k_block,
-    )
+    needs_refine = full_blocks | ((touch_counts > 1) & partial_blocks)
+    if bool(needs_refine.any()):
+        refined_partial = partial_blocks & needs_refine
+        refined_full = full_blocks & needs_refine
+        _refine_interval_blocks(
+            partial_blocks=refined_partial,
+            full_blocks=refined_full,
+            q_abs=q_abs,
+            k_abs=k_abs,
+            q_enter=q_enter,
+            k_enter=k_enter,
+            k_exit=k_exit,
+            q_block=q_block,
+            k_block=k_block,
+        )
+        partial_blocks = (partial_blocks & ~needs_refine) | refined_partial
+        full_blocks = (full_blocks & ~needs_refine) | refined_full
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
         device=device,
