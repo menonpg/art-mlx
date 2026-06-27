@@ -10,8 +10,8 @@ from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
 from ..utils.output_dirs import get_model_dir
 from .optimizer_state import (
-    ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
-    resolve_megatron_resume_step,
+    format_megatron_resume_message,
+    prepare_megatron_resume_state,
 )
 from .runtime_config import get_megatron_runtime_config
 
@@ -32,6 +32,7 @@ class MegatronBackend(LocalBackend):
         self._requires_explicit_packed_sequence_length = True
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
+        self._resume_prepared_models: set[str] = set()
 
     async def train(
         self,
@@ -80,25 +81,16 @@ class MegatronBackend(LocalBackend):
     async def _get_step(self, model: AnyTrainableModel) -> int:
         if not model.trainable:
             return 0
+        if model.name in self._resume_prepared_models:
+            return await super()._get_step(model)
         output_dir = get_model_dir(model=model, art_path=self._path)
-        info = resolve_megatron_resume_step(
+        info = prepare_megatron_resume_state(
             output_dir=output_dir,
             optimizer_state_path=f"{output_dir}/optimizer_states_rl",
         )
-        if info.used_unpaired_override:
-            print(
-                "Resuming Megatron from unpaired LoRA checkpoint "
-                f"{info.step} because {ALLOW_UNPAIRED_MEGATRON_RESUME_ENV} is set"
-            )
-        elif info.step != info.latest_lora_step:
-            print(
-                "Resuming Megatron from paired LoRA/optimizer checkpoint "
-                f"{info.step} instead of latest LoRA checkpoint "
-                f"{info.latest_lora_step}"
-            )
-        else:
-            print(f"Resuming Megatron from checkpoint {info.step}")
-        return info.step
+        print(format_megatron_resume_message(info))
+        self._resume_prepared_models.add(model.name)
+        return await super()._get_step(model)
 
     def _default_sft_batch_size(self) -> int:
         import torch

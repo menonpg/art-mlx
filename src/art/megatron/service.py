@@ -42,9 +42,9 @@ from .model_support.registry import (
     model_uses_expert_parallel,
 )
 from .optimizer_state import (
-    ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
     MegatronResumeStep,
-    resolve_megatron_resume_step,
+    format_megatron_resume_message,
+    prepare_megatron_resume_state,
 )
 from .runtime.client import (
     create_megatron_job_paths,
@@ -196,6 +196,7 @@ class MegatronService:
     )
     _is_sleeping: bool = False
     _latest_step: int = 0
+    _resume_step: MegatronResumeStep | None = None
     _megatron_process: asyncio.subprocess.Process | None = None
     _megatron_log_file: Any = None
     _megatron_log_path: str | None = None
@@ -464,23 +465,14 @@ class MegatronService:
         return optimizer_state_path
 
     def _resolve_resume_step(self) -> MegatronResumeStep:
-        info = resolve_megatron_resume_step(
+        if self._resume_step is not None:
+            return self._resume_step
+        info = prepare_megatron_resume_state(
             output_dir=self.output_dir,
             optimizer_state_path=self._get_optimizer_state_path("rl"),
         )
-        if info.used_unpaired_override:
-            self._status(
-                "Resuming Megatron from unpaired LoRA checkpoint "
-                f"{info.step} because {ALLOW_UNPAIRED_MEGATRON_RESUME_ENV} is set"
-            )
-        elif info.step != info.latest_lora_step:
-            self._status(
-                "Resuming Megatron from paired LoRA/optimizer checkpoint "
-                f"{info.step} instead of latest LoRA checkpoint "
-                f"{info.latest_lora_step}"
-            )
-        else:
-            self._status(f"Resuming Megatron from checkpoint {info.step}")
+        self._resume_step = info
+        self._status(format_megatron_resume_message(info))
         return info
 
     def _default_lora_adapter_config(self) -> LoraConfig:
