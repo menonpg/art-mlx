@@ -268,6 +268,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 tg.create_task(self._eval_stage(), name="eval_stage")
                 tg.create_task(self._status_loop(), name="status_loop")
         except* Exception as eg:
+            self.request_stop()
             for exc in eg.exceptions:
                 if not isinstance(exc, asyncio.CancelledError):
                     print(f"Pipeline stage failed: {exc}")

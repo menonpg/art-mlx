@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import gc
 import hashlib
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 logger = logging.getLogger(__name__)
+_SERVICE_CLOSE_TIMEOUT_SECONDS = 20.0
 
 _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
@@ -328,14 +330,25 @@ class LocalBackend(Backend):
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
         for service in self._services.values():
-            aclose = getattr(service, "aclose", None)
-            if aclose is None:
-                close = getattr(service, "close", None)
-                if close is not None:
-                    close()
-            else:
-                await aclose()
-            close_proxy(service)
+            try:
+                aclose = getattr(service, "aclose", None)
+                if aclose is None:
+                    close = getattr(service, "close", None)
+                    if close is not None:
+                        close()
+                else:
+                    await asyncio.wait_for(
+                        aclose(), timeout=_SERVICE_CLOSE_TIMEOUT_SECONDS
+                    )
+            except TimeoutError:
+                logger.warning("Timed out while closing local backend service.")
+            except Exception:
+                logger.exception("Failed to close local backend service.")
+            finally:
+                try:
+                    close_proxy(service)
+                except Exception:
+                    logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
         gc.collect()
@@ -345,10 +358,17 @@ class LocalBackend(Backend):
 
     def _close(self) -> None:
         for service in self._services.values():
-            close = getattr(service, "close", None)
-            if close is not None:
-                close()
-            close_proxy(service)
+            try:
+                close = getattr(service, "close", None)
+                if close is not None:
+                    close()
+            except Exception:
+                logger.exception("Failed to close local backend service.")
+            finally:
+                try:
+                    close_proxy(service)
+                except Exception:
+                    logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
         gc.collect()
