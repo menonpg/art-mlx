@@ -63,6 +63,7 @@ from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .dev import LoRAConfig
+from .errors import LocalServingUnavailableError
 from .gather import gather_trajectories, gather_trajectory_groups
 from .megatron.runtime_config import (
     get_megatron_runtime_config,
@@ -96,6 +97,7 @@ __all__ = [
     "Backend",
     "LocalTrainResult",
     "LoRAConfig",
+    "LocalServingUnavailableError",
     "MegatronRuntimeConfig",
     "MegatronTopologyConfig",
     "get_megatron_runtime_config",

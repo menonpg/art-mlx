@@ -5,16 +5,18 @@ import json
 import os
 import time
 from typing import TYPE_CHECKING, Any, Generic, Iterable, Optional, cast, overload
+from urllib.parse import urlparse
 import warnings
 
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import APIConnectionError, AsyncOpenAI, DefaultAsyncHttpxClient
 import polars as pl
 from pydantic import BaseModel
 from typing_extensions import Never, TypeVar
 
 from . import dev
 from .costs import CostCalculator
+from .errors import LocalServingUnavailableError
 from .metrics import MetricsBuilder, is_builder_managed_metric
 from .metrics_taxonomy import (
     SFT_GRADIENT_STEP_KEY,
@@ -42,6 +44,7 @@ ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
+LOCAL_INFERENCE_HOSTS = frozenset({"127.0.0.1", "0.0.0.0", "::1", "localhost"})
 
 
 def _merge_extra_body_defaults(
@@ -86,16 +89,28 @@ def _attach_response_art_metadata(response: Any) -> None:
         )
 
 
+def _is_local_inference_base_url(base_url: str | None) -> bool:
+    if base_url is None:
+        return False
+    try:
+        hostname = urlparse(base_url).hostname
+    except ValueError:
+        return False
+    return hostname in LOCAL_INFERENCE_HOSTS
+
+
 class _OpenAIChatCompletionsProxy:
     def __init__(
         self,
         completions: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
+        local_serving_base_url: str | None = None,
     ) -> None:
         self._completions = completions
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
+        self._local_serving_base_url = local_serving_base_url
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
         if self._default_extra_body is not None:
@@ -103,7 +118,16 @@ class _OpenAIChatCompletionsProxy:
                 self._default_extra_body,
                 kwargs.get("extra_body"),
             )
-        response = await self._completions.create(*args, **kwargs)
+        try:
+            response = await self._completions.create(*args, **kwargs)
+        except APIConnectionError as exc:
+            if self._local_serving_base_url is not None:
+                raise LocalServingUnavailableError(
+                    "ART-managed local inference endpoint became unreachable "
+                    f"at {self._local_serving_base_url}. Aborting training instead "
+                    "of counting rollouts as data errors."
+                ) from exc
+            raise
         _attach_response_art_metadata(response)
         self._record_costs(response)
         return response
@@ -118,12 +142,14 @@ class _OpenAIChatProxy:
         chat: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
+        local_serving_base_url: str | None = None,
     ) -> None:
         self._chat = chat
         self.completions = _OpenAIChatCompletionsProxy(
             chat.completions,
             record_costs,
             default_extra_body,
+            local_serving_base_url,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -136,17 +162,25 @@ class _OpenAIClientProxy:
         client: Any,
         record_costs: Any,
         default_extra_body: dict[str, Any] | None = None,
+        local_serving_base_url: str | None = None,
     ) -> None:
         self._client = client
         self._record_costs = record_costs
         self._default_extra_body = default_extra_body
-        self.chat = _OpenAIChatProxy(client.chat, record_costs, default_extra_body)
+        self._local_serving_base_url = local_serving_base_url
+        self.chat = _OpenAIChatProxy(
+            client.chat,
+            record_costs,
+            default_extra_body,
+            local_serving_base_url,
+        )
 
     def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
         return _OpenAIClientProxy(
             self._client.with_options(*args, **kwargs),
             self._record_costs,
             self._default_extra_body,
+            self._local_serving_base_url,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -391,6 +425,12 @@ class Model(
                 raw_client,
                 self._record_openai_completion_costs,
                 self._default_chat_completion_extra_body(),
+                (
+                    self.inference_base_url
+                    if self.trainable
+                    and _is_local_inference_base_url(self.inference_base_url)
+                    else None
+                ),
             ),
         )
         return self._openai_client

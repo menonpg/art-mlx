@@ -17,6 +17,7 @@ T = TypeVar("T")
 
 import art
 from art import TrajectoryGroup
+from art.errors import LocalServingUnavailableError
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -64,6 +65,9 @@ def make_group_rollout_fn(
             *[single_rollout_fn(model, scenario, config) for _ in range(n)],
             return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, LocalServingUnavailableError):
+                raise result
         return TrajectoryGroup(results)
 
     return group_rollout
@@ -515,6 +519,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
                 group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
             except asyncio.CancelledError:
+                raise
+            except LocalServingUnavailableError:
                 raise
             except Exception as exc:
                 errored = True
