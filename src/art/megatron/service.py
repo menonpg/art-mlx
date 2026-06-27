@@ -1157,7 +1157,7 @@ class MegatronService:
                 staging_lora_path=staging_lora_path,
                 step=next_step,
             )
-        except BaseException:
+        except Exception:
             await self.aclose()
             raise
 
@@ -1226,7 +1226,7 @@ class MegatronService:
                 checkpoint_dir=new_checkpoint_dir,
                 step=next_step,
             )
-        except BaseException:
+        except Exception:
             await self.aclose()
             raise
 
