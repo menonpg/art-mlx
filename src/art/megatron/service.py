@@ -224,7 +224,8 @@ class MegatronService:
         self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
         self._validate_megatron_dependencies()
 
-    def _on_child_process_exit(self, _error: RuntimeError) -> None:
+    def _on_child_process_exit(self, error: RuntimeError) -> None:
+        self._status(f"Child process exited unexpectedly: {error}")
         self.close()
 
     def _raise_if_child_failed(self) -> None:
@@ -556,15 +557,19 @@ class MegatronService:
             nccl_so_path=self._vllm_nccl_so_path,
         )
 
-    def _resolve_active_lora_path(self) -> str:
+    def _resolve_current_lora_path(self) -> str:
         resume_step = self._resolve_resume_step()
-        self._latest_step = resume_step.step
-        lora_path = get_step_checkpoint_dir(self.output_dir, resume_step.step)
-        if resume_step.step == 0 and not os.path.exists(lora_path):
+        if self._latest_step < resume_step.step:
+            self._latest_step = resume_step.step
+        lora_path = get_step_checkpoint_dir(self.output_dir, self._latest_step)
+        if self._latest_step == 0 and not os.path.exists(lora_path):
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
         self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
+
+    def _resolve_active_lora_path(self) -> str:
+        return self._resolve_current_lora_path()
 
     async def _set_served_model_name(self, step: int) -> None:
         import httpx
@@ -892,14 +897,7 @@ class MegatronService:
         )
 
     def _resolve_training_lora_path(self) -> str:
-        resume_step = self._resolve_resume_step()
-        self._latest_step = resume_step.step
-        lora_path = get_step_checkpoint_dir(self.output_dir, resume_step.step)
-        if resume_step.step == 0 and not os.path.exists(lora_path):
-            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-        self._ensure_identity_lora(lora_path)
-        self._ensure_lora_adapter_config(lora_path)
-        return lora_path
+        return self._resolve_current_lora_path()
 
     async def _prepare_for_training(self) -> str:
         self._raise_if_child_failed()
@@ -1158,7 +1156,8 @@ class MegatronService:
                 staging_lora_path=staging_lora_path,
                 step=next_step,
             )
-        except Exception:
+        except Exception as exc:
+            self._status(f"Megatron train failed: {type(exc).__name__}: {exc}")
             await self.aclose()
             raise
 
@@ -1227,7 +1226,8 @@ class MegatronService:
                 checkpoint_dir=new_checkpoint_dir,
                 step=next_step,
             )
-        except Exception:
+        except Exception as exc:
+            self._status(f"Megatron SFT train failed: {type(exc).__name__}: {exc}")
             await self.aclose()
             raise
 
