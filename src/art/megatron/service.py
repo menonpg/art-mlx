@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 import warnings
@@ -23,7 +24,7 @@ from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,
     managed_process_cmd,
-    terminate_asyncio_process_group,
+    terminate_popen_process_group,
 )
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
@@ -197,7 +198,7 @@ class MegatronService:
     _is_sleeping: bool = False
     _latest_step: int = 0
     _resume_step: MegatronResumeStep | None = None
-    _megatron_process: asyncio.subprocess.Process | None = None
+    _megatron_process: subprocess.Popen[Any] | None = None
     _megatron_log_file: Any = None
     _megatron_log_path: str | None = None
     _vllm_runtime: ManagedVllmRuntime = field(
@@ -859,8 +860,8 @@ class MegatronService:
             f"Starting Megatron worker on {num_gpus} GPU(s). "
             f"Logs: {self._display_path(megatron_log_path)}"
         )
-        self._megatron_process = await asyncio.create_subprocess_exec(
-            *managed_process_cmd(command),
+        self._megatron_process = subprocess.Popen(
+            managed_process_cmd(command),
             cwd=str(project_root),
             env=env,
             stdout=self._megatron_log_file,
@@ -868,7 +869,7 @@ class MegatronService:
             start_new_session=True,
         )
         self._install_parent_signal_cleanup()
-        self._child_processes.watch_asyncio_process(
+        self._child_processes.watch_popen(
             "Megatron worker",
             self._megatron_process,
             log_path=megatron_log_path,
@@ -1246,7 +1247,7 @@ class MegatronService:
             self._megatron_log_path = None
             self._active_megatron_topology = None
             return
-        terminate_asyncio_process_group(self._megatron_process)
+        terminate_popen_process_group(self._megatron_process)
         self._megatron_process = None
         self._active_megatron_topology = None
         if self._megatron_log_file is not None:
