@@ -9,6 +9,10 @@ from ..model import TrainableModel
 from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
 from ..utils.output_dirs import get_model_dir
+from .optimizer_state import (
+    ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
+    resolve_megatron_resume_step,
+)
 from .runtime_config import get_megatron_runtime_config
 
 
@@ -72,6 +76,29 @@ class MegatronBackend(LocalBackend):
                     process_name="megatron-service",
                 )
         return self._services[model.name]
+
+    async def _get_step(self, model: AnyTrainableModel) -> int:
+        if not model.trainable:
+            return 0
+        output_dir = get_model_dir(model=model, art_path=self._path)
+        info = resolve_megatron_resume_step(
+            output_dir=output_dir,
+            optimizer_state_path=f"{output_dir}/optimizer_states_rl",
+        )
+        if info.used_unpaired_override:
+            print(
+                "Resuming Megatron from unpaired LoRA checkpoint "
+                f"{info.step} because {ALLOW_UNPAIRED_MEGATRON_RESUME_ENV} is set"
+            )
+        elif info.step != info.latest_lora_step:
+            print(
+                "Resuming Megatron from paired LoRA/optimizer checkpoint "
+                f"{info.step} instead of latest LoRA checkpoint "
+                f"{info.latest_lora_step}"
+            )
+        else:
+            print(f"Resuming Megatron from checkpoint {info.step}")
+        return info.step
 
     def _default_sft_batch_size(self) -> int:
         import torch

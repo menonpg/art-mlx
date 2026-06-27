@@ -16,11 +16,9 @@ import torch
 from .. import dev, types
 from ..dev.get_model_config import default_target_modules
 from ..dev.validate import is_dedicated_mode
-from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..types import MegatronRuntimeConfig, MegatronTopologyConfig
-from ..utils.get_model_step import get_step_from_dir
 from ..utils.lifecycle import (
     ChildProcessSupervisor,
     ServiceLifecycle,
@@ -42,6 +40,11 @@ from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
     model_uses_expert_parallel,
+)
+from .optimizer_state import (
+    ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
+    MegatronResumeStep,
+    resolve_megatron_resume_step,
 )
 from .runtime.client import (
     create_megatron_job_paths,
@@ -460,6 +463,26 @@ class MegatronService:
         os.makedirs(optimizer_state_path, exist_ok=True)
         return optimizer_state_path
 
+    def _resolve_resume_step(self) -> MegatronResumeStep:
+        info = resolve_megatron_resume_step(
+            output_dir=self.output_dir,
+            optimizer_state_path=self._get_optimizer_state_path("rl"),
+        )
+        if info.used_unpaired_override:
+            self._status(
+                "Resuming Megatron from unpaired LoRA checkpoint "
+                f"{info.step} because {ALLOW_UNPAIRED_MEGATRON_RESUME_ENV} is set"
+            )
+        elif info.step != info.latest_lora_step:
+            self._status(
+                "Resuming Megatron from paired LoRA/optimizer checkpoint "
+                f"{info.step} instead of latest LoRA checkpoint "
+                f"{info.latest_lora_step}"
+            )
+        else:
+            self._status(f"Resuming Megatron from checkpoint {info.step}")
+        return info
+
     def _default_lora_adapter_config(self) -> LoraConfig:
         from .model_support import get_model_support_handler
 
@@ -541,12 +564,11 @@ class MegatronService:
         )
 
     def _resolve_active_lora_path(self) -> str:
-        lora_path = get_last_checkpoint_dir(self.output_dir)
-        if lora_path is None:
+        resume_step = self._resolve_resume_step()
+        self._latest_step = resume_step.step
+        lora_path = get_step_checkpoint_dir(self.output_dir, resume_step.step)
+        if resume_step.step == 0 and not os.path.exists(lora_path):
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            self._latest_step = 0
-        else:
-            self._latest_step = get_step_from_dir(self.output_dir)
         self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
@@ -877,10 +899,11 @@ class MegatronService:
         )
 
     def _resolve_training_lora_path(self) -> str:
-        lora_path = get_last_checkpoint_dir(self.output_dir)
-        if lora_path is None:
+        resume_step = self._resolve_resume_step()
+        self._latest_step = resume_step.step
+        lora_path = get_step_checkpoint_dir(self.output_dir, resume_step.step)
+        if resume_step.step == 0 and not os.path.exists(lora_path):
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
-            self._latest_step = 0
         self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
         return lora_path

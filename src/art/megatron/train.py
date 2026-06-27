@@ -43,6 +43,7 @@ from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     load_lora_tensors_for_megatron,
 )
+from art.megatron.optimizer_state import write_optimizer_step_marker
 from art.megatron.provider import (
     ProviderBundle,
     finalize_provider_bundle,
@@ -899,6 +900,10 @@ def _save_lora_and_optimizer(
         final_training_step=final_training_step,
     ):
         _save_optimizer(runtime, optimizer_state_path=optimizer_state_path)
+        if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+            torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
+        if runtime.rank == 0:
+            write_optimizer_step_marker(optimizer_state_path, step)
 
 
 def _should_save_optimizer(
