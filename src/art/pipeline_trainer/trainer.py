@@ -36,6 +36,10 @@ _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 
 
+class _ScenarioSourceExhausted(Exception):
+    pass
+
+
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
@@ -375,7 +379,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             try:
                 scenario = await anext(self._scenario_iter)
             except StopAsyncIteration:
-                return None
+                raise _ScenarioSourceExhausted
             self.state.scenario_offset += 1
             self.state.total_scenarios_consumed += 1
             return scenario
@@ -533,9 +537,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._status.note_rollout_finished(errored=errored)
 
     async def _rollout_stage(self) -> None:
-        async with asyncio.TaskGroup() as tg:
-            for i in range(self.num_rollout_workers):
-                tg.create_task(self._rollout_worker(i))
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for i in range(self.num_rollout_workers):
+                    tg.create_task(self._rollout_worker(i))
+        except* _ScenarioSourceExhausted:
+            print("Scenario source exhausted; stopping training.")
+            self.request_stop()
         if not self.state.done and self._output_queue is not None:
             try:
                 self._output_queue.put_nowait(None)
