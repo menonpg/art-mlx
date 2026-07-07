@@ -11,6 +11,7 @@ Options:
   --infra INFRA          Kubernetes-backed SkyPilot infra (default: k8s/cks-wb3)
   --no-cache             Disable registry-backed BuildKit cache
   --no-prewarm-nodes     Skip pre-pulling the pushed image on GPU nodes
+  --prewarm-infra INFRA  Kubernetes-backed infra to prewarm; repeatable
   --pull-image-repo REPO Image repository for cluster pulls/prewarm
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
   --tag TAG              Image tag to publish
@@ -31,6 +32,12 @@ buildkit_namespace="${KUBECTL_NAMESPACE:-default}"
 buildkit_wait_timeout="${BUILDKIT_WAIT_TIMEOUT:-300s}"
 no_cache="${NO_CACHE:-false}"
 prewarm_nodes="${PREWARM_NODES:-true}"
+prewarm_infras=()
+if [[ -n "${PREWARM_INFRAS:-}" ]]; then
+  while IFS= read -r prewarm_infra; do
+    [[ -n "${prewarm_infra}" ]] && prewarm_infras+=("${prewarm_infra}")
+  done < <(printf '%s\n' "${PREWARM_INFRAS}" | awk 'BEGIN { RS = "[[:space:],]+" } NF { print }')
+fi
 prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
 prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
@@ -69,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       prewarm_nodes=false
       shift
       ;;
+    --prewarm-infra)
+      prewarm_infras+=("$2")
+      shift 2
+      ;;
     --pull-image-repo)
       pull_image_repo="$2"
       shift 2
@@ -93,20 +104,32 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "${infra}" in
-  k8s/*)
-    kube_context="${infra#k8s/}"
-    ;;
-  kubernetes/*)
-    kube_context="${infra#kubernetes/}"
-    ;;
-  *)
-    echo "Unsupported --infra '${infra}'. Use k8s/<kubectl-context>." >&2
-    exit 1
-    ;;
-esac
+kube_context_from_infra() {
+  local infra_value="$1"
+  case "${infra_value}" in
+    k8s/*)
+      printf '%s\n' "${infra_value#k8s/}"
+      ;;
+    kubernetes/*)
+      printf '%s\n' "${infra_value#kubernetes/}"
+      ;;
+    *)
+      echo "Unsupported infra '${infra_value}'. Use k8s/<kubectl-context>." >&2
+      return 1
+      ;;
+  esac
+}
 
-kubectl_cmd=(kubectl --context "${kube_context}")
+kube_context="$(kube_context_from_infra "${infra}")"
+build_kubectl_cmd=(kubectl --context "${kube_context}")
+kubectl_cmd=("${build_kubectl_cmd[@]}")
+if [[ "${#prewarm_infras[@]}" == "0" ]]; then
+  prewarm_infras=("${infra}")
+fi
+prewarm_contexts=()
+for prewarm_infra in "${prewarm_infras[@]}"; do
+  prewarm_contexts+=("$(kube_context_from_infra "${prewarm_infra}")")
+done
 if [[ "${prewarm_node_selector}" != *=* ]]; then
   echo "PREWARM_NODE_SELECTOR must be a key=value selector, got: ${prewarm_node_selector}" >&2
   exit 1
@@ -250,7 +273,7 @@ cleanup() {
   rm -rf "${context_dir}"
   rm -f "${buildkit_manifest_path}" "${registry_auth_json_path}" \
     "${build_command_path}" "${build_log_snapshot_path}" "${build_log_offset_path}"
-  "${kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
+  "${build_kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
     --ignore-not-found --wait=true >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -823,6 +846,9 @@ EOF
 }
 
 if [[ "${prewarm_nodes}" == "true" ]]; then
+  for prewarm_context in "${prewarm_contexts[@]}"; do
+    kubectl_cmd=(kubectl --context "${prewarm_context}")
+    echo "Prewarming Kubernetes context ${prewarm_context}"
   if ! [[ "${prewarm_node_parallelism}" =~ ^[1-9][0-9]*$ ]]; then
     echo "PREWARM_NODE_PARALLELISM must be a positive integer, got: ${prewarm_node_parallelism}" >&2
     exit 1
@@ -920,6 +946,7 @@ EOF
       exit 1
     fi
   fi
+  done
 else
   echo "Skipping GPU node prewarm"
 fi
