@@ -44,6 +44,7 @@ prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
+prewarm_delete_timeout="${PREWARM_DELETE_TIMEOUT:-60s}"
 prewarm_node_retries="${PREWARM_NODE_RETRIES:-12}"
 prewarm_node_parallelism="${PREWARM_NODE_PARALLELISM:-3}"
 prewarm_tag_convergence_attempts="${PREWARM_TAG_CONVERGENCE_ATTEMPTS:-120}"
@@ -567,6 +568,29 @@ render_clear_tag_commands() {
   done
 }
 
+delete_pods_best_effort() {
+  if (( $# == 0 )); then
+    return 0
+  fi
+
+  if "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "$@" \
+    --ignore-not-found --wait=true --timeout="${prewarm_delete_timeout}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "$@" \
+    --ignore-not-found --wait=false --grace-period=0 --force >/dev/null 2>&1 || true
+}
+
+delete_pods_without_wait() {
+  if (( $# == 0 )); then
+    return 0
+  fi
+
+  "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "$@" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+
 render_tag_check_init_containers() {
   local clear_mutable_tag="${1:-${prewarm_clear_mutable_tag}}"
 
@@ -689,15 +713,15 @@ verify_steady_prewarm_daemonset() {
     fi
 
     echo "Steady-state ${prewarm_name} has ${#stale_pods[@]} pod(s) with stale ${prewarm_refresh_tag_image}; recreating them (attempt ${attempt}/${prewarm_node_retries})"
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${stale_pods[@]}" \
-      --wait=true >/dev/null 2>&1 || true
+    delete_pods_best_effort "${stale_pods[@]}"
     sleep "$((attempt * 10))"
   done
 }
 
 wait_for_mutable_tag_convergence() {
   local node="$1"
-  local pod="${prewarm_name}-tag-check"
+  local pod_base="${prewarm_name}-tag-check"
+  local pod
   local attempt
   local clear_mutable_tag
   local image_id
@@ -720,8 +744,8 @@ wait_for_mutable_tag_convergence() {
     if [[ "${attempt}" == "1" ]]; then
       clear_mutable_tag="${prewarm_clear_mutable_tag}"
     fi
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    pod="${pod_base}-${attempt}"
+    delete_pods_without_wait "${pod}"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -755,8 +779,7 @@ EOF
       --timeout="${prewarm_node_timeout}" >/dev/null 2>&1; then
       if verify_prewarm_refresh_tag_digest "${pod}"; then
         echo "Mutable tags converged to ${image_digest}"
-        "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-          --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        delete_pods_without_wait "${pod}"
         return 0
       fi
       echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} has not converged to ${image_digest}"
@@ -765,8 +788,7 @@ EOF
       "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
     fi
 
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    delete_pods_without_wait "${pod}"
     sleep "${prewarm_tag_convergence_interval}"
   done
 
@@ -789,8 +811,7 @@ prewarm_single_node() {
 
   for attempt in $(seq 1 "${prewarm_node_retries}"); do
     echo "Prewarming ${prewarm_display} on GPU node ${node} (attempt ${attempt}/${prewarm_node_retries})"
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    delete_pods_best_effort "${pod}"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -822,22 +843,19 @@ EOF
       --for=condition=Ready "pod/${pod}" \
       --timeout="${prewarm_node_timeout}"; then
       if verify_prewarm_refresh_tag_digest "${pod}"; then
-        "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-          --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        delete_pods_best_effort "${pod}"
         return 0
       fi
 
       echo "Prewarm mutable tag verification failed on node ${node}; retrying after tag convergence delay"
-      "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-        --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      delete_pods_best_effort "${pod}"
       sleep "$((attempt * 10))"
       continue
     fi
 
     echo "Prewarm failed on node ${node}; pod diagnostics:"
     "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
-    "${kubectl_cmd[@]}" delete pod -n "${prewarm_namespace}" "${pod}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    delete_pods_best_effort "${pod}"
     sleep "$((attempt * 10))"
   done
 

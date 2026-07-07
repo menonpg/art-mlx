@@ -57,7 +57,7 @@ permissions:
 
 concurrency:
   group: build-gpu-image
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-gpu-image:
