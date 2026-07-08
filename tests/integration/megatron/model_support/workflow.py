@@ -65,6 +65,7 @@ ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "qwen3_5_dense": "Qwen/Qwen3.5-27B",
     "gemma4_moe": "google/gemma-4-26B-A4B-it",
     "gemma4_dense": "google/gemma-4-31B-it",
+    "dsv4": "deepseek-ai/DeepSeek-V4-Flash",
     "gpt_oss_moe": "openai/gpt-oss-20b",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(
@@ -473,16 +474,23 @@ def run_correctness_sensitivity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
+    cp_supported = bool(handler.cp_supported)
+    correctness_precision = handler.correctness_precision()
+    correctness_use_fp32_lora_reference = handler.correctness_use_fp32_lora_reference()
+    correctness_phase_pass_fns = handler.correctness_phase_pass_fns(oracle_harness)
     case_config = oracle_harness.OracleCaseConfig(
         base_model=base_model,
         is_moe=handler.is_moe,
-        precision="fp32",
+        precision=correctness_precision,
         num_layers=max(1, architecture.recommended_min_layers),
         num_steps=1,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     suite_topologies = list(
-        oracle_harness.selected_suite_topologies(is_moe=handler.is_moe)
+        oracle_harness.selected_suite_topologies(
+            is_moe=handler.is_moe,
+            cp_supported=cp_supported,
+        )
     )
     objectives = list(oracle_harness.selected_oracle_objectives())
     skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
@@ -526,6 +534,14 @@ def run_correctness_sensitivity_stage(
                 is_moe=handler.is_moe,
             ).world_size()
             > max_world_size
+            or (
+                not cp_supported
+                and oracle_harness.sensitivity_topology_for_mutation(
+                    mutation,
+                    is_moe=handler.is_moe,
+                ).cp
+                > 1
+            )
         ]
         mutations = [
             mutation
@@ -539,6 +555,11 @@ def run_correctness_sensitivity_stage(
             suite_reports = oracle_harness.run_suite(
                 case_config=case_config,
                 max_world_size=max_world_size,
+                cp_supported=cp_supported,
+                phase_pass_fns=correctness_phase_pass_fns,
+                use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                prune_reference_artifacts=skip_sensitivity or not mutations,
+                prune_case_artifacts=skip_sensitivity or not mutations,
             )
         sensitivity_reports = []
         if skip_sensitivity:
@@ -572,7 +593,10 @@ def run_correctness_sensitivity_stage(
         passed=True,
         metrics={
             "requested_num_layers": case_config.num_layers,
+            "precision": correctness_precision,
+            "use_fp32_lora_reference": correctness_use_fp32_lora_reference,
             "is_moe": handler.is_moe,
+            "cp_supported": cp_supported,
             "allow_unvalidated_arch": allow_unvalidated_arch,
             "objectives": objectives,
             "sensitivity_mutations": mutations,
@@ -644,12 +668,40 @@ def run_merged_vllm_serving_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = merged_vllm_serving.run_merged_vllm_serving(case_config)
+    metrics = report.model_dump(mode="json")
+    warning_lines = _read_vllm_reload_warnings(report.output_dir)
+    metrics["vllm_reload_warning_count"] = len(warning_lines)
+    metrics["vllm_reload_warnings"] = warning_lines
+    metrics["readable_summary"] = _merged_vllm_serving_summary(metrics)
     return ValidationStageResult(
         name="merged_vllm_serving",
         passed=bool(report.model_ids),
-        metrics=report.model_dump(mode="json"),
+        metrics=metrics,
         artifact_dir=report.output_dir,
     )
+
+
+def _read_vllm_reload_warnings(output_dir: str) -> list[str]:
+    log_path = Path(output_dir) / "logs" / "vllm-runtime.log"
+    if not log_path.exists():
+        return []
+    return [
+        line.strip()
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if "Failed to load weights" in line
+    ]
+
+
+def _merged_vllm_serving_summary(metrics: dict[str, Any]) -> list[str]:
+    lines = [
+        f"served_model_name={metrics.get('served_model_name', '')}",
+        f"model_ids={metrics.get('model_ids', [])}",
+        f"completion_text={metrics.get('completion_text', '')!r}",
+        f"vllm_reload_warning_count={metrics.get('vllm_reload_warning_count', 0)}",
+    ]
+    for warning in metrics.get("vllm_reload_warnings", []):
+        lines.append(f"vllm_reload_warning={warning}")
+    return lines
 
 
 def run_chat_template_rollout_stage(
@@ -981,6 +1033,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _print_stage_result(stage: ValidationStageResult, *, indent: str = "") -> None:
+    status = "PASS" if stage.passed else "FAIL"
+    print(f"{indent}{stage.name}: {status}", flush=True)
+    child_indent = f"{indent}  "
+    if stage.artifact_dir:
+        print(f"{child_indent}artifact_dir={stage.artifact_dir}", flush=True)
+    summary = stage.metrics.get("readable_summary")
+    if isinstance(summary, list):
+        for line in summary:
+            print(f"{child_indent}{line}", flush=True)
+    if not stage.passed:
+        print(f"{child_indent}metrics={stage.metrics}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.all_architectures:
@@ -996,12 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
         for report in all_report.reports:
             print(f"base_model={report.base_model}", flush=True)
             for stage in report.stages:
-                status = "PASS" if stage.passed else "FAIL"
-                print(f"  {stage.name}: {status}", flush=True)
-                if stage.artifact_dir:
-                    print(f"    artifact_dir={stage.artifact_dir}", flush=True)
-                if not stage.passed:
-                    print(f"    metrics={stage.metrics}", flush=True)
+                _print_stage_result(stage, indent="  ")
         print(f"report_json={args.output_json}", flush=True)
         return 0 if all_report.passed else 1
     report = build_validation_report(
@@ -1015,12 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_unvalidated_arch=args.allow_unsupported_arch,
     )
     for stage in report.stages:
-        status = "PASS" if stage.passed else "FAIL"
-        print(f"{stage.name}: {status}", flush=True)
-        if stage.artifact_dir:
-            print(f"  artifact_dir={stage.artifact_dir}", flush=True)
-        if not stage.passed:
-            print(f"  metrics={stage.metrics}", flush=True)
+        _print_stage_result(stage)
     print(f"report_json={args.output_json}", flush=True)
     return 0 if all(stage.passed for stage in report.stages) else 1
 

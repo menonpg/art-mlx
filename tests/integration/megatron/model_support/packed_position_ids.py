@@ -52,6 +52,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_moe",
         "qwen3_5_dense",
         "qwen3_5_moe",
+        "dsv4",
         "gpt_oss_moe",
     }
 )
@@ -613,6 +614,7 @@ def _logits_equivalence_check(
             build_gdn_execution_spec=bool(
                 getattr(handler, "build_gdn_execution_spec", False)
             ),
+            model_support_handler=handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         )
@@ -663,6 +665,7 @@ def _logits_equivalence_check(
                     build_gdn_execution_spec=bool(
                         getattr(handler, "build_gdn_execution_spec", False)
                     ),
+                    model_support_handler=handler,
                     attention_head_dim=getattr(provider, "kv_channels", None),
                     attention_value_head_dim=getattr(provider, "kv_channels", None),
                 )

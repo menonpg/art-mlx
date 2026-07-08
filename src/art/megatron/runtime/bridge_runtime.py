@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import contextlib
 import fnmatch
 from typing import Any, cast
@@ -22,6 +22,8 @@ from megatron.core.utils import get_model_config
 import torch
 
 from art.megatron.model_support.spec import HfWeightSource
+
+_Fp32PreservedTensor = tuple[torch.nn.Module, str, torch.Tensor, bool]
 
 
 class ExpertTensorSlice:
@@ -240,6 +242,8 @@ def load_unique_hf_keys_once(
     hf_state_dict: Mapping[str, torch.Tensor],
     *,
     bridge: MegatronModelBridge | None = None,
+    extra_keys: Callable[[Iterable[str], Mapping[str, torch.Tensor]], Iterable[str]]
+    | None = None,
 ) -> dict[str, torch.Tensor | ExpertTensorSlice]:
     task_list = list(tasks)
     prefetch_task_by_key: dict[str, Any] = {}
@@ -248,6 +252,9 @@ def load_unique_hf_keys_once(
             continue
         for key in _iter_hf_param_names(task.mapping.hf_param):
             prefetch_task_by_key.setdefault(key, task)
+    if extra_keys is not None:
+        for key in extra_keys(tuple(sorted(prefetch_task_by_key)), hf_state_dict):
+            prefetch_task_by_key.setdefault(key, None)
     keys = sorted(prefetch_task_by_key)
     expert_slice_ranges: dict[str, tuple[int, int]] = {}
     expert_slice_task_by_key: dict[str, Any] = {}
@@ -415,19 +422,60 @@ def _wrap_with_mp_wrapper(
 ) -> list[MegatronModule]:
     if not (model_config.fp16 or model_config.bf16) or mixed_precision_wrapper is None:
         return model
-    keep_in_fp32: list[tuple[Any, torch.Tensor]] = []
-    for model_module in model:
-        for submodule in model_module.modules():
-            if hasattr(submodule, "_maintain_float32_expert_bias"):
-                expert_bias = getattr(submodule, "expert_bias", None)
-                if expert_bias is not None:
-                    keep_in_fp32.append((submodule, expert_bias.data.clone()))
+    keep_in_fp32 = _collect_fp32_preserved_tensors(model)
     wrapped = [
         mixed_precision_wrapper(model_config, model_module) for model_module in model
     ]
-    for submodule, fp32_data in keep_in_fp32:
-        submodule.expert_bias.data = fp32_data
+    _restore_fp32_preserved_tensors(keep_in_fp32)
     return wrapped
+
+
+def _collect_fp32_preserved_tensors(
+    model: list[MegatronModule],
+) -> list[_Fp32PreservedTensor]:
+    """Snapshot tensors explicitly marked to survive Megatron fp16/bf16 casts."""
+
+    keep_in_fp32: list[_Fp32PreservedTensor] = []
+    for model_module in model:
+        for submodule in model_module.modules():
+            fp32_parameter_names = set(getattr(submodule, "_keep_fp32_parameters", ()))
+            fp32_buffer_names = set(getattr(submodule, "_keep_fp32_buffers", ()))
+            explicit_names = fp32_parameter_names | fp32_buffer_names
+            seen: set[str] = set()
+            if hasattr(submodule, "_maintain_float32_expert_bias"):
+                expert_bias = getattr(submodule, "expert_bias", None)
+                if isinstance(expert_bias, torch.nn.Parameter):
+                    keep_in_fp32.append(
+                        (submodule, "expert_bias", expert_bias.data.clone(), True)
+                    )
+                    seen.add("expert_bias")
+            for name in explicit_names:
+                tensor = getattr(submodule, name, None)
+                if isinstance(tensor, torch.nn.Parameter):
+                    keep_in_fp32.append((submodule, name, tensor.data.clone(), True))
+                    seen.add(name)
+                elif isinstance(tensor, torch.Tensor):
+                    keep_in_fp32.append((submodule, name, tensor.data.clone(), False))
+                    seen.add(name)
+            for name, param in submodule.named_parameters(recurse=False):
+                if name not in seen and getattr(param, "_keep_fp32", False):
+                    keep_in_fp32.append((submodule, name, param.data.clone(), True))
+                    seen.add(name)
+            for name, buffer in submodule.named_buffers(recurse=False):
+                if name not in seen and getattr(buffer, "_keep_fp32", False):
+                    keep_in_fp32.append((submodule, name, buffer.data.clone(), False))
+                    seen.add(name)
+    return keep_in_fp32
+
+
+def _restore_fp32_preserved_tensors(
+    keep_in_fp32: list[_Fp32PreservedTensor],
+) -> None:
+    for submodule, name, fp32_data, is_parameter in keep_in_fp32:
+        if is_parameter:
+            getattr(submodule, name).data = fp32_data
+        else:
+            submodule._buffers[name] = fp32_data
 
 
 def _art_get_model(
@@ -527,11 +575,13 @@ def _column_parallel_hf_to_megatron(
         splits = list(torch.chunk(hf_weights, self.tp_size, dim=0))
     else:
         splits = None
-    return self.scatter_to_tp_ranks(
+    return _scatter_to_tp_ranks(
+        self,
         splits,
         target_param.shape,
         target_param.dtype,
         target_param.device,
+        output_tensor=target_param.data,
     )
 
 
@@ -542,20 +592,50 @@ def _scatter_to_tp_ranks(
     dtype: torch.dtype,
     device: torch.device,
     src_rank: int = 0,
+    output_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if self.tp_size == 1:
-        return cast(list[torch.Tensor], splits)[0].to(
-            device=device, dtype=dtype, non_blocking=True
-        )
-    output = torch.empty(output_shape, dtype=dtype, device=device)
+        shard = cast(list[torch.Tensor], splits)[0]
+        if output_tensor is None:
+            return shard.to(device=device, dtype=dtype, non_blocking=True)
+        output_tensor.copy_(shard, non_blocking=True)
+        if output_tensor.device.type == "cuda":
+            torch.cuda.synchronize(output_tensor.device)
+        return output_tensor
+    output = (
+        torch.empty(output_shape, dtype=dtype, device=device)
+        if output_tensor is None
+        else output_tensor
+    )
     dist = cast(Any, torch.distributed)
     global_src = dist.get_global_rank(group=self.tp_group, group_rank=src_rank)
-    scatter_list = None
-    if self.tp_rank == src_rank and splits:
-        scatter_list = [
-            shard.to(device=device, dtype=dtype, non_blocking=True) for shard in splits
-        ]
-    dist.scatter(output, scatter_list, src=global_src, group=self.tp_group)
+    if self.tp_rank == src_rank:
+        if not splits:
+            raise RuntimeError("source TP rank must provide tensor splits")
+        if len(splits) != self.tp_size:
+            raise RuntimeError(
+                f"source TP rank got {len(splits)} tensor splits for TP size "
+                f"{self.tp_size}"
+            )
+        for peer_rank, shard in enumerate(splits):
+            if peer_rank == src_rank:
+                output.copy_(shard, non_blocking=True)
+                continue
+            send_buffer = torch.empty(output_shape, dtype=dtype, device=device)
+            send_buffer.copy_(shard, non_blocking=True)
+            if send_buffer.device.type == "cuda":
+                torch.cuda.current_stream(send_buffer.device).synchronize()
+            dist.send(
+                send_buffer,
+                dst=dist.get_global_rank(group=self.tp_group, group_rank=peer_rank),
+                group=self.tp_group,
+            )
+            if send_buffer.device.type == "cuda":
+                torch.cuda.synchronize(send_buffer.device)
+    else:
+        dist.recv(output, src=global_src, group=self.tp_group)
+    if output.device.type == "cuda":
+        torch.cuda.synchronize(output.device)
     return output
 
 
@@ -598,7 +678,12 @@ def _optimized_load_weights_hf_to_megatron(
             stack.enter_context(megatron_model[0].hide_loss_modules())
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
     hf_state_dict = hf_pretrained.state
-    raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict, bridge=self)
+    raw_cache = load_unique_hf_keys_once(
+        tasks,
+        hf_state_dict,
+        bridge=self,
+        extra_keys=getattr(self, "art_extra_hf_prefetch_keys", None),
+    )
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
     pending_device_copy = False
@@ -642,7 +727,8 @@ def _optimized_load_weights_hf_to_megatron(
                 f"  Bridge type: {type(task.mapping).__name__}\n"
                 f"  HF mapping: {task.mapping.hf_param}"
             )
-        task.param_weight.data.copy_(converted_weights, non_blocking=True)
+        if converted_weights.data_ptr() != task.param_weight.data.data_ptr():
+            task.param_weight.data.copy_(converted_weights, non_blocking=True)
         if task.param_weight.device.type == "cuda":
             pending_device_copy = True
     if pending_device_copy and torch.cuda.is_available():

@@ -1,4 +1,4 @@
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import torch
 
@@ -10,6 +10,7 @@ from art.megatron.model_support.spec import (
     LayerFamilyInstance,
     RolloutWeightsMode,
     SharedExpertCompileState,
+    SharedPrefixModelStateContext,
 )
 
 _CONTEXT_PARALLEL_ATTENTION_WORKAROUND_FLAG = "context_parallel_attention"
@@ -37,6 +38,7 @@ class DefaultDenseHandler:
     key = "default_dense"
     build_gdn_execution_spec = False
     is_moe = False
+    cp_supported = True
     native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
@@ -96,6 +98,18 @@ class DefaultDenseHandler:
         del provider
         return None
 
+    def default_chat_template(self) -> str | None:
+        return None
+
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        del internal_config
+        return tokenizer
+
     def vllm_engine_args(
         self,
         *,
@@ -111,6 +125,23 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
+    def build_shared_prefix_model_state(
+        self,
+        context: SharedPrefixModelStateContext,
+    ) -> dict[str, Any]:
+        del context
+        return {}
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]:
+        return "fp32"
+
+    def correctness_use_fp32_lora_reference(self) -> bool:
+        return True
+
+    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any] | None:
+        del oracle_harness
+        return None
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -118,6 +149,9 @@ class DefaultDenseHandler:
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         return tensors, adapter_config
+
+    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        return adapter_config
 
     def from_vllm_lora_tensors(
         self,

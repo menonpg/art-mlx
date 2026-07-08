@@ -31,6 +31,7 @@ from art.megatron.gdn.gdn_shared_prefix import (
     move_gdn_rank_execution_plan_to_device,
     parse_gdn_shared_prefix_segments,
 )
+from art.megatron.model_support.spec import SharedPrefixModelStateContext
 
 
 class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
@@ -38,6 +39,7 @@ class SharedPrefixAttentionState(FlexSharedPrefixAttentionState):
 
     group_ids: Tensor
     parent_ids: Tensor
+    model_state: dict[str, Any] = Field(default_factory=dict)
     gdn_execution_spec: GdnPackedExecutionSpec | None = None
     gdn_execution_plan: GdnRankExecutionPlan | None = None
     gdn_hidden_layout: str = "attention"
@@ -59,6 +61,7 @@ def create_shared_prefix_state(
     input_pos: Tensor | None = None,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool = False,
+    model_support_handler: Any | None = None,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
@@ -106,6 +109,16 @@ def create_shared_prefix_state(
         sliding_block_masks=sliding_block_masks,
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
+        model_state=_build_model_state_once(
+            model_support_handler,
+            input_pos=input_pos_cpu,
+            group_ids=group_ids_cpu,
+            parent_ids=parent_ids_cpu,
+            device=device,
+            attention_token_layout_index=attention_token_layout_index,
+            attention_head_dim=attention_head_dim,
+            attention_value_head_dim=attention_value_head_dim,
+        ),
         gdn_execution_spec=gdn_execution_spec,
         gdn_execution_plan=_build_gdn_execution_plan_once(
             gdn_execution_spec,
@@ -115,6 +128,34 @@ def create_shared_prefix_state(
             cp_group=cp_group,
             attention_token_layout_index=attention_token_layout_index,
         ),
+    )
+
+
+def _build_model_state_once(
+    model_support_handler: Any | None,
+    *,
+    input_pos: Tensor | None,
+    group_ids: Tensor,
+    parent_ids: Tensor,
+    device: torch.device,
+    attention_token_layout_index: TokenLayoutIndex | None,
+    attention_head_dim: int | None,
+    attention_value_head_dim: int | None,
+) -> dict[str, Any]:
+    if model_support_handler is None:
+        return {}
+    return dict(
+        model_support_handler.build_shared_prefix_model_state(
+            SharedPrefixModelStateContext(
+                input_pos=input_pos,
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                device=device,
+                attention_token_layout_index=attention_token_layout_index,
+                attention_head_dim=attention_head_dim,
+                attention_value_head_dim=attention_value_head_dim,
+            )
+        )
     )
 
 

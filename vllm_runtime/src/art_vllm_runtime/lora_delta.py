@@ -87,6 +87,7 @@ def _iter_lora_checkpoint_deltas(
                 expert_a = a_tensor[expert_id * rank : (expert_id + 1) * rank]
                 delta = b_expert.float().matmul(expert_a.float()).mul_(scaling)
                 if previous_b is not None:
+                    assert previous_lora_tensors is not None
                     previous_a = previous_lora_tensors[a_key][
                         expert_id * rank : (expert_id + 1) * rank
                     ]
@@ -120,6 +121,7 @@ def _iter_lora_checkpoint_deltas(
                 expert_a = a_tensor[expert_id * rank : (expert_id + 1) * rank]
                 delta = b_expert.float().matmul(expert_a.float()).mul_(scaling)
                 if previous_b is not None:
+                    assert previous_lora_tensors is not None
                     previous_a = previous_lora_tensors[a_key][
                         expert_id * rank : (expert_id + 1) * rank
                     ]
@@ -157,6 +159,25 @@ def _default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> 
     param.data.copy_(loaded_weight)
 
 
+def _call_weight_loader(
+    loader: Any,
+    loader_param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if not hasattr(loader_param, "load_merged_column_weight"):
+        owner = getattr(loader, "__self__", None)
+        legacy_loader = getattr(owner, "weight_loader", None)
+        if (
+            legacy_loader is not None
+            and legacy_loader is not loader
+            and getattr(loader, "__name__", "") == "weight_loader_v2"
+        ):
+            return legacy_loader(loader_param, loaded_weight, *args, **kwargs)
+    return loader(loader_param, loaded_weight, *args, **kwargs)
+
+
 def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
     def load_delta(
         loader_param: torch.Tensor,
@@ -168,7 +189,13 @@ def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
         scratch = torch.zeros_like(real_data)
         loader_param.data = scratch
         try:
-            result = original_loader(loader_param, loaded_weight, *args, **kwargs)
+            result = _call_weight_loader(
+                original_loader,
+                loader_param,
+                loaded_weight,
+                *args,
+                **kwargs,
+            )
         finally:
             loader_param.data = real_data
         if result is not False:

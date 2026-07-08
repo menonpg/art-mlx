@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
@@ -44,6 +44,18 @@ class ArchitectureReport(BaseModel):
     layer_families: list[LayerFamilyInstance] = Field(default_factory=list)
     recommended_min_layers: int = 1
     unresolved_risks: list[str] = Field(default_factory=list)
+
+
+class SharedPrefixModelStateContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    group_ids: Any
+    parent_ids: Any
+    input_pos: Any | None = None
+    device: Any
+    attention_token_layout_index: Any | None = None
+    attention_head_dim: int | None = None
+    attention_value_head_dim: int | None = None
 
 
 class CompileWorkaroundConfig(BaseModel):
@@ -92,6 +104,7 @@ class ModelSupportSpec(BaseModel):
 class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
+    cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
@@ -121,6 +134,15 @@ class ModelSupportHandler(Protocol):
 
     def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
+    def default_chat_template(self) -> str | None: ...
+
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any: ...
+
     def vllm_engine_args(
         self,
         *,
@@ -130,6 +152,19 @@ class ModelSupportHandler(Protocol):
     def vllm_server_args(self) -> dict[str, object]: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def build_shared_prefix_model_state(
+        self,
+        context: SharedPrefixModelStateContext,
+    ) -> dict[str, Any]: ...
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]: ...
+
+    def correctness_use_fp32_lora_reference(self) -> bool: ...
+
+    def correctness_phase_pass_fns(
+        self, oracle_harness: Any
+    ) -> dict[str, Any] | None: ...
 
     def collect_layer_families(
         self,
@@ -157,6 +192,11 @@ class ModelSupportHandler(Protocol):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]: ...
+
+    def to_vllm_lora_config(
+        self,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]: ...
 

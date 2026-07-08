@@ -315,6 +315,7 @@ def _causal_attention_state(
     *,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool,
+    model_support_handler: Any,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
 ) -> Any:
@@ -327,6 +328,7 @@ def _causal_attention_state(
         input_pos=torch.arange(seq_len, dtype=torch.int64).unsqueeze(0),
         sliding_windows=sliding_windows,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        model_support_handler=model_support_handler,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
     )
@@ -360,6 +362,7 @@ def _prepare_dense_rl_micro(
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
+        model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
     )
@@ -561,6 +564,7 @@ def _prepare_dense_sft_micro(
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
+            model_support_handler=model_support_handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),

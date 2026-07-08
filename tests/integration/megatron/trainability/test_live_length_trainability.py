@@ -31,6 +31,7 @@ from .yes_no_trainability import (
     _get_env_int,
     _init_megatron_runtime_config,
     _list_model_ids,
+    _trainability_stage_resources,
 )
 
 torch = pytest.importorskip("torch")
@@ -209,6 +210,13 @@ def _target_tokens() -> int:
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
     if not model_uses_expert_parallel(base_model, allow_unvalidated_arch=True):
+        return
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name="length_trainability",
+        allow_unvalidated_arch=True,
+    )
+    if stage_resources is not None:
         return
     if os.environ.get(TRAINER_GPU_IDS_ENV) or os.environ.get(INFERENCE_GPU_IDS_ENV):
         return
@@ -636,6 +644,7 @@ async def run_length_trainability_async(
         "megatron_dedicated",
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        resource_stage_name="length_trainability",
     )
     _use_default_moe_dedicated_placement(variant, base_model=base_model)
     max_steps = _length_max_steps()
@@ -667,6 +676,7 @@ async def run_length_trainability_async(
         variant,
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        resource_stage_name="length_trainability",
     )
     internal_config["engine_args"]["max_model_len"] = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN",
@@ -682,8 +692,18 @@ async def run_length_trainability_async(
     chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
     rollout_weights_mode = internal_config["rollout_weights_mode"]
     _init_megatron_runtime_config(variant)
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name="length_trainability",
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    backend_env = stage_resources.megatron_env if stage_resources is not None else {}
 
-    async with _backend_context(variant, backend_root=backend_root) as backend:
+    async with _backend_context(
+        variant,
+        backend_root=backend_root,
+        extra_env=backend_env,
+    ) as backend:
         model = art.TrainableModel(
             name=f"length-{uuid.uuid4().hex[:8]}",
             project="integration-tests",

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+import hashlib
+import json
 import os
 from pathlib import Path
 import random
@@ -10,13 +12,13 @@ import shutil
 import socket
 import subprocess
 import sys
-from typing import Any, AsyncIterator, cast
+from typing import Any, AsyncIterator, Iterator, cast
 import uuid
 
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
-from art.dev.model import RolloutWeightsMode
+from art.dev.model import InternalModelConfig, RolloutWeightsMode
 from art.preprocessing.moe_routing import (
     MoeRoutingPackStats,
     PackedMoeRoutingReplay,
@@ -71,6 +73,7 @@ class RealPathConfig(BaseModel):
     diagnose_base: bool = False
     trace_layers: bool = False
     trace_enforce_eager: bool = False
+    adapter_cache_dir: str | None = None
 
 
 class RealPathMegatronWorkerRequest(BaseModel):
@@ -106,6 +109,23 @@ class RealPathBaseDiagnosticBundle(BaseModel):
     megatron_forward_trace_dir: str | None = None
 
 
+@contextmanager
+def _temporary_env(updates: dict[str, str] | None) -> Iterator[None]:
+    if not updates:
+        yield
+        return
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 class RealPathTrainInfReport(BaseModel):
     base_model: str
     artifact_dir: str
@@ -117,6 +137,8 @@ class RealPathTrainInfReport(BaseModel):
     base_moe_routing_shared_prefix_conflict_rows: int | None = None
     base_moe_routing_shared_prefix_conflict_slots: int | None = None
     adapter_path: str
+    adapter_cache_key: str
+    adapter_cache_hit: bool
     megatron_base_scores: str | None = None
     vllm_base_scores: str | None = None
     megatron_lora_scores: str
@@ -133,6 +155,12 @@ class RealPathTrainInfReport(BaseModel):
     mean_abs_pct_limit: float
     top20_kl_candidate_to_target_limit: float
     passed: bool
+
+
+class AdapterCacheResult(BaseModel):
+    path: str
+    cache_key: str
+    cache_hit: bool
 
 
 def _real_path_rollout_mode(config: TrainInfOutputParityConfig) -> RolloutMode:
@@ -196,6 +224,8 @@ def config_from_env() -> RealPathConfig:
             config.diagnose_base = True
     if raw := os.environ.get("ART_REAL_PATH_TRACE_ENFORCE_EAGER"):
         config.trace_enforce_eager = raw == "1"
+    if raw := os.environ.get("ART_TRAIN_INF_MISMATCH_ADAPTER_CACHE_DIR"):
+        config.adapter_cache_dir = raw
     return config
 
 
@@ -306,10 +336,19 @@ async def _collect_real_trajectory_groups(
     from transformers import AutoTokenizer
 
     import art
+    from art.megatron.model_support.tokenizer import (
+        configure_tokenizer_for_model_support,
+    )
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
-    tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    tokenizer = configure_tokenizer_for_model_support(
+        AutoTokenizer.from_pretrained(config.output_parity.base_model),
+        base_model=config.output_parity.base_model,
+        internal_config={
+            "allow_unvalidated_arch": config.output_parity.allow_unvalidated_arch
+        },
+    )
     chat_template_kwargs: dict[str, Any] = {}
     if isinstance(tokenizer.chat_template, str):
         if "enable_thinking" in tokenizer.chat_template:
@@ -819,6 +858,134 @@ def _make_nonzero_adapter(
     return _run_real_path_megatron_worker(request, adapter_only=True).adapter_path or ""
 
 
+def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
+    from art.megatron.model_support import vllm_lora_config_for_model
+
+    from .output_parity import _adapter_config
+
+    def jsonable(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: jsonable(item) for key, item in value.items()}
+        if isinstance(value, set):
+            return [jsonable(item) for item in sorted(value, key=str)]
+        if isinstance(value, (list, tuple)):
+            return [jsonable(item) for item in value]
+        return value
+
+    adapter_config = _adapter_config(config)
+    published_adapter_config = vllm_lora_config_for_model(
+        config.base_model,
+        adapter_config,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    payload = {
+        "schema": 2,
+        "base_model": config.base_model,
+        "seed": config.seed,
+        "allow_unvalidated_arch": config.allow_unvalidated_arch,
+        "lora_target_modules": _lora_target_modules(config),
+        "adapter_config": adapter_config,
+        "published_adapter_config": published_adapter_config,
+    }
+    encoded = json.dumps(
+        jsonable(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _default_adapter_cache_dir() -> Path:
+    return REPO_ROOT / "scratch" / "train_inf_mismatch_adapters"
+
+
+def _adapter_cache_dir(config: RealPathConfig) -> Path:
+    if config.adapter_cache_dir:
+        return Path(config.adapter_cache_dir)
+    return _default_adapter_cache_dir()
+
+
+def _adapter_cache_manifest_path(adapter_path: Path) -> Path:
+    return adapter_path / "art_train_inf_mismatch_adapter_cache.json"
+
+
+def _cached_adapter_is_valid(adapter_path: Path, *, cache_key: str) -> bool:
+    manifest_path = _adapter_cache_manifest_path(adapter_path)
+    model_path = adapter_path / "adapter_model.safetensors"
+    config_path = adapter_path / "adapter_config.json"
+    if not (manifest_path.exists() and model_path.exists() and config_path.exists()):
+        return False
+    try:
+        manifest = _read_json(manifest_path)
+    except Exception:
+        return False
+    return (
+        manifest.get("cache_key") == cache_key
+        and manifest.get("non_identity") is True
+        and int(manifest.get("adapter_model_bytes", 0)) == model_path.stat().st_size
+        and model_path.stat().st_size > 0
+    )
+
+
+def _copy_adapter_dir(src: Path, dst: Path, *, cache_key: str) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for filename in ("adapter_model.safetensors", "adapter_config.json"):
+        shutil.copy2(src / filename, dst / filename)
+    _write_json(
+        _adapter_cache_manifest_path(dst),
+        {
+            "cache_key": cache_key,
+            "non_identity": True,
+            "adapter_model_bytes": (dst / "adapter_model.safetensors").stat().st_size,
+        },
+    )
+
+
+def _prune_adapter_cache_dir(cache_dir: Path, *, keep_key: str) -> None:
+    if not cache_dir.exists():
+        return
+    cache_root = cache_dir.resolve()
+    keep_path = (cache_root / keep_key).resolve()
+    for candidate in cache_root.iterdir():
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        resolved = candidate.resolve()
+        if resolved == keep_path:
+            continue
+        resolved.relative_to(cache_root)
+        if _adapter_cache_manifest_path(resolved).exists():
+            shutil.rmtree(resolved)
+
+
+def _make_or_reuse_nonzero_adapter(
+    *,
+    config: RealPathConfig,
+    artifact_dir: Path,
+) -> AdapterCacheResult:
+    cache_key = _adapter_cache_key(config.output_parity)
+    cache_dir = _adapter_cache_dir(config)
+    cache_path = cache_dir / cache_key
+    if _cached_adapter_is_valid(cache_path, cache_key=cache_key):
+        _prune_adapter_cache_dir(cache_dir, keep_key=cache_key)
+        return AdapterCacheResult(
+            path=str(cache_path),
+            cache_key=cache_key,
+            cache_hit=True,
+        )
+    adapter_path = Path(
+        _make_nonzero_adapter(config=config.output_parity, artifact_dir=artifact_dir)
+    )
+    if not adapter_path:
+        raise RuntimeError("Real-path adapter worker did not create an adapter")
+    _copy_adapter_dir(adapter_path, cache_path, cache_key=cache_key)
+    _prune_adapter_cache_dir(cache_dir, keep_key=cache_key)
+    return AdapterCacheResult(
+        path=str(cache_path),
+        cache_key=cache_key,
+        cache_hit=False,
+    )
+
+
 def _run_logits_with_replay(
     *,
     runtime: Any,
@@ -923,6 +1090,7 @@ def _real_path_megatron_worker(
 
     from art.megatron import train as megatron_train
     from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
+    from art.megatron.training.weight_offload import WeightOffloadManager
     from art.preprocessing.pack import packed_tensors_from_dir
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -959,92 +1127,113 @@ def _real_path_megatron_worker(
     for chunk in runtime.model:
         chunk.eval()
 
+    weight_offload = None
+    if not adapter_only:
+        weight_offload = WeightOffloadManager.from_env(
+            model=runtime.model,
+            rank=torch.distributed.get_rank(),  # type: ignore[possibly-missing-attribute]
+            compile_enabled=runtime.transformer_layers_compiled,
+        )
+        weight_offload.install()
+        weight_offload.after_job()
+        weight_offload.before_job()
+
     artifact_dir = Path(request.artifact_dir)
     adapter_path: Path | None = None
-    if request.weight_state == "lora":
-        if request.adapter_path is None:
-            initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
-            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+    job_completed = False
+    try:
+        if request.weight_state == "lora":
+            if request.adapter_path is None:
+                initial_state = _collect_full_lora_state(cast(list[Any], runtime.model))
+                if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+                    adapter_path = artifact_dir / "real_path_active_lora"
+                    initialized = _build_deterministic_nonzero_lora(
+                        initial_state or {},
+                        seed=request.config.seed,
+                    )
+                    _save_vllm_lora_adapter(
+                        lora_path=adapter_path,
+                        state=initialized,
+                        runtime=runtime,
+                        config=request.config,
+                    )
+                torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
                 adapter_path = artifact_dir / "real_path_active_lora"
-                initialized = _build_deterministic_nonzero_lora(
-                    initial_state or {},
-                    seed=request.config.seed,
+            else:
+                adapter_path = Path(request.adapter_path)
+            adapter_model = load_lora_tensors_for_megatron(
+                str(adapter_path),
+                handler=runtime.model_support_handler,
+                allow_unvalidated_arch=request.config.allow_unvalidated_arch,
+            )
+            megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+
+        if adapter_only:
+            if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+                result = RealPathMegatronWorkerResult(
+                    score_path="",
+                    adapter_path=str(adapter_path)
+                    if adapter_path is not None
+                    else None,
                 )
-                _save_vllm_lora_adapter(
-                    lora_path=adapter_path,
-                    state=initialized,
-                    runtime=runtime,
-                    config=request.config,
+                _write_json(
+                    artifact_dir / "real_path_adapter_worker_result.json",
+                    result.model_dump(mode="json"),
                 )
             torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-            adapter_path = artifact_dir / "real_path_active_lora"
-        else:
-            adapter_path = Path(request.adapter_path)
-        adapter_model = load_lora_tensors_for_megatron(
-            str(adapter_path),
-            handler=runtime.model_support_handler,
-            allow_unvalidated_arch=request.config.allow_unvalidated_arch,
-        )
-        megatron_train.load_adapter_into_model(runtime.model, adapter_model)
+            torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
+            return
 
-    if adapter_only:
+        packed_tensors = packed_tensors_from_dir(**request.disk_packed_tensors)
+        logical_map = LogicalTokenMap.model_validate(
+            _read_json(Path(request.logical_map_path))
+        )
+        forward_trace_capture = None
+        if request.forward_trace_dir is not None:
+            from ..model_support.forward_trace import (
+                CAPTURE_NAME_TOKENS,
+                ForwardTraceCapture,
+            )
+
+            forward_trace_capture = ForwardTraceCapture(
+                runtime.model,
+                enabled=True,
+                capture_name_tokens=(*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm"),
+                strict_output_match=True,
+            )
+            forward_trace_capture.set_step(
+                0,
+                list(range(int(packed_tensors["tokens"].shape[0]))),
+            )
+        score = _score_megatron_runtime(
+            runtime=runtime,
+            packed_tensors=cast(dict[str, Any], packed_tensors),
+            logical_map=logical_map,
+            weight_state=request.weight_state,
+            rollout_mode=_real_path_rollout_mode(request.config),
+            global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
+            forward_trace_capture=forward_trace_capture,
+            forward_trace_dir=request.forward_trace_dir,
+        )
+
         if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
+            score_path = (
+                artifact_dir / f"real_path_megatron_{request.weight_state}.json"
+            )
+            _write_json(score_path, score.model_dump(mode="json"))
             result = RealPathMegatronWorkerResult(
-                score_path="",
+                score_path=str(score_path),
                 adapter_path=str(adapter_path) if adapter_path is not None else None,
             )
             _write_json(
-                artifact_dir / "real_path_adapter_worker_result.json",
+                artifact_dir
+                / f"real_path_megatron_{request.weight_state}_worker_result.json",
                 result.model_dump(mode="json"),
             )
-        torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-        torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
-        return
-
-    packed_tensors = packed_tensors_from_dir(**request.disk_packed_tensors)
-    logical_map = LogicalTokenMap.model_validate(
-        _read_json(Path(request.logical_map_path))
-    )
-    forward_trace_capture = None
-    if request.forward_trace_dir is not None:
-        from ..model_support.forward_trace import (
-            CAPTURE_NAME_TOKENS,
-            ForwardTraceCapture,
-        )
-
-        forward_trace_capture = ForwardTraceCapture(
-            runtime.model,
-            enabled=True,
-            capture_name_tokens=(*CAPTURE_NAME_TOKENS, ".decoder.final_layernorm"),
-            strict_output_match=True,
-        )
-        forward_trace_capture.set_step(
-            0,
-            list(range(int(packed_tensors["tokens"].shape[0]))),
-        )
-    score = _score_megatron_runtime(
-        runtime=runtime,
-        packed_tensors=cast(dict[str, Any], packed_tensors),
-        logical_map=logical_map,
-        weight_state=request.weight_state,
-        rollout_mode=_real_path_rollout_mode(request.config),
-        global_grad_accumulation_sequences=request.global_grad_accumulation_sequences,
-        forward_trace_capture=forward_trace_capture,
-        forward_trace_dir=request.forward_trace_dir,
-    )
-
-    if torch.distributed.get_rank() == 0:  # type: ignore[possibly-missing-attribute]
-        score_path = artifact_dir / f"real_path_megatron_{request.weight_state}.json"
-        _write_json(score_path, score.model_dump(mode="json"))
-        result = RealPathMegatronWorkerResult(
-            score_path=str(score_path),
-            adapter_path=str(adapter_path) if adapter_path is not None else None,
-        )
-        _write_json(
-            artifact_dir
-            / f"real_path_megatron_{request.weight_state}_worker_result.json",
-            result.model_dump(mode="json"),
-        )
+        job_completed = True
+    finally:
+        if weight_offload is not None and job_completed:
+            weight_offload.after_job()
     torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
     torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
 
@@ -1066,6 +1255,7 @@ def _run_real_path_megatron_worker(
     env["CUDA_VISIBLE_DEVICES"] = ",".join(
         str(value) for value in request.config.trainer_gpu_ids
     )
+    env.update(request.config.megatron_env)
     env["PYTHONUNBUFFERED"] = "1"
     tests_dir = str(REPO_ROOT / "tests")
     env["PYTHONPATH"] = (
@@ -1142,11 +1332,8 @@ async def run_real_path_train_inf_mismatch(
         allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
     )
     _write_json(artifact_dir / "real_path_config.json", config.model_dump(mode="json"))
-    adapter_path = _make_nonzero_adapter(
-        config=parity_config, artifact_dir=artifact_dir
-    )
-    if not adapter_path:
-        raise RuntimeError("Real-path adapter worker did not create an adapter")
+    adapter = _make_or_reuse_nonzero_adapter(config=config, artifact_dir=artifact_dir)
+    adapter_path = adapter.path
 
     _init_art_megatron_runtime_config(parity_config)
     backend = MegatronBackend(
@@ -1154,16 +1341,9 @@ async def run_real_path_train_inf_mismatch(
         enable_expert_replay=is_moe,
     )
     backend_open = False
-    model = art.TrainableModel(
-        name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
-        project="train_inf_mismatch",
-        base_model=parity_config.base_model,
-        lora_config=(
-            {"target_modules": _lora_target_modules(parity_config)}
-            if parity_config.lora_target_modules is not None
-            else None
-        ),
-        _internal_config={
+    internal_config = cast(
+        InternalModelConfig,
+        {
             "trainer_gpu_ids": parity_config.trainer_gpu_ids,
             "inference_gpu_ids": parity_config.inference_gpu_ids,
             "rollout_weights_mode": _real_path_rollout_weights_mode(parity_config),
@@ -1181,11 +1361,29 @@ async def run_real_path_train_inf_mismatch(
             },
         },
     )
+    if parity_config.external_vllm_server_url is not None:
+        internal_config["vllm_runtime"] = {
+            "mode": "external",
+            "server_url": parity_config.external_vllm_server_url,
+            "api_key": parity_config.external_vllm_api_key,
+        }
+    model = art.TrainableModel(
+        name=f"train-inf-real-{uuid.uuid4().hex[:8]}",
+        project="train_inf_mismatch",
+        base_model=parity_config.base_model,
+        lora_config=(
+            {"target_modules": _lora_target_modules(parity_config)}
+            if parity_config.lora_target_modules is not None
+            else None
+        ),
+        _internal_config=internal_config,
+    )
     _move_adapter_to_step_zero(adapter_path=adapter_path, model=model, backend=backend)
 
     try:
-        await model.register(backend)
-        backend_open = True
+        with _temporary_env(parity_config.megatron_env):
+            await model.register(backend)
+            backend_open = True
         trajectory_groups = await _collect_real_trajectory_groups(
             model=model,
             config=config,
@@ -1342,6 +1540,8 @@ async def run_real_path_train_inf_mismatch(
                 else None
             ),
             adapter_path=adapter_path,
+            adapter_cache_key=adapter.cache_key,
+            adapter_cache_hit=adapter.cache_hit,
             megatron_base_scores=(
                 base_diagnostic.megatron_score_path
                 if base_diagnostic is not None
