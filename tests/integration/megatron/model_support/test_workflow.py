@@ -11,6 +11,8 @@ from art.megatron.model_support.spec import (
 
 from .validation_spec import ValidationReport, ValidationStageResult
 from .workflow import (
+    INCLUDE_FLASH_SENSITIVITY_ENV,
+    KEEP_TOPOLOGY_ARTIFACTS_ENV,
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
@@ -39,6 +41,7 @@ from .workflow_resources import (
 
 @pytest.fixture(autouse=True)
 def _stub_pinned_git_state(monkeypatch) -> None:
+    monkeypatch.delenv(INCLUDE_FLASH_SENSITIVITY_ENV, raising=False)
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow.pinned_git_state",
         lambda suite_name: SimpleNamespace(
@@ -457,6 +460,50 @@ def test_build_validation_report_populates_architecture_stage(
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
 
 
+def test_build_validation_report_preserves_traces_when_sensitivity_runs(
+    monkeypatch,
+) -> None:
+    seen_keep_env: list[str | None] = []
+
+    monkeypatch.delenv(KEEP_TOPOLOGY_ARTIFACTS_ENV, raising=False)
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        lambda base_model: ArchitectureReport(
+            base_model=base_model,
+            model_key="qwen3_5_moe",
+            handler_key="qwen3_5_moe",
+            layer_families=[LayerFamilyInstance(key="standard_attention", count=1)],
+            recommended_min_layers=1,
+        ),
+    )
+
+    def _run_stage_in_subprocess(
+        *,
+        stage_name,
+        base_model,
+        architecture,
+        allow_unvalidated_arch=False,
+    ) -> ValidationStageResult:
+        del base_model, architecture, allow_unvalidated_arch
+        if stage_name == "correctness_sensitivity":
+            seen_keep_env.append(os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV))
+        return ValidationStageResult(name=stage_name, passed=True, metrics={})
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._run_stage_in_subprocess",
+        _run_stage_in_subprocess,
+    )
+
+    build_validation_report(
+        base_model="Qwen/Qwen3.5-35B-A3B",
+        include_sensitivity=True,
+    )
+
+    assert seen_keep_env == ["1"]
+    assert os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV) is None
+
+
 def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
@@ -781,6 +828,9 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
     assert result.metrics["correctness_variant_count"] == 1
     assert result.metrics["correctness_excluded_topologies"] == []
     assert result.metrics["sensitivity_mutations"] == ["skip_finalize"]
+    assert result.metrics["default_excluded_sensitivity_mutations"] == [
+        "attn_skip_flash_lse_normalize"
+    ]
     assert case_configs[0].is_moe is False
 
 
@@ -804,7 +854,10 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
                         "saturated_step": 2,
                     },
                 )
-            )
+            ),
+            yes_no_trainability_passed=lambda report: (
+                report.final_eval_reward >= report.reward_threshold
+            ),
         ),
     )
 
@@ -1126,6 +1179,9 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
     assert stage.metrics["is_moe"] is True
     assert stage.metrics["objectives"] == ["sft"]
     assert stage.metrics["sensitivity_mutations"] == ["skip_finalize"]
+    assert stage.metrics["default_excluded_sensitivity_mutations"] == [
+        "attn_skip_flash_lse_normalize"
+    ]
     assert stage.metrics["available_gpu_count"] == 2
     assert stage.metrics["required_gpu_count"] == 1
     assert stage.metrics["correctness_variant_count"] == 1
@@ -1256,6 +1312,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     assert stage.metrics["required_gpu_count"] == 1
     assert stage.metrics["correctness_variant_count"] == 1
     assert stage.metrics["sensitivity_mutations"] == []
+    assert stage.metrics["default_excluded_sensitivity_mutations"] == []
     assert stage.metrics["sensitivity_skipped"] is True
     assert stage.metrics["sensitivity_skip_reason"] == f"{SKIP_SENSITIVITY_ENV}=1"
     assert stage.metrics["sensitivity_variant_count"] == 0

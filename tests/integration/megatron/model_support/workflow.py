@@ -37,7 +37,10 @@ SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
 LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
 ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
+INCLUDE_FLASH_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_INCLUDE_FLASH_SENSITIVITY"
+KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
 WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
+FLASH_SENSITIVITY_MUTATION = "attn_skip_flash_lse_normalize"
 
 MANDATORY_VALIDATION_STAGES = (
     "dependency_resolution",
@@ -515,6 +518,7 @@ def run_correctness_sensitivity_stage(
         if topology.world_size() > max_world_size
     ]
     mutations: list[str] = []
+    default_excluded_sensitivity_mutations: list[str] = []
     excluded_sensitivity_mutations: list[str] = []
     if not skip_sensitivity:
         for objective in objectives:
@@ -543,10 +547,16 @@ def run_correctness_sensitivity_stage(
                 > 1
             )
         ]
+        if not _truthy_env(INCLUDE_FLASH_SENSITIVITY_ENV):
+            default_excluded_sensitivity_mutations.append(FLASH_SENSITIVITY_MUTATION)
         mutations = [
             mutation
             for mutation in mutations
-            if mutation not in excluded_sensitivity_mutations
+            if mutation
+            not in {
+                *excluded_sensitivity_mutations,
+                *default_excluded_sensitivity_mutations,
+            }
         ]
     LIVE_TRAINING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     LIVE_TRAINING_LOG_PATH.write_text("", encoding="utf-8")
@@ -601,6 +611,9 @@ def run_correctness_sensitivity_stage(
             "objectives": objectives,
             "sensitivity_mutations": mutations,
             "excluded_sensitivity_mutations": excluded_sensitivity_mutations,
+            "default_excluded_sensitivity_mutations": (
+                default_excluded_sensitivity_mutations
+            ),
             "available_gpu_count": available_gpu_count,
             "max_world_size": max_world_size,
             "required_gpu_count": oracle_world_size,
@@ -738,14 +751,7 @@ def run_yes_no_trainability_stage(
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    passed = (
-        report.saturated_step is not None
-        and report.saturated_step > 0
-        and report.initial_eval_reward < report.reward_threshold
-        and report.final_eval_reward is not None
-        and report.final_eval_reward >= report.reward_threshold
-        and report.final_eval_reward > report.initial_eval_reward
-    )
+    passed = yes_no_trainability.yes_no_trainability_passed(report)
     return ValidationStageResult(
         name=YES_NO_TRAINABILITY_STAGE,
         passed=passed,
@@ -883,11 +889,11 @@ def build_validation_report(
         YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
         NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
-    env = (
-        {SKIP_SENSITIVITY_ENV: "0" if include_sensitivity else "1"}
-        if include_sensitivity is not None
-        else {}
-    )
+    env = {}
+    if include_sensitivity is not None:
+        env[SKIP_SENSITIVITY_ENV] = "0" if include_sensitivity else "1"
+    if include_sensitivity:
+        env[KEEP_TOPOLOGY_ARTIFACTS_ENV] = "1"
     skip_stages = skip_stages or set()
     architecture: ArchitectureReport | None = None
     context = _temporary_env(**env) if env else nullcontext()

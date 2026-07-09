@@ -33,7 +33,7 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from art.megatron.dsv4.compressor import (
     DeepSeekV4Compressor,
     Dsv4CompressionLayout,
-    Dsv4SharedPrefixState,
+    Dsv4PrefixTreeState,
     compressed_layout_topk_idxs,
 )
 from art.megatron.dsv4.kernel.tilelang_sparse_mla import sparse_attn_tilelang
@@ -44,6 +44,7 @@ from art.megatron.dsv4.rope import (
     get_rope_cache_at_positions,
 )
 from art.megatron.dsv4.v4_indexer import V4Indexer
+from art.megatron.prefix_tree import PrefixTreeRow, PrefixTreeSegment, parse_prefix_tree
 
 
 def _window_topk_idxs(
@@ -73,7 +74,7 @@ def _compress_topk_idxs(
     return compress.unsqueeze(0).expand(bsz, -1, -1).to(torch.int32)
 
 
-def _shared_prefix_tensors(
+def _prefix_tree_tensors(
     attention_bias: Any,
     *,
     bsz: int,
@@ -88,14 +89,14 @@ def _shared_prefix_tensors(
     parent_ids = parent_ids.to(device=device, dtype=torch.long)
     if group_ids.shape != (bsz, seqlen) or parent_ids.shape != (bsz, seqlen):
         raise ValueError(
-            "DSV4 shared-prefix metadata must match attention input shape: "
+            "DSV4 prefix-tree metadata must match attention input shape: "
             f"group_ids={tuple(group_ids.shape)} parent_ids={tuple(parent_ids.shape)} "
             f"expected={(bsz, seqlen)}."
         )
     return group_ids, parent_ids
 
 
-def _shared_prefix_window_topk_idxs(
+def _prefix_tree_window_topk_idxs(
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
@@ -104,50 +105,82 @@ def _shared_prefix_window_topk_idxs(
 ) -> torch.Tensor:
     bsz, seqlen = group_ids.shape
     width = min(seqlen, window_size)
-    arange = torch.arange(seqlen, device=group_ids.device).expand(bsz, -1)
-    valid_token = (group_ids != -1) & (parent_ids != -1)
-    group_start = valid_token.clone()
-    group_start[:, 1:] &= group_ids[:, 1:] != group_ids[:, :-1]
-    start_values = torch.where(group_start, arange, torch.zeros_like(arange))
-    group_start_idx = torch.cummax(start_values, dim=1).values
-    prompt_start = group_start & (group_ids == parent_ids)
-    prompt_values = torch.where(prompt_start, arange, torch.zeros_like(arange))
-    prompt_start_idx = torch.cummax(prompt_values, dim=1).values
-
-    q_pos = position_ids.to(device=group_ids.device, dtype=torch.long)
-    group_start_pos = q_pos.gather(1, group_start_idx)
-    offsets = torch.arange(width, device=group_ids.device)
-    target_pos = q_pos.unsqueeze(-1) - width + 1 + offsets
-    from_group = target_pos >= group_start_pos.unsqueeze(-1)
-    group_k = group_start_idx.unsqueeze(-1) + target_pos - group_start_pos.unsqueeze(-1)
-    prompt_k = prompt_start_idx.unsqueeze(-1) + target_pos
-    k_idx = torch.where(from_group, group_k, prompt_k)
-    valid = (
-        valid_token.unsqueeze(-1)
-        & (target_pos >= 0)
-        & (target_pos <= q_pos.unsqueeze(-1))
-        & (k_idx >= 0)
-        & (k_idx < seqlen)
+    position_cpu = position_ids.detach().cpu()
+    rows = parse_prefix_tree(
+        group_ids=group_ids.detach().cpu(),
+        parent_ids=parent_ids.detach().cpu(),
     )
-    return torch.where(valid, k_idx, torch.full_like(k_idx, -1)).to(torch.int32)
+    topk = torch.full((bsz, seqlen, width), -1, dtype=torch.int32)
+    if width == 0:
+        return topk.to(device=group_ids.device)
+
+    def branch_indices(
+        row: PrefixTreeRow,
+        segment: PrefixTreeSegment,
+        by_group: dict[int, PrefixTreeSegment],
+        positions_by_group: dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        branch_len = int(positions_by_group[segment.group_id][-1].item()) + 1
+        indices = torch.full((branch_len,), -1, dtype=torch.int32)
+        for group_id in (*segment.ancestors, segment.group_id):
+            path_segment = by_group[group_id]
+            logical_positions = positions_by_group[group_id]
+            physical_indices = torch.arange(
+                path_segment.start,
+                path_segment.end,
+                dtype=torch.int32,
+            )
+            indices[logical_positions] = physical_indices
+        if bool((indices < 0).any().item()):
+            raise ValueError(
+                "DSV4 prefix-tree SWA path must cover every logical position "
+                f"from 0 through {branch_len - 1}."
+            )
+        return indices
+
+    for row in rows:
+        by_group = {candidate.group_id: candidate for candidate in row.segments}
+        positions_by_group = {
+            candidate.group_id: position_cpu[
+                row.row_index, candidate.start : candidate.end
+            ].to(torch.long)
+            for candidate in row.segments
+        }
+        for segment in row.segments:
+            indices = branch_indices(row, segment, by_group, positions_by_group)
+            padded = torch.cat(
+                (
+                    torch.full((width - 1,), -1, dtype=torch.int32),
+                    indices,
+                )
+            )
+            windows = padded.unfold(0, width, 1)
+            q_positions = position_cpu[row.row_index, segment.start : segment.end].to(
+                torch.long
+            )
+            topk[row.row_index, segment.start : segment.end] = windows.index_select(
+                0,
+                q_positions,
+            )
+    return topk.to(device=group_ids.device)
 
 
-def _dsv4_shared_prefix_state(attention_bias: Any) -> Dsv4SharedPrefixState:
+def _dsv4_prefix_tree_state(attention_bias: Any) -> Dsv4PrefixTreeState:
     model_state = getattr(attention_bias, "model_state", None)
     state = model_state.get("dsv4") if isinstance(model_state, dict) else None
-    if not isinstance(state, Dsv4SharedPrefixState):
+    if not isinstance(state, Dsv4PrefixTreeState):
         raise RuntimeError(
-            "DSV4 shared-prefix state is missing. Build it once per packed "
-            "sequence through the model-support shared-prefix state hook."
+            "DSV4 prefix-tree state is missing. Build it once per packed "
+            "sequence through the model-support prefix-tree state hook."
         )
     return state
 
 
 def _dsv4_topk_cache(attention_bias: Any) -> dict[Any, Any]:
-    return _dsv4_shared_prefix_state(attention_bias).topk_idx_cache
+    return _dsv4_prefix_tree_state(attention_bias).topk_idx_cache
 
 
-def _shared_prefix_window_topk_idxs_cached(
+def _prefix_tree_window_topk_idxs_cached(
     attention_bias: Any,
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
@@ -159,7 +192,7 @@ def _shared_prefix_window_topk_idxs_cached(
     key = ("raw_swa", int(window_size))
     cached = cache.get(key)
     if cached is None:
-        cached = _shared_prefix_window_topk_idxs(
+        cached = _prefix_tree_window_topk_idxs(
             position_ids,
             group_ids,
             parent_ids,
@@ -169,13 +202,11 @@ def _shared_prefix_window_topk_idxs_cached(
     return cached
 
 
-def _shared_prefix_compressed_topk_idxs_cached(
+def _prefix_tree_compressed_topk_idxs_cached(
     attention_bias: Any,
     layout: Dsv4CompressionLayout,
     *,
     position_ids: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
     ratio: int,
     offset: int,
 ) -> torch.Tensor:
@@ -187,8 +218,6 @@ def _shared_prefix_compressed_topk_idxs_cached(
             compressed_layout_topk_idxs(
                 layout,
                 position_ids=position_ids,
-                group_ids=group_ids,
-                parent_ids=parent_ids,
                 offset=offset,
             )
             .to(torch.int32)
@@ -198,26 +227,20 @@ def _shared_prefix_compressed_topk_idxs_cached(
     return cached
 
 
-def _shared_prefix_i32_metadata_cached(
+def _prefix_tree_i32_metadata_cached(
     attention_bias: Any,
     position_ids: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     cache = _dsv4_topk_cache(attention_bias)
     key = "indexer_q_metadata_i32"
     cached = cache.get(key)
     if cached is None:
-        cached = (
-            position_ids.to(torch.int32).contiguous(),
-            group_ids.to(torch.int32).contiguous(),
-            parent_ids.to(torch.int32).contiguous(),
-        )
+        cached = position_ids.to(torch.int32).contiguous()
         cache[key] = cached
     return cached
 
 
-def _shared_layout_indexer_metadata_cached(
+def _prefix_tree_layout_indexer_metadata_cached(
     attention_bias: Any,
     layout: Dsv4CompressionLayout,
     *,
@@ -228,26 +251,26 @@ def _shared_layout_indexer_metadata_cached(
     cached = cache.get(key)
     if cached is None:
         cached = (
-            layout.entry_group_ids.to(torch.int32).contiguous(),
-            layout.entry_parent_visible.to(torch.int32).contiguous(),
+            layout.query_group_pre_order.to(torch.int32).contiguous(),
+            layout.entry_group_pre_order.to(torch.int32).contiguous(),
+            layout.entry_group_post_order.to(torch.int32).contiguous(),
             layout.entry_end_positions.to(torch.int32).contiguous(),
-            layout.entry_valid.to(torch.int32).contiguous(),
         )
         cache[key] = cached
     return cached
 
 
-def _shared_prefix_compression_layout(
+def _prefix_tree_compression_layout(
     attention_bias: Any,
     *,
     ratio: int,
 ) -> Dsv4CompressionLayout:
-    layouts = _dsv4_shared_prefix_state(attention_bias).compression_layouts
+    layouts = _dsv4_prefix_tree_state(attention_bias).compression_layouts
     if ratio not in layouts:
         raise RuntimeError(
-            "DSV4 shared-prefix compression layout was not prepared on the "
+            "DSV4 prefix-tree compression layout was not prepared on the "
             f"attention state for ratio={ratio}. Build it once per packed "
-            "sequence through the model-support shared-prefix state hook."
+            "sequence through the model-support prefix-tree state hook."
         )
     layout = layouts[ratio]
     if not isinstance(layout, Dsv4CompressionLayout):
@@ -486,16 +509,12 @@ class DeepSeekV4Attention(MegatronModule):
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-        shared_prefix = _shared_prefix_tensors(
+        prefix_tree = _prefix_tree_tensors(
             attention_bias, bsz=bsz, seqlen=seqlen_local, device=x.device
         )
         shared_layout: Dsv4CompressionLayout | None = None
-        if (
-            self.compress_ratio
-            and shared_prefix is not None
-            and position_ids is not None
-        ):
-            shared_layout = _shared_prefix_compression_layout(
+        if self.compress_ratio and prefix_tree is not None and position_ids is not None:
+            shared_layout = _prefix_tree_compression_layout(
                 attention_bias,
                 ratio=ratio,
             )
@@ -519,9 +538,9 @@ class DeepSeekV4Attention(MegatronModule):
         seqlen_global = seqlen_local
         q_positions = torch.arange(seqlen_local, device=x.device)
 
-        if shared_prefix is not None and position_ids is not None:
-            group_ids, parent_ids = shared_prefix
-            topk_idxs = _shared_prefix_window_topk_idxs_cached(
+        if prefix_tree is not None and position_ids is not None:
+            group_ids, parent_ids = prefix_tree
+            topk_idxs = _prefix_tree_window_topk_idxs_cached(
                 attention_bias,
                 position_ids,
                 group_ids,
@@ -544,32 +563,27 @@ class DeepSeekV4Attention(MegatronModule):
                         qr_sbd, group=self.tp_group
                     )
                 if isinstance(self.indexer, V4Indexer):
-                    group_ids = parent_ids = None
                     shared_layout_i32 = None
                     index_position_ids = position_ids
-                    if shared_prefix is not None:
-                        group_ids, parent_ids = shared_prefix
-                        if position_ids is not None and shared_layout is not None:
-                            index_position_ids, group_ids, parent_ids = (
-                                _shared_prefix_i32_metadata_cached(
-                                    attention_bias,
-                                    position_ids,
-                                    group_ids,
-                                    parent_ids,
-                                )
-                            )
-                            shared_layout_i32 = _shared_layout_indexer_metadata_cached(
-                                attention_bias,
-                                shared_layout,
-                                ratio=ratio,
-                            )
+                    if (
+                        prefix_tree is not None
+                        and position_ids is not None
+                        and shared_layout is not None
+                    ):
+                        index_position_ids = _prefix_tree_i32_metadata_cached(
+                            attention_bias,
+                            position_ids,
+                        )
+                        shared_layout_i32 = _prefix_tree_layout_indexer_metadata_cached(
+                            attention_bias,
+                            shared_layout,
+                            ratio=ratio,
+                        )
                     compress_topk_idxs = self.indexer(
                         x_sbd,
                         qr_sbd,
                         position_ids=index_position_ids,
                         shared_layout=shared_layout,
-                        group_ids=group_ids,
-                        parent_ids=parent_ids,
                         shared_layout_i32=shared_layout_i32,
                     )
                 else:
@@ -594,22 +608,15 @@ class DeepSeekV4Attention(MegatronModule):
                         compress_topk_idxs + kv_compress_offset,
                     )
             else:
-                if (
-                    shared_layout is None
-                    or shared_prefix is None
-                    or position_ids is None
-                ):
+                if shared_layout is None or prefix_tree is None or position_ids is None:
                     compress_topk_idxs = _compress_topk_idxs(
                         q_positions, ratio=ratio, bsz=bsz
                     )
                 else:
-                    group_ids, parent_ids = shared_prefix
-                    compress_topk_idxs = _shared_prefix_compressed_topk_idxs_cached(
+                    compress_topk_idxs = _prefix_tree_compressed_topk_idxs_cached(
                         attention_bias,
                         shared_layout,
                         position_ids=position_ids,
-                        group_ids=group_ids,
-                        parent_ids=parent_ids,
                         ratio=ratio,
                         offset=kv_compress_offset,
                     )

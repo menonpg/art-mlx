@@ -1,12 +1,17 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any, cast
 
+import pytest
 from safetensors.torch import load_file, save_file
 import torch
+
+pytest.importorskip("megatron.bridge.models.gpt_provider")
 
 from art.megatron import lora as lora_module
 from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner
@@ -16,6 +21,7 @@ from art.megatron.model_support.handlers import (
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
+from art.megatron.model_support.handlers.gemma4 import GEMMA4_MOE_HANDLER
 from art.megatron.model_support.lora_disk import (
     load_lora_tensors_for_megatron,
     normalize_lora_checkpoint_to_vllm,
@@ -32,6 +38,66 @@ from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 REPO_ROOT = Path(__file__).parents[4]
 VLLM_PYTHON = REPO_ROOT / "vllm_runtime/.venv/bin/python"
 VLLM_RUNTIME_SRC = REPO_ROOT / "vllm_runtime/src"
+_VLLM_RUNTIME_UNAVAILABLE_REASON: str | None | object = object()
+
+
+def _vllm_python_cmd() -> list[str]:
+    override = os.environ.get("ART_TEST_VLLM_PYTHON")
+    if override:
+        return [override]
+    if VLLM_PYTHON.exists():
+        return [str(VLLM_PYTHON)]
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            f"{VLLM_PYTHON} does not exist and uv is not available to run "
+            "the locked vLLM runtime project"
+        )
+    return [
+        uv,
+        "run",
+        "--project",
+        str(REPO_ROOT / "vllm_runtime"),
+        "--frozen",
+        "--no-dev",
+        "python",
+    ]
+
+
+def _vllm_runtime_unavailable_reason() -> str | None:
+    global _VLLM_RUNTIME_UNAVAILABLE_REASON
+    if isinstance(_VLLM_RUNTIME_UNAVAILABLE_REASON, str):
+        return _VLLM_RUNTIME_UNAVAILABLE_REASON
+    if _VLLM_RUNTIME_UNAVAILABLE_REASON is None:
+        return None
+    try:
+        subprocess.run(
+            [
+                *_vllm_python_cmd(),
+                "-c",
+                "import vllm; from vllm.lora.lora_model import LoRAModel",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        _VLLM_RUNTIME_UNAVAILABLE_REASON = (
+            "Stock vLLM loader runtime is unavailable. Run "
+            "`uv sync --project vllm_runtime --frozen --no-dev`, or set "
+            "`ART_TEST_VLLM_PYTHON` to a Python environment with vLLM installed. "
+            f"Original error: {exc}"
+        )
+        return _VLLM_RUNTIME_UNAVAILABLE_REASON
+    _VLLM_RUNTIME_UNAVAILABLE_REASON = None
+    return None
+
+
+def test_stock_vllm_loader_runtime_is_available() -> None:
+    reason = _vllm_runtime_unavailable_reason()
+    if reason is not None:
+        pytest.fail(reason)
 
 
 def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
@@ -119,6 +185,8 @@ def _assert_stock_vllm_loads(
     expected_modules: set[str],
     mapper: str = "none",
 ) -> list[str]:
+    if reason := _vllm_runtime_unavailable_reason():
+        pytest.skip(reason)
     script = r"""
 import json
 import sys
@@ -145,7 +213,7 @@ print(json.dumps(sorted(lora.loras)))
 """
     result = subprocess.run(
         [
-            str(VLLM_PYTHON),
+            *_vllm_python_cmd(),
             "-c",
             script,
             str(path),
@@ -724,6 +792,84 @@ def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():
     roundtrip = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
         vllm_tensors,
         adapter_config=vllm_config,
+    )
+    _assert_tensors_equal(roundtrip, original)
+
+
+def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path):
+    art_prefix = "base_model.model.model.layers.0"
+    hidden_size = 3
+    model_dir = tmp_path / "gemma4"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 1}),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "model.layers.0.pre_feedforward_layernorm.weight": torch.tensor(
+                [2.0, 4.0, 8.0]
+            ),
+            "model.layers.0.pre_feedforward_layernorm_2.weight": torch.tensor(
+                [1.0, 2.0, 4.0]
+            ),
+        },
+        model_dir / "model-00001-of-00001.safetensors",
+    )
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.pre_feedforward_layernorm.weight": (
+                        "model-00001-of-00001.safetensors"
+                    ),
+                    "model.layers.0.pre_feedforward_layernorm_2.weight": (
+                        "model-00001-of-00001.safetensors"
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = {
+        f"{art_prefix}.mlp.shared_experts.gate_proj.lora_A.weight": torch.ones(
+            2,
+            hidden_size,
+        ),
+        f"{art_prefix}.mlp.shared_experts.gate_proj.lora_B.weight": torch.ones(4, 2),
+        f"{art_prefix}.mlp.shared_experts.up_proj.lora_A.weight": torch.ones(
+            2,
+            hidden_size,
+        ),
+        f"{art_prefix}.mlp.shared_experts.up_proj.lora_B.weight": torch.ones(4, 2),
+        f"{art_prefix}.mlp.shared_experts.down_proj.lora_A.weight": torch.ones(2, 4),
+        f"{art_prefix}.mlp.shared_experts.down_proj.lora_B.weight": torch.ones(
+            hidden_size,
+            2,
+        ),
+    }
+    adapter_config = _config(str(model_dir))
+    vllm_tensors, _ = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        original,
+        adapter_config=adapter_config,
+    )
+
+    assert set(vllm_tensors) == {
+        f"{art_prefix}.mlp.gate_proj.lora_A.weight",
+        f"{art_prefix}.mlp.gate_proj.lora_B.weight",
+        f"{art_prefix}.mlp.up_proj.lora_A.weight",
+        f"{art_prefix}.mlp.up_proj.lora_B.weight",
+        f"{art_prefix}.mlp.down_proj.lora_A.weight",
+        f"{art_prefix}.mlp.down_proj.lora_B.weight",
+    }
+    assert not any("shared_expert" in key for key in vllm_tensors)
+    assert torch.equal(
+        vllm_tensors[f"{art_prefix}.mlp.gate_proj.lora_A.weight"],
+        torch.full((2, hidden_size), 0.5),
+    )
+    roundtrip = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+        vllm_tensors,
+        adapter_config=adapter_config,
     )
     _assert_tensors_equal(roundtrip, original)
 

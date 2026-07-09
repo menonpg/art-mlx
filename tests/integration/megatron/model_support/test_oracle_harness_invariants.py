@@ -30,6 +30,8 @@ from .oracle_harness import (
     selected_sensitivity_mutations_for_objective,
     sensitivity_topology_for_mutation,
 )
+from .oracle_worker import _matches_grad_sync_skip_mutation
+from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 
 def _metric_row(
@@ -96,6 +98,25 @@ def _expert_trace_call(
             "expert_dp_world_size": 1,
         },
     }
+
+
+def test_fc1_grad_sync_sensitivity_matches_split_and_fused_lora_names() -> None:
+    assert _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
+    assert _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.gate_lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
+    assert _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc1.up_lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
+    assert not _matches_grad_sync_skip_mutation(
+        "chunk0.module.decoder.layers.0.mlp.experts.linear_fc2.lora.A_T",
+        "bwd_skip_sync_fc1_a",
+    )
 
 
 def test_metric_threshold_rule_can_require_strictly_positive_values() -> None:
@@ -409,6 +430,37 @@ def test_forward_trace_canonicalizes_row_outputs_by_token_uid() -> None:
     assert torch.equal(
         call["output"]["routing_map"],
         torch.tensor([[False], [True], [True]]),
+    )
+
+
+def test_forward_trace_drops_exact_zero_padding_rows() -> None:
+    trace: dict[str, list[dict[str, Any]]] = {
+        "chunk0.module.decoder.layers.0.self_attention.out_proj": [
+            {
+                "primary_output": torch.tensor(
+                    [[0.0, 0.0], [30.0, 31.0], [10.0, 11.0], [20.0, 21.0]]
+                ),
+                "output": {
+                    "hidden": torch.tensor(
+                        [[0.0, 0.0], [3.0, 3.1], [1.0, 1.1], [2.0, 2.1]]
+                    )
+                },
+                "row_token_uids": torch.tensor([-1, 3, 1, 2]),
+            }
+        ]
+    }
+
+    ForwardTraceCapture.canonicalize_trace(trace)
+
+    call = trace["chunk0.module.decoder.layers.0.self_attention.out_proj"][0]
+    assert torch.equal(call["row_token_uids"], torch.tensor([1, 2, 3]))
+    assert torch.equal(
+        call["primary_output"],
+        torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]),
+    )
+    assert torch.equal(
+        call["output"]["hidden"],
+        torch.tensor([[1.0, 1.1], [2.0, 2.1], [3.0, 3.1]]),
     )
 
 
@@ -982,6 +1034,14 @@ def test_dense_sensitivity_keeps_dp_and_cp_attention_cases() -> None:
         )
         == DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY
     )
+    assert sensitivity_topology_for_mutation(
+        "attn_skip_flash_lse_normalize",
+        is_moe=False,
+    ) == Topology(tp=1, ep=1, etp=1, dp=1, cp=4, sp=False)
+    assert sensitivity_topology_for_mutation(
+        "attn_skip_flash_lse_normalize",
+        is_moe=True,
+    ) == Topology(tp=1, ep=2, etp=1, dp=1, cp=4, sp=False)
 
 
 def test_case_config_base_model_can_be_overridden_by_env(
@@ -1004,3 +1064,22 @@ def test_packed_tensor_defaults_match_main_rebase_oracle_tokens() -> None:
     assert config.decode_tokens_jitter == 32
     assert config.packing_mode == "stop_early"
     assert config.vocab_high == 8192
+
+
+def test_prefix_tree_workload_fits_hf_parity_packed_size() -> None:
+    packed_tensors = build_complex_prefix_tree_packed_tensors(
+        PackedTensorConfig(
+            num_sequences=4,
+            sequence_length=256,
+            prefill_tokens=64,
+            completion_branches_per_prefix=2,
+            decode_tokens=64,
+            decode_tokens_jitter=32,
+            packing_mode="stop_early",
+        ),
+        seed=20260304,
+    )
+
+    assert int((packed_tensors["group_ids"] != -1).sum().item()) > 0
+    assert int(packed_tensors["assistant_mask"].sum().item()) > 0
+    assert int((packed_tensors["weights"] != 0).sum().item()) > 0

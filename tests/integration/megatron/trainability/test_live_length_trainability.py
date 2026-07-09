@@ -37,6 +37,8 @@ from .yes_no_trainability import (
 torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
+DEFAULT_LENGTH_LEARNING_RATE = 1e-4
+LARGE_MOE_LENGTH_LEARNING_RATE = 7e-5
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -64,6 +66,16 @@ BASE_PROMPT = (
     "Write a plain answer about a quiet harbor. Use the unrelated notes below "
     "only as background texture. Use one sentence. Do not use bullets, numbering, "
     "code, or a preface."
+)
+LENGTH_PROMPT_MIDS = (
+    "Branch alpha: the harbor office is preparing a routine status note.",
+    "Branch beta: the harbor office is summarizing a quiet maintenance record.",
+)
+LENGTH_PROMPT_LEAVES = (
+    "Case one: mention calm water without adding drama.",
+    "Case two: mention ordinary work near the pier.",
+    "Case three: mention a simple observation from the office.",
+    "Case four: mention a reserved conclusion about the day.",
 )
 FILLER_SENTENCES = (
     "The morning ledger mentioned a bicycle bell near the old customs window.",
@@ -159,6 +171,8 @@ class LengthTrainabilityReport(BaseModel):
     training_topology: dict[str, int | bool]
     rollout_weights_mode: str
     rollouts_per_prompt: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     normalize_advantages: bool
     summary_log_path: str
     latest_summary_log_path: str
@@ -206,6 +220,12 @@ def _word_count(text: str) -> int:
 
 def _target_tokens() -> int:
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", 10)
+
+
+def _default_learning_rate(base_model: str) -> float:
+    if base_model == DEFAULT_BASE_MODEL:
+        return LARGE_MOE_LENGTH_LEARNING_RATE
+    return DEFAULT_LENGTH_LEARNING_RATE
 
 
 def _use_default_moe_dedicated_placement(variant: Any, *, base_model: str) -> None:
@@ -298,14 +318,31 @@ def _prompt_for_index(index: int) -> tuple[str, int]:
     sentences = list(FILLER_SENTENCES)
     rng.shuffle(sentences)
     selected: list[str] = []
-    prompt = BASE_PROMPT
+    mid = LENGTH_PROMPT_MIDS[(index // 2) % len(LENGTH_PROMPT_MIDS)]
+    leaf = LENGTH_PROMPT_LEAVES[index % len(LENGTH_PROMPT_LEAVES)]
+    prefix = f"{BASE_PROMPT}\n\n{mid}\n\n{leaf}"
+    prompt = prefix
     for sentence in sentences:
         if _word_count(prompt) >= target_words:
             break
         selected.append(sentence)
-        prompt = f"{BASE_PROMPT}\n\nNotes: {' '.join(selected)}"
+        prompt = f"{prefix}\n\nNotes: {' '.join(selected)}"
     _check_prompt_hides_target(prompt)
     return prompt, _word_count(prompt)
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in LENGTH_PROMPT_MIDS if any(mid in prompt for prompt in prompts)}
+    )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in LENGTH_PROMPT_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
 def _scenario(
@@ -772,7 +809,7 @@ async def run_length_trainability_async(
             max_steps_off_policy=max_steps_off_policy,
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
-                1e-4,
+                _default_learning_rate(base_model),
             ),
             loss_fn="cispo",
             normalize_advantages=normalize_advantages,
@@ -803,7 +840,7 @@ async def run_length_trainability_async(
     success_step = next(
         (
             step
-            for step, abs_error in train_abs_error_by_step.items()
+            for step, abs_error in sorted(train_abs_error_by_step.items())
             if _success_abs_error_passed(abs_error, thresholds)
         ),
         None,
@@ -819,6 +856,13 @@ async def run_length_trainability_async(
         if final_train_samples
         else None
     )
+    prompt_tree_sample_count = 4 if scenario_limit is None else min(4, scenario_limit)
+    prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(
+        [
+            _scenario(index, base_model=base_model).prompt
+            for index in range(prompt_tree_sample_count)
+        ]
+    )
     topology = cast(Topology, variant.topology)
     report = LengthTrainabilityReport(
         base_model=base_model,
@@ -831,6 +875,8 @@ async def run_length_trainability_async(
         training_topology=cast(dict[str, int | bool], topology.model_dump()),
         rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
+        prompt_tree_depth=prompt_tree_depth,
+        prompt_tree_branch_count=prompt_tree_branch_count,
         normalize_advantages=normalize_advantages,
         summary_log_path=str(summary_log_path),
         latest_summary_log_path=str(LATEST_SUMMARY_LOG_PATH),

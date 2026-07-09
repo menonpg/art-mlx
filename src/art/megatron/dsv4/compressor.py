@@ -15,19 +15,33 @@ from art.megatron.dsv4.rope import (
     get_rope_cache_at_positions,
 )
 from art.megatron.dsv4.utils import rotate_activation
+from art.megatron.prefix_tree import (
+    PrefixTreeRow,
+    PrefixTreeSegment,
+    parse_prefix_tree,
+)
 
 
 class Dsv4CompressionLayout(NamedTuple):
     current_indices: torch.Tensor
     previous_indices: torch.Tensor
-    entry_group_ids: torch.Tensor
-    entry_parent_visible: torch.Tensor
+    entry_group_pre_order: torch.Tensor
+    entry_group_post_order: torch.Tensor
     entry_start_positions: torch.Tensor
     entry_end_positions: torch.Tensor
-    entry_valid: torch.Tensor
+    query_group_pre_order: torch.Tensor
 
 
-class Dsv4SharedPrefixState(BaseModel):
+class _Dsv4CompressionPlan(NamedTuple):
+    row: PrefixTreeRow
+    position_to_index_by_group: dict[int, dict[int, int]]
+    positions_by_group: dict[int, list[int]]
+    group_pre_order: dict[int, int]
+    group_post_order: dict[int, int]
+    query_group_pre_order: list[int]
+
+
+class Dsv4PrefixTreeState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     compression_layouts: dict[int, Dsv4CompressionLayout]
@@ -43,232 +57,261 @@ def move_compression_layout_to_device(
     )
 
 
-def build_shared_prefix_compression_layouts(
+def build_prefix_tree_compression_layouts(
     *,
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     device: torch.device,
 ) -> dict[int, Dsv4CompressionLayout]:
+    plan = _build_prefix_tree_compression_plan(
+        position_ids=position_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    )
     return {
         ratio: move_compression_layout_to_device(
-            build_shared_prefix_compression_layout(
-                position_ids=position_ids,
-                group_ids=group_ids,
-                parent_ids=parent_ids,
-                ratio=ratio,
-                duplicate_prompt_entries=ratio == 4,
-            ),
+            _emit_prefix_tree_compression_layout(plan=plan, ratio=ratio),
             device,
         )
         for ratio in (4, 128)
     }
 
 
-def _logical_window_indices(
+def _segment_positions(
+    position_row: torch.Tensor,
+    segment: PrefixTreeSegment,
+) -> list[int]:
+    positions = [int(value) for value in position_row[segment.start : segment.end]]
+    if positions != list(range(positions[0], positions[-1] + 1)):
+        raise ValueError(
+            "DSV4 prefix-tree compression requires contiguous positions within "
+            f"group={segment.group_id}, got {positions[:4]}...{positions[-4:]}."
+        )
+    return positions
+
+
+def _segment_path(
+    row: PrefixTreeRow,
+    segment: PrefixTreeSegment,
+) -> tuple[PrefixTreeSegment, ...]:
+    by_group = {candidate.group_id: candidate for candidate in row.segments}
+    return tuple(
+        by_group[group_id] for group_id in (*segment.ancestors, segment.group_id)
+    )
+
+
+def _branch_position_map(
     *,
-    prompt_start: int,
-    prompt_len: int,
-    completion_start: int | None,
+    row: PrefixTreeRow,
+    segment: PrefixTreeSegment,
+    positions_by_group: dict[int, list[int]],
+) -> dict[int, int]:
+    by_group = {candidate.group_id: candidate for candidate in row.segments}
+    mapping: dict[int, int] = {}
+    expected = 0
+    for path_segment in _segment_path(row, segment):
+        positions = positions_by_group[path_segment.group_id]
+        if positions[0] != expected:
+            raise ValueError(
+                "DSV4 prefix-tree compression requires contiguous branch "
+                f"positions; expected {expected}, got {positions[0]} for "
+                f"group={path_segment.group_id}."
+            )
+        for offset, logical_pos in enumerate(positions):
+            mapping[logical_pos] = by_group[path_segment.group_id].start + offset
+        expected = positions[-1] + 1
+    return mapping
+
+
+def _group_preorder_intervals(
+    row: PrefixTreeRow,
+) -> tuple[dict[int, int], dict[int, int]]:
+    children_by_group: dict[int, list[int]] = {
+        segment.group_id: [] for segment in row.segments
+    }
+    roots: list[int] = []
+    for segment in row.segments:
+        if segment.depth == 0:
+            roots.append(segment.group_id)
+        else:
+            children_by_group[segment.parent_id].append(segment.group_id)
+
+    pre_order: dict[int, int] = {}
+    post_order: dict[int, int] = {}
+    next_order = 0
+
+    def visit(group_id: int) -> None:
+        nonlocal next_order
+        pre_order[group_id] = next_order
+        next_order += 1
+        for child_group_id in children_by_group[group_id]:
+            visit(child_group_id)
+        post_order[group_id] = next_order
+
+    for root_group_id in roots:
+        visit(root_group_id)
+    return pre_order, post_order
+
+
+def _build_prefix_tree_compression_plan(
+    *,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+) -> _Dsv4CompressionPlan:
+    if position_ids.ndim != 2 or group_ids.ndim != 2 or parent_ids.ndim != 2:
+        raise ValueError("DSV4 prefix-tree metadata must be rank-2.")
+    if int(position_ids.shape[0]) != 1:
+        raise ValueError(
+            "DSV4 prefix-tree compression expects one packed sequence per "
+            f"Megatron microbatch, got batch={int(position_ids.shape[0])}."
+        )
+    if tuple(position_ids.shape) != tuple(group_ids.shape) or tuple(
+        group_ids.shape
+    ) != tuple(parent_ids.shape):
+        raise ValueError(
+            "DSV4 prefix-tree position/group/parent metadata must share shape, "
+            f"got {tuple(position_ids.shape)}, {tuple(group_ids.shape)}, "
+            f"{tuple(parent_ids.shape)}."
+        )
+
+    position_cpu = position_ids.detach().cpu()
+    group_cpu = group_ids.detach().cpu()
+    parent_cpu = parent_ids.detach().cpu()
+    (row,) = parse_prefix_tree(group_ids=group_cpu, parent_ids=parent_cpu)
+    positions_by_group = {
+        segment.group_id: _segment_positions(position_cpu[0], segment)
+        for segment in row.segments
+    }
+    group_pre_order, group_post_order = _group_preorder_intervals(row)
+    query_group_pre_order = [-1] * int(position_ids.shape[1])
+    for segment in row.segments:
+        pre_order = group_pre_order[segment.group_id]
+        for token_index in range(segment.start, segment.end):
+            query_group_pre_order[token_index] = pre_order
+    position_to_index_by_group = {
+        segment.group_id: _branch_position_map(
+            row=row,
+            segment=segment,
+            positions_by_group=positions_by_group,
+        )
+        for segment in row.segments
+    }
+    return _Dsv4CompressionPlan(
+        row=row,
+        position_to_index_by_group=position_to_index_by_group,
+        positions_by_group=positions_by_group,
+        group_pre_order=group_pre_order,
+        group_post_order=group_post_order,
+        query_group_pre_order=query_group_pre_order,
+    )
+
+
+def _logical_window_indices(
+    position_to_index: dict[int, int],
+    *,
     logical_start: int,
     ratio: int,
+    allow_negative_padding: bool,
 ) -> list[int]:
     indices: list[int] = []
     for logical_pos in range(logical_start, logical_start + ratio):
-        if logical_pos < 0:
-            indices.append(-1)
-        elif logical_pos < prompt_len:
-            indices.append(prompt_start + logical_pos)
-        elif completion_start is not None:
-            indices.append(completion_start + logical_pos - prompt_len)
-        else:
-            indices.append(-1)
+        index = position_to_index.get(logical_pos)
+        if index is None:
+            if logical_pos < 0 and allow_negative_padding:
+                indices.append(-1)
+                continue
+            raise ValueError(
+                "DSV4 prefix-tree compression window references missing "
+                f"logical position {logical_pos}."
+            )
+        indices.append(index)
     return indices
 
 
-def build_shared_prefix_compression_layout(
+def build_prefix_tree_compression_layout(
     *,
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     ratio: int,
-    duplicate_prompt_entries: bool = False,
 ) -> Dsv4CompressionLayout:
-    device = position_ids.device
-    bsz, seqlen = position_ids.shape
-    position_cpu = position_ids.detach().cpu()
-    group_cpu = group_ids.detach().cpu()
-    parent_cpu = parent_ids.detach().cpu()
-    current_rows: list[list[list[int]]] = []
-    previous_rows: list[list[list[int]]] = []
-    group_rows: list[list[int]] = []
-    parent_visible_rows: list[list[bool]] = []
-    start_rows: list[list[int]] = []
-    end_rows: list[list[int]] = []
+    return _emit_prefix_tree_compression_layout(
+        plan=_build_prefix_tree_compression_plan(
+            position_ids=position_ids,
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+        ),
+        ratio=ratio,
+    )
 
-    for b in range(bsz):
-        valid_mask = (group_cpu[b] != -1) & (parent_cpu[b] != -1)
-        padding = torch.nonzero(~valid_mask, as_tuple=False)
-        valid_len = int(padding[0].item()) if padding.numel() else seqlen
-        if bool(valid_mask[valid_len:].any().item()):
-            raise ValueError("DSV4 shared-prefix metadata must pad only at row end.")
-        segments: list[tuple[int, int, int, int, int, int]] = []
-        cursor = 0
-        while cursor < valid_len:
-            group = int(group_cpu[b, cursor].item())
-            parent = int(parent_cpu[b, cursor].item())
-            start = cursor
-            cursor += 1
-            while cursor < valid_len and int(group_cpu[b, cursor].item()) == group:
-                cursor += 1
-            end = cursor
-            start_pos = int(position_cpu[b, start].item())
-            end_pos = int(position_cpu[b, end - 1].item())
-            segments.append((group, parent, start, end, start_pos, end_pos))
 
-        row_current: list[list[int]] = []
-        row_previous: list[list[int]] = []
-        row_groups: list[int] = []
-        row_parent_visible: list[bool] = []
-        row_starts: list[int] = []
-        row_ends: list[int] = []
+def _emit_prefix_tree_compression_layout(
+    *,
+    plan: _Dsv4CompressionPlan,
+    ratio: int,
+) -> Dsv4CompressionLayout:
+    current_rows: list[list[int]] = []
+    previous_rows: list[list[int]] = []
+    entry_pre_orders: list[int] = []
+    entry_post_orders: list[int] = []
+    start_rows: list[int] = []
+    end_rows: list[int] = []
 
-        def append_entry(
-            *,
-            entry_group: int,
-            parent_visible: bool,
-            current_indices: list[int],
-            previous_indices: list[int],
-            logical_start: int,
-        ) -> None:
-            row_current.append(current_indices)
-            row_previous.append(previous_indices)
-            row_groups.append(entry_group)
-            row_parent_visible.append(parent_visible)
-            row_starts.append(logical_start)
-            row_ends.append(logical_start + ratio - 1)
-
-        seg_idx = 0
-        while seg_idx < len(segments):
-            group, parent, prompt_start, prompt_end, _, _ = segments[seg_idx]
-            if group != parent:
-                seg_idx += 1
+    for segment in plan.row.segments:
+        position_to_index = plan.position_to_index_by_group[segment.group_id]
+        segment_positions = plan.positions_by_group[segment.group_id]
+        segment_end_pos = segment_positions[-1]
+        parent_end_pos = (
+            -1
+            if not segment.ancestors
+            else plan.positions_by_group[segment.ancestors[-1]][-1]
+        )
+        usable = ((segment_end_pos + 1) // ratio) * ratio
+        for logical_start in range(0, usable, ratio):
+            if logical_start + ratio - 1 <= parent_end_pos:
                 continue
-            prompt_len = prompt_end - prompt_start
-            shared_usable = (prompt_len // ratio) * ratio
-            shared_windows: list[tuple[list[int], list[int], int]] = []
-            for logical_start in range(0, shared_usable, ratio):
-                current_indices = _logical_window_indices(
-                    prompt_start=prompt_start,
-                    prompt_len=prompt_len,
-                    completion_start=None,
+            current_rows.append(
+                _logical_window_indices(
+                    position_to_index,
                     logical_start=logical_start,
                     ratio=ratio,
+                    allow_negative_padding=False,
                 )
-                previous_indices = _logical_window_indices(
-                    prompt_start=prompt_start,
-                    prompt_len=prompt_len,
-                    completion_start=None,
+            )
+            previous_rows.append(
+                _logical_window_indices(
+                    position_to_index,
                     logical_start=logical_start - ratio,
                     ratio=ratio,
+                    allow_negative_padding=True,
                 )
-                shared_windows.append(
-                    (current_indices, previous_indices, logical_start)
-                )
-                append_entry(
-                    entry_group=group,
-                    parent_visible=not duplicate_prompt_entries,
-                    current_indices=current_indices,
-                    previous_indices=previous_indices,
-                    logical_start=logical_start,
-                )
+            )
+            entry_pre_orders.append(plan.group_pre_order[segment.group_id])
+            entry_post_orders.append(plan.group_post_order[segment.group_id])
+            start_rows.append(logical_start)
+            end_rows.append(logical_start + ratio - 1)
 
-            child_idx = seg_idx + 1
-            while child_idx < len(segments):
-                child_group, child_parent, child_start, _, _, child_end_pos = segments[
-                    child_idx
-                ]
-                if child_group == child_parent or child_parent != group:
-                    break
-                if duplicate_prompt_entries:
-                    for (
-                        current_indices,
-                        previous_indices,
-                        logical_start,
-                    ) in shared_windows:
-                        append_entry(
-                            entry_group=child_group,
-                            parent_visible=False,
-                            current_indices=current_indices,
-                            previous_indices=previous_indices,
-                            logical_start=logical_start,
-                        )
-                branch_usable = ((child_end_pos + 1) // ratio) * ratio
-                for logical_start in range(0, branch_usable, ratio):
-                    if logical_start + ratio <= prompt_len:
-                        continue
-                    append_entry(
-                        entry_group=child_group,
-                        parent_visible=False,
-                        current_indices=_logical_window_indices(
-                            prompt_start=prompt_start,
-                            prompt_len=prompt_len,
-                            completion_start=child_start,
-                            logical_start=logical_start,
-                            ratio=ratio,
-                        ),
-                        previous_indices=_logical_window_indices(
-                            prompt_start=prompt_start,
-                            prompt_len=prompt_len,
-                            completion_start=child_start,
-                            logical_start=logical_start - ratio,
-                            ratio=ratio,
-                        ),
-                        logical_start=logical_start,
-                    )
-                child_idx += 1
-            seg_idx = child_idx
-
-        current_rows.append(row_current)
-        previous_rows.append(row_previous)
-        group_rows.append(row_groups)
-        parent_visible_rows.append(row_parent_visible)
-        start_rows.append(row_starts)
-        end_rows.append(row_ends)
-
-    max_entries = max((len(row) for row in current_rows), default=0)
-    current = torch.full((bsz, max_entries, ratio), -1, dtype=torch.long, device=device)
-    previous = torch.full_like(current, -1)
-    entry_groups = torch.full((bsz, max_entries), -1, dtype=torch.long, device=device)
-    parent_visible = torch.zeros((bsz, max_entries), dtype=torch.bool, device=device)
-    starts = torch.full_like(entry_groups, -1)
-    ends = torch.full_like(entry_groups, -1)
-    valid = torch.zeros((bsz, max_entries), dtype=torch.bool, device=device)
-    for b, row in enumerate(current_rows):
-        if not row:
-            continue
-        count = len(row)
-        current[b, :count] = torch.tensor(row, dtype=torch.long, device=device)
-        previous[b, :count] = torch.tensor(
-            previous_rows[b], dtype=torch.long, device=device
-        )
-        entry_groups[b, :count] = torch.tensor(
-            group_rows[b], dtype=torch.long, device=device
-        )
-        parent_visible[b, :count] = torch.tensor(
-            parent_visible_rows[b], dtype=torch.bool, device=device
-        )
-        starts[b, :count] = torch.tensor(start_rows[b], dtype=torch.long, device=device)
-        ends[b, :count] = torch.tensor(end_rows[b], dtype=torch.long, device=device)
-        valid[b, :count] = True
+    entry_count = len(current_rows)
+    current = torch.empty((entry_count, ratio), dtype=torch.long)
+    previous = torch.empty_like(current)
+    if entry_count:
+        current[:] = torch.tensor(current_rows, dtype=torch.long)
+        previous[:] = torch.tensor(previous_rows, dtype=torch.long)
+    entry_pre_order = torch.tensor(entry_pre_orders, dtype=torch.int32)
+    entry_post_order = torch.tensor(entry_post_orders, dtype=torch.int32)
+    starts = torch.tensor(start_rows, dtype=torch.long)
+    ends = torch.tensor(end_rows, dtype=torch.long)
+    query_pre_order = torch.tensor(plan.query_group_pre_order, dtype=torch.int32)
     return Dsv4CompressionLayout(
         current,
         previous,
-        entry_groups,
-        parent_visible,
+        entry_pre_order,
+        entry_post_order,
         starts,
         ends,
-        valid,
+        query_pre_order,
     )
 
 
@@ -276,42 +319,38 @@ def compressed_layout_visibility(
     layout: Dsv4CompressionLayout,
     *,
     position_ids: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
     q_start: int = 0,
     q_end: int | None = None,
 ) -> torch.Tensor:
+    if int(position_ids.shape[0]) != 1:
+        raise ValueError(
+            "DSV4 prefix-tree compressed visibility expects one packed sequence."
+        )
     if q_end is None:
         q_end = position_ids.shape[1]
-    q_pos = position_ids[:, q_start:q_end].to(dtype=torch.long).unsqueeze(-1)
-    q_group = group_ids[:, q_start:q_end].to(dtype=torch.long).unsqueeze(-1)
-    q_parent = parent_ids[:, q_start:q_end].to(dtype=torch.long).unsqueeze(-1)
-    entry_group = layout.entry_group_ids.unsqueeze(1)
-    parent_visible = layout.entry_parent_visible.unsqueeze(1)
-    return (
-        layout.entry_valid.unsqueeze(1)
-        & (layout.entry_end_positions.unsqueeze(1) <= q_pos)
-        & ((entry_group == q_group) | (parent_visible & (entry_group == q_parent)))
+    q_pos = position_ids[0, q_start:q_end].to(dtype=torch.long).unsqueeze(-1)
+    q_group_pre = layout.query_group_pre_order[q_start:q_end].unsqueeze(-1)
+    visible = (
+        (layout.entry_end_positions.unsqueeze(0) <= q_pos)
+        & (layout.entry_group_pre_order.unsqueeze(0) <= q_group_pre)
+        & (q_group_pre < layout.entry_group_post_order.unsqueeze(0))
     )
+    return visible.unsqueeze(0)
 
 
 def compressed_layout_topk_idxs(
     layout: Dsv4CompressionLayout,
     *,
     position_ids: torch.Tensor,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
     offset: int,
 ) -> torch.Tensor:
     visibility = compressed_layout_visibility(
         layout,
         position_ids=position_ids,
-        group_ids=group_ids,
-        parent_ids=parent_ids,
     )
     entry_ids = torch.arange(
-        layout.entry_group_ids.shape[1],
-        device=layout.entry_group_ids.device,
+        layout.entry_group_pre_order.shape[0],
+        device=layout.entry_group_pre_order.device,
         dtype=torch.long,
     ).view(1, 1, -1)
     return torch.where(visibility, entry_ids + offset, torch.full_like(entry_ids, -1))
@@ -372,7 +411,18 @@ def _gather_projected_tokens(
 ) -> torch.Tensor:
     bsz, seqlen, channels = tensor.shape
     if indices.numel() == 0:
+        if indices.ndim == 2:
+            return tensor.new_empty((bsz, *indices.shape, channels))
         return tensor.new_empty((*indices.shape, channels))
+    if indices.ndim == 2:
+        if bsz != 1:
+            raise ValueError(
+                "DSV4 prefix-tree compression expects one packed sequence per "
+                f"Megatron microbatch, got batch={bsz}."
+            )
+        safe_indices = indices.clamp(0, max(seqlen - 1, 0))
+        gathered = tensor[0].index_select(0, safe_indices.reshape(-1))
+        return gathered.view(*indices.shape, channels).unsqueeze(0)
     batch_offsets = (
         torch.arange(bsz, device=tensor.device, dtype=torch.long).view(bsz, 1, 1)
         * seqlen
@@ -534,7 +584,7 @@ class DeepSeekV4Compressor(nn.Module):
 
         return kv
 
-    def _compress_shared_prefix_projected(
+    def _compress_prefix_tree_projected(
         self,
         kv: torch.Tensor,
         score: torch.Tensor,
@@ -585,11 +635,6 @@ class DeepSeekV4Compressor(nn.Module):
             slots_kv = current_kv
             slots_score = current_score + self.ape.view(1, 1, ratio, -1)
 
-        slots_score = torch.where(
-            layout.entry_valid[:, :, None, None],
-            slots_score,
-            torch.zeros_like(slots_score),
-        )
         score_softmax = slots_score.softmax(dim=2, dtype=torch.float32).to(
             slots_kv.dtype
         )
@@ -599,11 +644,6 @@ class DeepSeekV4Compressor(nn.Module):
             self, position_ids=layout.entry_start_positions, device=kv.device
         )
         apply_rotary_emb(compressed[..., -self.rope_head_dim :], freqs_cis)
-        compressed = torch.where(
-            layout.entry_valid.unsqueeze(-1),
-            compressed,
-            torch.zeros_like(compressed),
-        )
 
         if self.rotate:
             compressed = rotate_activation(compressed)
@@ -618,9 +658,7 @@ class DeepSeekV4Compressor(nn.Module):
     ) -> torch.Tensor:
         kv, score = self._project_raw(x)
         if shared_layout is not None:
-            return self._compress_shared_prefix_projected(
-                kv, score, layout=shared_layout
-            )
+            return self._compress_prefix_tree_projected(kv, score, layout=shared_layout)
         usable = (x.shape[1] // self.compress_ratio) * self.compress_ratio
         freqs_cis = get_rope_cache(self, seqlen=usable, device=x.device)[
             : usable : self.compress_ratio

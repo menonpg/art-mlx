@@ -15,7 +15,7 @@ from art.megatron.model_support.handlers.default_dense import (
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     LayerFamilyInstance,
-    SharedPrefixModelStateContext,
+    PrefixTreeModelStateContext,
 )
 
 _ORACLE_HIDDEN_SIZE = 512
@@ -107,22 +107,22 @@ class Dsv4Handler(DefaultMoeHandler):
             return tokenizer
         return get_dsv4_tokenizer(tokenizer)
 
-    def build_shared_prefix_model_state(
+    def build_prefix_tree_model_state(
         self,
-        context: SharedPrefixModelStateContext,
+        context: PrefixTreeModelStateContext,
     ) -> dict[str, Any]:
         if context.input_pos is None:
             raise RuntimeError(
-                "DSV4 shared-prefix compression layouts require input_pos."
+                "DSV4 prefix-tree compression layouts require input_pos."
             )
         from art.megatron.dsv4.compressor import (
-            Dsv4SharedPrefixState,
-            build_shared_prefix_compression_layouts,
+            Dsv4PrefixTreeState,
+            build_prefix_tree_compression_layouts,
         )
 
         return {
-            "dsv4": Dsv4SharedPrefixState(
-                compression_layouts=build_shared_prefix_compression_layouts(
+            "dsv4": Dsv4PrefixTreeState(
+                compression_layouts=build_prefix_tree_compression_layouts(
                     position_ids=context.input_pos,
                     group_ids=context.group_ids,
                     parent_ids=context.parent_ids,

@@ -44,7 +44,7 @@ def _branch_rows_without_future_scored_tokens(
 
     vLLM returns routes for forwards it actually ran. During generation it does
     not run a forward for the final generated token, because no later token is
-    sampled from that row. ART shared-prefix packing may still leave a masked
+    sampled from that row. ART prefix-tree packing may still leave a masked
     suffix token in the same branch, so a physical group boundary is not enough
     to identify rows that can safely use synthetic replay routes.
     """

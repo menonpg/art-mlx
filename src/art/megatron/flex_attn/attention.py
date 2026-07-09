@@ -20,8 +20,8 @@ from art.megatron.flex_attn.compiled import (
 )
 
 
-class SharedPrefixAttentionState(BaseModel):
-    """Shared-prefix sparsity metadata for one packed ART training sample."""
+class PrefixTreeAttentionState(BaseModel):
+    """Prefix-tree sparsity metadata for one packed ART training sample."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     block_mask: BlockMask
@@ -124,14 +124,14 @@ def _configure_softmax_offset(
         raise ValueError(f"Unsupported softmax_type: {config.softmax_type}")
 
 
-def create_shared_prefix_attention_state(
+def create_prefix_tree_attention_state(
     group_ids: Tensor,
     parent_ids: Tensor,
     *,
     input_pos: Tensor | None = None,
     sliding_windows: tuple[int, ...] = (),
-) -> SharedPrefixAttentionState:
-    """Build a compiled block mask for ART shared-prefix packing.
+) -> PrefixTreeAttentionState:
+    """Build a compiled block mask for ART prefix-tree packing.
 
     Initialized on the device of the group_ids tensor.
 
@@ -140,9 +140,9 @@ def create_shared_prefix_attention_state(
         parent_ids: `[B, S]` parent group id for each token in a packed sequence.
     """
 
-    from art.megatron.shared_prefix_state import create_shared_prefix_state
+    from art.megatron.prefix_tree_state import create_prefix_tree_state
 
-    return create_shared_prefix_state(
+    return create_prefix_tree_state(
         group_ids,
         parent_ids,
         input_pos=input_pos,
@@ -220,7 +220,7 @@ class FlexDotProductAttention(torch.nn.Module):
             key: `[S, B, Hkv, D]`
             value: `[S, B, Hkv, D]`
             attention_mask: unused placeholder tensor kept for Megatron checkpoint API.
-            attention_bias: `SharedPrefixAttentionState` or `BlockMask`.
+            attention_bias: `PrefixTreeAttentionState` or `BlockMask`.
         """
 
         del attention_mask, attn_mask_type
@@ -228,7 +228,7 @@ class FlexDotProductAttention(torch.nn.Module):
             "PackedSeqParams is not used in ART Megatron flex path."
         )
 
-        if isinstance(attention_bias, SharedPrefixAttentionState):
+        if isinstance(attention_bias, PrefixTreeAttentionState):
             block_mask = attention_bias.block_mask_for_window(
                 getattr(self, "art_sliding_window", None)
             )

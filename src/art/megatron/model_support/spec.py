@@ -46,7 +46,7 @@ class ArchitectureReport(BaseModel):
     unresolved_risks: list[str] = Field(default_factory=list)
 
 
-class SharedPrefixModelStateContext(BaseModel):
+class PrefixTreeModelStateContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     group_ids: Any
@@ -104,6 +104,7 @@ class ModelSupportSpec(BaseModel):
 class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
+    build_gdn_execution_spec: bool
     cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
@@ -153,9 +154,9 @@ class ModelSupportHandler(Protocol):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
-    def build_shared_prefix_model_state(
+    def build_prefix_tree_model_state(
         self,
-        context: SharedPrefixModelStateContext,
+        context: PrefixTreeModelStateContext,
     ) -> dict[str, Any]: ...
 
     def correctness_precision(self) -> Literal["bf16", "fp32"]: ...

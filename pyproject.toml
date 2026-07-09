@@ -277,6 +277,7 @@ allowed-unresolved-imports = [
     "peft.**",
     "pyarrow.**",
     "torch.**",
+    "torchvision.**",
     "torchao.**",
     "transformers.**",
     "trl.**",

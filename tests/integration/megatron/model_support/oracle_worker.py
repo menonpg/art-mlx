@@ -788,7 +788,8 @@ def _matches_grad_sync_skip_mutation(
         return ".self_attention.linear_proj.lora.B_T" in param_name
     if mutation == "bwd_skip_sync_fc1_a":
         return (
-            ".mlp.experts.linear_fc1.gate_lora.A_T" in param_name
+            ".mlp.experts.linear_fc1.lora.A_T" in param_name
+            or ".mlp.experts.linear_fc1.gate_lora.A_T" in param_name
             or ".mlp.experts.linear_fc1.up_lora.A_T" in param_name
             or ".mlp.linear_fc1.gate_lora.A_T" in param_name
             or ".mlp.linear_fc1.up_lora.A_T" in param_name
@@ -1136,12 +1137,16 @@ def _patch_lora_for_fp32(
 
     def _reference_fc1_forward(self: Any, x: torch.Tensor, tokens_per_expert: Any):
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
-        adapter_out = torch.cat(
-            (
-                self.gate_lora(x, tokens_per_expert),
-                self.up_lora(x, tokens_per_expert),
-            ),
-            dim=1,
+        adapter_out = (
+            self.lora(x, tokens_per_expert)
+            if self.fused_gate_up
+            else torch.cat(
+                (
+                    self.gate_lora(x, tokens_per_expert),
+                    self.up_lora(x, tokens_per_expert),
+                ),
+                dim=1,
+            )
         )
         return base_out + adapter_out, bias_out
 

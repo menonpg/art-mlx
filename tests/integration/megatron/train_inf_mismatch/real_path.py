@@ -64,7 +64,7 @@ class RealPathConfig(BaseModel):
     output_parity: TrainInfOutputParityConfig = Field(
         default_factory=TrainInfOutputParityConfig
     )
-    prompt_count: int = 2
+    prompt_count: int = 4
     rollouts_per_prompt: int = 2
     max_completion_tokens: int = 16
     prompt_sentence_count: int = 28
@@ -101,10 +101,10 @@ class RealPathBaseDiagnosticBundle(BaseModel):
     logical_prompt_count: int
     logical_token_count: int
     moe_routing_packed_tokens: int
-    moe_routing_shared_prefix_rows: int
-    moe_routing_shared_prefix_conflict_rows: int
-    moe_routing_shared_prefix_conflict_slots: int
-    moe_routing_shared_prefix_compared_slots: int
+    moe_routing_prefix_tree_rows: int
+    moe_routing_prefix_tree_conflict_rows: int
+    moe_routing_prefix_tree_conflict_slots: int
+    moe_routing_prefix_tree_compared_slots: int
     vllm_forward_trace_dir: str | None = None
     megatron_forward_trace_dir: str | None = None
 
@@ -134,8 +134,8 @@ class RealPathTrainInfReport(BaseModel):
     base_logical_prompt_count: int | None = None
     base_logical_token_count: int | None = None
     base_moe_routing_packed_tokens: int | None = None
-    base_moe_routing_shared_prefix_conflict_rows: int | None = None
-    base_moe_routing_shared_prefix_conflict_slots: int | None = None
+    base_moe_routing_prefix_tree_conflict_rows: int | None = None
+    base_moe_routing_prefix_tree_conflict_slots: int | None = None
     adapter_path: str
     adapter_cache_key: str
     adapter_cache_hit: bool
@@ -148,10 +148,12 @@ class RealPathTrainInfReport(BaseModel):
     lora: PairComparison
     lora_topk: TopKComparison
     moe_routing_packed_tokens: int
-    moe_routing_shared_prefix_rows: int
-    moe_routing_shared_prefix_conflict_rows: int
-    moe_routing_shared_prefix_conflict_slots: int
-    moe_routing_shared_prefix_compared_slots: int
+    moe_routing_prefix_tree_rows: int
+    moe_routing_prefix_tree_conflict_rows: int
+    moe_routing_prefix_tree_conflict_slots: int
+    moe_routing_prefix_tree_compared_slots: int
+    prompt_tree_depth: int = 0
+    prompt_tree_branch_count: int = 0
     mean_abs_pct_limit: float
     top20_kl_candidate_to_target_limit: float
     passed: bool
@@ -175,13 +177,13 @@ def _real_path_rollout_weights_mode(
 
 _PROMPT_SENTENCES = [
     "A careful systems engineer checks assumptions before changing thresholds.",
-    "The training batch contains shared prefixes and divergent completions.",
+    "The training batch contains prefix treees and divergent completions.",
     "Numerical parity should be measured on the exact tokens used by the policy.",
     "Sparse expert routing can create discontinuous output differences.",
     "A reproducible test writes enough artifacts to explain every comparison.",
     "LoRA adapters must be active and nonzero during both inference and training.",
     "The prompt should be realistic enough to exercise ordinary tokenizer paths.",
-    "Packed Megatron inputs use shared prefixes while vLLM receives flat requests.",
+    "Packed Megatron inputs use prefix treees while vLLM receives flat requests.",
     "If tokenization diverges, the mismatch should fail as early as possible.",
     "The report includes target logprobs and top token overlap for diagnosis.",
     "Routing replay should use vLLM expert ids captured from real rollouts.",
@@ -200,6 +202,20 @@ _PROMPT_SENTENCES = [
     "Validation code belongs in tests unless production needs the behavior.",
 ]
 _PROMPT_TOKENS_PER_SENTENCE_ESTIMATE = 12
+_PROMPT_TREE_ROOT = (
+    "Write a concise continuation for a validation note. Preserve the technical "
+    "tone and keep the answer concrete."
+)
+_PROMPT_TREE_MIDS = (
+    "Branch alpha: emphasize runtime validation and packed training inputs.",
+    "Branch beta: emphasize serving parity and reproducible comparison artifacts.",
+)
+_PROMPT_TREE_LEAVES = (
+    "Case one: describe a route where a prefix tree splits into two completions.",
+    "Case two: describe a route where the same branch has a longer continuation.",
+    "Case three: describe a route where another branch reaches a different expert.",
+    "Case four: describe a direct leaf that skips the intermediate branch.",
+)
 
 
 def config_from_env() -> RealPathConfig:
@@ -276,10 +292,23 @@ def _apply_sliding_window_prompt_defaults(config: RealPathConfig) -> None:
 
 
 def _build_prompt_from_sentences(index: int, sentences: list[str]) -> str:
-    return (
-        "Write a concise continuation for probe "
-        f"{index}. Preserve the technical tone.\n\n" + " ".join(sentences)
+    mid = _PROMPT_TREE_MIDS[(index // 2) % len(_PROMPT_TREE_MIDS)]
+    leaf = _PROMPT_TREE_LEAVES[index % len(_PROMPT_TREE_LEAVES)]
+    return f"{_PROMPT_TREE_ROOT}\n\n{mid}\n\n{leaf}\n\nNotes: " + " ".join(sentences)
+
+
+def _prompt_tree_shape(prompts: list[str]) -> tuple[int, int]:
+    mid_count = len(
+        {mid for mid in _PROMPT_TREE_MIDS if any(mid in prompt for prompt in prompts)}
     )
+    leaf_count = len(
+        {
+            leaf
+            for leaf in _PROMPT_TREE_LEAVES
+            if any(leaf in prompt for prompt in prompts)
+        }
+    )
+    return (3 if mid_count and leaf_count else 1, mid_count + leaf_count)
 
 
 def _build_prompts(config: RealPathConfig) -> list[str]:
@@ -756,14 +785,10 @@ async def _score_base_real_generation_path(
         logical_prompt_count=len(logical_map.prompts),
         logical_token_count=len(logical_map.tokens),
         moe_routing_packed_tokens=int(stats.packed_tokens),
-        moe_routing_shared_prefix_rows=int(stats.shared_prefix_rows),
-        moe_routing_shared_prefix_conflict_rows=int(stats.shared_prefix_conflict_rows),
-        moe_routing_shared_prefix_conflict_slots=int(
-            stats.shared_prefix_conflict_slots
-        ),
-        moe_routing_shared_prefix_compared_slots=int(
-            stats.shared_prefix_compared_slots
-        ),
+        moe_routing_prefix_tree_rows=int(stats.prefix_tree_rows),
+        moe_routing_prefix_tree_conflict_rows=int(stats.prefix_tree_conflict_rows),
+        moe_routing_prefix_tree_conflict_slots=int(stats.prefix_tree_conflict_slots),
+        moe_routing_prefix_tree_compared_slots=int(stats.prefix_tree_compared_slots),
         vllm_forward_trace_dir=(
             str(vllm_forward_trace_dir) if vllm_forward_trace_dir is not None else None
         ),
@@ -1504,6 +1529,9 @@ async def run_real_path_train_inf_mismatch(
             parity_config.base_model,
             allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
         )
+        prompt_tree_depth, prompt_tree_branch_count = _prompt_tree_shape(
+            _build_prompts(config)
+        )
         passed = (
             comparison.mean_abs_pct <= mean_abs_pct_limit
             and topk_comparison.top20_intersection_kl_candidate_to_target
@@ -1529,13 +1557,13 @@ async def run_real_path_train_inf_mismatch(
                 if base_diagnostic is not None
                 else None
             ),
-            base_moe_routing_shared_prefix_conflict_rows=(
-                base_diagnostic.moe_routing_shared_prefix_conflict_rows
+            base_moe_routing_prefix_tree_conflict_rows=(
+                base_diagnostic.moe_routing_prefix_tree_conflict_rows
                 if base_diagnostic is not None
                 else None
             ),
-            base_moe_routing_shared_prefix_conflict_slots=(
-                base_diagnostic.moe_routing_shared_prefix_conflict_slots
+            base_moe_routing_prefix_tree_conflict_slots=(
+                base_diagnostic.moe_routing_prefix_tree_conflict_slots
                 if base_diagnostic is not None
                 else None
             ),
@@ -1557,16 +1585,16 @@ async def run_real_path_train_inf_mismatch(
             lora=comparison,
             lora_topk=topk_comparison,
             moe_routing_packed_tokens=int(stats.packed_tokens),
-            moe_routing_shared_prefix_rows=int(stats.shared_prefix_rows),
-            moe_routing_shared_prefix_conflict_rows=int(
-                stats.shared_prefix_conflict_rows
+            moe_routing_prefix_tree_rows=int(stats.prefix_tree_rows),
+            moe_routing_prefix_tree_conflict_rows=int(stats.prefix_tree_conflict_rows),
+            moe_routing_prefix_tree_conflict_slots=int(
+                stats.prefix_tree_conflict_slots
             ),
-            moe_routing_shared_prefix_conflict_slots=int(
-                stats.shared_prefix_conflict_slots
+            moe_routing_prefix_tree_compared_slots=int(
+                stats.prefix_tree_compared_slots
             ),
-            moe_routing_shared_prefix_compared_slots=int(
-                stats.shared_prefix_compared_slots
-            ),
+            prompt_tree_depth=prompt_tree_depth,
+            prompt_tree_branch_count=prompt_tree_branch_count,
             mean_abs_pct_limit=mean_abs_pct_limit,
             top20_kl_candidate_to_target_limit=top20_kl_limit,
             passed=passed,

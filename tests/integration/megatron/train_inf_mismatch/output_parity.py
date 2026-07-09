@@ -11,6 +11,8 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from art.megatron.prefix_tree import parse_prefix_tree_row
+
 from ..model_support.workflow_resources import (
     handler_workflow_resources_for_base_model,
     resolve_stage_resources_for_current_host,
@@ -139,9 +141,8 @@ class LogicalPrompt(BaseModel):
     sample_id: int
     family_id: int
     completion_id: int
-    # Packed prompt rows are the shared prefix segment exactly: prompt_end-start.
-    # ART stores the final context token at the start of each completion segment,
-    # so vLLM's generated-token logprobs start one token after this boundary.
+    # ART stores the final context token at the start of each leaf segment, so
+    # vLLM's generated-token logprobs start one token after the ancestor path.
     packed_prompt_length: int
     scored_token_start_index: int
     token_ids: list[int]
@@ -433,6 +434,17 @@ def config_from_env() -> TrainInfOutputParityConfig:
         config.topology = config.topology.model_copy(update=updates)
     if raw_targets := os.environ.get("ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES"):
         config.lora_target_modules = _parse_str_list(raw_targets)
+    if raw_vllm_memory := os.environ.get(
+        "ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"
+    ):
+        config.engine_args["gpu_memory_utilization"] = float(raw_vllm_memory)
+    if raw_gdn_backend := os.environ.get("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND"):
+        raw_additional_config = config.engine_args.get("additional_config")
+        additional_config: dict[str, Any] = {}
+        if isinstance(raw_additional_config, dict):
+            additional_config.update(cast(dict[str, Any], raw_additional_config))
+        additional_config["gdn_prefill_backend"] = raw_gdn_backend
+        config.engine_args["additional_config"] = additional_config
     raw_url = os.environ.get(train_inf_external_url_env)
     if raw_url is None and stage_resources is not None:
         raw_url = os.environ.get(model_support_external_url_env)
@@ -457,40 +469,36 @@ def config_from_env() -> TrainInfOutputParityConfig:
     return config
 
 
-def _prompt_family_segments(
+def _prefix_tree_leaf_paths(
     group_ids: Any,
     parent_ids: Any,
     *,
-    required_completion_count: int = 1,
-) -> list[tuple[tuple[int, int], list[tuple[int, int]]]]:
-    valid_tokens = int((group_ids != -1).sum().item())
-    families: list[tuple[tuple[int, int], list[tuple[int, int]]]] = []
-    cursor = 0
-    while cursor < valid_tokens:
-        group_id = int(group_ids[cursor].item())
-        parent_id = int(parent_ids[cursor].item())
-        prompt_start = cursor
-        while cursor < valid_tokens and int(group_ids[cursor].item()) == group_id:
-            cursor += 1
-        prompt_end = cursor
-        if group_id != parent_id:
+    required_leaf_count: int = 1,
+) -> list[tuple[int, tuple[tuple[int, int], ...], tuple[int, int]]]:
+    tree = parse_prefix_tree_row(group_ids=group_ids, parent_ids=parent_ids)
+    segment_by_group = {segment.group_id: segment for segment in tree.segments}
+    child_count_by_group: dict[int, int] = {}
+    for segment in tree.segments:
+        if segment.group_id == segment.parent_id:
             continue
-        completions: list[tuple[int, int]] = []
-        while cursor < valid_tokens:
-            completion_group_id = int(group_ids[cursor].item())
-            completion_parent_id = int(parent_ids[cursor].item())
-            if completion_parent_id != group_id or completion_group_id == group_id:
-                break
-            completion_start = cursor
-            while (
-                cursor < valid_tokens
-                and int(group_ids[cursor].item()) == completion_group_id
-            ):
-                cursor += 1
-            completions.append((completion_start, cursor))
-        if len(completions) >= required_completion_count:
-            families.append(((prompt_start, prompt_end), completions))
-    return families
+        child_count_by_group[segment.parent_id] = (
+            child_count_by_group.get(segment.parent_id, 0) + 1
+        )
+    paths = [
+        (
+            leaf.family_index,
+            tuple(
+                (segment_by_group[group_id].start, segment_by_group[group_id].end)
+                for group_id in leaf.ancestors
+            ),
+            (leaf.start, leaf.end),
+        )
+        for leaf in tree.segments
+        if leaf.group_id != leaf.parent_id
+        and child_count_by_group.get(leaf.group_id, 0) == 0
+        and leaf.end - leaf.start >= 2
+    ]
+    return paths if len(paths) >= required_leaf_count else []
 
 
 def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
@@ -513,64 +521,61 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
         return True
 
     for sample_id in range(int(tokens.shape[0])):
-        families = _prompt_family_segments(group_ids[sample_id], parent_ids[sample_id])
-        for family_id, (prompt_segment, completion_segments) in enumerate(families):
-            prompt_start, prompt_end = prompt_segment
-            prompt_len = prompt_end - prompt_start
-            for completion_id, (completion_start, completion_end) in enumerate(
-                completion_segments
-            ):
-                last_scored_i = None
-                for packed_i in range(completion_start + 1, completion_end):
-                    if scored_token(sample_id, packed_i):
-                        last_scored_i = packed_i
-                if last_scored_i is None:
+        leaf_paths = _prefix_tree_leaf_paths(
+            group_ids[sample_id], parent_ids[sample_id]
+        )
+        for completion_id, (family_id, ancestor_segments, leaf_segment) in enumerate(
+            leaf_paths
+        ):
+            leaf_start, leaf_end = leaf_segment
+            last_scored_i = None
+            for packed_i in range(leaf_start + 1, leaf_end):
+                if scored_token(sample_id, packed_i):
+                    last_scored_i = packed_i
+            if last_scored_i is None:
+                continue
+            effective_leaf_end = last_scored_i + 1
+            prompt_len = sum(end - start for start, end in ancestor_segments)
+            reference_segments = (*ancestor_segments, (leaf_start, effective_leaf_end))
+            flat = [
+                int(value)
+                for start, end in reference_segments
+                for value in tokens[sample_id, start:end].tolist()
+            ]
+            flat_key = tuple(flat)
+            prompt_id = prompt_id_by_tokens.get(flat_key)
+            if prompt_id is None:
+                prompt_id = len(prompts)
+                prompt_id_by_tokens[flat_key] = prompt_id
+                prompts.append(
+                    LogicalPrompt(
+                        prompt_id=prompt_id,
+                        sample_id=sample_id,
+                        family_id=family_id,
+                        completion_id=completion_id,
+                        packed_prompt_length=prompt_len,
+                        scored_token_start_index=prompt_len + 1,
+                        token_ids=flat,
+                    )
+                )
+            for packed_i in range(leaf_start + 1, effective_leaf_end):
+                if not scored_token(sample_id, packed_i):
                     continue
-                effective_completion_end = last_scored_i + 1
-                flat = [
-                    int(value)
-                    for value in tokens[sample_id, prompt_start:prompt_end].tolist()
-                ] + [
-                    int(value)
-                    for value in tokens[
-                        sample_id, completion_start:effective_completion_end
-                    ].tolist()
-                ]
-                flat_key = tuple(flat)
-                prompt_id = prompt_id_by_tokens.get(flat_key)
-                if prompt_id is None:
-                    prompt_id = len(prompts)
-                    prompt_id_by_tokens[flat_key] = prompt_id
-                    prompts.append(
-                        LogicalPrompt(
-                            prompt_id=prompt_id,
-                            sample_id=sample_id,
-                            family_id=family_id,
-                            completion_id=completion_id,
-                            packed_prompt_length=prompt_len,
-                            scored_token_start_index=prompt_len + 1,
-                            token_ids=flat,
-                        )
+                logical_tokens.append(
+                    LogicalToken(
+                        token_id=int(tokens[sample_id, packed_i].item()),
+                        sample_id=sample_id,
+                        family_id=family_id,
+                        completion_id=completion_id,
+                        prompt_id=prompt_id,
+                        art_packed_token_index=packed_i,
+                        art_logit_index=packed_i - 1,
+                        vllm_prompt_token_index=prompt_len + (packed_i - leaf_start),
                     )
-                for packed_i in range(completion_start + 1, effective_completion_end):
-                    if not scored_token(sample_id, packed_i):
-                        continue
-                    logical_tokens.append(
-                        LogicalToken(
-                            token_id=int(tokens[sample_id, packed_i].item()),
-                            sample_id=sample_id,
-                            family_id=family_id,
-                            completion_id=completion_id,
-                            prompt_id=prompt_id,
-                            art_packed_token_index=packed_i,
-                            art_logit_index=packed_i - 1,
-                            vllm_prompt_token_index=prompt_len
-                            + (packed_i - completion_start),
-                        )
-                    )
+                )
 
     if not prompts or not logical_tokens:
-        raise RuntimeError("Shared-prefix probe produced no comparable logical tokens")
+        raise RuntimeError("Prefix-tree probe produced no comparable logical tokens")
     return LogicalTokenMap(prompts=prompts, tokens=logical_tokens)
 
 
@@ -988,7 +993,7 @@ def _run_logits(
 ) -> Any:
     import torch
 
-    from art.megatron.shared_prefix_state import create_shared_prefix_state
+    from art.megatron.prefix_tree_state import create_prefix_tree_state
     from art.megatron.training.trace import (
         packed_sequence_token_uids,
         prepare_replay_local_input_token_uids,
@@ -1000,7 +1005,7 @@ def _run_logits(
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
-    attention_state = create_shared_prefix_state(
+    attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         input_pos=position_ids,
