@@ -1209,20 +1209,24 @@ class LocalBackend(Backend):
         )
         service_config = config.model_copy(update={"batch_size": batch_size})
 
-        # Auto-detect instruction/response parts from model
-        from ..utils.model_config import get_instruction_response_parts
+        if config.train_on == "last_assistant":
+            # Loss boundaries come from the chat template itself; the
+            # instruction/response template parts are unused.
+            instruction_part, response_part = "", ""
+        else:
+            # Auto-detect instruction/response parts from model
+            from ..utils.model_config import get_instruction_response_parts
 
-        instruction_part, response_part = get_instruction_response_parts(
-            model.base_model, tokenizer
-        )
+            instruction_part, response_part = get_instruction_response_parts(
+                model.base_model, tokenizer
+            )
+            if verbose:
+                print(f"Using instruction_part: {instruction_part!r}")
+                print(f"Using response_part: {response_part!r}")
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
         chat_template_tool_schema_format = self._chat_template_tool_schema_format(
             internal_config
         )
-
-        if verbose:
-            print(f"Using instruction_part: {instruction_part!r}")
-            print(f"Using response_part: {response_part!r}")
 
         max_seq_length = self._model_max_sequence_length(model)
 
@@ -1251,6 +1255,7 @@ class LocalBackend(Backend):
                     chat_template_kwargs=chat_template_kwargs,
                     chat_template_tool_schema_format=chat_template_tool_schema_format,
                     max_seq_length=max_seq_length,
+                    train_on=config.train_on,
                 )
             )
 

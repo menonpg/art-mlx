@@ -546,6 +546,12 @@ class ServerlessBackend(Backend):
 
         assert model.id is not None, "Model ID is required"
 
+        if config.train_on != "assistant":
+            raise ValueError(
+                "ServerlessBackend SFT does not support "
+                f"train_on={config.train_on!r} yet. Use a local SFT backend."
+            )
+
         # Get the user's default entity from W&B if not set
         if model.entity is None:
             api = wandb_sdk.api(api_key=self._client.api_key)

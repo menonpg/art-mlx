@@ -27,7 +27,11 @@ from .moe_routing import (
     TokenRoute,
     align_choice_routes_to_tokenized_result,
 )
-from .response_masking import response_only_labels, token_ids_for_template_part
+from .response_masking import (
+    last_assistant_sample,
+    response_only_labels,
+    token_ids_for_template_part,
+)
 from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
@@ -544,6 +548,7 @@ def tokenize_sft_batch(
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     max_seq_length: int | None = None,
+    train_on: Literal["assistant", "last_assistant"] = "assistant",
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -555,6 +560,9 @@ def tokenize_sft_batch(
         response_part: Response template part (e.g., "<|im_start|>assistant")
         max_seq_length: Optional maximum tokenized trajectory length. Trajectories
             longer than this limit are dropped before tensors are created.
+        train_on: "assistant" trains on every assistant turn located via the
+            instruction/response template parts; "last_assistant" trains only on
+            the final assistant message.
 
     Returns:
         SFTBatch object for this batch
@@ -579,26 +587,33 @@ def tokenize_sft_batch(
         )
         template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
 
-        # Single-step tokenization: apply_chat_template with tokenize=True
-        input_ids = _apply_chat_template_token_ids(
-            tokenizer,
-            messages,
-            tools=tools,
-            tokenize=True,
-            add_generation_prompt=False,
-            **template_kwargs,
-        )
+        if train_on == "last_assistant":
+            input_ids, labels = last_assistant_sample(
+                tokenizer,
+                messages,
+                tools=tools,
+                template_kwargs=template_kwargs,
+            )
+        else:
+            # Single-step tokenization: apply_chat_template with tokenize=True
+            input_ids = _apply_chat_template_token_ids(
+                tokenizer,
+                messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            labels = response_only_labels(
+                input_ids,
+                instruction_ids=instruction_ids,
+                response_ids=response_ids,
+            )
         if max_seq_length is not None and len(input_ids) > max_seq_length:
             num_dropped_trajectories += 1
             continue
 
         attention_mask = [1] * len(input_ids)
-
-        labels = response_only_labels(
-            input_ids,
-            instruction_ids=instruction_ids,
-            response_ids=response_ids,
-        )
 
         trajectory_tensors.append(
             {

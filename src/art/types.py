@@ -49,6 +49,10 @@ class MegatronRuntimeConfig(pydantic.BaseModel):
 class TrainSFTConfig(pydantic.BaseModel):
     learning_rate: float | list[float] = 5e-5  # Single value or per-batch list
     batch_size: int | Literal["auto"] = "auto"
+    # "assistant" trains on every assistant turn; "last_assistant" trains only
+    # on the final assistant message, with the preceding conversation rendered
+    # exactly as the inference prompt and excluded from the loss.
+    train_on: Literal["assistant", "last_assistant"] = "assistant"
 
 
 class SFTMetricLoggingConfig(TypedDict, total=False):
