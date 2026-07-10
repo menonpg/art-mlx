@@ -49,6 +49,7 @@ class MegatronRuntimeConfig(pydantic.BaseModel):
 class TrainSFTConfig(pydantic.BaseModel):
     learning_rate: float | list[float] = 5e-5  # Single value or per-batch list
     batch_size: int | Literal["auto"] = "auto"
+    assistant_turns: Literal["all", "last"] = "all"
 
 
 class SFTMetricLoggingConfig(TypedDict, total=False):

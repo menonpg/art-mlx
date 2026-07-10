@@ -285,6 +285,31 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
 
 
 @pytest.mark.asyncio
+async def test_serverless_train_sft_rejects_last_assistant_mode() -> None:
+    backend = _make_backend()
+    model = TrainableModel(
+        name="serverless-sft-last-assistant",
+        project="pipeline-tests",
+        base_model="test-model",
+    )
+    trajectory = Trajectory(
+        messages_and_choices=[
+            {"role": "user", "content": "prompt"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+
+    with pytest.raises(NotImplementedError, match="currently requires LocalBackend"):
+        async for _ in backend._train_sft(
+            model,
+            [trajectory],
+            TrainSFTConfig(assistant_turns="last"),
+            {},
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_serverless_train_forwards_kl_step_lag() -> None:
     backend = _make_backend()
     model = TrainableModel(

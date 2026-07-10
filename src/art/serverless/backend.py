@@ -538,6 +538,11 @@ class ServerlessBackend(Backend):
         Yields:
             Dictionary containing training metrics for each batch.
         """
+        if config.assistant_turns == "last":
+            raise NotImplementedError(
+                "assistant_turns='last' currently requires LocalBackend"
+            )
+
         import json
         import tempfile
         import uuid

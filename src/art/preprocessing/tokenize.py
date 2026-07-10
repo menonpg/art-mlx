@@ -246,6 +246,60 @@ def _apply_chat_template_token_ids(
     return cast(list[int], output)
 
 
+def _apply_chat_template_text(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> str:
+    output = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        **kwargs,
+    )
+    if not isinstance(output, str):
+        raise TypeError("Expected the chat template to render one string")
+    return output
+
+
+def _last_assistant_input_ids_and_labels(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, Any]],
+    tools: list[ChatTemplateTool] | None,
+    template_kwargs: dict[str, Any],
+) -> tuple[list[int], list[int]]:
+    if not messages or messages[-1].get("role") != "assistant":
+        raise ValueError(
+            "assistant_turns='last' requires the final message to be an assistant"
+        )
+
+    prompt_text = _apply_chat_template_text(
+        tokenizer,
+        messages[:-1],
+        tools=tools,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    completed_text = _apply_chat_template_text(
+        tokenizer,
+        messages,
+        tools=tools,
+        add_generation_prompt=False,
+        **template_kwargs,
+    )
+    if not completed_text.startswith(prompt_text):
+        raise ValueError(
+            "Cannot isolate the final assistant response because the completed chat "
+            "does not extend its generation prompt"
+        )
+
+    target_text = completed_text[len(prompt_text) :]
+    prompt_ids = token_ids_for_template_part(tokenizer, prompt_text)
+    target_ids = token_ids_for_template_part(tokenizer, target_text)
+    input_ids = [*prompt_ids, *target_ids]
+    labels = [-100] * len(prompt_ids) + target_ids
+    return input_ids, labels
+
+
 def _choice_logprobs(
     choice: Choice,
     *,
@@ -544,6 +598,7 @@ def tokenize_sft_batch(
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     max_seq_length: int | None = None,
+    assistant_turns: Literal["all", "last"] = "all",
 ) -> SFTBatch:
     """Tokenize a single batch of trajectories for SFT.
 
@@ -555,6 +610,7 @@ def tokenize_sft_batch(
         response_part: Response template part (e.g., "<|im_start|>assistant")
         max_seq_length: Optional maximum tokenized trajectory length. Trajectories
             longer than this limit are dropped before tensors are created.
+        assistant_turns: Whether to train every assistant turn or only the final one.
 
     Returns:
         SFTBatch object for this batch
@@ -579,26 +635,33 @@ def tokenize_sft_batch(
         )
         template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
 
-        # Single-step tokenization: apply_chat_template with tokenize=True
-        input_ids = _apply_chat_template_token_ids(
-            tokenizer,
-            messages,
-            tools=tools,
-            tokenize=True,
-            add_generation_prompt=False,
-            **template_kwargs,
-        )
+        if assistant_turns == "last":
+            input_ids, labels = _last_assistant_input_ids_and_labels(
+                tokenizer,
+                messages,
+                tools,
+                template_kwargs,
+            )
+        else:
+            # Preserve the existing response-marker behavior for all assistant turns.
+            input_ids = _apply_chat_template_token_ids(
+                tokenizer,
+                messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            labels = response_only_labels(
+                input_ids,
+                instruction_ids=instruction_ids,
+                response_ids=response_ids,
+            )
         if max_seq_length is not None and len(input_ids) > max_seq_length:
             num_dropped_trajectories += 1
             continue
 
         attention_mask = [1] * len(input_ids)
-
-        labels = response_only_labels(
-            input_ids,
-            instruction_ids=instruction_ids,
-            response_ids=response_ids,
-        )
 
         trajectory_tensors.append(
             {
