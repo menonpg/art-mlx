@@ -19,23 +19,26 @@ The original ART requires NVIDIA GPUs (vLLM + Unsloth). This fork lets you:
 ## Quick Start
 
 ```bash
-# Clone
+# Clone and checkout MLX branch
 git clone https://github.com/menonpg/art-mlx
 cd art-mlx
+git checkout mlx-backend
 
-# Install
-pip install -e .
-pip install mlx mlx-lm
+# Install with MLX dependencies
+pip install -e ".[mlx]"
 
-# Verify
+# Verify your environment
 python examples/mlx_quicktest.py
+
+# Run Tic Tac Toe training example
+python examples/mlx_tictactoe.py
 ```
 
 ## Requirements
 
 - **Apple Silicon Mac** (M1/M2/M3/M4)
 - **macOS 13.5+**
-- **Python 3.10+**
+- **Python 3.12+**
 - **16GB+ RAM** (64GB recommended for 7B+ models)
 
 ## Usage
@@ -60,34 +63,59 @@ await model.register(backend)
 # Your training loop here...
 ```
 
+## Examples
+
+| Example | Description | Runtime |
+|---------|-------------|---------|
+| `mlx_quicktest.py` | Verify MLX environment | 1 min |
+| `mlx_tictactoe.py` | Train agent to play Tic Tac Toe | ~30 min |
+
 ## Architecture
 
 | Component | Original ART | ART-MLX |
-|-----------|-------------|---------|
+|-----------|-------------|--------|
 | Inference | vLLM (CUDA) | mlx-lm |
 | LoRA Training | Unsloth (CUDA) | MLX native |
 | GRPO Algorithm | PyTorch CUDA | MLX native |
 | Supported Hardware | NVIDIA GPU | Apple Silicon |
 
+## Project Structure
+
+```
+src/art/mlx/
+├── __init__.py      # Module exports
+├── backend.py       # MLXBackend class
+├── grpo.py          # GRPO algorithm
+└── lora.py          # LoRA utilities
+
+examples/
+├── mlx_quicktest.py # Environment verification
+└── mlx_tictactoe.py # Training example
+```
+
 ## Status
 
-🚧 **Work in Progress** — Core GRPO algorithm implemented, testing in progress.
+🚧 **Active Development** — Core GRPO algorithm implemented, testing in progress.
 
 - [x] MLXBackend class structure
-- [x] GRPO algorithm in MLX
+- [x] GRPO algorithm in MLX  
+- [x] LoRA layer implementation
 - [x] Basic inference with mlx-lm
-- [ ] Full LoRA training integration
+- [x] Tic Tac Toe training example
+- [ ] Full gradient updates in training loop
 - [ ] Checkpoint save/load
-- [ ] Example notebooks (Tic Tac Toe, 2048)
+- [ ] 2048 game example
 - [ ] Benchmarks vs original ART
+- [ ] PR to upstream OpenPipe/ART
 
 ## Contributing
 
 This is an experimental fork. PRs welcome, especially for:
 
-- GRPO training loop testing
+- Testing on different Mac hardware (M1/M2/M3/M4, various RAM configs)
+- GRPO training loop testing and debugging
 - Memory optimization for larger models
-- Example tasks and benchmarks
+- Additional example tasks
 
 ## Credits
 
@@ -98,3 +126,7 @@ This is an experimental fork. PRs welcome, especially for:
 ## License
 
 Apache 2.0 (same as original ART)
+
+---
+
+**Created by [ThinkCreate.AI](https://thinkcreateai.com)** — First GRPO on Apple Silicon
