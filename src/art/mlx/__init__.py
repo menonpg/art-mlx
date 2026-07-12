@@ -6,10 +6,29 @@ reinforcement training on Apple Silicon Macs without CUDA dependencies.
 
 Components:
 - MLXBackend: Drop-in replacement for LocalBackend using MLX
-- MLX-LM integration for inference
-- Native MLX LoRA training with GRPO
+- GRPOTrainer: GRPO algorithm implementation in MLX
+- LoRA utilities: Apply and train LoRA adapters
 """
 
 from .backend import MLXBackend
+from .grpo import GRPOTrainer, GRPOConfig
+from .lora import (
+    LoRALinear,
+    apply_lora_to_model,
+    save_lora_weights,
+    load_lora_weights,
+    get_lora_parameters,
+    count_lora_parameters,
+)
 
-__all__ = ["MLXBackend"]
+__all__ = [
+    "MLXBackend",
+    "GRPOTrainer",
+    "GRPOConfig",
+    "LoRALinear",
+    "apply_lora_to_model",
+    "save_lora_weights",
+    "load_lora_weights",
+    "get_lora_parameters",
+    "count_lora_parameters",
+]
