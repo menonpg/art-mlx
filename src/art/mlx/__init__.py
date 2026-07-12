@@ -20,6 +20,7 @@ from .lora import (
     get_lora_parameters,
     count_lora_parameters,
 )
+from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 
 __all__ = [
     "MLXBackend",
@@ -31,4 +32,7 @@ __all__ = [
     "load_lora_weights",
     "get_lora_parameters",
     "count_lora_parameters",
+    "save_checkpoint",
+    "load_checkpoint",
+    "find_latest_checkpoint",
 ]
