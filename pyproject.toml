@@ -70,6 +70,12 @@ langgraph = [
     "langgraph>=0.6.2",
     "langchain-openai>=0.3.27",
 ]
+
+# MLX backend for Apple Silicon (M1/M2/M3/M4 Macs)
+mlx = [
+    "mlx>=0.22.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.22.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 tinker = [
     "fastapi>=0.128.0",
     "huggingface_hub",
