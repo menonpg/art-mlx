@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ART-MLX — Tic Tac Toe GRPO Test Results | The Menon Lab</title>
+    <meta name="description" content="Verified end-to-end test results for the ART-MLX Tic Tac Toe GRPO example on Apple Silicon: what broke, what was fixed, and how it trains.">
+
+    <!-- Open Graph -->
+    <meta property="og:title" content="ART-MLX — Tic Tac Toe GRPO Test Results">
+    <meta property="og:description" content="Verified end-to-end GRPO training on Apple Silicon: environment, fixes, and live training logs.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://menonpg.github.io/art-mlx/mlx-tictactoe-results.html">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --bg: #0a0a0a;
+            --bg-secondary: #141414;
+            --bg-tertiary: #1a1a1a;
+            --text: #fafafa;
+            --text-secondary: #a1a1aa;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --green: #22c55e;
+            --red: #ef4444;
+            --orange: #f97316;
+            --purple: #a855f7;
+            --border: #27272a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.65;
+        }
+        code, pre { font-family: 'JetBrains Mono', monospace; }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+        header {
+            border-bottom: 1px solid var(--border);
+            padding: 20px 0;
+            position: sticky; top: 0;
+            background: rgba(10,10,10,0.85);
+            backdrop-filter: blur(10px);
+            z-index: 10;
+        }
+        header .wrap { display: flex; align-items: center; justify-content: space-between; }
+        .brand { font-weight: 700; font-size: 1.05rem; }
+        .brand span { color: var(--accent); }
+        nav a { color: var(--text-secondary); margin-left: 20px; font-size: 0.9rem; }
+        nav a:hover { color: var(--text); }
+
+        .hero { padding: 64px 0 32px; }
+        .eyebrow {
+            display: inline-block;
+            font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase;
+            color: var(--accent); font-weight: 600; margin-bottom: 14px;
+        }
+        h1 { font-size: 2.4rem; line-height: 1.15; font-weight: 700; letter-spacing: -0.02em; }
+        h1 .grad {
+            background: linear-gradient(90deg, var(--accent), var(--purple));
+            -webkit-background-clip: text; background-clip: text; color: transparent;
+        }
+        .lede { color: var(--text-secondary); font-size: 1.1rem; margin-top: 16px; max-width: 680px; }
+
+        .badges { margin-top: 24px; display: flex; gap: 10px; flex-wrap: wrap; }
+        .badge {
+            font-size: 0.8rem; padding: 5px 12px; border-radius: 999px;
+            border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary);
+        }
+        .badge.pass { color: var(--green); border-color: rgba(34,197,94,0.4); }
+
+        section { padding: 32px 0; border-top: 1px solid var(--border); }
+        h2 { font-size: 1.5rem; margin-bottom: 8px; letter-spacing: -0.01em; }
+        h2 .n { color: var(--accent); font-weight: 600; margin-right: 8px; }
+        section > .wrap > p { color: var(--text-secondary); margin-bottom: 18px; }
+
+        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin-top: 8px; }
+        .card {
+            background: var(--bg-secondary); border: 1px solid var(--border);
+            border-radius: 12px; padding: 18px;
+        }
+        .card .k { font-size: 0.78rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+        .card .v { font-size: 1.6rem; font-weight: 700; margin-top: 6px; }
+        .card .v.up { color: var(--green); }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.92rem; }
+        th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+        th { color: var(--text-secondary); font-weight: 600; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.04em; }
+        td code { background: var(--bg-tertiary); padding: 2px 6px; border-radius: 5px; font-size: 0.85em; }
+        .tag { font-size: 0.72rem; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+        .tag.fix { color: var(--green); background: rgba(34,197,94,0.12); }
+        .tag.api { color: var(--orange); background: rgba(249,115,22,0.12); }
+        .tag.core { color: var(--purple); background: rgba(168,85,247,0.12); }
+
+        pre {
+            background: var(--bg-secondary); border: 1px solid var(--border);
+            border-radius: 12px; padding: 18px; overflow-x: auto;
+            font-size: 0.82rem; line-height: 1.55; color: #d4d4d8; margin-top: 8px;
+        }
+        pre .ok { color: var(--green); }
+        pre .hi { color: var(--accent); }
+        pre .dim { color: var(--text-secondary); }
+
+        ul.clean { list-style: none; margin-top: 8px; }
+        ul.clean li { padding: 8px 0 8px 26px; position: relative; color: var(--text-secondary); border-bottom: 1px solid var(--border); }
+        ul.clean li::before { content: "→"; position: absolute; left: 0; color: var(--accent); }
+        ul.clean li b { color: var(--text); }
+
+        .callout {
+            background: linear-gradient(180deg, rgba(59,130,246,0.08), transparent);
+            border: 1px solid rgba(59,130,246,0.25);
+            border-radius: 12px; padding: 18px; margin-top: 12px;
+        }
+        .callout b { color: var(--text); }
+
+        footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--text-secondary); font-size: 0.88rem; }
+        footer a { color: var(--text-secondary); }
+        .meta { color: var(--text-secondary); font-size: 0.85rem; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="wrap">
+            <div class="brand">ART<span>-MLX</span></div>
+            <nav>
+                <a href="index.html">Home</a>
+                <a href="https://github.com/menonpg/art-mlx">GitHub</a>
+                <a href="https://github.com/menonpg/art-mlx/pull/1">PR #1</a>
+            </nav>
+        </div>
+    </header>
+
+    <div class="hero">
+        <div class="wrap">
+            <span class="eyebrow">Verified Test Report</span>
+            <h1>Tic Tac Toe <span class="grad">GRPO Training</span><br>on Apple Silicon</h1>
+            <p class="lede">
+                End-to-end verification of the <code>examples/mlx_tictactoe.py</code> GRPO example: what broke against
+                the current <code>mlx-lm</code> API, the fixes applied, and live training logs proving real gradient
+                updates on an Apple M1 GPU.
+            </p>
+            <div class="badges">
+                <span class="badge pass">✓ quicktest passed</span>
+                <span class="badge pass">✓ 15/15 training steps</span>
+                <span class="badge">MLX 0.32.0</span>
+                <span class="badge">mlx-lm 0.31.3</span>
+                <span class="badge">Python 3.13</span>
+                <span class="badge">Apple M1 GPU</span>
+            </div>
+            <p class="meta">Tested 2026-07-12 · <a href="https://github.com/menonpg/art-mlx/pull/1">PR #1 — fix/mlx-lm-api-qlora-grpo</a></p>
+        </div>
+    </div>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">01</span>Results at a glance</h2>
+            <p>A fresh 90-game training run (15 steps × 6 games) with initial and final evaluation over 30 games each.</p>
+            <div class="cards">
+                <div class="card"><div class="k">Initial win rate</div><div class="v">53.3%</div></div>
+                <div class="card"><div class="k">Final win rate</div><div class="v">56.7%</div></div>
+                <div class="card"><div class="k">Change</div><div class="v up">+3.3%</div></div>
+                <div class="card"><div class="k">Trainable LoRA params</div><div class="v">1.47M</div></div>
+                <div class="card"><div class="k">Avg step time</div><div class="v">~6.1s</div></div>
+                <div class="card"><div class="k">Model</div><div class="v" style="font-size:1rem;">Qwen2.5-0.5B-4bit</div></div>
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">02</span>What went wrong</h2>
+            <p>The example was written against an older <code>mlx-lm</code> release. On current versions it failed at three
+               points — the first two are API drift, the third is a fundamental limitation of training a quantized model.</p>
+            <table>
+                <thead>
+                    <tr><th>Symptom</th><th>Root cause</th><th>Type</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>generate_step() got an unexpected keyword argument 'temp'</code></td>
+                        <td>The <code>temp=</code> argument was removed from <code>generate()</code>; sampling params now come from a sampler object.</td>
+                        <td><span class="tag api">API</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>module 'mlx.core' has no attribute 'log_softmax'</code></td>
+                        <td><code>log_softmax</code> moved to <code>mlx.nn</code>.</td>
+                        <td><span class="tag api">API</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>[QuantizedMatmul::vjp] no gradient wrt the quantized weights</code></td>
+                        <td>The example loads a <b>4-bit quantized</b> model. MLX cannot backprop through quantized weights, so full-model gradient updates are impossible.</td>
+                        <td><span class="tag core">Core</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">03</span>How it was fixed</h2>
+            <p>Three targeted changes in <code>examples/mlx_tictactoe.py</code> — the key one converts training to a
+               QLoRA scheme so gradients flow through small trainable adapters instead of the frozen quantized base.</p>
+            <table>
+                <thead>
+                    <tr><th>Change</th><th>Detail</th><th></th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Sampler API</td>
+                        <td><code>temp=0.8</code> → <code>sampler=make_sampler(temp=0.8)</code></td>
+                        <td><span class="tag fix">fixed</span></td>
+                    </tr>
+                    <tr>
+                        <td>log-softmax</td>
+                        <td><code>mx.log_softmax</code> → <code>nn.log_softmax</code></td>
+                        <td><span class="tag fix">fixed</span></td>
+                    </tr>
+                    <tr>
+                        <td>QLoRA training</td>
+                        <td><code>model.freeze()</code> + <code>linear_to_lora_layers(...)</code>, and
+                            <code>mx.value_and_grad(fn)(model)</code> → <code>nn.value_and_grad(model, fn)()</code>
+                            so only the ~1.47M LoRA params receive gradients.</td>
+                        <td><span class="tag fix">fixed</span></td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="callout">
+                <b>Why QLoRA?</b> Freezing the 4-bit base and attaching LoRA adapters keeps memory tiny while making
+                the model trainable — gradients now flow only through the adapter weights, which is exactly what the
+                GRPO optimizer updates.
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">04</span>Environment check — <code>mlx_quicktest.py</code></h2>
+            <p>Confirms MLX, the Metal GPU, model loading, and generation before any training.</p>
+<pre><span class="dim">==================================================</span>
+ART-MLX Environment Check
+<span class="dim">==================================================</span>
+
+<span class="ok">✓</span> MLX available (version: 0.32.0)
+<span class="ok">✓</span> Device: Device(gpu, 0)
+<span class="ok">✓</span> MLX-LM available
+
+Loading mlx-community/Qwen2.5-0.5B-Instruct-4bit...
+<span class="ok">✓</span> Model loaded: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+
+Testing generation with prompt: 'What is 2 + 2?'
+<span class="ok">✓</span> Generation working
+  Response: The answer is 4.
+<span class="ok">✓</span> ART MLX backend importable
+
+<span class="dim">==================================================</span>
+<span class="ok">✓ Ready for GRPO training!</span>
+<span class="dim">==================================================</span></pre>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">05</span>Training run — <code>mlx_tictactoe.py</code></h2>
+            <p>Full GRPO loop: load → evaluate → train (15 steps × 6 games) → re-evaluate. Loss changes and win rate
+               fluctuates between steps, confirming real weight updates.</p>
+<pre><span class="dim">============================================================</span>
+ART-MLX Tic Tac Toe — GRPO Training
+<span class="dim">============================================================</span>
+
+Loading: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+<span class="ok">✓</span> Loaded in 0.5s
+<span class="ok">✓</span> Device: Device(gpu, 0)
+<span class="ok">✓</span> LoRA adapters applied (<span class="hi">1,466,368 trainable params</span>)
+
+GRPOTrainer initialized with lr=1e-05
+Initial evaluation (30 games)...
+  Win rate: <span class="hi">53.3%</span>   W/L/D: 16/9/5
+
+Training: 15 steps × 6 games = 90 total games
+<span class="dim">------------------------------------------------------------</span>
+Step  1/15: win_rate=83% loss= 0.3247 updates=26 (5.9s)
+Step  2/15: win_rate=33% loss=-3.1994 updates=28 (6.6s)
+Step  3/15: win_rate=83% loss= 3.1662 updates=27 (6.4s)
+Step  4/15: win_rate=50% loss= 0.0065 updates=24 (5.8s)
+Step  5/15: win_rate=50% loss= 0.6881 updates=28 (6.7s)
+Step  6/15: win_rate=67% loss= 2.8066 updates=24 (5.8s)
+Step  7/15: win_rate=50% loss= 0.6254 updates=28 (6.7s)
+Step  8/15: win_rate=33% loss= 1.4201 updates=26 (6.4s)
+Step  9/15: win_rate=33% loss= 1.0067 updates=22 (5.3s)
+Step 10/15: win_rate=50% loss= 0.9868 updates=27 (6.5s)
+Step 11/15: win_rate=83% loss=-0.8903 updates=26 (6.3s)
+Step 12/15: win_rate=50% loss= 1.2905 updates=25 (6.0s)
+Step 13/15: win_rate=67% loss= 2.2286 updates=23 (5.5s)
+Step 14/15: win_rate=83% loss= 0.0288 updates=24 (5.8s)
+Step 15/15: win_rate=50% loss= 0.4528 updates=26 (6.2s)
+<span class="dim">------------------------------------------------------------</span>
+
+Final evaluation (30 games)...
+  Win rate: <span class="hi">56.7%</span>   W/L/D: 17/10/3
+
+<span class="dim">============================================================</span>
+RESULTS
+<span class="dim">============================================================</span>
+Initial win rate: 53.3%
+Final win rate:   56.7%
+Change:           <span class="ok">+3.3%</span></pre>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">06</span>Reproduce it</h2>
+            <ul class="clean">
+                <li>Requires <b>Python ≥ 3.12</b> and Apple Silicon (arm64 macOS) for the MLX wheels.</li>
+                <li>Create a venv and install: <code>pip install -e ".[mlx]"</code></li>
+                <li>Environment check: <code>python examples/mlx_quicktest.py</code></li>
+                <li>Train: <code>python examples/mlx_tictactoe.py</code></li>
+            </ul>
+            <div class="callout" style="margin-top:18px;">
+                <b>Note on the +3.3% result.</b> The training mechanics are correct and verified; the size of the win-rate
+                gain varies per run and with hyperparameters (learning rate, number of steps, and how many layers get LoRA
+                adapters). This report documents that the loop <b>trains end-to-end with real gradient updates</b>, not a
+                tuned final accuracy.
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="wrap">
+            ART-MLX · The Menon Lab — GRPO reinforcement learning for Apple Silicon.<br>
+            Report generated from a verified local run on 2026-07-12.
+            See <a href="https://github.com/menonpg/art-mlx/pull/1">Pull Request #1</a> for the code changes.
+        </div>
+    </footer>
+</body>
+</html>
