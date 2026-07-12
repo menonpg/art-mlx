@@ -426,18 +426,22 @@
                     <div class="card">
                         <h4>📧 Email Agent</h4>
                         <p>Train a model to draft replies that match your style. Reward = human approval rating.</p>
+                        <p style="margin-top: 8px; font-size: 0.85rem;"><code>python examples/industry/email_support_agent.py</code></p>
                     </div>
                     <div class="card">
-                        <h4>🎮 Game Bot</h4>
-                        <p>Teach an AI to play a game. Reward = win/lose. Our Tic Tac Toe example does exactly this.</p>
+                        <h4>🗏️ SQL Assistant</h4>
+                        <p>Natural language to SQL that actually works. Reward = query correctness + performance.</p>
+                        <p style="margin-top: 8px; font-size: 0.85rem;"><code>python examples/industry/sql_assistant.py</code></p>
                     </div>
                     <div class="card">
-                        <h4>🔧 Tool Calling</h4>
-                        <p>Improve how an agent uses APIs/tools. Reward = task completion, no errors.</p>
+                        <h4>👀 Code Review</h4>
+                        <p>PR reviews that identify real issues. Reward = developer acceptance rate.</p>
+                        <p style="margin-top: 8px; font-size: 0.85rem;"><code>python examples/industry/code_review_agent.py</code></p>
                     </div>
                     <div class="card">
-                        <h4>🌐 Web Navigation</h4>
-                        <p>Train an agent to fill forms or find information. Reward = correct result.</p>
+                        <h4>🎮 Game Bots</h4>
+                        <p>Tic Tac Toe (simple) and 2048 (complex). Reward = win/lose or score.</p>
+                        <p style="margin-top: 8px; font-size: 0.85rem;"><code>python examples/mlx_tictactoe.py</code></p>
                     </div>
                 </div>
                 
@@ -446,8 +450,8 @@
                     After training, you get LoRA adapter weights. You can:
                 </p>
                 <ul style="color: var(--text-secondary); margin-left: 20px;">
-                    <li><strong>Merge</strong> into the base model for a single fine-tuned model</li>
-                    <li><strong>Upload to Hugging Face</strong> to share with others</li>
+                    <li><strong>Upload to Hugging Face:</strong> <code>python -m art.mlx.export --checkpoint ./model --repo user/name --push</code></li>
+                    <li><strong>Merge into base model</strong> for a single fine-tuned model</li>
                     <li><strong>Convert for Ollama/llama.cpp</strong> using standard GGUF conversion</li>
                     <li><strong>Keep separate</strong> and load dynamically (hot-swap behaviors)</li>
                 </ul>
