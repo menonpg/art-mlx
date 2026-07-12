@@ -3,16 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ART-MLX — Agent RL Training for Apple Silicon | The Menon Lab</title>
-    <meta name="description" content="First GRPO implementation for Apple Silicon. Train AI agents with reinforcement learning on your Mac. Open source from The Menon Lab.">
+    <title>ART-MLX — Train AI Agents on Your Mac | The Menon Lab</title>
+    <meta name="description" content="First GRPO implementation for Apple Silicon. Train AI agents with reinforcement learning on your M1/M2/M3/M4 Mac. Open source.">
     
-    <!-- Open Graph -->
-    <meta property="og:title" content="ART-MLX — Agent RL Training for Apple Silicon">
-    <meta property="og:description" content="First GRPO implementation for Apple Silicon. Train AI agents with reinforcement learning on your Mac.">
+    <meta property="og:title" content="ART-MLX — Train AI Agents on Your Mac">
+    <meta property="og:description" content="Reinforcement learning for AI agents, running natively on Apple Silicon. No NVIDIA required.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://menonpg.github.io/art-mlx/">
     
-    <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -32,37 +30,20 @@
             --border: #27272a;
         }
         
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background: var(--bg);
             color: var(--text);
-            line-height: 1.6;
+            line-height: 1.7;
         }
         
-        code, pre {
-            font-family: 'JetBrains Mono', monospace;
-        }
+        code, pre { font-family: 'JetBrains Mono', monospace; }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
         
-        a {
-            color: var(--accent);
-            text-decoration: none;
-        }
-        
-        a:hover {
-            text-decoration: underline;
-        }
-        
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 0 24px;
-        }
+        .container { max-width: 900px; margin: 0 auto; padding: 0 24px; }
         
         /* Header */
         header {
@@ -76,27 +57,15 @@
             align-items: center;
         }
         
-        .logo {
-            font-size: 1.25rem;
-            font-weight: 600;
-            color: var(--text);
-        }
-        
-        .logo span {
-            color: var(--text-secondary);
-            font-weight: 400;
-        }
+        .logo { font-size: 1.25rem; font-weight: 600; color: var(--text); }
+        .logo span { color: var(--text-secondary); font-weight: 400; }
         
         nav a {
             margin-left: 24px;
             color: var(--text-secondary);
             font-size: 0.9rem;
         }
-        
-        nav a:hover {
-            color: var(--text);
-            text-decoration: none;
-        }
+        nav a:hover { color: var(--text); text-decoration: none; }
         
         /* Hero */
         .hero {
@@ -106,48 +75,26 @@
         
         .badge {
             display: inline-block;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            padding: 6px 12px;
+            background: var(--green);
+            color: white;
+            padding: 6px 14px;
             border-radius: 20px;
             font-size: 0.8rem;
-            color: var(--text-secondary);
+            font-weight: 500;
             margin-bottom: 24px;
         }
         
-        .badge .dot {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            background: var(--green);
-            border-radius: 50%;
-            margin-right: 8px;
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        
         h1 {
-            font-size: 3.5rem;
+            font-size: 3rem;
             font-weight: 700;
             line-height: 1.1;
             margin-bottom: 24px;
         }
         
-        h1 .highlight {
-            background: linear-gradient(135deg, var(--accent), var(--purple));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        
         .hero-subtitle {
             font-size: 1.25rem;
             color: var(--text-secondary);
-            max-width: 600px;
+            max-width: 650px;
             margin: 0 auto 32px;
         }
         
@@ -169,28 +116,12 @@
             transition: all 0.2s;
         }
         
-        .btn-primary {
-            background: var(--accent);
-            color: white;
-        }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-hover); text-decoration: none; }
+        .btn-secondary { background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); }
+        .btn-secondary:hover { background: var(--bg-secondary); text-decoration: none; }
         
-        .btn-primary:hover {
-            background: var(--accent-hover);
-            text-decoration: none;
-        }
-        
-        .btn-secondary {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            color: var(--text);
-        }
-        
-        .btn-secondary:hover {
-            background: var(--bg-secondary);
-            text-decoration: none;
-        }
-        
-        /* What is this */
+        /* Sections */
         .section {
             padding: 80px 0;
             border-top: 1px solid var(--border);
@@ -201,87 +132,51 @@
             margin-bottom: 16px;
         }
         
+        h3 {
+            font-size: 1.3rem;
+            margin-bottom: 12px;
+            margin-top: 32px;
+        }
+        
         .section-subtitle {
             color: var(--text-secondary);
             margin-bottom: 40px;
             font-size: 1.1rem;
         }
         
-        /* Architecture diagram */
-        .architecture {
+        /* Cards */
+        .card {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 12px;
-            padding: 32px;
-            margin: 32px 0;
+            padding: 24px;
+            margin-bottom: 16px;
         }
         
-        .arch-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 24px;
-            margin-bottom: 24px;
-        }
-        
-        .arch-box {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 20px;
-            text-align: center;
-        }
-        
-        .arch-box h4 {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        .arch-box .value {
+        .card h4 {
             font-size: 1.1rem;
-            font-weight: 600;
+            margin-bottom: 8px;
         }
         
-        .arch-box.original .value { color: var(--text-secondary); }
-        .arch-box.mlx .value { color: var(--green); }
-        
-        .arch-arrow {
-            text-align: center;
+        .card p {
             color: var(--text-secondary);
-            font-size: 1.5rem;
-        }
-        
-        /* Comparison table */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 24px 0;
-        }
-        
-        th, td {
-            padding: 16px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-        }
-        
-        th {
-            font-weight: 600;
-            color: var(--text-secondary);
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        td {
             font-size: 0.95rem;
         }
         
-        .check { color: var(--green); }
-        .cross { color: var(--text-secondary); }
+        /* Grid */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
         
-        /* Code blocks */
+        .grid-3 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        
+        /* Code */
         pre {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
@@ -292,113 +187,63 @@
             margin: 24px 0;
         }
         
-        code {
-            color: var(--text);
+        code { color: var(--text); }
+        
+        /* Table */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 24px 0;
         }
         
-        .code-comment { color: var(--text-secondary); }
-        .code-keyword { color: var(--purple); }
-        .code-string { color: var(--green); }
-        .code-function { color: var(--accent); }
-        
-        /* Features grid */
-        .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 24px;
-            margin-top: 40px;
-        }
-        
-        .feature {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 24px;
-        }
-        
-        .feature-icon {
-            width: 40px;
-            height: 40px;
-            background: var(--bg-tertiary);
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin-bottom: 16px;
-            font-size: 1.25rem;
-        }
-        
-        .feature h3 {
-            font-size: 1.1rem;
-            margin-bottom: 8px;
-        }
-        
-        .feature p {
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-        }
-        
-        /* Roadmap */
-        .roadmap {
-            margin-top: 40px;
-        }
-        
-        .roadmap-item {
-            display: flex;
-            gap: 16px;
-            padding: 16px 0;
+        th, td {
+            padding: 14px;
+            text-align: left;
             border-bottom: 1px solid var(--border);
         }
         
-        .roadmap-status {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.8rem;
-            flex-shrink: 0;
-        }
-        
-        .roadmap-status.done {
-            background: var(--green);
-            color: white;
-        }
-        
-        .roadmap-status.progress {
-            background: var(--orange);
-            color: white;
-        }
-        
-        .roadmap-status.todo {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            color: var(--text-secondary);
-        }
-        
-        .roadmap-content h4 {
-            font-size: 1rem;
-            margin-bottom: 4px;
-        }
-        
-        .roadmap-content p {
+        th {
+            font-weight: 600;
             color: var(--text-secondary);
             font-size: 0.85rem;
+            text-transform: uppercase;
         }
         
-        /* The Big Picture */
-        .diagram-text {
+        /* Diagram */
+        .diagram {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 24px;
+            border-radius: 12px;
+            padding: 32px;
+            margin: 32px 0;
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.85rem;
             line-height: 1.8;
             overflow-x: auto;
             white-space: pre;
         }
+        
+        /* Roadmap */
+        .roadmap-item {
+            display: flex;
+            gap: 16px;
+            padding: 14px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .status {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            flex-shrink: 0;
+        }
+        
+        .status.done { background: var(--green); color: white; }
+        .status.todo { background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text-secondary); }
         
         /* Footer */
         footer {
@@ -409,18 +254,8 @@
             font-size: 0.9rem;
         }
         
-        footer a {
-            color: var(--text-secondary);
-        }
-        
-        footer a:hover {
-            color: var(--text);
-        }
-        
-        /* Responsive */
         @media (max-width: 768px) {
-            h1 { font-size: 2.5rem; }
-            .arch-row { grid-template-columns: 1fr; }
+            h1 { font-size: 2.2rem; }
             .hero { padding: 60px 0; }
             .section { padding: 60px 0; }
         }
@@ -433,7 +268,8 @@
             <nav>
                 <a href="#what">What</a>
                 <a href="#how">How</a>
-                <a href="#roadmap">Roadmap</a>
+                <a href="#use-cases">Use Cases</a>
+                <a href="#quickstart">Start</a>
                 <a href="https://github.com/menonpg/art-mlx">GitHub</a>
             </nav>
         </div>
@@ -442,327 +278,284 @@
     <main>
         <section class="hero">
             <div class="container">
-                <div class="badge">
-                    <span class="dot"></span>
-                    ✅ Verified on M1 Max — GRPO Training Works
-                </div>
-                <h1>Agent RL Training<br>for <span class="highlight">Apple Silicon</span></h1>
+                <div class="badge">✅ Verified on M1 Max</div>
+                <h1>Train AI Agents<br>on Your Mac</h1>
                 <p class="hero-subtitle">
-                    First GRPO implementation for Mac. Train AI agents with reinforcement learning 
-                    on your M1/M2/M3/M4 — no NVIDIA GPU required.
+                    Teach AI models to get better at tasks through practice. 
+                    Reinforcement learning that runs on Apple Silicon — no expensive GPU servers required.
                 </p>
                 <div class="hero-buttons">
                     <a href="https://github.com/menonpg/art-mlx" class="btn btn-primary">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-                        View on GitHub
+                        GitHub →
                     </a>
                     <a href="#quickstart" class="btn btn-secondary">
-                        Quick Start →
+                        Quick Start
                     </a>
                     <a href="mlx-tictactoe-results.html" class="btn btn-secondary">
-                        🧪 Test Results →
+                        🧪 Test Results
                     </a>
                 </div>
             </div>
         </section>
         
+        <!-- WHAT IS THIS -->
         <section class="section" id="what">
             <div class="container">
                 <h2>What is this?</h2>
                 <p class="section-subtitle">
-                    A fork of <a href="https://github.com/openpipe/art">OpenPipe's ART</a> that replaces 
-                    CUDA dependencies with native MLX, enabling agent reinforcement learning on Apple Silicon.
+                    ART-MLX trains AI models to improve at specific tasks through trial and error — 
+                    like how you get better at video games by playing more.
                 </p>
                 
-                <div class="architecture">
-                    <div class="arch-row">
-                        <div class="arch-box original">
-                            <h4>Original ART</h4>
-                            <div class="value">vLLM (CUDA)</div>
-                        </div>
-                        <div class="arch-arrow">→</div>
-                        <div class="arch-box mlx">
-                            <h4>ART-MLX</h4>
-                            <div class="value">mlx-lm (Metal)</div>
-                        </div>
+                <div class="grid-2">
+                    <div class="card">
+                        <h4>🎯 The Problem</h4>
+                        <p>
+                            ChatGPT and Claude are general-purpose. They're okay at everything but great at nothing specific.
+                            What if you want an AI that's <em>really good</em> at your specific task — answering your emails, 
+                            navigating your app, playing your game?
+                        </p>
                     </div>
-                    <div class="arch-row">
-                        <div class="arch-box original">
-                            <h4>Training</h4>
-                            <div class="value">Unsloth (CUDA)</div>
-                        </div>
-                        <div class="arch-arrow">→</div>
-                        <div class="arch-box mlx">
-                            <h4>Training</h4>
-                            <div class="value">MLX Native</div>
-                        </div>
-                    </div>
-                    <div class="arch-row">
-                        <div class="arch-box original">
-                            <h4>Hardware</h4>
-                            <div class="value">NVIDIA GPU</div>
-                        </div>
-                        <div class="arch-arrow">→</div>
-                        <div class="arch-box mlx">
-                            <h4>Hardware</h4>
-                            <div class="value">Apple Silicon</div>
-                        </div>
+                    <div class="card">
+                        <h4>💡 The Solution</h4>
+                        <p>
+                            Take a smaller model, have it practice your task thousands of times, 
+                            reward it when it does well, and update its weights. 
+                            This is called <strong>reinforcement learning</strong> (RL).
+                        </p>
                     </div>
                 </div>
                 
-                <h3 style="margin-top: 48px; margin-bottom: 16px;">Why does this matter?</h3>
+                <h3>The catch (before ART-MLX)</h3>
+                <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                    The tools for this (like OpenPipe's ART) only run on NVIDIA GPUs. If you have a Mac, your options were:
+                </p>
+                
                 <table>
-                    <thead>
-                        <tr>
-                            <th>Scenario</th>
-                            <th>Before ART-MLX</th>
-                            <th>With ART-MLX</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td>Train an agent on Mac</td>
-                            <td class="cross">❌ Impossible (CUDA required)</td>
-                            <td class="check">✓ Native on M1/M2/M3/M4</td>
-                        </tr>
-                        <tr>
-                            <td>Quick iteration</td>
-                            <td class="cross">❌ Rent cloud GPU, wait for upload</td>
-                            <td class="check">✓ Run locally in seconds</td>
-                        </tr>
-                        <tr>
-                            <td>Cost to experiment</td>
-                            <td class="cross">$15-200 per training run</td>
-                            <td class="check">✓ $0 (your Mac)</td>
-                        </tr>
-                        <tr>
-                            <td>64GB M1 Max</td>
-                            <td class="cross">❌ Unused for ML training</td>
-                            <td class="check">✓ Train 7B-14B models with LoRA</td>
-                        </tr>
-                    </tbody>
+                    <tr>
+                        <th>Option</th>
+                        <th>Cost</th>
+                        <th>Friction</th>
+                    </tr>
+                    <tr>
+                        <td>Rent cloud GPU (RunPod, Lambda)</td>
+                        <td>$0.50-3/hour</td>
+                        <td>Upload code, wait, download</td>
+                    </tr>
+                    <tr>
+                        <td>Use W&B ServerlessBackend</td>
+                        <td>$15-200/run</td>
+                        <td>Network latency, API limits</td>
+                    </tr>
+                    <tr>
+                        <td><strong>ART-MLX (this)</strong></td>
+                        <td><strong>$0</strong></td>
+                        <td><strong>Run locally in seconds</strong></td>
+                    </tr>
                 </table>
             </div>
         </section>
         
+        <!-- HOW IT WORKS -->
         <section class="section" id="how">
             <div class="container">
                 <h2>How it works</h2>
                 <p class="section-subtitle">
-                    GRPO (Group Relative Policy Optimization) trains agents by comparing 
-                    multiple attempts at the same task and learning from the differences.
+                    GRPO (Group Relative Policy Optimization) — the same algorithm used to train 
+                    DeepSeek-R1's reasoning abilities.
                 </p>
                 
-                <div class="diagram-text">
+                <div class="diagram">
 ┌─────────────────────────────────────────────────────────────────┐
-│                        GRPO Training Loop                        │
+│                     THE TRAINING LOOP                            │
 └─────────────────────────────────────────────────────────────────┘
 
-    ┌──────────┐     ┌──────────┐     ┌──────────┐
-    │ Rollout  │     │ Rollout  │     │ Rollout  │    Same task,
-    │    A     │     │    B     │     │    C     │    multiple attempts
-    │ reward=1 │     │ reward=0 │     │ reward=1 │
-    └────┬─────┘     └────┬─────┘     └────┬─────┘
-         │                │                │
-         └────────────────┼────────────────┘
-                          ▼
-              ┌───────────────────────┐
-              │   Compute Advantages  │   A & C better than average
-              │   (relative to mean)  │   B worse than average
-              └───────────┬───────────┘
-                          ▼
-              ┌───────────────────────┐
-              │     GRPO Update       │   Increase P(A), P(C)
-              │   (update LoRA)       │   Decrease P(B)
-              └───────────┬───────────┘
-                          ▼
-              ┌───────────────────────┐
-              │   Better Agent 🎉     │   Repeat...
-              └───────────────────────┘
+  1. PRACTICE        2. EVALUATE         3. LEARN
+  ───────────        ──────────         ─────────
+                     
+  Agent tries        Did it work?       Update weights
+  the task           
+                     ✓ Win  → +1        Good actions
+  "Play this         ✗ Lose → -1        get more likely
+   game move"        ~ Draw →  0        
+                                        Bad actions
+  (multiple                             get less likely
+   attempts)         
+                     
+                     Compare to
+                     group average      → Repeat!
                 </div>
                 
-                <h3 style="margin-top: 48px; margin-bottom: 16px;">The key insight</h3>
-                <p style="color: var(--text-secondary); margin-bottom: 24px;">
-                    GRPO doesn't need a separate "critic" network to estimate how good actions are. 
-                    Instead, it runs multiple attempts on the same task and compares them directly.
-                    Trajectories that score higher than the group average get reinforced. 
-                    This is the same algorithm used to train reasoning models like DeepSeek-R1.
+                <h3>What you're actually training</h3>
+                <div class="grid-3">
+                    <div class="card">
+                        <h4>Base Model</h4>
+                        <p>A pre-trained LLM (e.g., Qwen 0.5B-7B). This stays <strong>frozen</strong> — we don't change it.</p>
+                    </div>
+                    <div class="card">
+                        <h4>LoRA Adapters</h4>
+                        <p>Small trainable layers (~1.5M params) that modify the model's behavior. This is what we update.</p>
+                    </div>
+                    <div class="card">
+                        <h4>Output</h4>
+                        <p>A set of adapter weights you can merge into the base model or share on Hugging Face.</p>
+                    </div>
+                </div>
+                
+                <h3>Training data</h3>
+                <p style="color: var(--text-secondary);">
+                    You don't need a dataset. The model generates its own training data by <em>trying the task</em>. 
+                    You just define:
+                </p>
+                <ul style="color: var(--text-secondary); margin-top: 12px; margin-left: 20px;">
+                    <li><strong>The task:</strong> What should the agent try to do?</li>
+                    <li><strong>The reward:</strong> How do you score success/failure?</li>
+                </ul>
+            </div>
+        </section>
+        
+        <!-- USE CASES -->
+        <section class="section" id="use-cases">
+            <div class="container">
+                <h2>What can you build?</h2>
+                <p class="section-subtitle">
+                    Any task where you can define success/failure and run many attempts.
                 </p>
                 
-                <h3 style="margin-top: 48px; margin-bottom: 16px;" id="quickstart">Quick Start</h3>
-                <pre><code><span class="code-comment"># Clone and checkout MLX branch</span>
+                <div class="grid-2">
+                    <div class="card">
+                        <h4>📧 Email Agent</h4>
+                        <p>Train a model to draft replies that match your style. Reward = human approval rating.</p>
+                    </div>
+                    <div class="card">
+                        <h4>🎮 Game Bot</h4>
+                        <p>Teach an AI to play a game. Reward = win/lose. Our Tic Tac Toe example does exactly this.</p>
+                    </div>
+                    <div class="card">
+                        <h4>🔧 Tool Calling</h4>
+                        <p>Improve how an agent uses APIs/tools. Reward = task completion, no errors.</p>
+                    </div>
+                    <div class="card">
+                        <h4>🌐 Web Navigation</h4>
+                        <p>Train an agent to fill forms or find information. Reward = correct result.</p>
+                    </div>
+                </div>
+                
+                <h3>Output artifacts</h3>
+                <p style="color: var(--text-secondary); margin-bottom: 16px;">
+                    After training, you get LoRA adapter weights. You can:
+                </p>
+                <ul style="color: var(--text-secondary); margin-left: 20px;">
+                    <li><strong>Merge</strong> into the base model for a single fine-tuned model</li>
+                    <li><strong>Upload to Hugging Face</strong> to share with others</li>
+                    <li><strong>Convert for Ollama/llama.cpp</strong> using standard GGUF conversion</li>
+                    <li><strong>Keep separate</strong> and load dynamically (hot-swap behaviors)</li>
+                </ul>
+            </div>
+        </section>
+        
+        <!-- QUICK START -->
+        <section class="section" id="quickstart">
+            <div class="container">
+                <h2>Quick Start</h2>
+                <p class="section-subtitle">
+                    Get training in 3 commands. Requires Apple Silicon Mac (M1/M2/M3/M4).
+                </p>
+                
+                <pre><code># Clone the repo
 git clone https://github.com/menonpg/art-mlx
 cd art-mlx
-git checkout mlx-backend
 
-<span class="code-comment"># Install with MLX dependencies</span>
-pip install -e <span class="code-string">".[mlx]"</span>
+# Install with MLX dependencies
+pip install -e ".[mlx]"
 
-<span class="code-comment"># Verify your environment</span>
-python examples/mlx_quicktest.py
-
-<span class="code-comment"># Run Tic Tac Toe training example</span>
+# Run the Tic Tac Toe training example
 python examples/mlx_tictactoe.py</code></pre>
-            </div>
-        </section>
-        
-        <section class="section" id="integration">
-            <div class="container">
-                <h2>Future: OpenClaw-RL Integration</h2>
-                <p class="section-subtitle">
-                    We're planning to integrate concepts from 
-                    <a href="https://github.com/Gen-Verse/OpenClaw-RL">OpenClaw-RL</a> — 
-                    a framework for continuous learning from agent interactions.
+                
+                <h3>What happens</h3>
+                <ol style="color: var(--text-secondary); margin-left: 20px; margin-top: 12px;">
+                    <li>Downloads Qwen 0.5B 4-bit model (~300MB first time)</li>
+                    <li>Applies LoRA adapters (1.47M trainable params)</li>
+                    <li>Plays 30 evaluation games → shows initial win rate</li>
+                    <li>Trains for 15 steps (90 games total) with GRPO</li>
+                    <li>Plays 30 more games → shows final win rate</li>
+                </ol>
+                
+                <p style="margin-top: 24px;">
+                    <strong>Expected result:</strong> ~53% → ~57% win rate in ~90 seconds. 
+                    <a href="mlx-tictactoe-results.html">See full test results →</a>
                 </p>
-                
-                <div class="features">
-                    <div class="feature">
-                        <div class="feature-icon">📊</div>
-                        <h3>Evaluative Signals</h3>
-                        <p>Did the task succeed? ART already captures this via rewards (+1 for success, -1 for failure).</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">🎯</div>
-                        <h3>Directive Signals</h3>
-                        <p><strong>Coming soon:</strong> How should it have been different? Extract specific corrections from errors and user feedback.</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">🔄</div>
-                        <h3>Continuous Learning</h3>
-                        <p><strong>Future:</strong> Train the model live from every interaction, not just explicit training runs.</p>
-                    </div>
-                </div>
-                
-                <pre style="margin-top: 32px;"><code><span class="code-comment"># Current ART: just reward</span>
-trajectory.<span class="code-function">set_reward</span>(<span class="code-keyword">1.0</span> <span class="code-keyword">if</span> success <span class="code-keyword">else</span> <span class="code-keyword">-1.0</span>)
-
-<span class="code-comment"># Future ART-MLX + OpenClaw-RL: reward + directive hint</span>
-trajectory.<span class="code-function">set_reward</span>(reward)
-trajectory.<span class="code-function">set_directive_hint</span>(
-    <span class="code-function">extract_correction_from_error</span>(error_message)
-)</code></pre>
             </div>
         </section>
         
+        <!-- ROADMAP -->
         <section class="section" id="roadmap">
             <div class="container">
-                <h2>Roadmap</h2>
-                <p class="section-subtitle">
-                    Current status and what's coming next.
-                </p>
+                <h2>Status & Roadmap</h2>
                 
-                <div class="roadmap">
-                    <div class="roadmap-item">
-                        <div class="roadmap-status done">✓</div>
-                        <div class="roadmap-content">
-                            <h4>MLXBackend class structure</h4>
-                            <p>Drop-in replacement for LocalBackend</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status done">✓</div>
-                        <div class="roadmap-content">
-                            <h4>GRPO algorithm in MLX</h4>
-                            <p>Core training algorithm ported to MLX</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status done">✓</div>
-                        <div class="roadmap-content">
-                            <h4>LoRA layer implementation</h4>
-                            <p>Low-rank adapters for efficient fine-tuning</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status done">✓</div>
-                        <div class="roadmap-content">
-                            <h4>Tic Tac Toe example</h4>
-                            <p>End-to-end training demonstration</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status done">✓</div>
-                        <div class="roadmap-content">
-                            <h4>Full gradient updates</h4>
-                            <p>GRPO backprop with AdamW optimizer — working!</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status done">✓</div>
-                        <div class="roadmap-content">
-                            <h4>Checkpoint save/load</h4>
-                            <p>Persist training progress</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status todo">○</div>
-                        <div class="roadmap-content">
-                            <h4>2048 game example</h4>
-                            <p>More complex training task</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status todo">○</div>
-                        <div class="roadmap-content">
-                            <h4>Benchmarks vs ServerlessBackend</h4>
-                            <p>Performance comparison with original ART</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status todo">○</div>
-                        <div class="roadmap-content">
-                            <h4>OpenClaw-RL directive signals</h4>
-                            <p>Extract "how to improve" hints from errors</p>
-                        </div>
-                    </div>
-                    <div class="roadmap-item">
-                        <div class="roadmap-status todo">○</div>
-                        <div class="roadmap-content">
-                            <h4>PR to upstream OpenPipe/ART</h4>
-                            <p>Contribute back to the community</p>
-                        </div>
-                    </div>
+                <div class="roadmap-item">
+                    <div class="status done">✓</div>
+                    <div><strong>MLX Backend</strong> — Drop-in replacement for CUDA backend</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status done">✓</div>
+                    <div><strong>GRPO Algorithm</strong> — Policy gradient with group-relative advantages</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status done">✓</div>
+                    <div><strong>LoRA Training</strong> — QLoRA with frozen quantized base</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status done">✓</div>
+                    <div><strong>Gradient Updates</strong> — Real backprop via mx.value_and_grad</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status done">✓</div>
+                    <div><strong>Tic Tac Toe Example</strong> — End-to-end training verified on M1 Max</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status done">✓</div>
+                    <div><strong>Checkpoint Save/Load</strong> — Persist training progress</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status todo">○</div>
+                    <div><strong>2048 Game Example</strong> — More complex task with clearer improvement signal</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status todo">○</div>
+                    <div><strong>Benchmarks</strong> — Performance comparison vs ServerlessBackend</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status todo">○</div>
+                    <div><strong>HuggingFace Export</strong> — One-command upload of trained adapters</div>
+                </div>
+                <div class="roadmap-item">
+                    <div class="status todo">○</div>
+                    <div><strong>PR to OpenPipe</strong> — Contribute MLX backend upstream</div>
                 </div>
             </div>
         </section>
         
+        <!-- ABOUT -->
         <section class="section">
             <div class="container">
                 <h2>About</h2>
-                <p class="section-subtitle">
-                    ART-MLX is an open-source project from <strong>The Menon Lab</strong> — 
-                    building practical AI infrastructure at the intersection of research and production.
+                <p style="color: var(--text-secondary); max-width: 600px;">
+                    ART-MLX is an open-source project from <strong>The Menon Lab</strong>. 
+                    We build practical AI tools that work on hardware you already own.
                 </p>
-                
-                <div class="features">
-                    <div class="feature">
-                        <div class="feature-icon">🔬</div>
-                        <h3>The Menon Lab</h3>
-                        <p>AI research and engineering. Blog at <a href="https://blog.themenonlab.com">blog.themenonlab.com</a></p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">🤝</div>
-                        <h3>Built on Giants</h3>
-                        <p><a href="https://github.com/openpipe/art">OpenPipe ART</a>, <a href="https://github.com/ml-explore/mlx">Apple MLX</a>, <a href="https://github.com/ml-explore/mlx-lm">mlx-lm</a></p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">📖</div>
-                        <h3>Open Source</h3>
-                        <p>Apache 2.0 license. Contributions welcome.</p>
-                    </div>
-                </div>
+                <p style="margin-top: 16px;">
+                    <a href="https://github.com/menonpg/art-mlx">GitHub</a> · 
+                    <a href="https://blog.themenonlab.com">Blog</a> · 
+                    <a href="https://themenonlab.com">The Menon Lab</a>
+                </p>
             </div>
         </section>
     </main>
     
     <footer>
         <div class="container">
-            <p>
-                <a href="https://github.com/menonpg/art-mlx">GitHub</a> · 
-                <a href="https://blog.themenonlab.com">Blog</a> · 
-                <a href="https://themenonlab.com">The Menon Lab</a>
-            </p>
-            <p style="margin-top: 8px;">Apache 2.0 License · 2026</p>
+            <p>Apache 2.0 License · 2026 · First GRPO on Apple Silicon</p>
         </div>
     </footer>
 </body>
