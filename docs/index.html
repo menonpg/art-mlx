@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ART-MLX — Agent RL Training for Apple Silicon | The Menon Lab</title>
+    <meta name="description" content="First GRPO implementation for Apple Silicon. Train AI agents with reinforcement learning on your Mac. Open source from The Menon Lab.">
+    
+    <!-- Open Graph -->
+    <meta property="og:title" content="ART-MLX — Agent RL Training for Apple Silicon">
+    <meta property="og:description" content="First GRPO implementation for Apple Silicon. Train AI agents with reinforcement learning on your Mac.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://menonpg.github.io/art-mlx/">
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg: #0a0a0a;
+            --bg-secondary: #141414;
+            --bg-tertiary: #1a1a1a;
+            --text: #fafafa;
+            --text-secondary: #a1a1aa;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --green: #22c55e;
+            --orange: #f97316;
+            --purple: #a855f7;
+            --border: #27272a;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        
+        code, pre {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        
+        a:hover {
+            text-decoration: underline;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+        
+        /* Header */
+        header {
+            padding: 24px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logo {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text);
+        }
+        
+        .logo span {
+            color: var(--text-secondary);
+            font-weight: 400;
+        }
+        
+        nav a {
+            margin-left: 24px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        
+        nav a:hover {
+            color: var(--text);
+            text-decoration: none;
+        }
+        
+        /* Hero */
+        .hero {
+            padding: 80px 0;
+            text-align: center;
+        }
+        
+        .badge {
+            display: inline-block;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 24px;
+        }
+        
+        .badge .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: var(--green);
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 24px;
+        }
+        
+        h1 .highlight {
+            background: linear-gradient(135deg, var(--accent), var(--purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .hero-subtitle {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto 32px;
+        }
+        
+        .hero-buttons {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 500;
+            font-size: 0.95rem;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: var(--accent-hover);
+            text-decoration: none;
+        }
+        
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        
+        .btn-secondary:hover {
+            background: var(--bg-secondary);
+            text-decoration: none;
+        }
+        
+        /* What is this */
+        .section {
+            padding: 80px 0;
+            border-top: 1px solid var(--border);
+        }
+        
+        h2 {
+            font-size: 2rem;
+            margin-bottom: 16px;
+        }
+        
+        .section-subtitle {
+            color: var(--text-secondary);
+            margin-bottom: 40px;
+            font-size: 1.1rem;
+        }
+        
+        /* Architecture diagram */
+        .architecture {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+            margin: 32px 0;
+        }
+        
+        .arch-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+        
+        .arch-box {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .arch-box h4 {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .arch-box .value {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+        
+        .arch-box.original .value { color: var(--text-secondary); }
+        .arch-box.mlx .value { color: var(--green); }
+        
+        .arch-arrow {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 1.5rem;
+        }
+        
+        /* Comparison table */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 24px 0;
+        }
+        
+        th, td {
+            padding: 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        th {
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        td {
+            font-size: 0.95rem;
+        }
+        
+        .check { color: var(--green); }
+        .cross { color: var(--text-secondary); }
+        
+        /* Code blocks */
+        pre {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            overflow-x: auto;
+            font-size: 0.9rem;
+            margin: 24px 0;
+        }
+        
+        code {
+            color: var(--text);
+        }
+        
+        .code-comment { color: var(--text-secondary); }
+        .code-keyword { color: var(--purple); }
+        .code-string { color: var(--green); }
+        .code-function { color: var(--accent); }
+        
+        /* Features grid */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 24px;
+            margin-top: 40px;
+        }
+        
+        .feature {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+        
+        .feature-icon {
+            width: 40px;
+            height: 40px;
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 16px;
+            font-size: 1.25rem;
+        }
+        
+        .feature h3 {
+            font-size: 1.1rem;
+            margin-bottom: 8px;
+        }
+        
+        .feature p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        
+        /* Roadmap */
+        .roadmap {
+            margin-top: 40px;
+        }
+        
+        .roadmap-item {
+            display: flex;
+            gap: 16px;
+            padding: 16px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .roadmap-status {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            flex-shrink: 0;
+        }
+        
+        .roadmap-status.done {
+            background: var(--green);
+            color: white;
+        }
+        
+        .roadmap-status.progress {
+            background: var(--orange);
+            color: white;
+        }
+        
+        .roadmap-status.todo {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+        
+        .roadmap-content h4 {
+            font-size: 1rem;
+            margin-bottom: 4px;
+        }
+        
+        .roadmap-content p {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+        
+        /* The Big Picture */
+        .diagram-text {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 24px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            line-height: 1.8;
+            overflow-x: auto;
+            white-space: pre;
+        }
+        
+        /* Footer */
+        footer {
+            padding: 40px 0;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        
+        footer a {
+            color: var(--text-secondary);
+        }
+        
+        footer a:hover {
+            color: var(--text);
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            h1 { font-size: 2.5rem; }
+            .arch-row { grid-template-columns: 1fr; }
+            .hero { padding: 60px 0; }
+            .section { padding: 60px 0; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container header-content">
+            <div class="logo">ART-MLX <span>by The Menon Lab</span></div>
+            <nav>
+                <a href="#what">What</a>
+                <a href="#how">How</a>
+                <a href="#roadmap">Roadmap</a>
+                <a href="https://github.com/menonpg/art-mlx">GitHub</a>
+            </nav>
+        </div>
+    </header>
+    
+    <main>
+        <section class="hero">
+            <div class="container">
+                <div class="badge">
+                    <span class="dot"></span>
+                    Work in Progress — Testing Phase
+                </div>
+                <h1>Agent RL Training<br>for <span class="highlight">Apple Silicon</span></h1>
+                <p class="hero-subtitle">
+                    First GRPO implementation for Mac. Train AI agents with reinforcement learning 
+                    on your M1/M2/M3/M4 — no NVIDIA GPU required.
+                </p>
+                <div class="hero-buttons">
+                    <a href="https://github.com/menonpg/art-mlx" class="btn btn-primary">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+                        View on GitHub
+                    </a>
+                    <a href="#quickstart" class="btn btn-secondary">
+                        Quick Start →
+                    </a>
+                </div>
+            </div>
+        </section>
+        
+        <section class="section" id="what">
+            <div class="container">
+                <h2>What is this?</h2>
+                <p class="section-subtitle">
+                    A fork of <a href="https://github.com/openpipe/art">OpenPipe's ART</a> that replaces 
+                    CUDA dependencies with native MLX, enabling agent reinforcement learning on Apple Silicon.
+                </p>
+                
+                <div class="architecture">
+                    <div class="arch-row">
+                        <div class="arch-box original">
+                            <h4>Original ART</h4>
+                            <div class="value">vLLM (CUDA)</div>
+                        </div>
+                        <div class="arch-arrow">→</div>
+                        <div class="arch-box mlx">
+                            <h4>ART-MLX</h4>
+                            <div class="value">mlx-lm (Metal)</div>
+                        </div>
+                    </div>
+                    <div class="arch-row">
+                        <div class="arch-box original">
+                            <h4>Training</h4>
+                            <div class="value">Unsloth (CUDA)</div>
+                        </div>
+                        <div class="arch-arrow">→</div>
+                        <div class="arch-box mlx">
+                            <h4>Training</h4>
+                            <div class="value">MLX Native</div>
+                        </div>
+                    </div>
+                    <div class="arch-row">
+                        <div class="arch-box original">
+                            <h4>Hardware</h4>
+                            <div class="value">NVIDIA GPU</div>
+                        </div>
+                        <div class="arch-arrow">→</div>
+                        <div class="arch-box mlx">
+                            <h4>Hardware</h4>
+                            <div class="value">Apple Silicon</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <h3 style="margin-top: 48px; margin-bottom: 16px;">Why does this matter?</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Scenario</th>
+                            <th>Before ART-MLX</th>
+                            <th>With ART-MLX</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Train an agent on Mac</td>
+                            <td class="cross">❌ Impossible (CUDA required)</td>
+                            <td class="check">✓ Native on M1/M2/M3/M4</td>
+                        </tr>
+                        <tr>
+                            <td>Quick iteration</td>
+                            <td class="cross">❌ Rent cloud GPU, wait for upload</td>
+                            <td class="check">✓ Run locally in seconds</td>
+                        </tr>
+                        <tr>
+                            <td>Cost to experiment</td>
+                            <td class="cross">$15-200 per training run</td>
+                            <td class="check">✓ $0 (your Mac)</td>
+                        </tr>
+                        <tr>
+                            <td>64GB M1 Max</td>
+                            <td class="cross">❌ Unused for ML training</td>
+                            <td class="check">✓ Train 7B-14B models with LoRA</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        
+        <section class="section" id="how">
+            <div class="container">
+                <h2>How it works</h2>
+                <p class="section-subtitle">
+                    GRPO (Group Relative Policy Optimization) trains agents by comparing 
+                    multiple attempts at the same task and learning from the differences.
+                </p>
+                
+                <div class="diagram-text">
+┌─────────────────────────────────────────────────────────────────┐
+│                        GRPO Training Loop                        │
+└─────────────────────────────────────────────────────────────────┘
+
+    ┌──────────┐     ┌──────────┐     ┌──────────┐
+    │ Rollout  │     │ Rollout  │     │ Rollout  │    Same task,
+    │    A     │     │    B     │     │    C     │    multiple attempts
+    │ reward=1 │     │ reward=0 │     │ reward=1 │
+    └────┬─────┘     └────┬─────┘     └────┬─────┘
+         │                │                │
+         └────────────────┼────────────────┘
+                          ▼
+              ┌───────────────────────┐
+              │   Compute Advantages  │   A & C better than average
+              │   (relative to mean)  │   B worse than average
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │     GRPO Update       │   Increase P(A), P(C)
+              │   (update LoRA)       │   Decrease P(B)
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │   Better Agent 🎉     │   Repeat...
+              └───────────────────────┘
+                </div>
+                
+                <h3 style="margin-top: 48px; margin-bottom: 16px;">The key insight</h3>
+                <p style="color: var(--text-secondary); margin-bottom: 24px;">
+                    GRPO doesn't need a separate "critic" network to estimate how good actions are. 
+                    Instead, it runs multiple attempts on the same task and compares them directly.
+                    Trajectories that score higher than the group average get reinforced. 
+                    This is the same algorithm used to train reasoning models like DeepSeek-R1.
+                </p>
+                
+                <h3 style="margin-top: 48px; margin-bottom: 16px;" id="quickstart">Quick Start</h3>
+                <pre><code><span class="code-comment"># Clone and checkout MLX branch</span>
+git clone https://github.com/menonpg/art-mlx
+cd art-mlx
+git checkout mlx-backend
+
+<span class="code-comment"># Install with MLX dependencies</span>
+pip install -e <span class="code-string">".[mlx]"</span>
+
+<span class="code-comment"># Verify your environment</span>
+python examples/mlx_quicktest.py
+
+<span class="code-comment"># Run Tic Tac Toe training example</span>
+python examples/mlx_tictactoe.py</code></pre>
+            </div>
+        </section>
+        
+        <section class="section" id="integration">
+            <div class="container">
+                <h2>Future: OpenClaw-RL Integration</h2>
+                <p class="section-subtitle">
+                    We're planning to integrate concepts from 
+                    <a href="https://github.com/Gen-Verse/OpenClaw-RL">OpenClaw-RL</a> — 
+                    a framework for continuous learning from agent interactions.
+                </p>
+                
+                <div class="features">
+                    <div class="feature">
+                        <div class="feature-icon">📊</div>
+                        <h3>Evaluative Signals</h3>
+                        <p>Did the task succeed? ART already captures this via rewards (+1 for success, -1 for failure).</p>
+                    </div>
+                    <div class="feature">
+                        <div class="feature-icon">🎯</div>
+                        <h3>Directive Signals</h3>
+                        <p><strong>Coming soon:</strong> How should it have been different? Extract specific corrections from errors and user feedback.</p>
+                    </div>
+                    <div class="feature">
+                        <div class="feature-icon">🔄</div>
+                        <h3>Continuous Learning</h3>
+                        <p><strong>Future:</strong> Train the model live from every interaction, not just explicit training runs.</p>
+                    </div>
+                </div>
+                
+                <pre style="margin-top: 32px;"><code><span class="code-comment"># Current ART: just reward</span>
+trajectory.<span class="code-function">set_reward</span>(<span class="code-keyword">1.0</span> <span class="code-keyword">if</span> success <span class="code-keyword">else</span> <span class="code-keyword">-1.0</span>)
+
+<span class="code-comment"># Future ART-MLX + OpenClaw-RL: reward + directive hint</span>
+trajectory.<span class="code-function">set_reward</span>(reward)
+trajectory.<span class="code-function">set_directive_hint</span>(
+    <span class="code-function">extract_correction_from_error</span>(error_message)
+)</code></pre>
+            </div>
+        </section>
+        
+        <section class="section" id="roadmap">
+            <div class="container">
+                <h2>Roadmap</h2>
+                <p class="section-subtitle">
+                    Current status and what's coming next.
+                </p>
+                
+                <div class="roadmap">
+                    <div class="roadmap-item">
+                        <div class="roadmap-status done">✓</div>
+                        <div class="roadmap-content">
+                            <h4>MLXBackend class structure</h4>
+                            <p>Drop-in replacement for LocalBackend</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status done">✓</div>
+                        <div class="roadmap-content">
+                            <h4>GRPO algorithm in MLX</h4>
+                            <p>Core training algorithm ported to MLX</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status done">✓</div>
+                        <div class="roadmap-content">
+                            <h4>LoRA layer implementation</h4>
+                            <p>Low-rank adapters for efficient fine-tuning</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status done">✓</div>
+                        <div class="roadmap-content">
+                            <h4>Tic Tac Toe example</h4>
+                            <p>End-to-end training demonstration</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status progress">⏳</div>
+                        <div class="roadmap-content">
+                            <h4>Full gradient updates</h4>
+                            <p>Wire up actual LoRA weight updates in training loop</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status todo">○</div>
+                        <div class="roadmap-content">
+                            <h4>Checkpoint save/load</h4>
+                            <p>Persist training progress</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status todo">○</div>
+                        <div class="roadmap-content">
+                            <h4>2048 game example</h4>
+                            <p>More complex training task</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status todo">○</div>
+                        <div class="roadmap-content">
+                            <h4>Benchmarks vs ServerlessBackend</h4>
+                            <p>Performance comparison with original ART</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status todo">○</div>
+                        <div class="roadmap-content">
+                            <h4>OpenClaw-RL directive signals</h4>
+                            <p>Extract "how to improve" hints from errors</p>
+                        </div>
+                    </div>
+                    <div class="roadmap-item">
+                        <div class="roadmap-status todo">○</div>
+                        <div class="roadmap-content">
+                            <h4>PR to upstream OpenPipe/ART</h4>
+                            <p>Contribute back to the community</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+        
+        <section class="section">
+            <div class="container">
+                <h2>About</h2>
+                <p class="section-subtitle">
+                    ART-MLX is an open-source project from <strong>The Menon Lab</strong> — 
+                    building practical AI infrastructure at the intersection of research and production.
+                </p>
+                
+                <div class="features">
+                    <div class="feature">
+                        <div class="feature-icon">🔬</div>
+                        <h3>The Menon Lab</h3>
+                        <p>AI research and engineering. Blog at <a href="https://blog.themenonlab.com">blog.themenonlab.com</a></p>
+                    </div>
+                    <div class="feature">
+                        <div class="feature-icon">🤝</div>
+                        <h3>Built on Giants</h3>
+                        <p><a href="https://github.com/openpipe/art">OpenPipe ART</a>, <a href="https://github.com/ml-explore/mlx">Apple MLX</a>, <a href="https://github.com/ml-explore/mlx-lm">mlx-lm</a></p>
+                    </div>
+                    <div class="feature">
+                        <div class="feature-icon">📖</div>
+                        <h3>Open Source</h3>
+                        <p>Apache 2.0 license. Contributions welcome.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+    
+    <footer>
+        <div class="container">
+            <p>
+                <a href="https://github.com/menonpg/art-mlx">GitHub</a> · 
+                <a href="https://blog.themenonlab.com">Blog</a> · 
+                <a href="https://themenonlab.com">The Menon Lab</a>
+            </p>
+            <p style="margin-top: 8px;">Apache 2.0 License · 2026</p>
+        </div>
+    </footer>
+</body>
+</html>
