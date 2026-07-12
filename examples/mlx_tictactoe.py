@@ -22,7 +22,10 @@ try:
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
+    from mlx.utils import tree_flatten
     from mlx_lm import load, generate
+    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.tuner.utils import linear_to_lora_layers
     MLX_AVAILABLE = True
 except ImportError:
     MLX_AVAILABLE = False
@@ -159,7 +162,7 @@ class GRPOTrainer:
         logits = model(inputs)  # [1, seq_len-1, vocab_size]
         
         # Compute log probabilities
-        log_probs = mx.log_softmax(logits, axis=-1)  # [1, seq_len-1, vocab_size]
+        log_probs = nn.log_softmax(logits, axis=-1)  # [1, seq_len-1, vocab_size]
         
         # Gather log probs for the actual tokens
         # labels shape: [1, seq_len-1]
@@ -219,12 +222,12 @@ class GRPOTrainer:
         
         # Process each sequence
         for input_ids, advantage in training_pairs:
-            # Define loss function for this sequence
-            def loss_fn(model):
-                return self.compute_loss_for_sequence(model, input_ids, advantage)
-            
-            # Compute loss and gradients
-            loss, grads = mx.value_and_grad(loss_fn)(self.model)
+            # Define loss function for this sequence (captures inputs via closure)
+            def loss_fn():
+                return self.compute_loss_for_sequence(self.model, input_ids, advantage)
+
+            # Compute loss and gradients w.r.t. trainable (LoRA) parameters only
+            loss, grads = nn.value_and_grad(self.model, loss_fn)()
             
             # Update model parameters
             self.optimizer.update(self.model, grads)
@@ -286,7 +289,7 @@ Your move (single digit):"""
             self.tokenizer,
             prompt=prompt,
             max_tokens=3,
-            temp=0.8,
+            sampler=make_sampler(temp=0.8),
             verbose=False
         )
         
@@ -377,6 +380,14 @@ async def main():
     model, tokenizer = load(model_name)
     print(f"✓ Loaded in {time.time() - start:.1f}s")
     print(f"✓ Device: {mx.default_device()}")
+
+    # Apply LoRA adapters so the 4-bit quantized base stays frozen while
+    # small adapter weights remain trainable (QLoRA-style GRPO fine-tuning).
+    model.freeze()
+    lora_config = {"rank": 8, "scale": 20.0, "dropout": 0.0}
+    linear_to_lora_layers(model, num_layers=8, config=lora_config)
+    num_trainable = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
+    print(f"✓ LoRA adapters applied ({num_trainable:,} trainable params)")
     print()
     
     # Create agent and trainer
