@@ -22,6 +22,16 @@ from .lora import (
 )
 from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 
+# Optional: export utilities (import errors handled gracefully)
+try:
+    from .export import push_to_hub, merge_adapters, convert_to_gguf
+    _EXPORT_AVAILABLE = True
+except ImportError:
+    _EXPORT_AVAILABLE = False
+    push_to_hub = None
+    merge_adapters = None
+    convert_to_gguf = None
+
 __all__ = [
     "MLXBackend",
     "GRPOTrainer",
@@ -35,4 +45,7 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "find_latest_checkpoint",
+    "push_to_hub",
+    "merge_adapters",
+    "convert_to_gguf",
 ]
