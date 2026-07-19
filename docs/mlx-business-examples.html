@@ -79,6 +79,13 @@
         ul.clean li::before { content: "→"; position: absolute; left: 0; color: var(--accent); }
         ul.clean li b { color: var(--text); }
 
+        ol.steps { margin: 8px 0 8px 0; padding-left: 0; list-style: none; counter-reset: step; }
+        ol.steps li { position: relative; padding: 12px 0 12px 46px; border-bottom: 1px solid var(--border); color: var(--text-secondary); }
+        ol.steps li::before { counter-increment: step; content: counter(step); position: absolute; left: 0; top: 12px; width: 28px; height: 28px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 700; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; }
+        ol.steps li b { color: var(--text); }
+        .datatable td:first-child { color: var(--text); font-weight: 600; white-space: nowrap; }
+        .pilltag { display:inline-block; font-size:0.72rem; padding:2px 8px; border-radius:999px; background:var(--bg-tertiary); color:var(--text-secondary); margin:2px 3px 2px 0; }
+
         footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--text-secondary); font-size: 0.88rem; }
         footer a { color: var(--text-secondary); }
     </style>
@@ -101,8 +108,9 @@
             <h1>Practical <span class="grad">Business Use-Cases</span><br>trained on a MacBook</h1>
             <p class="lede">
                 Three real-world GRPO examples run end-to-end on Apple Silicon — a natural-language-to-SQL assistant,
-                a customer-support email agent, and a code-review agent. Each fine-tunes a small model on your Mac using
-                LoRA adapters, with no cloud GPU, database, or API keys required.
+                a customer-support email agent, and a code-review agent. Each teaches a small model from a page of
+                hand-written examples plus a grading rubric — on your Mac, with no cloud GPU, database, or API keys.
+                <b>Jump to <a href="#training-data">“what the training data actually is”</a> below.</b>
             </p>
             <div class="badges">
                 <span class="badge pass">✓ SQL assistant</span>
@@ -119,9 +127,10 @@
     <section>
         <div class="wrap">
             <h2><span class="n">01</span>What these examples are</h2>
-            <p>Each script follows the same pattern: score the model on a business task, run 8 rounds of GRPO training
-               (reinforcement learning) that nudge trainable LoRA adapters toward higher-scoring outputs, then re-score.
-               They are self-contained — the reward is computed by a built-in heuristic scorer, so they run offline.</p>
+            <p>Each script follows the same pattern: take a page of hand-written example tasks, score the model's attempts
+               with a built-in rubric, run 8 rounds of GRPO training (reinforcement learning) that nudge trainable LoRA
+               adapters toward higher-scoring answers, then re-score. They are self-contained and run offline — the next
+               section explains exactly what that example data and rubric are.</p>
             <div class="cards">
                 <div class="card"><div class="k">Example 1</div><div class="v tag-industry">SQL Assistant</div><div class="k" style="margin-top:8px;">Data Analytics / BI</div></div>
                 <div class="card"><div class="k">Example 2</div><div class="v tag-industry">Email Support Agent</div><div class="k" style="margin-top:8px;">Customer Service</div></div>
@@ -130,9 +139,74 @@
         </div>
     </section>
 
+    <section id="training-data">
+        <div class="wrap">
+            <h2><span class="n">02</span>What the “training data” actually is (the key idea)</h2>
+            <p>There is <b>no giant dataset and no database</b>. Everything the model learns from is written in plain text
+               directly inside each script — about a page of examples. Teaching the model works exactly like coaching a new
+               hire with a <b>worked-examples sheet</b> and a <b>grading rubric</b>. Two ingredients:</p>
+            <div class="cards">
+                <div class="card">
+                    <div class="k">Ingredient 1</div>
+                    <div class="v" style="font-size:1.1rem;">Example tasks</div>
+                    <p style="color:var(--text-secondary); font-size:0.9rem; margin-top:8px;">A short, hand-written list of
+                    realistic tasks (6 questions / 6 tickets / 5 code diffs). Literally a Python list at the top of the file.
+                    In production you paste in your own real ones.</p>
+                </div>
+                <div class="card">
+                    <div class="k">Ingredient 2</div>
+                    <div class="v" style="font-size:1.1rem;">A grader (the rubric)</div>
+                    <p style="color:var(--text-secondary); font-size:0.9rem; margin-top:8px;">A set of plain rules that award
+                    points for what a good answer looks like — the “answer key.” In production you swap it for a real
+                    outcome (did the query return the right rows? did the customer come back happy?).</p>
+                </div>
+            </div>
+            <p style="margin-top:18px;">During training, for each example task the model writes several attempts, the grader
+               scores each one, and training nudges the model toward the higher-scoring attempts. Repeat 8 times. That’s the
+               whole loop.</p>
+
+            <h3>Exactly what data each example ships with</h3>
+            <table class="datatable">
+                <thead><tr><th>Example</th><th>The example tasks (the “data”)</th><th>How it was created</th><th>What the grader rewards</th></tr></thead>
+                <tbody>
+                    <tr>
+                        <td>SQL Assistant</td>
+                        <td>6 English questions about a 4-table e-commerce database (each with a reference SQL answer)</td>
+                        <td>Hand-written synthetic, in the <code>SAMPLE_QUESTIONS</code> list</td>
+                        <td>Uses <code>SELECT</code>, the correct tables, the right keywords (SUM/GROUP&nbsp;BY/LIMIT); penalizes <code>SELECT *</code></td>
+                    </tr>
+                    <tr>
+                        <td>Email Support</td>
+                        <td>6 support tickets (login, billing, feature request, integration, cancellation, praise) tagged with category + urgency</td>
+                        <td>Hand-written synthetic, in the <code>SAMPLE_TICKETS</code> list</td>
+                        <td>Empathy, a concrete next step, greeting/closing, right length; category-aware bonuses</td>
+                    </tr>
+                    <tr>
+                        <td>Code Review</td>
+                        <td>5 code diffs, each with a planted bug (hardcoded password, SQL injection, exposed secret, sleep-in-loop, mutable default)</td>
+                        <td>Hand-written synthetic, in the <code>SAMPLE_DIFFS</code> list</td>
+                        <td>Naming the real issue, being actionable, explaining <i>why</i>, matching severity</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>How a non-technical person actually does this</h3>
+            <ol class="steps">
+                <li><b>Collect ~5–10 real examples of the task.</b> Real tickets from your inbox, real questions your team asks, real pull requests. Pure copy-paste — no code.</li>
+                <li><b>Decide what a good answer looks like.</b> Either jot down simple rules (“must apologize, must give a next step, keep under 6 sentences”) <i>or</i> have a colleague rate a handful of answers 1–5. This rubric is the most important part.</li>
+                <li><b>Hand both to the script.</b> Paste your examples into the list at the top of the file (or give them to a developer for ~15 minutes to wire in).</li>
+                <li><b>Run one command.</b> The model writes attempts, grades itself against your rubric, and practices — all on your Mac, offline.</li>
+                <li><b>Graduate to real feedback.</b> When ready, replace the rule-based grader with a real signal: actually run the SQL and check the rows, track whether the customer replied happy, or track whether the developer accepted the review.</li>
+            </ol>
+            <div class="callout info">
+                <b>The one-sentence version:</b> you teach the model by giving it <b>a few example tasks</b> and <b>a rubric that scores answers</b> — then it practices against the rubric until it scores higher. You are grading homework, and the model is the student.
+            </div>
+        </div>
+    </section>
+
     <section>
         <div class="wrap">
-            <h2><span class="n">02</span>Results summary</h2>
+            <h2><span class="n">03</span>Results summary</h2>
             <p>All three trained through all 8 steps with real gradient updates. "Best" is the top single-attempt score
                reached during training; the heuristic scorer runs 0.0–1.0.</p>
             <table>
@@ -156,9 +230,21 @@
 
     <section>
         <div class="wrap">
-            <h2><span class="n">03</span>SQL Assistant — <code>examples/industry/sql_assistant.py</code></h2>
-            <p><b>Use case:</b> turn a plain-English question into a correct, efficient SQL query. Scored on structure
-               (SELECT, JOINs, GROUP BY, LIMIT) and table usage.</p>
+            <h2><span class="n">04</span>SQL Assistant — <code>examples/industry/sql_assistant.py</code></h2>
+            <p><b>Use case:</b> let a non-technical analyst ask a question in plain English and get the SQL for a BI tool.
+               Scored on structure (SELECT, JOINs, GROUP BY, LIMIT) and table usage.</p>
+<pre><span class="dim">TRAINING DATA — 6 English questions about this e-commerce schema (in SAMPLE_QUESTIONS):</span>
+  tables: customers, orders, order_items, products
+
+<span class="dim">One example item:</span>
+  question:          "What are the top 5 customers by total spend?"
+  expected_tables:   customers, orders
+  expected_keywords: SUM, GROUP BY, ORDER BY, LIMIT
+  reference_sql:     SELECT c.name, SUM(o.total_amount) AS total_spend
+                     FROM customers c JOIN orders o ON c.id = o.customer_id
+                     GROUP BY c.id, c.name ORDER BY total_spend DESC LIMIT 5
+
+<span class="dim">Grader:</span> +0.2 has SELECT | +0.1 each correct table | +0.1 each keyword | <span class="warn">-0.1 SELECT *</span></pre>
 <pre>BEFORE TRAINING
 Question: What are the top 5 customers by total spend?
 Score: <span class="hi">0.90</span>  (+has_select, +uses_customers, +uses_orders, +has_sum,
@@ -181,9 +267,21 @@ Score: <span class="hi">0.90</span>  <span class="warn">(query became more garbl
 
     <section>
         <div class="wrap">
-            <h2><span class="n">04</span>Email Support Agent — <code>examples/industry/email_support_agent.py</code></h2>
-            <p><b>Use case:</b> draft an empathetic, actionable reply to a customer ticket. Scored on empathy, a concrete
-               action, greeting/closing, and length.</p>
+            <h2><span class="n">05</span>Email Support Agent — <code>examples/industry/email_support_agent.py</code></h2>
+            <p><b>Use case:</b> draft a fast, consistent first-response email so support agents reply quicker. Scored on
+               empathy, a concrete action, greeting/closing, and length.</p>
+<pre><span class="dim">TRAINING DATA — 6 real-style support tickets (in SAMPLE_TICKETS):</span>
+  login issue (high) | billing question (med) | feature request (low)
+  integration error (high) | cancellation (high) | praise (low)
+
+<span class="dim">One example item:</span>
+  subject:  "Can't login to my account"
+  body:     "...trying to login for the past hour... really frustrating, I have a deadline today."
+  category: account_access    urgency: high
+
+<span class="dim">Grader:</span> +empathy words | +a concrete next step | +greeting/closing | right length
+         + category-aware bonuses (churn → retention offer, billing → mentions charge/refund,
+         high urgency → acts immediately)</pre>
 <pre>BEFORE TRAINING
 Ticket: Can't login to my account
 Score: <span class="hi">0.85</span>  (+empathy, +action, +greeting, +closing)
@@ -205,9 +303,21 @@ Score: <span class="hi">0.70</span>  <span class="warn">(-too_long — model fel
 
     <section>
         <div class="wrap">
-            <h2><span class="n">05</span>Code-Review Agent — <code>examples/industry/code_review_agent.py</code></h2>
-            <p><b>Use case:</b> review a pull-request diff and flag issues. Scored on catching the planted SQL-injection /
-               raw-query bug, being actionable, and matching severity. This example hit a <b>perfect 1.00</b> at step 2.</p>
+            <h2><span class="n">06</span>Code-Review Agent — <code>examples/industry/code_review_agent.py</code></h2>
+            <p><b>Use case:</b> an automated first-pass reviewer that catches security bugs before a human looks. Scored on
+               catching the planted issue, being actionable, and matching severity. This example hit a <b>perfect 1.00</b> at step 2.</p>
+<pre><span class="dim">TRAINING DATA — 5 code diffs, each with a planted bug (in SAMPLE_DIFFS):</span>
+  auth.py (hardcoded password) | api.py (SQL injection) | utils.py (sleep in loop)
+  config.py (exposed AWS secret) | models.py (mutable default)
+
+<span class="dim">One example item (api.py):</span>
+  -    return db.query(User).filter(User.id == user_id).first()
+  +    query = f"SELECT * FROM users WHERE id = {user_id}"      <span class="warn">&lt;- SQL injection</span>
+  +    return db.execute(query)
+  known_issues: sql_injection, raw_query    severity: critical
+
+<span class="dim">Grader:</span> +0.15 each named issue | +actionable suggestion | +explains WHY | +matches severity
+         <span class="warn">-penalizes nitpicking (formatting/whitespace) on critical bugs</span></pre>
 <pre>BEFORE TRAINING
 File: api.py  (diff introduces an f-string SQL query = injection risk)
 Score: <span class="hi">0.80</span>  (+identified_sql_injection, +identified_raw_query,
@@ -230,7 +340,7 @@ Score: <span class="hi">0.70</span>  (+identified_sql_injection, +identified_raw
 
     <section>
         <div class="wrap">
-            <h2><span class="n">06</span>Reproduce it</h2>
+            <h2><span class="n">07</span>Reproduce it</h2>
             <ul class="clean">
                 <li>Requires <b>Python ≥ 3.12</b> on Apple Silicon; install with <code>pip install -e ".[mlx]"</code></li>
                 <li>SQL: <code>python examples/industry/sql_assistant.py</code></li>
