@@ -8,6 +8,31 @@ Each example shows:
 3. Training loop with GRPO
 4. Before/after comparison
 
+## What is the "training data" here? (read this first)
+
+There is **no external dataset and no database**. Everything the model learns from is
+written in plain text at the top of each script — about a page. Teaching the model works
+like coaching a new hire with a **worked-examples sheet** and a **grading rubric**:
+
+| Ingredient | What it is | Where it lives |
+|---|---|---|
+| **Example tasks** | A short hand-written list of realistic tasks (6 questions / 6 tickets / 5 diffs) | `SAMPLE_QUESTIONS` / `SAMPLE_TICKETS` / `SAMPLE_DIFFS` |
+| **A grader (rubric)** | Plain rules that award points for what a good answer looks like | the `score_*()` function |
+
+During training, for each example task the model writes several attempts, the grader scores
+each, and training nudges the model toward the higher-scoring ones. Repeat 8 times.
+
+**How a non-technical person does this:**
+1. Collect ~5–10 **real** examples of the task (real tickets, real questions, real PRs) — copy-paste, no code.
+2. Decide what a **good answer** looks like: simple rules, or have a colleague rate answers 1–5. This rubric matters most.
+3. Paste your examples into the list at the top of the script (or hand them to a developer for ~15 min).
+4. Run one command — the model practices and grades itself against your rubric, offline on your Mac.
+5. Later, replace the rubric with a **real signal**: run the SQL and check the rows, track if the customer replied happy, or track if the developer accepted the review.
+
+> One-sentence version: you teach by giving **a few example tasks** + **a rubric that scores answers**; the model practices against the rubric. You grade homework; the model is the student.
+
+📊 **Full report with real training data samples and logs:** https://menonpg.github.io/art-mlx/mlx-business-examples.html
+
 ## Examples
 
 ### 📧 Customer Support Email Agent
