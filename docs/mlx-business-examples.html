@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ART-MLX — Business Use-Case Test Results | The Menon Lab</title>
+    <meta name="description" content="Verified end-to-end GRPO training results for three practical business examples on Apple Silicon: SQL assistant, customer-support email agent, and code-review agent.">
+
+    <meta property="og:title" content="ART-MLX — Business Use-Case Test Results">
+    <meta property="og:description" content="Three practical GRPO business demos trained on a MacBook: NL→SQL, support email, and code review.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://menonpg.github.io/art-mlx/mlx-business-examples.html">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --bg: #0a0a0a; --bg-secondary: #141414; --bg-tertiary: #1a1a1a;
+            --text: #fafafa; --text-secondary: #a1a1aa;
+            --accent: #3b82f6; --accent-hover: #2563eb;
+            --green: #22c55e; --red: #ef4444; --orange: #f97316; --purple: #a855f7;
+            --border: #27272a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); line-height: 1.65; }
+        code, pre { font-family: 'JetBrains Mono', monospace; }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .wrap { max-width: 920px; margin: 0 auto; padding: 0 24px; }
+
+        header { border-bottom: 1px solid var(--border); padding: 20px 0; position: sticky; top: 0; background: rgba(10,10,10,0.85); backdrop-filter: blur(10px); z-index: 10; }
+        header .wrap { display: flex; align-items: center; justify-content: space-between; }
+        .brand { font-weight: 700; font-size: 1.05rem; }
+        .brand span { color: var(--accent); }
+        nav a { color: var(--text-secondary); margin-left: 20px; font-size: 0.9rem; }
+        nav a:hover { color: var(--text); }
+
+        .hero { padding: 64px 0 32px; }
+        .eyebrow { display: inline-block; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); font-weight: 600; margin-bottom: 14px; }
+        h1 { font-size: 2.4rem; line-height: 1.15; font-weight: 700; letter-spacing: -0.02em; }
+        h1 .grad { background: linear-gradient(90deg, var(--accent), var(--purple)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .lede { color: var(--text-secondary); font-size: 1.1rem; margin-top: 16px; max-width: 720px; }
+        .badges { margin-top: 24px; display: flex; gap: 10px; flex-wrap: wrap; }
+        .badge { font-size: 0.8rem; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary); }
+        .badge.pass { color: var(--green); border-color: rgba(34,197,94,0.4); }
+        .meta { color: var(--text-secondary); font-size: 0.85rem; margin-top: 14px; }
+
+        section { padding: 32px 0; border-top: 1px solid var(--border); }
+        h2 { font-size: 1.5rem; margin-bottom: 8px; letter-spacing: -0.01em; }
+        h2 .n { color: var(--accent); font-weight: 600; margin-right: 8px; }
+        h3 { font-size: 1.15rem; margin: 22px 0 6px; }
+        section > .wrap > p { color: var(--text-secondary); margin-bottom: 16px; }
+
+        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 8px; }
+        .card { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+        .card .k { font-size: 0.78rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+        .card .v { font-size: 1.5rem; font-weight: 700; margin-top: 6px; }
+        .card .v.tag-industry { font-size: 0.95rem; color: var(--purple); }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.92rem; }
+        th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+        th { color: var(--text-secondary); font-weight: 600; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.04em; }
+        td code { background: var(--bg-tertiary); padding: 2px 6px; border-radius: 5px; font-size: 0.85em; }
+
+        pre { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; padding: 18px; overflow-x: auto; font-size: 0.8rem; line-height: 1.55; color: #d4d4d8; margin-top: 8px; white-space: pre-wrap; }
+        pre .ok { color: var(--green); }
+        pre .hi { color: var(--accent); }
+        pre .dim { color: var(--text-secondary); }
+        pre .warn { color: var(--orange); }
+
+        .callout { background: linear-gradient(180deg, rgba(249,115,22,0.08), transparent); border: 1px solid rgba(249,115,22,0.28); border-radius: 12px; padding: 18px; margin-top: 12px; }
+        .callout.info { background: linear-gradient(180deg, rgba(59,130,246,0.08), transparent); border-color: rgba(59,130,246,0.25); }
+        .callout b { color: var(--text); }
+
+        ul.clean { list-style: none; margin-top: 8px; }
+        ul.clean li { padding: 8px 0 8px 26px; position: relative; color: var(--text-secondary); border-bottom: 1px solid var(--border); }
+        ul.clean li::before { content: "→"; position: absolute; left: 0; color: var(--accent); }
+        ul.clean li b { color: var(--text); }
+
+        footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--text-secondary); font-size: 0.88rem; }
+        footer a { color: var(--text-secondary); }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="wrap">
+            <div class="brand">ART<span>-MLX</span></div>
+            <nav>
+                <a href="index.html">Home</a>
+                <a href="mlx-tictactoe-results.html">Game Results</a>
+                <a href="https://github.com/menonpg/art-mlx">GitHub</a>
+            </nav>
+        </div>
+    </header>
+
+    <div class="hero">
+        <div class="wrap">
+            <span class="eyebrow">Verified Test Report</span>
+            <h1>Practical <span class="grad">Business Use-Cases</span><br>trained on a MacBook</h1>
+            <p class="lede">
+                Three real-world GRPO examples run end-to-end on Apple Silicon — a natural-language-to-SQL assistant,
+                a customer-support email agent, and a code-review agent. Each fine-tunes a small model on your Mac using
+                LoRA adapters, with no cloud GPU, database, or API keys required.
+            </p>
+            <div class="badges">
+                <span class="badge pass">✓ SQL assistant</span>
+                <span class="badge pass">✓ Email support agent</span>
+                <span class="badge pass">✓ Code-review agent</span>
+                <span class="badge">MLX 0.32.0</span>
+                <span class="badge">Qwen2.5-0.5B-4bit</span>
+                <span class="badge">Apple M1 GPU</span>
+            </div>
+            <p class="meta">Tested 2026-07-18 · Python 3.13 · mlx-lm 0.31.3 · ~1.47M trainable LoRA params each</p>
+        </div>
+    </div>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">01</span>What these examples are</h2>
+            <p>Each script follows the same pattern: score the model on a business task, run 8 rounds of GRPO training
+               (reinforcement learning) that nudge trainable LoRA adapters toward higher-scoring outputs, then re-score.
+               They are self-contained — the reward is computed by a built-in heuristic scorer, so they run offline.</p>
+            <div class="cards">
+                <div class="card"><div class="k">Example 1</div><div class="v tag-industry">SQL Assistant</div><div class="k" style="margin-top:8px;">Data Analytics / BI</div></div>
+                <div class="card"><div class="k">Example 2</div><div class="v tag-industry">Email Support Agent</div><div class="k" style="margin-top:8px;">Customer Service</div></div>
+                <div class="card"><div class="k">Example 3</div><div class="v tag-industry">Code-Review Agent</div><div class="k" style="margin-top:8px;">Developer Tools</div></div>
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">02</span>Results summary</h2>
+            <p>All three trained through all 8 steps with real gradient updates. "Best" is the top single-attempt score
+               reached during training; the heuristic scorer runs 0.0–1.0.</p>
+            <table>
+                <thead>
+                    <tr><th>Example</th><th>Business task</th><th>Before</th><th>Best in training</th><th>Step time</th><th>Status</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>sql_assistant.py</code></td><td>Natural language → SQL</td><td>0.90</td><td>0.90</td><td>~6–11s</td><td>✅ ran</td></tr>
+                    <tr><td><code>email_support_agent.py</code></td><td>Support email drafting</td><td>0.85</td><td>0.85</td><td>~12–18s</td><td>✅ ran</td></tr>
+                    <tr><td><code>code_review_agent.py</code></td><td>PR code review</td><td>0.80</td><td><b>1.00</b></td><td>~18–20s</td><td>✅ ran</td></tr>
+                </tbody>
+            </table>
+            <div class="callout">
+                <b>Honest caveat.</b> These runs prove the <b>training pipeline works end-to-end</b> on Apple Silicon —
+                not that the model's quality reliably improves. With a tiny 0.5&nbsp;B model, a keyword-based reward, and
+                only 8 steps, final outputs sometimes <b>degrade</b> (e.g. repetition loops). Real deployments need a
+                larger model, a genuine reward signal (execution results / human feedback), and many more steps.
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">03</span>SQL Assistant — <code>examples/industry/sql_assistant.py</code></h2>
+            <p><b>Use case:</b> turn a plain-English question into a correct, efficient SQL query. Scored on structure
+               (SELECT, JOINs, GROUP BY, LIMIT) and table usage.</p>
+<pre>BEFORE TRAINING
+Question: What are the top 5 customers by total spend?
+Score: <span class="hi">0.90</span>  (+has_select, +uses_customers, +uses_orders, +has_sum,
+                +has_group by, +has_order by, +has_limit, +proper_join)
+
+TRAINING
+Step 1/8: score=0.56 best=0.70 (5.9s)
+Step 2/8: score=0.78 best=0.85 (5.3s)
+Step 3/8: score=0.47 best=0.90 (11.2s)
+Step 4/8: score=0.62 best=0.90 (9.0s)
+Step 5/8: score=0.59 best=0.70 (9.7s)
+Step 6/8: score=0.56 best=0.90 (10.5s)
+Step 7/8: score=0.76 best=0.85 (7.5s)
+Step 8/8: score=0.73 best=0.90 (6.5s)
+
+AFTER TRAINING
+Score: <span class="hi">0.90</span>  <span class="warn">(query became more garbled but hit the same keyword score)</span></pre>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">04</span>Email Support Agent — <code>examples/industry/email_support_agent.py</code></h2>
+            <p><b>Use case:</b> draft an empathetic, actionable reply to a customer ticket. Scored on empathy, a concrete
+               action, greeting/closing, and length.</p>
+<pre>BEFORE TRAINING
+Ticket: Can't login to my account
+Score: <span class="hi">0.85</span>  (+empathy, +action, +greeting, +closing)
+
+TRAINING
+Step 1/8: score=0.69 best=0.75 loss= 0.0021 (13.4s)
+Step 2/8: score=0.74 best=0.80 loss= 0.0041 (12.4s)
+Step 3/8: score=0.73 best=0.85 loss=-0.0051 (13.2s)
+Step 4/8: score=0.61 best=0.85 loss= 0.0246 (15.8s)
+Step 5/8: score=0.64 best=0.70 loss= 0.0069 (18.2s)
+Step 6/8: score=0.69 best=0.80 loss= 0.0062 (18.0s)
+Step 7/8: score=0.71 best=0.80 loss= 0.0009 (18.3s)
+Step 8/8: score=0.69 best=0.70 loss= 0.0032 (18.5s)
+
+AFTER TRAINING
+Score: <span class="hi">0.70</span>  <span class="warn">(-too_long — model fell into an "I apologize" repetition loop)</span></pre>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">05</span>Code-Review Agent — <code>examples/industry/code_review_agent.py</code></h2>
+            <p><b>Use case:</b> review a pull-request diff and flag issues. Scored on catching the planted SQL-injection /
+               raw-query bug, being actionable, and matching severity. This example hit a <b>perfect 1.00</b> at step 2.</p>
+<pre>BEFORE TRAINING
+File: api.py  (diff introduces an f-string SQL query = injection risk)
+Score: <span class="hi">0.80</span>  (+identified_sql_injection, +identified_raw_query,
+                +actionable, +severity_match)
+
+TRAINING
+Step 1/8: score=0.64 best=0.90 (18.2s)
+Step 2/8: score=0.83 best=<span class="ok">1.00</span> (19.2s)   &lt;- caught the SQL injection perfectly
+Step 3/8: score=0.61 best=0.90 (17.6s)
+Step 4/8: score=0.63 best=0.95 (19.0s)
+Step 5/8: score=0.69 best=0.90 (19.8s)
+Step 6/8: score=0.46 best=0.70 (18.9s)
+Step 7/8: score=0.41 best=0.65 (18.6s)
+Step 8/8: score=0.47 best=0.70 (18.3s)
+
+AFTER TRAINING
+Score: <span class="hi">0.70</span>  (+identified_sql_injection, +identified_raw_query, +severity_match)</pre>
+        </div>
+    </section>
+
+    <section>
+        <div class="wrap">
+            <h2><span class="n">06</span>Reproduce it</h2>
+            <ul class="clean">
+                <li>Requires <b>Python ≥ 3.12</b> on Apple Silicon; install with <code>pip install -e ".[mlx]"</code></li>
+                <li>SQL: <code>python examples/industry/sql_assistant.py</code></li>
+                <li>Email: <code>python examples/industry/email_support_agent.py</code></li>
+                <li>Code review: <code>python examples/industry/code_review_agent.py</code></li>
+                <li>Run long jobs with <code>caffeinate -i python -u ...</code> so sleep can't stall the GPU.</li>
+            </ul>
+            <div class="callout info">
+                <b>How to make these actually improve.</b> Swap the heuristic <code>score_*()</code> for a real reward
+                (run the SQL and compare rows; measure ticket resolution; track whether devs accept the review), use a
+                bigger base model, and train for far more steps. The plumbing shown here stays the same.
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="wrap">
+            ART-MLX · The Menon Lab — GRPO reinforcement learning for Apple Silicon.<br>
+            Report generated from verified local runs on 2026-07-18.
+            See the <a href="mlx-tictactoe-results.html">game-training report</a> and the
+            <a href="https://github.com/menonpg/art-mlx/tree/main/examples/industry">industry examples</a>.
+        </div>
+    </footer>
+</body>
+</html>

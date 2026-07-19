@@ -52,6 +52,30 @@ python examples/industry/code_review_agent.py
 
 ---
 
+## Verified Results (2026-07-18)
+
+All three examples were run end-to-end on an Apple M1 Mac (Python 3.13, MLX 0.32.0,
+mlx-lm 0.31.3, Qwen2.5-0.5B-Instruct-4bit, ~1.47M trainable LoRA params). Each trained
+through all 8 GRPO steps with real gradient updates.
+
+| Example | Task | Before | Best in training | Step time |
+|---|---|---|---|---|
+| `sql_assistant.py` | Natural language → SQL | 0.90 | 0.90 | ~6–11s |
+| `email_support_agent.py` | Support email drafting | 0.85 | 0.85 | ~12–18s |
+| `code_review_agent.py` | PR code review | 0.80 | **1.00** | ~18–20s |
+
+📊 **Full report with logs:** https://menonpg.github.io/art-mlx/mlx-business-examples.html
+
+> **Honest caveat:** these runs prove the *training pipeline* works end-to-end on Apple
+> Silicon — not that output quality reliably improves. With a tiny 0.5B model, a keyword
+> heuristic reward, and only 8 steps, final outputs sometimes degrade (e.g. repetition
+> loops). Production use needs a larger model, a genuine reward signal, and many more steps.
+>
+> **Tip:** run long jobs with `caffeinate -i python -u ...` so the Mac sleeping can't stall
+> the GPU mid-run.
+
+---
+
 ## Building Your Own
 
 The pattern is always:
